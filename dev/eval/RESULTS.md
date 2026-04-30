@@ -185,6 +185,64 @@ CUDA_VISIBLE_DEVICES=7 PYTHONPATH=/data/yuzhou/projects/sglang/python \
 # ~16 min wall for full 50/200 iter run.
 ```
 
+### Arena structural cost — scheduler-side bookkeeping bisection (DOES NOT REPRODUCE)
+
+After ruling out the fused_moe TLB hypothesis above, paper §sec:eval-arena-cost
+was rewritten to attribute the 5.86%/12.34% gap to scheduler-side bookkeeping.
+We bisected by adding L2 layers one at a time on top of the no-arena baseline:
+
+- **C0** = no arena, no budgeter (matches paper cell_00)
+- **C1** = arena only (cuMemMap range, from_blob tensors, arena-aware allocator); no budgeter
+- **C2** = C1 + `SGLANG_BUDGETER=1` (per-tick snapshot, no planner)
+- **C3** = C2 + `SGLANG_BUDGETER_XPOOL_PLANNER=1` + `_COORDINATED=1` + thresholds (= cell_11 minus L1)
+
+L1 (HPB-LRU, K_BIG) held OFF for all cells so the gap is purely arena/L2 machinery.
+
+**Result on B2 cold_burst recovery (GSP, RPS=2, paper headline workload):**
+
+| cell | TPS | mean TTFT (ms) | p99 TTFT (ms) | med E2E (ms) |
+|------|----:|---------------:|--------------:|-------------:|
+| C0_baseline       | 27907 | 284.80 | 1144 | 2921 |
+| C1_pure_arena     | 27906 | 286.88 | 1108 | 2907 |
+| C2_arena_budget   | 27921 | 284.75 | 1131 | 2905 |
+| C3_arena_planner  | 27913 | 284.77 | 1118 | 2966 |
+
+TPS spread 0.05%, mean TTFT 0.7%, P99 TTFT 3.2%. **Gap does not reproduce.**
+
+**Result on random-prefill workload (random 512in/128out, RPS=8, n=100, matches `dev/2e/24_arena_from_blob_perf.sh` — the original measurement source):**
+
+| cell | TPS | mean TTFT (ms) | p99 TTFT (ms) | med E2E (ms) |
+|------|----:|---------------:|--------------:|-------------:|
+| C0_baseline       | 2076 | 43.71 | 74.0 | 632 |
+| C1_pure_arena     | 2077 | 45.36 | 81.1 | 637 |
+| C2_arena_budget   | 2076 | 46.90 | 83.3 | 646 |
+| C3_arena_planner  | 2076 | 45.41 | 81.9 | 634 |
+
+TPS literally identical. Mean TTFT C1-vs-C0 +3.8%, P99 TTFT +9.6% — both at noise
+floor for n=100 (P99 of 100 samples = single worst observation).
+
+**Conclusion:** the 5.86% mean / 12.34% P99 TTFT cost cited in paper
+§sec:eval-arena-cost (sourced from `dev/2e/24_arena_from_blob_perf.sh`,
+2026-04-30) **does not reproduce on current code**. Either intervening fixes
+closed it (static_min/soft split, set_capacity off-by-one, etc.) or the original
+single-point measurement had cross-cell contention noise (no variance bands).
+The current measurement budget shows arena structural cost ≤ 4% mean TTFT
+at the noise floor; budgeter and planner add nothing measurable on top of
+the arena. Pool capacities are identical across C0 and C1
+(`max_total_num_tokens=1263072, max_running_requests=120`); only
+`available_gpu_mem` differs (25.65 GB → 23.47 GB, arena reserves 2.2 GB).
+
+**Next:** higher-n (n=500) C0-vs-C1 single-pass to nail the magnitude with
+stable percentiles, then update paper §sec:eval-arena-cost (likely drop
+the 5.86%/12.34% claim or replace with the new tighter measurement).
+
+**Repro:**
+```bash
+GPU=2 PORT_BASE=33000 bash dev/eval/bisect_arena_cost/run.sh        # B2 cold_burst
+GPU=2 PORT_BASE=33100 bash dev/eval/bisect_arena_cost/run_random.sh # random-prefill
+# Per-cell wall: B2 ~5min, random ~3min. Total ~20min for 4-cell sequential.
+```
+
 ### Engine commits frozen for paper-final
 ```
 4ae88b097  prelude/eval: rewrite B3 to use sglang built-in --gsp-num-turns
