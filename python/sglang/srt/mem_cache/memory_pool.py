@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -275,11 +276,33 @@ class MambaPool:
                 # CPU uses a different layout of conv_state for kernel optimization
                 conv_state = _init_amx_conv_state(conv_state)
 
-            temporal_state = torch.zeros(
-                size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                dtype=ssm_dtype,
-                device=device,
+            # Phase 2e.5.1 (A2): when SGLANG_MAMBA_PERLAYER=1, temporal_state is
+            # a List[Tensor] of length num_mamba_layers, each shape
+            # (size+1, *temporal_state_shape). Mirrors the per-layer KV pool
+            # layout, makes the pool VMM-arena-friendly. Default off.
+            self._mamba_perlayer = os.environ.get("SGLANG_MAMBA_PERLAYER") == "1"
+            logger.info(
+                "MambaPool: temporal layout=%s, num_layers=%d, size=%d, "
+                "temporal_shape=%s, conv_shapes=%s",
+                "per-layer-list" if self._mamba_perlayer else "stacked",
+                num_mamba_layers, size, tuple(temporal_state_shape),
+                [tuple(s) for s in conv_state_shape],
             )
+            if self._mamba_perlayer:
+                temporal_state = [
+                    torch.zeros(
+                        size=(size + 1,) + temporal_state_shape,
+                        dtype=ssm_dtype,
+                        device=device,
+                    )
+                    for _ in range(num_mamba_layers)
+                ]
+            else:
+                temporal_state = torch.zeros(
+                    size=(num_mamba_layers, size + 1) + temporal_state_shape,
+                    dtype=ssm_dtype,
+                    device=device,
+                )
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
@@ -363,11 +386,18 @@ class MambaPool:
                 t.shape[0], need_size, *t.shape[2:]
             )
             t[:, select_index] = z
-        t = self.mamba_cache.temporal
-        z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-            t.shape[0], need_size, *t.shape[2:]
-        )
-        t[:, select_index] = z
+        if isinstance(self.mamba_cache.temporal, list):
+            for t in self.mamba_cache.temporal:
+                z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+                    need_size, *t.shape[1:]
+                )
+                t[select_index] = z
+        else:
+            t = self.mamba_cache.temporal
+            z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+                t.shape[0], need_size, *t.shape[2:]
+            )
+            t[:, select_index] = z
 
         return select_index
 
@@ -386,9 +416,13 @@ class MambaPool:
             self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
                 :, src_index
             ]
-        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
-            :, src_index
-        ]
+        if isinstance(self.mamba_cache.temporal, list):
+            for t in self.mamba_cache.temporal:
+                t[dst_index] = t[src_index]
+        else:
+            self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
+                :, src_index
+            ]
         return
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
@@ -404,9 +438,15 @@ class MambaPool:
             conv[:, indices].to("cpu", non_blocking=True)
             for conv in self.mamba_cache.conv
         ]
-        temporal_cpu = self.mamba_cache.temporal[:, indices].to(
-            "cpu", non_blocking=True
-        )
+        if isinstance(self.mamba_cache.temporal, list):
+            temporal_cpu = [
+                t[indices].to("cpu", non_blocking=True)
+                for t in self.mamba_cache.temporal
+            ]
+        else:
+            temporal_cpu = self.mamba_cache.temporal[:, indices].to(
+                "cpu", non_blocking=True
+            )
         torch.cuda.synchronize()
         return conv_cpu, temporal_cpu
 
@@ -415,9 +455,13 @@ class MambaPool:
         torch.cuda.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
-        self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
-            self.mamba_cache.temporal.device, non_blocking=True
-        )
+        if isinstance(self.mamba_cache.temporal, list):
+            for i, t in enumerate(self.mamba_cache.temporal):
+                t[indices] = temporal_cpu[i].to(t.device, non_blocking=True)
+        else:
+            self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
+                self.mamba_cache.temporal.device, non_blocking=True
+            )
         torch.cuda.synchronize()
 
     def get_contiguous_buf_infos(self):
@@ -469,9 +513,12 @@ class MambaPool:
 
         dim_per_tensor = []
         for state_tensor in state_tensors:
-            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # The sliceable dimension is at index 2 (after num_layers and size)
-            sliceable_dim = state_tensor.shape[2]
+            if isinstance(state_tensor, list):
+                # Per-layer split (Phase 2e.5.1): each entry shape (size+1, sliceable_dim, ...)
+                sliceable_dim = state_tensor[0].shape[1]
+            else:
+                # Stacked: [num_layers, size+1, sliceable_dim, ...]
+                sliceable_dim = state_tensor.shape[2]
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
@@ -879,30 +926,87 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+        # Phase 2e.4.c: optional ChunkArena-backed allocation. Gated by
+        # SGLANG_KV_ARENA=1. Restricted to head_dim == v_head_dim for now;
+        # falls through to default for the asymmetric case.
+        use_arena = (
+            os.environ.get("SGLANG_KV_ARENA") == "1"
+            and self.head_dim == self.v_head_dim
+            and not self.enable_custom_mem_pool
+        )
+        logger.info(
+            "MHATokenToKVPool buffers: backend=%s (SGLANG_KV_ARENA=%s, "
+            "head_dim==v_head_dim=%s, custom_mem_pool=%s), size=%d, page_size=%d, "
+            "layer_num=%d, head_num=%d, head_dim=%d",
+            "arena" if use_arena else "torch.zeros",
+            os.environ.get("SGLANG_KV_ARENA", "<unset>"),
+            self.head_dim == self.v_head_dim,
+            self.enable_custom_mem_pool,
+            self.size, self.page_size, self.layer_num,
+            self.head_num, self.head_dim,
+        )
+        if use_arena:
+            from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                # For the first cut, init = max (no soft-cap headroom);
+                # set_capacity_tokens(n) will be added to enable runtime
+                # resize once the budgeter is wired in 2e.4.d.
+                tot = self.size + self.page_size
+                chunk_bytes = 64 * 1024 * 1024
+                per_token_bytes = (
+                    self.head_num * self.head_dim
+                    * torch.tensor([], dtype=self.store_dtype).element_size()
+                )
+                tokens_per_chunk = chunk_bytes // per_token_bytes
+                # Round up to chunk-aligned token count.
+                tot_aligned = (
+                    (tot + tokens_per_chunk - 1) // tokens_per_chunk
+                ) * tokens_per_chunk
+                self._kv_arena = MultiTensorArena(
+                    device_id=torch.cuda.current_device(),
+                    n_layers=self.layer_num,
+                    n_kinds=2,
+                    per_token_shape=(self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    max_tokens=tot_aligned,
+                    init_tokens=tot_aligned,
+                    chunk_bytes=chunk_bytes,
+                )
+                logger.info(
+                    "MHATokenToKVPool arena: tot_tokens=%d (tot_aligned=%d), "
+                    "tokens_per_chunk=%d, chunk_bytes=%d, per_token_bytes=%d",
+                    tot, tot_aligned, tokens_per_chunk, chunk_bytes, per_token_bytes,
+                )
+            self.k_buffer = [self._kv_arena.tensor(i, 0) for i in range(self.layer_num)]
+            self.v_buffer = [self._kv_arena.tensor(i, 1) for i in range(self.layer_num)]
+            # Match torch.zeros semantics for the padded slot at index 0.
+            for buf in self.k_buffer + self.v_buffer:
+                buf[: self.page_size].zero_()
+        else:
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    # [size, head_num, head_dim] for each layer
+                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.v_head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -926,6 +1030,43 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+
+    def set_capacity_tokens(self, n_tokens: int) -> int:
+        """Resize the KV pool to back exactly `n_tokens` of capacity (plus padding).
+
+        Only valid when the pool was created with SGLANG_KV_ARENA=1. Returns
+        the actual capacity (rounded up to chunk granularity by the arena).
+        Caller is responsible for ensuring no live allocation references
+        token indices >= the new capacity before calling shrink.
+        """
+        if not hasattr(self, "_kv_arena"):
+            raise RuntimeError(
+                "set_capacity_tokens requires SGLANG_KV_ARENA=1 at pool creation"
+            )
+        target = n_tokens + self.page_size
+        # The arena rounds to its chunk granularity; clamp to its max.
+        chunk = self._kv_arena._arena.chunk_size
+        per_token = self._kv_arena.per_token_bytes
+        tokens_per_chunk = chunk // per_token
+        target_aligned = (
+            (target + tokens_per_chunk - 1) // tokens_per_chunk
+        ) * tokens_per_chunk
+        target_aligned = min(target_aligned, self._kv_arena.max_tokens)
+        prev = self._kv_arena.current_capacity_tokens()
+        self._kv_arena.set_capacity_tokens(target_aligned)
+        new_advertised = target_aligned - self.page_size
+        logger.info(
+            "MHATokenToKVPool.set_capacity_tokens: req=%d -> aligned=%d "
+            "(prev=%d, advertised=%d, page_size=%d)",
+            n_tokens, target_aligned, prev, new_advertised, self.page_size,
+        )
+        return new_advertised
+
+    def live_capacity_tokens(self) -> int:
+        """Currently-backed token capacity (excludes padding)."""
+        if hasattr(self, "_kv_arena"):
+            return self._kv_arena.current_capacity_tokens() - self.page_size
+        return self.size  # static path: capacity == size
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")

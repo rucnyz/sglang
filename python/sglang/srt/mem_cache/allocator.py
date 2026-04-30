@@ -20,9 +20,12 @@ Page-aligned memory pool.
 """
 
 import abc
+import logging
 from typing import TYPE_CHECKING
 
 import torch
+
+logger = logging.getLogger(__name__)
 import triton
 import triton.language as tl
 
@@ -69,6 +72,56 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def backup_state(self):
         return (self.free_pages, self.release_pages)
+
+    @property
+    def live_size(self) -> int:
+        """Currently-active page capacity (= size unless capped by budgeter)."""
+        cap = getattr(self, "_cap", None)
+        return cap if cap is not None else self.size
+
+    def set_capacity_pages(self, n_pages: int) -> None:
+        """Restrict the allocator to only hand out pages with id <= n_pages.
+
+        Maintains a `_capped_pages` tensor of held-out indices so that a
+        later grow can restore them. Initial cap = self.size (full
+        capacity, _capped_pages empty).
+
+        Does NOT verify that no in-flight allocation references id >
+        n_pages — the caller (typically the budgeter) is responsible
+        for that.
+        """
+        cap = getattr(self, "_cap", None)
+        if cap is None:
+            cap = self.size
+        if n_pages == cap:
+            return
+        logger.info(
+            "Allocator.set_capacity_pages: %d -> %d (size=%d, free=%d, capped=%d)",
+            cap, n_pages, self.size,
+            len(self.free_pages),
+            getattr(self, "_capped_pages", torch.empty(0)).numel(),
+        )
+        if n_pages < cap:
+            # Shrink: move free pages with id > n_pages out to _capped.
+            mask = self.free_pages > n_pages
+            held_now = self.free_pages[mask]
+            self.free_pages = self.free_pages[~mask]
+            existing = getattr(self, "_capped_pages", None)
+            if existing is None or existing.numel() == 0:
+                self._capped_pages = held_now
+            else:
+                self._capped_pages = torch.cat([existing, held_now])
+        else:
+            # Grow: move _capped pages with id <= n_pages back to free.
+            held = getattr(self, "_capped_pages", None)
+            if held is None or held.numel() == 0:
+                pass
+            else:
+                mask = held <= n_pages
+                move = held[mask]
+                self.free_pages = torch.cat([self.free_pages, move])
+                self._capped_pages = held[~mask]
+        self._cap = n_pages
 
     def free_group_begin(self):
         self.is_not_in_free_group = False

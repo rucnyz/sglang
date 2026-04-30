@@ -306,7 +306,16 @@ class SchedulerRuntimeCheckerMixin:
         else:
             protected = self.tree_cache.protected_size()
             session_held = self._session_held_tokens()
-            total = self.max_total_num_tokens
+            # Honor live_size if the allocator was capped by the budgeter
+            # (Phase 2e.4.d). Falls back to static max for unmodified
+            # allocators.
+            alloc = self.token_to_kv_pool_allocator
+            live = getattr(alloc, "live_size", None)
+            page_size = getattr(alloc, "page_size", 1)
+            if live is not None and live != alloc.size:
+                total = live * page_size
+            else:
+                total = self.max_total_num_tokens
         return self._check_pool_invariant(
             "full",
             ps.full_available_size,

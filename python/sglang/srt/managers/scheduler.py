@@ -1007,6 +1007,10 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
 
+        # Phase 2 budgeter (gated by SGLANG_BUDGETER env var; no-op otherwise)
+        from sglang.srt.budgeter import BudgetAgent
+        self.budget_agent = BudgetAgent(self)
+
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
         uses_transformers_backend = (
@@ -1493,6 +1497,9 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
+            # Phase 2 budgeter tick (rate-limited internally; no-op when disabled)
+            self.budget_agent.tick()
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1548,6 +1555,9 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
+
+            # Phase 2 budgeter tick (rate-limited internally; no-op when disabled)
+            self.budget_agent.tick()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
