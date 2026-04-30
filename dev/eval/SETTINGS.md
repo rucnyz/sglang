@@ -292,7 +292,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | 2.3 | Prefix sweep | **DONE PASS** — paper Table 3 updated, V_prefix flat | — |
 | 3.A | V_prefix' faithful | **DONE PARTIAL (3-arm)** — default best on TTFT, all configs in 80-83% hit band | host-tier-on arm + pressured-pool workload future work |
 | 3.B | V_prefix' stability | **DONE PASS** — HPB recovery -18% TTFT vs recency, paper tab:q3b | — |
-| 3.C | Composed L1+L2 | DONE — null on this trace (1 transfer per cell across all L1 configs); requires pressure-pool trace | trace-design follow-up |
+| 3.C | Composed L1+L2 | **DONE** — Layer 2 invariant to L1 on stress trace (21 transfers all cells); shows clean separation of concerns | feedback-loop workload follow-up |
 | 3.D | HPB-vs-recency on GSP | **DONE PASS** — paper tab:hpb-gsp added, -19.77% TTFT | — |
 | 4 | Estimator accuracy | DONE INDIRECT — V_kv'/V_mamba' not separately logged; budgeter's plan decisions in A3/A4 are the indirect validation | direct comparison needs new instrumentation |
 | 5.A | Path-axis dense | not started | **path-axis dispatcher implementation** |
