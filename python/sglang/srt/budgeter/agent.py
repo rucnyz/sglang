@@ -407,13 +407,25 @@ class BudgetAgent:
         # Setting 4 follow-up: pass queue_depth so the planner has an
         # admission-pressure signal at saturation (V≈usage proxy alone
         # is saturation-blind).
-        _q = snapshot.get("num_queue_reqs", 0)
-        _qt = getattr(_q, "total", None)
-        qdepth = int(_qt) if isinstance(_qt, (int, float)) else (
-            int(_q) if isinstance(_q, (int, float)) else 0
-        )
+        def _scalar_or_total(v) -> int:
+            t = getattr(v, "total", None)
+            if isinstance(t, (int, float)):
+                return int(t)
+            return int(v) if isinstance(v, (int, float)) else 0
 
-        decision = self._xpool_planner.decide(usage_kv, usage_mamba, queue_depth=qdepth)
+        qdepth = _scalar_or_total(snapshot.get("num_queue_reqs", 0))
+        # Net-benefit gate (Setting 1 v9-auto follow-up): expose paused/
+        # retracted counts so the planner can refuse to fire when L1's
+        # snapshot retention has already absorbed the binding shift.
+        n_paused = _scalar_or_total(snapshot.get("num_paused_reqs", 0))
+        n_retracted = _scalar_or_total(snapshot.get("num_retracted_reqs", 0))
+
+        decision = self._xpool_planner.decide(
+            usage_kv, usage_mamba,
+            queue_depth=qdepth,
+            num_paused_reqs=n_paused,
+            num_retracted_reqs=n_retracted,
+        )
         snapshot["xpool_plan_direction"] = decision.direction or "none"
         snapshot["xpool_plan_reason"] = decision.reason
         snapshot["xpool_plan_usage_kv"] = decision.usage_kv
