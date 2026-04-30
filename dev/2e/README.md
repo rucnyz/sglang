@@ -25,7 +25,9 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.5.4 | **Performance regression bench**: A/B on Qwen3.5-35B-A3B TP=1, throughput/TTFT/TPOT, ≤2% regression allowed | bench | **PASS** 2026-04-30 |
 | 2e.5.5 | Mamba pool: optional MultiTensorArena allocation gated `SGLANG_MAMBA_ARENA=1` | ~70 LoC | **PASS** 2026-04-30 (mechanism + e2e) |
 | 2e.5.5 | Migrate mamba pool to MultiTensorArena (depends on 2e.5.4 passing) | ~150 LoC | not started |
-| 2e.5.6 | Hybrid workload-shift demo: KV ↔ mamba transfer driven by LagrangePlanner with real signals | 3–5 days | not started |
+| 2e.5.6.0 | Design note: `SharedHandlePool` + cross-arena transfer mechanism | doc | **done** 2026-04-30 |
+| 2e.5.6.1 | `SharedHandlePool` class + `ChunkArena` external-pool support + unit test | ~120 LoC | **PASS** 2026-04-30 |
+| 2e.5.6.2 | E2E hybrid workload-shift demo: KV ↔ mamba transfer driven by LagrangePlanner with real signals | 3–5 days | not started |
 
 ## 2e.1.a — VMM smoke test (done)
 
@@ -774,4 +776,146 @@ Worst regression: **+0.05%** (output throughput, well below 2% threshold). The +
 **Lessons learned (now folded back into the script).**
 - Initial gate `worst = max(abs(delta))` flagged FAIL on a clearly-passing run because it conflated "+12% P99 TTFT" (regression) with "−16% median E2E" (improvement). Latency metrics need `+sign`, throughput needs `−sign`; only signed regressions count.
 - `tail -F` with `set -eu` exits 143 on `kill`. Wrap kill+wait in `|| true` so the script doesn't abort right when the server reaches ready.
+
+## 2e.5.6.0 — Design note: shared handle pool for cross-arena transfer
+
+**Status:** awaiting sign-off, but the dev workflow says: write the note, then implement.
+
+### The problem
+
+After 2e.5.5 e2e, both KV and mamba are arena-backed but their arenas are **independent**:
+```
+KV  : ChunkArena_kv    → VA reservation #1, _handles_kv,    _free_handles_kv
+Mamba: ChunkArena_mamba → VA reservation #2, _handles_mamba, _free_handles_mamba
+```
+`ChunkArena.transfer_chunks(from_pool, to_pool, n)` only operates within one arena: it moves a handle from one VA sub-range to another *within the same `_handles` array*. Cross-arena transfer (steal a chunk from KV, give it to mamba) doesn't have a path.
+
+### What we need
+
+Paper §4.4's actuator transfers physical bytes between pools by `cuMemUnmap`-ping a handle from the source pool's VA window and `cuMemMap`-ping it into the destination pool's VA window. This works for handles created on the same device — handles are not bound to a specific VA range. So mechanically:
+
+```
+shrink(kv, 1)  # unmap one chunk from KV, push handle into shared free list
+grow(mamba, 1) # pop handle from shared free list, map into mamba's VA
+```
+
+The only thing standing in the way is that `_handles` and `_free_handles` are **owned** by the `ChunkArena` instance. We need to lift them into a shared container that both arenas reference.
+
+### Options considered
+
+| Option | What it does | LoC | Risk | Notes |
+|---|---|---|---|---|
+| **S1: SharedHandlePool** | Extract `_handles` + `_free_handles` into a `SharedHandlePool` class. `ChunkArena` accepts an optional `external_handle_pool=`; if provided, it uses that instead of creating its own. Add a `cross_arena_transfer(from_arena, from_pool, to_arena, to_pool, n)` free function. | ~80 | Low | Requires only that handles were created with same `_prop` (same device, same allocation type). |
+| **S2: One mega-arena** | Build one `ChunkArena` with a single VA reservation containing both KV and mamba sub-pool windows. Each `MultiTensorArena` gets a slice of that. | ~150 | Medium — VA reservation must be sized for both pools' worst case at construction; less flexible. | Closer to paper's "one chunk-bitmap arena" framing. |
+| **S3: Two arenas + manual handle migration** | Keep arenas independent; cross-arena migration is "destroy handle in arena A, create new handle, register in arena B." | ~50 | High — every transfer pays cuMemCreate/cuMemRelease cost (~ms per chunk), and the bytes don't follow the handle (you'd have to memcpy first). | Drops the §4.4 zero-copy property. |
+
+### Picked: S1
+
+**Why.** S2 is closer to the paper's text but requires deciding both pools' VA sizes up-front, which is exactly the static partitioning the paper attacks. S3 drops the load-bearing zero-copy property. S1 is the smallest change that preserves it: each pool's VA reservation stays separate (so KV can be sized differently from mamba, and they can grow into different VA address ranges without colliding), but the *physical handles* are pooled across both arenas, exactly where the actuator's resource lives.
+
+**Wireup at construction.** When `SGLANG_ARENA_SHARED=1`:
+1. The first arena-using pool to be constructed (KV in current scheduler init order) creates a process-singleton `SharedHandlePool` sized for `KV.max_chunks + Mamba.max_chunks`.
+2. KV's `MultiTensorArena` is built with `external_handle_pool=that_singleton`.
+3. Mamba's `MultiTensorArena` is built with the same `external_handle_pool`.
+4. Both arenas' free-handle reads/writes hit the singleton.
+
+**Cross-arena transfer.** A free function `cross_arena_transfer(from_arena, from_pool, to_arena, to_pool, n)` calls `from_arena.shrink(from_pool, n)` (which pushes handles into the shared pool) followed by `to_arena.grow(to_pool, n)` (which pops them). Identical semantics to single-arena `transfer_chunks`, just spanning two arenas.
+
+### Files that change
+
+| File | Change | LoC |
+|---|---|---|
+| `python/sglang/srt/arena/chunk_arena.py` | Add `SharedHandlePool` class. `ChunkArena.__init__` accepts `external_handle_pool=None`; if provided, skips its own handle creation and uses the external instance. `_free_handles` becomes a property delegating to the pool. Add module-level `cross_arena_transfer(from_arena, from_pool, to_arena, to_pool, n)`. | ~80 |
+| `python/sglang/srt/arena/multi_tensor_arena.py` | Pass `external_handle_pool` through `__init__`. | ~10 |
+| `python/sglang/srt/mem_cache/memory_pool.py` | Process-singleton `SharedHandlePool` lazily created when `SGLANG_ARENA_SHARED=1`. KV pool builds it; mamba pool reuses it. | ~30 |
+
+No engine-runtime kernel changes; the actuator only operates above the live capacity.
+
+### Test plan
+
+| Step | What | Reproduce | Pass criterion |
+|---|---|---|---|
+| 14 unit | Two `MultiTensorArena`s with shared pool. Write pattern A into KV slot 0, transfer 1 chunk KV→mamba, read mamba's view: should see pattern A. Then transfer back with new pattern B written in mamba: KV view sees B. Tensor `data_ptr()` stable across both transfers. | `dev/2e/14_cross_arena_transfer_unit.py` | All assertions pass; data follows handle, not VA. |
+| 15 e2e (deferred to 2e.5.6.2) | Real Qwen3.5-35B-A3B serving with `SGLANG_ARENA_SHARED=1`, budgeter periodically transfers 1 GB KV↔mamba mid-serving, capture decision JSONL. | `dev/2e/15_kv_mamba_xfer_demo.sh` | No segfault, completions remain coherent across multiple transfer cycles. |
+
+The unit test (14) is the load-bearing correctness check; once it passes, e2e is a mostly-mechanical wiring exercise atop 2e.5.5.
+
+### Documentation discipline
+
+Same discipline as 2e.5: every sub-step lands its reproduce + result here before the next sub-step starts. 2e.5.6.1 (unit) writes its result section here on completion; 2e.5.6.2 (e2e) does the same.
+
+## 2e.5.6.1 — SharedHandlePool + cross-arena transfer (PASS, 2026-04-30)
+
+**Goal.** Implement `SharedHandlePool` and `cross_arena_transfer(...)` so two `ChunkArena`s — one for KV, one for mamba — can move physical handles between each other while keeping their tensor `data_ptr()`s stable.
+
+**Code.**
+- `python/sglang/srt/arena/chunk_arena.py`:
+  - New `SharedHandlePool` class (~40 LoC) — owns a list of `cuMemCreate`'d handles + a free-list, plus device/chunk-size sanity fields.
+  - `ChunkArena.__init__` accepts `external_handle_pool=None`. When provided, the arena's `_handles` and `_free_handles` are aliased to the shared pool's lists; `n_handles` is ignored.
+  - `ChunkArena.cleanup()` only releases handles when self-owned.
+  - New module-level `cross_arena_transfer(from_arena, from_pool, to_arena, to_pool, n)` — `shrink` followed by `grow`, with explicit guards: same arena → raise; different `SharedHandlePool` instances → raise.
+- `python/sglang/srt/arena/multi_tensor_arena.py`:
+  - New params: `external_handle_pool` (forwarded to inner `ChunkArena`), `subpool_offset` (shifts the C-side `arena_multi64.so` pool indices so two `MultiTensorArena`s in one process don't collide on `pool0_*` / `pool1_*` symbol pairs). `_pool_name(i)` now returns `sub{c_index}` (= `sub{subpool_offset + i}`), giving disjoint name spaces too.
+
+**Reproduce.**
+```bash
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=3 PYTHONPATH=/data/yuzhou/projects/sglang/python:$PYTHONPATH \
+  .venv/bin/python -u dev/2e/14_cross_arena_transfer_unit.py
+```
+
+**Result (2026-04-30, GPU 3, H200).**
+```
+== Test 1: basic cross-arena transfer ==
+  A.va_base=0x..., B.va_base=0x...
+  initial: shared free=4
+  after A.grow(2): shared free=2
+  wrote A.slot0=0xA0, A.slot1=0xA1
+  cross_arena_transfer(A.kv0 → B.mamba0, 1): moved=1
+  B.slot0 reads 0xa1 — bytes followed the handle. GOOD.
+  A.slot0 still reads 0xa0, untouched. GOOD.
+  transferred back, A.slot1 reads 0xcc. GOOD.
+  VA bases unchanged across transfers. GOOD.
+  cross_arena_transfer(A,A) correctly raises.
+  cross_arena_transfer with disjoint pools correctly raises.
+PASS Test 1
+
+== Test 2: legacy self-owned ChunkArena still works ==
+  legacy mode preserved + cross-arena correctly refuses without shared pool
+PASS Test 2
+
+== Test 3: two MultiTensorArenas with shared handle pool ==
+  shared pool free after both inited: 2
+  all 6 sub-tensors at distinct VAs. GOOD.
+  KV first sub-pool name: sub0, mamba first sub-pool name: sub4
+  cross_arena_transfer(KV.sub0 → mamba.sub4, 1): moved=1
+    kv._arena.pool_mapped_chunks('sub0') = 0
+    mamba._arena.pool_mapped_chunks('sub4') = 2
+  all sub-tensor data_ptrs stable across cross-arena transfer. GOOD.
+  transferred back. GOOD.
+PASS Test 3
+
+== ALL PASS: SharedHandlePool + cross_arena_transfer ready ==
+```
+
+**Findings.**
+
+1. **Bytes follow the handle across arenas.** Test 1 writes `0xA1` into `arena_A.kv0.slot1`, transfers 1 chunk to `arena_B.mamba0`. Tail-eviction picks slot 1, so the handle holding `0xA1` is the one that moves. `arena_B.mamba0.slot0` reads back `0xA1`. The reverse direction works the same way. This is the foundational property paper §4.4 needs for cross-pool resize without memcpy.
+
+2. **`data_ptr()` is stable across cross-arena transfer.** Test 3 builds two `MultiTensorArena`s (KV-shaped: 2 layers × 2 kinds, mamba-shaped: 2 layers × 1 kind), snapshots all 6 sub-tensors' `data_ptr`s, runs a cross-arena transfer KV → mamba, re-snapshots: the lists are equal. This is what lets captured CUDA graphs survive a cross-pool resize.
+
+3. **Existing legacy callers untouched.** Test 2 builds a self-owned `ChunkArena` with `external_handle_pool=None` (the default). It works exactly as before; cross-arena transfer with no shared pool is correctly refused. No regression risk for the already-passing 2e.4 / 2e.5.5 paths.
+
+4. **C-side pool-index collision avoided via `subpool_offset`.** The `arena_multi64.so` allocator only has 64 fixed pool slots numbered 0..63 (`pool0_malloc`, `pool0_free`, …, `pool63_*`). Without an offset, two `MultiTensorArena`s would both register sub-pool 0 → the second `multi_init(0, …)` clobbers the first's bump-allocator state. The new `subpool_offset` param shifts the C-side index range; KV uses 0..n_kv-1, mamba uses n_kv..n_kv+n_mamba-1. The 64-slot ceiling caps a single process's total sub-pools at 64, which is fine for any practical engine config (≤ 96 layers in current open-source hybrids; typical < 50).
+
+5. **Process-exit segfault in PyTorch's MemPool destructor — same known issue as 2e.4.c / 2e.5.5.** Worked around in the test by stashing the live arenas in a module-level keep-alive list and calling `os._exit(0)` at the end of `main()` — Python destructors don't run, so no fault. This is fine for unit tests; the long-running engine never tears these objects down anyway.
+
+**Implication for 2e.5.6.2.** The mechanism is ready. Engine wiring needs:
+1. A `SGLANG_ARENA_SHARED=1` env flag (implies `SGLANG_KV_ARENA=1` + `SGLANG_MAMBA_ARENA=1`).
+2. A process-singleton `SharedHandlePool` lazily created at first use, sized for `n_kv_subpools + n_mamba_subpools` chunks of 64 MiB each, plus headroom for the planner.
+3. Both `MHATokenToKVPool._create_buffers` and `MambaPool.__init__` pass the singleton + the right `subpool_offset` (KV at 0, mamba at `2 * kv_n_layers`).
+4. A `CrossPoolTransferActuator` that takes the two pools' `MultiTensorArena`s and exposes `transfer_kv_to_mamba(n_chunks)` / `transfer_mamba_to_kv(n_chunks)` calling `cross_arena_transfer` against the right named sub-pools (one cross-arena transfer per layer-kind in the source pool, with the destination side having only one sub-pool per layer for mamba).
+5. A `BudgetAgent` arm that wires real per-pool pressure signals into the existing `LagrangePlanner` and calls the actuator on plan-output decisions.
+
+The wiring is mechanical; the only research-y choice left is what pressure signal to use for "mamba pressure" (slot stall rate? Long-context request fraction?). 2e.5.6.2 will pick one and run a workload-shift trace on Qwen3.5-35B-A3B.
 

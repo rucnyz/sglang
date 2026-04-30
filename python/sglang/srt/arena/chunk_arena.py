@@ -93,6 +93,48 @@ def _check(rc: int, what: str) -> None:
         raise RuntimeError(f"{what} failed: {rc} {msg.value.decode() if msg.value else ''}")
 
 
+class SharedHandlePool:
+    """Owns a pool of cuMemCreate'd physical handles that may be shared
+    between multiple ChunkArenas on the same device.
+
+    Phase 2e.5.6: cross-arena (KV ↔ mamba) transfer needs both arenas to
+    share a single bag of handles. `ChunkArena.__init__(external_handle_pool=...)`
+    references this object instead of creating its own handle list.
+    """
+
+    def __init__(self, device_id: int, chunk_size: int, n_handles: int) -> None:
+        self.device_id = device_id
+        self.chunk_size = chunk_size
+
+        prop = _CUmemAllocationProp()
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.requestedHandleTypes = 0
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location.id = device_id
+        self._prop = prop  # kept for sanity-equality checks
+
+        self.handles: List[int] = []
+        for _ in range(n_handles):
+            h = _HANDLE(0)
+            _check(CUDA.cuMemCreate(
+                ctypes.byref(h), chunk_size, ctypes.byref(prop), 0),
+                "cuMemCreate (SharedHandlePool)")
+            self.handles.append(h.value)
+
+        # Free handles: indices into `self.handles` that are currently unmapped
+        # *anywhere*. Both arenas pop/push on this list.
+        self.free: List[int] = list(range(n_handles))
+
+    def free_count(self) -> int:
+        return len(self.free)
+
+    def cleanup(self) -> None:
+        for h in self.handles:
+            CUDA.cuMemRelease(h)
+        self.handles.clear()
+        self.free.clear()
+
+
 @dataclass
 class _PoolState:
     name: str
@@ -137,14 +179,20 @@ class ChunkArena:
         chunk_size: int,
         n_handles: int,
         pool_capacities: List[Tuple[str, int]],
+        external_handle_pool: Optional["SharedHandlePool"] = None,
     ) -> None:
         """
         Args:
             device_id: CUDA device for cuMemCreate.
             chunk_size: bytes per chunk; must be a multiple of recommended granularity.
             n_handles: total physical handles available across all pools.
+                Ignored when `external_handle_pool` is provided.
             pool_capacities: list of (pool_name, max_chunks_in_pool).
                 The sum of max_chunks may exceed n_handles (over-provisioned VA).
+            external_handle_pool: if provided, this arena's handle list and
+                free-list are aliased to the shared pool. Phase 2e.5.6:
+                two ChunkArenas with the same external pool can transfer
+                handles between each other via `cross_arena_transfer`.
         """
         self.device_id = device_id
         self.chunk_size = chunk_size
@@ -174,16 +222,33 @@ class ChunkArena:
             ctypes.byref(ptr), self.total_va_size, 0, 0, 0), "cuMemAddressReserve")
         self.va_base = ptr.value
 
-        # Create physical handles.
-        self._handles: List[int] = []
-        for _ in range(n_handles):
-            h = _HANDLE(0)
-            _check(CUDA.cuMemCreate(
-                ctypes.byref(h), chunk_size, ctypes.byref(self._prop), 0), "cuMemCreate")
-            self._handles.append(h.value)
-
-        # Free handles: indices into self._handles that are currently unmapped.
-        self._free_handles: List[int] = list(range(n_handles))
+        # Handle ownership: either we create our own (default) or alias an
+        # external SharedHandlePool. Self-owned is the legacy path.
+        if external_handle_pool is None:
+            self._owned_handles: List[int] = []
+            for _ in range(n_handles):
+                h = _HANDLE(0)
+                _check(CUDA.cuMemCreate(
+                    ctypes.byref(h), chunk_size, ctypes.byref(self._prop), 0), "cuMemCreate")
+                self._owned_handles.append(h.value)
+            self._handles: List[int] = self._owned_handles
+            self._free_handles: List[int] = list(range(n_handles))
+            self._external_pool: Optional["SharedHandlePool"] = None
+        else:
+            if external_handle_pool.chunk_size != chunk_size:
+                raise ValueError(
+                    f"external pool chunk_size {external_handle_pool.chunk_size} "
+                    f"!= arena chunk_size {chunk_size}"
+                )
+            if external_handle_pool.device_id != device_id:
+                raise ValueError(
+                    f"external pool device {external_handle_pool.device_id} "
+                    f"!= arena device {device_id}"
+                )
+            self._owned_handles = []
+            self._handles = external_handle_pool.handles
+            self._free_handles = external_handle_pool.free
+            self._external_pool = external_handle_pool
 
         # Carve VA sub-ranges per pool.
         self.pools: dict[str, _PoolState] = {}
@@ -300,7 +365,11 @@ class ChunkArena:
         return granted
 
     def cleanup(self) -> None:
-        """Tear down the arena: unmap everything, release handles, free VA."""
+        """Tear down the arena: unmap everything, release handles, free VA.
+
+        Owned handles are released here. External (SharedHandlePool) handles
+        are NOT released — that's the pool's responsibility.
+        """
         for pool in self.pools.values():
             for slot, handle_idx in enumerate(pool.mapped):
                 if handle_idx is not None:
@@ -309,6 +378,44 @@ class ChunkArena:
                     if rc != CU_SUCCESS:
                         # Best-effort cleanup; print but do not raise.
                         print(f"warning: cuMemUnmap failed during cleanup: rc={rc}")
-        for h in self._handles:
-            CUDA.cuMemRelease(h)
+        if self._external_pool is None:
+            for h in self._owned_handles:
+                CUDA.cuMemRelease(h)
         CUDA.cuMemAddressFree(self.va_base, self.total_va_size)
+
+
+def cross_arena_transfer(
+    from_arena: "ChunkArena",
+    from_pool: str,
+    to_arena: "ChunkArena",
+    to_pool: str,
+    n: int,
+) -> int:
+    """Move n physical handles from `from_arena[from_pool]` to `to_arena[to_pool]`.
+
+    Both arenas MUST share the same `SharedHandlePool` (i.e. they were
+    constructed with the same `external_handle_pool=`); otherwise the
+    handles would not be reachable from `to_arena`'s grow path. This is
+    the cross-arena equivalent of `transfer_chunks`, used by Phase 2e.5.6
+    for KV ↔ mamba physical-byte movement.
+
+    Returns: number of chunks actually transferred.
+    """
+    if from_arena is to_arena:
+        raise ValueError(
+            "from_arena is to_arena — use ChunkArena.transfer_chunks for "
+            "intra-arena transfers."
+        )
+    if from_arena._external_pool is None or to_arena._external_pool is None:
+        raise ValueError(
+            "cross_arena_transfer requires both arenas to use a "
+            "SharedHandlePool (external_handle_pool=...)."
+        )
+    if from_arena._external_pool is not to_arena._external_pool:
+        raise ValueError(
+            "cross_arena_transfer requires the two arenas to share the "
+            "SAME SharedHandlePool instance, not just equivalent ones."
+        )
+    unmapped = from_arena.shrink(from_pool, n)
+    granted = to_arena.grow(to_pool, unmapped)
+    return granted

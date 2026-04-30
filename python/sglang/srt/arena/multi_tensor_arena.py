@@ -29,11 +29,15 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.arena.chunk_arena import ChunkArena, _DPTR  # noqa: F401
+from sglang.srt.arena.chunk_arena import (
+    ChunkArena,
+    SharedHandlePool,
+    _DPTR,  # noqa: F401
+)
 
 
 logger = logging.getLogger(__name__)
@@ -67,11 +71,14 @@ class MultiTensorArena:
         max_tokens: int,
         init_tokens: int,
         chunk_bytes: int = 32 * 1024 * 1024,
+        external_handle_pool: Optional[SharedHandlePool] = None,
+        subpool_offset: int = 0,
     ) -> None:
         n_subpools = n_layers * n_kinds
-        if n_subpools > _MAX_SUBPOOLS:
+        if subpool_offset + n_subpools > _MAX_SUBPOOLS:
             raise ValueError(
-                f"need {n_subpools} sub-pools but arena_multi64.so only has {_MAX_SUBPOOLS}"
+                f"need C indices [{subpool_offset}, {subpool_offset + n_subpools}) "
+                f"but arena_multi64.so only has {_MAX_SUBPOOLS}"
             )
 
         self.n_layers = n_layers
@@ -79,6 +86,11 @@ class MultiTensorArena:
         self.per_token_shape = per_token_shape
         self.dtype = dtype
         self.max_tokens = max_tokens
+        # Phase 2e.5.6: shift C-side pool indices when sharing arena_multi64.so
+        # between two MultiTensorArenas (e.g., KV at offset 0, mamba at
+        # offset n_kv_subpools). Logical sub-pool index `i` maps to C index
+        # `subpool_offset + i`.
+        self._subpool_offset = subpool_offset
 
         per_token = _per_token_bytes(per_token_shape, dtype)
         if chunk_bytes % per_token != 0:
@@ -106,6 +118,9 @@ class MultiTensorArena:
         # max_chunks_per_pool of VA per pool, but only init_chunks worth
         # of physical pages are backed; growth requires more handles.
         # For the smoke test we provision room for the full max (no soft cap).
+        # Phase 2e.5.6: when external_handle_pool is provided, this arena
+        # alias-uses that pool's handles instead of creating its own. The
+        # caller is responsible for sizing it for all participating arenas.
         n_handles = n_subpools * self.max_chunks_per_pool
 
         self._arena = ChunkArena(
@@ -116,6 +131,7 @@ class MultiTensorArena:
                 (self._pool_name(i), self.max_chunks_per_pool)
                 for i in range(n_subpools)
             ],
+            external_handle_pool=external_handle_pool,
         )
 
         # Initial mapping: init_chunks_per_pool to each sub-pool.
@@ -134,7 +150,8 @@ class MultiTensorArena:
         self._lib.multi_set_capacity.argtypes = [ctypes.c_int, ctypes.c_size_t]
         for i in range(n_subpools):
             base = self._arena.pool_va_base(self._pool_name(i))
-            self._lib.multi_init(i, base, chunk_bytes, self.init_chunks_per_pool)
+            self._lib.multi_init(
+                self._c_index(i), base, chunk_bytes, self.init_chunks_per_pool)
 
         # Per-sub-pool MemPool + tensor allocation. SOFT-CAP DESIGN:
         # the C-side allocator's `n_chunks` controls what bump-alloc
@@ -154,22 +171,23 @@ class MultiTensorArena:
         self._so_path = so_path
 
         for i in range(n_subpools):
+            ci = self._c_index(i)
             plug = CUDAPluggableAllocator(
-                so_path, f"pool{i}_malloc", f"pool{i}_free")
+                so_path, f"pool{ci}_malloc", f"pool{ci}_free")
             mp = torch.cuda.MemPool(allocator=plug.allocator())
             self._mempools.append(mp)
             # Temporarily expose max-chunks so PyTorch's segment grab
             # for the (max_tokens, *) tensor succeeds. This is OK
             # because the over-promised VA past init_chunks is reserved
             # but unmapped; torch.empty doesn't probe.
-            self._lib.multi_set_capacity(i, self.max_chunks_per_pool)
+            self._lib.multi_set_capacity(ci, self.max_chunks_per_pool)
             with torch.cuda.use_mem_pool(mp):
                 t = torch.empty(
                     (max_tokens, *per_token_shape), dtype=dtype, device="cuda")
             # Restore so subsequent torch.empty inside this MemPool
             # would respect the live capacity. (Not used in practice;
             # only one tensor per sub-pool.)
-            self._lib.multi_set_capacity(i, self.init_chunks_per_pool)
+            self._lib.multi_set_capacity(ci, self.init_chunks_per_pool)
             self._tensors.append(t)
 
         torch.cuda.synchronize()
@@ -185,7 +203,13 @@ class MultiTensorArena:
     # ------------------------------------------------------------------
 
     def _pool_name(self, i: int) -> str:
-        return f"sub{i}"
+        # ChunkArena pool names must be unique across all arenas sharing the
+        # same SharedHandlePool. We include the C-index so two MTAs at
+        # different subpool_offsets get disjoint name spaces.
+        return f"sub{self._c_index(i)}"
+
+    def _c_index(self, i: int) -> int:
+        return self._subpool_offset + i
 
     def _subpool_index(self, layer: int, kind: int) -> int:
         return layer * self.n_kinds + kind
@@ -234,7 +258,7 @@ class MultiTensorArena:
                 self._arena.grow(self._pool_name(i), new_chunks - cur)
             elif new_chunks < cur:
                 self._arena.shrink(self._pool_name(i), cur - new_chunks)
-            self._lib.multi_set_capacity(i, new_chunks)
+            self._lib.multi_set_capacity(self._c_index(i), new_chunks)
 
     def cleanup(self) -> None:
         # PyTorch's caching allocator caches segments backed by our chunks.
