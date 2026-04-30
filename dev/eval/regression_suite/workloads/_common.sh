@@ -15,14 +15,18 @@ MODEL=${MODEL:-Qwen/Qwen3.5-35B-A3B}
 WARMUP_S=${WARMUP_S:-300}
 SERVER_LOG="$OUT_DIR/server.log"
 
+# Qwen3.5-mamba-only flags (piecewise CUDA graph + qwen3 reasoning parser).
+# Workloads using non-mamba models (e.g. R3 LoRA on Qwen3-4B) override
+# MAMBA_FLAGS="" so these stay off — they break the LoRA Triton dispatch.
+MAMBA_FLAGS=${MAMBA_FLAGS:---enforce-piecewise-cuda-graph --reasoning-parser qwen3}
+
 boot_server() {
   pkill -f "launch_server.*--port $PORT" 2>/dev/null || true
   sleep 4
   nohup .venv/bin/python -m sglang.launch_server \
       --model-path "$MODEL" --host 127.0.0.1 --port $PORT \
       --mem-fraction-static $MEM_FRACTION --log-level info \
-      --enforce-piecewise-cuda-graph \
-      --reasoning-parser qwen3 \
+      $MAMBA_FLAGS \
       ${EXTRA_FLAGS:-} \
       >"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!

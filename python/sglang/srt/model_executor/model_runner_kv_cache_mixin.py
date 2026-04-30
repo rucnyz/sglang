@@ -65,14 +65,22 @@ class ModelRunnerKVCacheMixin:
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
-        # Arena memory transparency (issue #17): when SGLANG_ARENA_SHARED is on,
-        # MambaPool and KV pool each reserve `*_HEADROOM_CHUNKS × chunk_bytes`
+        # Arena memory transparency (issue #17, path A): when SGLANG_ARENA_SHARED
+        # is on, MambaPool + KV pool each reserve `*_HEADROOM_CHUNKS × chunk_bytes`
         # of unmapped VA so the cross-pool actuator can grow them at runtime.
-        # This headroom is GPU memory the pools end up consuming, but until this
-        # fix it was reserved on top of `rest_memory`, silently eating ~5–10 %
-        # of the user's mem_fraction_static budget and causing OOM at 0.8 on
-        # H200. Subtract the headroom from rest_memory before pool sizing so
-        # the user-set mem_fraction stays meaningful.
+        # Without compensation, this 8 GiB-class reservation either (a) takes
+        # from the user's mem_fraction_static budget — making same-config
+        # baseline-vs-prelude comparisons unfair and silently shrinking
+        # max_total_num_tokens — or (b) overflows GPU memory and OOMs.
+        #
+        # Path A: keep the user's KV+mamba budget at the baseline value and
+        # take arena headroom from the activations/cuda-graph reserve band
+        # (the (1-mem_fraction)·pre slice). This makes Layer 2 transparent to
+        # mem_fraction_static — same setting → same KV+mamba capacity →
+        # baseline-comparable max_total_num_tokens and steady-state TPS.
+        # Cap at the physical free memory so we never over-commit; if the
+        # user has set mem_fraction so high that there's no room, we fall
+        # back to subtracting (path B) and emit a warning.
         if os.environ.get("SGLANG_ARENA_SHARED") == "1":
             chunk_bytes = int(os.environ.get(
                 "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
@@ -83,20 +91,42 @@ class ModelRunnerKVCacheMixin:
             kv_headroom_chunks = int(os.environ.get(
                 "SGLANG_ARENA_KV_HEADROOM_CHUNKS", "4"
             ))
-            arena_headroom_bytes = (
+            arena_headroom_gib = (
                 (mamba_headroom_chunks + kv_headroom_chunks) * chunk_bytes
-            )
-            arena_headroom_gib = arena_headroom_bytes / (1 << 30)
-            logger.info(
-                "Arena memory transparency: subtracting %.2f GiB "
-                "(mamba=%d × %.0f MiB + kv=%d × %.0f MiB) from rest_memory "
-                "(%.2f → %.2f GiB) so user-set mem_fraction_static stays honored.",
-                arena_headroom_gib,
-                mamba_headroom_chunks, chunk_bytes / (1 << 20),
-                kv_headroom_chunks, chunk_bytes / (1 << 20),
-                rest_memory, rest_memory - arena_headroom_gib,
-            )
-            rest_memory -= arena_headroom_gib
+            ) / (1 << 30)
+            # Activations+cuda-graph+safety reserve currently sized as
+            # pre_model_load_memory * (1 - mem_fraction_static). The arena
+            # headroom must come out of this band to leave KV+mamba untouched.
+            reserve_band_gib = pre_model_load_memory * (1 - self.mem_fraction_static)
+            # Free physical memory currently above the planned pools = post_load
+            # minus rest_memory = reserve_band_gib (by construction). We need
+            # at least arena_headroom_gib of it to remain free for arena.
+            if reserve_band_gib >= arena_headroom_gib:
+                # Path A works: keep rest_memory = baseline KV+mamba budget.
+                # Arena will take its headroom from the reserve band.
+                logger.info(
+                    "Arena memory transparency (path A): user mem_fraction_static=%.3f; "
+                    "KV+mamba budget kept at %.2f GiB; arena headroom %.2f GiB "
+                    "drawn from the (1-mem_fraction)·pre reserve band of %.2f GiB. "
+                    "Layer 2 is transparent to user-set mem_fraction.",
+                    self.mem_fraction_static, rest_memory, arena_headroom_gib,
+                    reserve_band_gib,
+                )
+            else:
+                # Reserve band too small; fall back to path B (shrink KV+mamba)
+                # and warn so the user can lower mem_fraction or reduce
+                # SGLANG_ARENA_*_HEADROOM_CHUNKS.
+                deficit = arena_headroom_gib - reserve_band_gib
+                logger.warning(
+                    "Arena memory transparency: reserve band only %.2f GiB but "
+                    "arena needs %.2f GiB headroom. Falling back to path B "
+                    "(shrinking KV+mamba by the %.2f GiB deficit). Layer 2 "
+                    "comparability may be reduced; consider mem_fraction_static "
+                    "≤ %.2f or reducing SGLANG_ARENA_*_HEADROOM_CHUNKS.",
+                    reserve_band_gib, arena_headroom_gib, deficit,
+                    1.0 - arena_headroom_gib / pre_model_load_memory,
+                )
+                rest_memory -= deficit
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 

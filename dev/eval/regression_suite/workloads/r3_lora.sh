@@ -1,7 +1,10 @@
 #!/bin/bash
-# R3 — LoRA-skewed (Qwen3-4B + 32 LoRA, ml=8). Different model.
+# R3 — LoRA-skewed (Qwen3-4B + 32 LoRA, ml=8). Non-mamba model.
 set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Disable Qwen3.5-mamba-only flags BEFORE sourcing _common.sh — they break
+# the LoRA Triton dispatch on Qwen3-4B (assert x.shape[-1] == K).
+export MAMBA_FLAGS=""
 source "$SCRIPT_DIR/_common.sh"
 export SGLANG_BUDGETER_LOG="$OUT_DIR/budgeter.jsonl"
 

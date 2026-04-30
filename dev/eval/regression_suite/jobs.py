@@ -34,14 +34,16 @@ PRELUDE_ENV = {
     "SGLANG_XPOOL_MAMBA_LOW": "0.40",
     "SGLANG_XPOOL_COOLDOWN": "2",
     "SGLANG_XPOOL_EDGE_TRIGGER": "1",  # the property under test
-    "MEM_FRACTION": "0.7",   # leave headroom for arena
+    # With arena memory transparency (path A) landed in
+    # model_runner_kv_cache_mixin._profile_available_bytes, mem_fraction=0.8
+    # is now safe with the full Layer 2 stack — the arena headroom is taken
+    # from the (1-mem_fraction)·pre reserve band, so KV+mamba get the same
+    # budget as baseline at the same mem_fraction.
+    "MEM_FRACTION": "0.8",
 }
 
 BASELINE_ENV = {
-    # Match prelude's mem_fraction so the comparison isolates Layer 1/2
-    # behavior (any difference in available memory across arms would
-    # confound the regression check).
-    "MEM_FRACTION": "0.7",
+    "MEM_FRACTION": "0.8",
 }
 
 
@@ -71,12 +73,14 @@ def build_manifest() -> list[Job]:
     jobs.append(make("R2_steady_gsp", "prelude", "r2_steady_gsp.sh",
                      PRELUDE_ENV, base_port + 3))
 
-    # R3 LoRA: removed for now — Qwen3-4B + LoRA hits a pre-existing
-    # chunked_sgmv assertion in this engine version. The Layer 2 logic
-    # under test doesn't activate on a non-mamba model anyway. To re-add
-    # later, we'd need a separate runner without --reasoning-parser qwen3
-    # and --enforce-piecewise-cuda-graph (those are Qwen3.5-mamba-specific).
-    #
+    # R3 LoRA: re-added with MAMBA_FLAGS="" override (qwen3-mamba-only flags
+    # break the LoRA Triton dispatch on Qwen3-4B). Tests that L2 stays
+    # silent on non-mamba workloads (mamba_pool doesn't exist → 0 transfers).
+    jobs.append(make("R3_lora", "baseline", "r3_lora.sh",
+                     BASELINE_ENV, base_port + 4))
+    jobs.append(make("R3_lora", "prelude", "r3_lora.sh",
+                     PRELUDE_ENV, base_port + 5))
+
     # B1: phase-shift cyclic (mamba-heavy ↔ KV-heavy). Continuous traffic, no drains.
     # Pass: prelude TPS ≥ baseline + 5% OR median E2E ≤ 95% of baseline (whichever).
     j_b1_bl = Job(name="B1_phase_shift", workload="B1_phase_shift", arm="baseline",
