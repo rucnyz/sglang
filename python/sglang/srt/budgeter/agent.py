@@ -112,6 +112,13 @@ class BudgetAgent:
         # Balanced-unit multiplier. Default 1 → smallest leftover-free
         # round-trip the actuator supports (uses lcm of sub-pool counts).
         self._xpool_unit = int(os.environ.get("SGLANG_BUDGETER_XPOOL_UNIT", "1"))
+        # Phase 2e.5.6.3: when SGLANG_BUDGETER_XPOOL_COORDINATED=1, the
+        # cross-pool actuator is constructed with per-pool actuators
+        # (KVArenaActuator + MambaArenaActuator) so capacity changes
+        # propagate to allocators. Otherwise (legacy / 2e.5.6.2 path),
+        # only raw chunk movement happens, which is only safe in idle
+        # windows.
+        self.xpool_coordinated = _env_flag("SGLANG_BUDGETER_XPOOL_COORDINATED", False)
 
         if self.enabled:
             try:
@@ -177,10 +184,16 @@ class BudgetAgent:
         pool = alloc.get_kvcache() if hasattr(alloc, "get_kvcache") else None
         if pool is None:
             return
-        if not hasattr(pool, "_kv_arena"):
+        # Hybrid models route through HybridLinearKVPool (a thin wrapper):
+        # the actual MHATokenToKVPool with `_kv_arena` is `pool.full_kv_pool`.
+        # Single-pool (non-hybrid) models put the arena directly on `pool`.
+        kv_pool = pool
+        if not hasattr(kv_pool, "_kv_arena") and hasattr(pool, "full_kv_pool"):
+            kv_pool = pool.full_kv_pool
+        if not hasattr(kv_pool, "_kv_arena"):
             return
         from sglang.srt.arena.kv_actuator import KVArenaActuator
-        self._arena_actuator = KVArenaActuator(pool, alloc)
+        self._arena_actuator = KVArenaActuator(kv_pool, alloc)
         logger.info("BudgetAgent: arena actuator attached (max=%d)",
                     self._arena_actuator.max_tokens)
 
@@ -241,14 +254,32 @@ class BudgetAgent:
         from sglang.srt.arena.cross_pool_actuator import (
             CrossPoolTransferActuator,
         )
+        kv_act = None
+        mamba_act = None
+        if self.xpool_coordinated:
+            self._ensure_arena_actuator()
+            kv_act = self._arena_actuator
+            from sglang.srt.arena.mamba_actuator import MambaArenaActuator
+            try:
+                mamba_act = MambaArenaActuator(mamba_pool)
+            except RuntimeError as e:
+                logger.warning(
+                    "MambaArenaActuator build failed (%s); falling back to "
+                    "raw chunk-move path (idle-window-only).", e,
+                )
+                mamba_act = None
         self._xpool_actuator = CrossPoolTransferActuator(
             kv_arena=kv_arena,
             mamba_arena=mamba_arena,
             shared_pool=shared,
+            kv_actuator=kv_act,
+            mamba_actuator=mamba_act,
         )
         logger.info(
-            "BudgetAgent xpool: actuator attached, oscillator unit=%d",
-            self._xpool_unit,
+            "BudgetAgent xpool: actuator attached, oscillator unit=%d, "
+            "coordinated=%s (kv_act=%s, mamba_act=%s)",
+            self._xpool_unit, self.xpool_coordinated,
+            kv_act is not None, mamba_act is not None,
         )
 
     def _maybe_xpool_actuate(self, snapshot: dict) -> None:

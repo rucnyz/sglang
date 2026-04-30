@@ -49,10 +49,20 @@ class CrossPoolTransferActuator:
         kv_arena: "MultiTensorArena",
         mamba_arena: "MultiTensorArena",
         shared_pool: "SharedHandlePool",
+        kv_actuator=None,        # Optional[KVArenaActuator]
+        mamba_actuator=None,     # Optional[MambaArenaActuator]
     ) -> None:
         self.kv = kv_arena
         self.mamba = mamba_arena
         self.shared = shared_pool
+        # Phase 2e.5.6.3: when both per-pool actuators are provided, the
+        # cross-pool actuator coordinates capacity changes with the
+        # allocators so the engine respects the new capacities (live-
+        # traffic safe, modulo the busy-engine gate at the budgeter level).
+        # When omitted, falls back to the 2e.5.6.2 "raw chunk move only"
+        # behavior — safe only in idle windows.
+        self.kv_actuator = kv_actuator
+        self.mamba_actuator = mamba_actuator
 
         if kv_arena._arena._external_pool is not shared_pool:
             raise ValueError("kv_arena does not use the provided shared_pool")
@@ -95,6 +105,12 @@ class CrossPoolTransferActuator:
         n = mta.n_layers * mta.n_kinds
         return [mta._pool_name(i) for i in range(n)]
 
+    def _src_actuator(self, src: "MultiTensorArena"):
+        return self.kv_actuator if src is self.kv else self.mamba_actuator
+
+    def _dst_actuator(self, dst: "MultiTensorArena"):
+        return self.kv_actuator if dst is self.kv else self.mamba_actuator
+
     def _do_transfer(
         self,
         src: "MultiTensorArena",
@@ -134,6 +150,38 @@ class CrossPoolTransferActuator:
         needed = n_per_dst_subpool * n_dst
         n_per_src_subpool = (needed + n_src - 1) // n_src
 
+        # Phase 2e.5.6.3: if per-pool actuators are wired, coordinate
+        # with the allocators. The contract:
+        #   1. BEFORE shrinking the src arena physically, cap the src
+        #      pool's allocator to its new capacity (= live - shrink
+        #      tokens). New requests are immediately refused tail slots;
+        #      already-allocated slots in the soon-to-be-unmapped tail
+        #      MUST have been drained by the busy-engine gate at the
+        #      budgeter level (or, for the demo, we just refuse to fire
+        #      while engine is busy).
+        #   2. Do the chunk move (src.shrink + dst.grow).
+        #   3. AFTER the dst arena has new physical chunks, raise the
+        #      dst pool's allocator cap so the new slots become
+        #      allocatable.
+        src_act = self._src_actuator(src)
+        dst_act = self._dst_actuator(dst)
+        # Translate chunk counts to token counts for the actuator API.
+        src_tokens_per_chunk = src.tokens_per_chunk
+        dst_tokens_per_chunk = dst.tokens_per_chunk
+        src_shrink_tokens = n_per_src_subpool * src_tokens_per_chunk
+        dst_grow_tokens = n_per_dst_subpool * dst_tokens_per_chunk
+
+        if src_act is not None:
+            new_src_cap = max(1, src_act.live_capacity_tokens() - src_shrink_tokens)
+            # IMPORTANT: cap_allocator_only, NOT set_capacity_tokens. The
+            # latter calls through to MultiTensorArena.set_capacity_tokens,
+            # which would physically shrink the source arena — and our
+            # explicit `src._arena.shrink(...)` below would then shrink
+            # AGAIN, leaking handles to the shared free pool. The cross-
+            # pool actuator owns the physical chunk movement; per-pool
+            # actuators only manage allocator-side capacity.
+            src_act.cap_allocator_only(new_src_cap)
+
         free_before = self.shared.free_count()
         unmapped_total = 0
         for name in src_names:
@@ -149,6 +197,12 @@ class CrossPoolTransferActuator:
             granted_total += dst._arena.grow(name, n_per_dst_subpool)
 
         free_after_grow = self.shared.free_count()
+
+        if dst_act is not None:
+            new_dst_cap = dst_act.live_capacity_tokens() + dst_grow_tokens
+            # Same reasoning as above — only un-cap the allocator side;
+            # the dst arena was already grown above by `dst._arena.grow`.
+            dst_act.cap_allocator_only(new_dst_cap)
 
         stats = {
             "direction": direction_label,

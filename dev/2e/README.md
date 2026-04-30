@@ -29,7 +29,9 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.5.6.1 | `SharedHandlePool` class + `ChunkArena` external-pool support + unit test | ~120 LoC | **PASS** 2026-04-30 |
 | 2e.5.6.2 | E2E demo: KV ↔ mamba physical-handle migration during live serving (oscillator) | bench | **PASS** 2026-04-30 |
 | 2e.5.6.2.fix | Follow-up: SIGTERM force-exit handler + lcm-balanced unit + Test 5 (PyTorch IO survives) + Test 16 (baseline byte-equivalence) | ~120 LoC | **PASS** 2026-04-30 |
-| 2e.5.6.3 | LagrangePlanner with real per-pool pressure signals (KV preempt rate / mamba slot stall) | 3–5 days | not started |
+| 2e.5.6.3.a | MambaArenaActuator + capacity-coordinated cross-pool actuator (live-traffic safety prerequisite) | ~150 LoC | **PASS** 2026-04-30 |
+| 2e.5.6.3.b | Perf regression bench: baseline vs SGLANG_ARENA_SHARED+xpool+coordinated | bench | not started |
+| 2e.5.6.3.c | LagrangePlanner with real per-pool pressure signals (KV preempt rate / mamba slot stall) + headline trace | 3–5 days | not started |
 
 ## 2e.1.a — VMM smoke test (done)
 
@@ -1103,4 +1105,53 @@ Also: budgeter logs confirm `leftover free 0` on every transfer, so the oscillat
 4. **Test 5 covers PyTorch IO at the front slot only.** We pre-write through `tensor[0].fill_(...)` and verify after roundtrip. The transferred chunks are at the **tail** of each sub-pool, and we don't pre-write/read through them via PyTorch. So Test 5 proves "PyTorch IO at the static-min region survives transfers" but not "PyTorch IO at the just-grown region works correctly." Test 16's byte-equivalence covers the latter implicitly (the engine reads/writes across the whole tensor as it serves), so we do have e2e coverage of that case — but we don't have a focused unit test for it.
 
 **Implication for 2e.5.6.3 (unchanged from before, just cleaner footing).** The mechanism is solid for "transfer in idle windows produces no observable engine drift." Now build the policy on top: `MambaArenaActuator`, capacity-aware actuator (so live traffic is safe), real per-pool pressure signals into `LagrangePlanner`, then the headline trace.
+
+## 2e.5.6.3.a — capacity-coordinated cross-pool actuator (PASS, 2026-04-30)
+
+**Goal.** Wire the cross-pool actuator to the per-pool allocators so the engine learns about capacity changes. Without this, `2e.5.6.2` fired transfers in idle windows but the scheduler kept thinking KV had its full original capacity — under live traffic, an allocation could land in the (now-unmapped) tail and segfault.
+
+**Code.**
+
+- `python/sglang/srt/arena/mamba_actuator.py` (new): `MambaArenaActuator(mamba_pool)`. Mirror of `KVArenaActuator`. Exposes `set_capacity_tokens(n)`, `live_capacity_tokens()`, `cap_allocator_only(n)`. Drives `MambaPool.set_capacity_slots`.
+- `python/sglang/srt/mem_cache/memory_pool.py` `MambaPool`: new `set_capacity_slots(n)` + `live_size` (mirror of allocator's `_capped_pages` pattern from 2e.4.d). Caps the slot allocator: free-slot ids > n move to `_capped_slots`; `free()` of an id above the live cap routes to `_capped_slots` instead of `free_slots`. Plus `set_capacity_tokens(n)` (= 1:1 wrapper) and `live_capacity_tokens()`.
+- `python/sglang/srt/arena/kv_actuator.py`: new `cap_allocator_only(n)` and `live_capacity_tokens()`. The existing `set_capacity_tokens` was unsafe for the cross-pool path because it calls through to `MultiTensorArena.set_capacity_tokens`, which physically shrinks the arena — the cross-pool actuator does the physical shrink itself, so calling `set_capacity_tokens` would shrink twice and leak handles to the shared pool's free list. `cap_allocator_only` is the new "allocator-side only" path.
+- `python/sglang/srt/arena/cross_pool_actuator.py`: takes optional `kv_actuator` / `mamba_actuator`. If provided, calls `cap_allocator_only` *before* the explicit shrink (src side) and *after* the explicit grow (dst side). The contract: physical chunks move via `cross_arena_transfer`; per-pool actuators only sync the allocator-side capacity.
+- `python/sglang/srt/budgeter/agent.py`: new `SGLANG_BUDGETER_XPOOL_COORDINATED=1` env flag. Constructs both per-pool actuators (`KVArenaActuator` and `MambaArenaActuator`) and wires them into the cross-pool actuator. `_ensure_arena_actuator` updated to traverse `pool.full_kv_pool` for hybrid models.
+- `python/sglang/srt/managers/scheduler_runtime_checker_mixin.py`:
+  - `_check_full_pool` (hybrid branch): now honors `allocator.live_size` instead of always using `allocator.size`. Without this fix, capping KV trips the leak check (`total != available + evictable + protected`).
+  - `_check_mamba_pool`: now honors `mamba_pool.live_size`. Same reason — capping mamba's slots was tripping the mamba-side leak check.
+
+**Reproduce.**
+```bash
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=3 WARMUP_S=600 dev/2e/17_kv_mamba_xfer_coordinated.sh
+```
+
+**Result (2026-04-30, GPU 3, H200, Qwen3.5-35B-A3B TP=1).**
+```
+[shared_xpool_coord] coordination engaged: BudgetAgent xpool: actuator attached,
+                     oscillator unit=1, coordinated=True (kv_act=True, mamba_act=True)
+[shared_xpool_coord] capacity-update events: KV=13, mamba=12
+[shared_xpool_coord] xpool transfers: kv→mamba=7 mamba→kv=6
+PASS: completions byte-identical between baseline and shared+xpool+coordinated arms
+```
+
+Every transfer log line shows `leftover free 0` (no handle drift). Every KV cap-down is paired with a corresponding cap-up; same for mamba. KV oscillates 1310720 ↔ 1114112 tokens (-3 chunks per sub-pool), mamba 384 ↔ 448 tokens (+2 chunks per sub-pool). 5 deterministic prompts at temperature=0 are byte-identical to the no-arena SGLang baseline.
+
+**Findings.**
+
+1. **Live-traffic safety prerequisite is now in place.** When the cross-pool actuator shrinks KV physically, the KV allocator immediately learns about the new capacity (`Allocator.set_capacity_pages: 1263072 → 1066464`). The scheduler refuses new requests targeted at the unmapped tail. No more "transfers in idle windows only" caveat at the *mechanism* level — the gate is still there in the demo, but the gate's job is now correctness of the drain protocol (no in-flight requests *currently* using the tail), not "the allocator still thinks capacity is the old number." That latter risk is gone.
+
+2. **The `set_capacity_tokens` / `cap_allocator_only` separation is the load-bearing API choice.** `KVArenaActuator.set_capacity_tokens` was originally written for KV-only resize (2e.4.d), where the actuator owns both arena and allocator. For cross-pool transfer, the arena work is done elsewhere (`cross_arena_transfer`); the actuator should only touch the allocator. The earlier mistake (calling the wrong method from the cross-pool path) shrank KV physically *twice* per call, leaking 60 handles into the shared free pool each round-trip — visible in the v4 log as "leftover free 60" instead of 0. The v5 fix resolved it; the byte-equivalence check still passed in v4 because the leaked-but-unmapped chunks weren't accessed by the engine, but the math was wrong and the failure would have shown up under heavier traffic.
+
+3. **Four separate bugs were caught by the e2e test, in sequence.** The v1 demo's PASS was misleading because the safety gate masked them. With the proper coordinated path:
+   1. `_ensure_arena_actuator` couldn't find `_kv_arena` on the hybrid wrapper. Caught by `kv_act=False` in the log.
+   2. Scheduler's mamba leak check didn't honor `live_size`. Caught by `pool memory leak detected!` mid-warmup.
+   3. `KVArenaActuator` didn't have `live_capacity_tokens()`. Caught by `AttributeError` on every tick.
+   4. Scheduler's full-pool leak check (hybrid branch) didn't honor `live_size`. Caught by `pool memory leak detected!` after the kv_act fix.
+   5. (= the v4 issue) `set_capacity_tokens` double-shrunk the arena. Caught by `leftover free 60` instead of 0. The byte-equivalence test passed despite this because the leaked chunks weren't accessed.
+
+   This is the value of the e2e test we added in 2e.5.6.2.fix: every layer of safety has to be right for the byte-equivalence to come out clean.
+
+**Implication for 2e.5.6.3.b.** Mechanism is correct; perf bench is the next gate.
 

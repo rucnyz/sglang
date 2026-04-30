@@ -55,3 +55,25 @@ class KVArenaActuator:
 
     def shrink_fraction(self, frac: float) -> int:
         return self.set_capacity_tokens(int(self.max_tokens * frac))
+
+    def live_capacity_tokens(self) -> int:
+        """Phase 2e.5.6.3: uniform getter so CrossPoolTransferActuator can
+        use either KVArenaActuator or MambaArenaActuator interchangeably.
+        """
+        return self.live_tokens
+
+    def cap_allocator_only(self, n_tokens: int) -> int:
+        """Phase 2e.5.6.3: cap ONLY the allocator's free-page list,
+        without touching the underlying MultiTensorArena's physical
+        chunk mapping. Used by `CrossPoolTransferActuator` which
+        orchestrates arena shrink/grow itself via `cross_arena_transfer`
+        (calling the regular `set_capacity_tokens` here would shrink
+        the arena a second time, leaking handles to the shared free
+        pool).
+        """
+        n_tokens = max(self.pool.page_size, min(n_tokens, self.max_tokens))
+        page_size = max(1, self.pool.page_size)
+        n_pages = min(n_tokens // page_size, self.allocator.size)
+        self.allocator.set_capacity_pages(n_pages)
+        self.live_tokens = n_pages * page_size
+        return self.live_tokens

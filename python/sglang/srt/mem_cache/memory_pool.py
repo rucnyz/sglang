@@ -477,12 +477,93 @@ class MambaPool:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+        # Phase 2e.5.6.3: a freed slot whose id is above the current live cap
+        # must go to _capped_slots, not back to free_slots; otherwise the next
+        # alloc would hand it back out, but its underlying chunk has been
+        # unmapped via cross-pool transfer.
+        cap = getattr(self, "_cap_slots", None)
+        if cap is not None:
+            mask_above = free_index > cap
+            if mask_above.any():
+                held_now = free_index[mask_above]
+                kept = free_index[~mask_above]
+                existing = getattr(self, "_capped_slots", None)
+                if existing is None or existing.numel() == 0:
+                    self._capped_slots = held_now
+                else:
+                    self._capped_slots = torch.cat([existing, held_now])
+                if kept.numel() > 0:
+                    self.free_slots = torch.cat((self.free_slots, kept))
+                return
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
         self.free_slots = torch.arange(
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
+
+    @property
+    def live_size(self) -> int:
+        """Currently-active slot capacity (= self.size unless capped by budgeter)."""
+        cap = getattr(self, "_cap_slots", None)
+        return cap if cap is not None else self.size
+
+    def set_capacity_slots(self, n_slots: int) -> int:
+        """Phase 2e.5.6.3: restrict allocations to slot ids <= `n_slots`.
+
+        Slot 0 is the padding slot; live capacity must always include at
+        least 1 usable slot. The free-slot list is partitioned into a live
+        head (ids ≤ n_slots) and a held-out tail kept in `_capped_slots`.
+        Grow restores ids from `_capped_slots` whose value is ≤ the new
+        cap. Mirrors `BaseTokenToKVPoolAllocator.set_capacity_pages`.
+
+        Does NOT verify in-flight slots above n_slots have been freed —
+        the caller (cross-pool actuator) is responsible for guaranteeing
+        the engine isn't holding slots in the soon-to-be-unmapped tail.
+        """
+        n_slots = max(1, min(n_slots, self.size))
+        cap = getattr(self, "_cap_slots", self.size)
+        if n_slots == cap:
+            return n_slots
+
+        capped_existing = getattr(self, "_capped_slots", None)
+        capped_count = capped_existing.numel() if capped_existing is not None else 0
+        logger.info(
+            "MambaPool.set_capacity_slots: %d -> %d (size=%d, free=%d, capped=%d)",
+            cap, n_slots, self.size, self.free_slots.numel(), capped_count,
+        )
+
+        if n_slots < cap:
+            # Shrink: move free slots with id > n_slots out to _capped_slots.
+            mask = self.free_slots > n_slots
+            held_now = self.free_slots[mask]
+            self.free_slots = self.free_slots[~mask]
+            if capped_existing is None or capped_existing.numel() == 0:
+                self._capped_slots = held_now
+            else:
+                self._capped_slots = torch.cat([capped_existing, held_now])
+        else:
+            # Grow: pull eligible slots back from _capped_slots.
+            held = capped_existing
+            if held is not None and held.numel() > 0:
+                mask = held <= n_slots
+                move = held[mask]
+                if move.numel() > 0:
+                    self.free_slots = torch.cat([self.free_slots, move])
+                self._capped_slots = held[~mask]
+        self._cap_slots = n_slots
+        return n_slots
+
+    def set_capacity_tokens(self, n_tokens: int) -> int:
+        """Token-shaped wrapper: each MambaPool slot stores one full
+        sequence's state, so tokens == slots. Provided so the cross-pool
+        actuator's API (`set_capacity_tokens` on both KV and mamba pools)
+        is uniform.
+        """
+        return self.set_capacity_slots(n_tokens)
+
+    def live_capacity_tokens(self) -> int:
+        return self.live_size
 
     def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
