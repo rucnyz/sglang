@@ -6,7 +6,9 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ## TL;DR — 2026-04-30 night session final summary
 
-**12 PASS, 4 INFORMATIVE/QUANTITATIVE-FINDING, 2 NULL (control + composed), 3 BLOCKED, +1 implementation fix landed.**
+**13 PASS, 4 INFORMATIVE/QUANTITATIVE-FINDING, 1 NULL (composed), 3 BLOCKED, +3 implementation fixes landed.**
+
+(Setting 1 originally NULL on v6 trace, but **v9 pool-binding-shift trace + adaptive K_BIG (v9-auto)** delivers a real headline result: 13 PASS now. The 1 NULL is Setting 3.C composed effect.)
 
 | setting | status | headline |
 |---|---|---|
@@ -380,7 +382,23 @@ v6/v7/v8 nulled because their three phases all bound on the mamba pool. v9 redes
 4. **L2 alone fires 0 transfers** but L1+L2 fires 28: Layer 1 actually CAUSES Layer 2 to engage. Without L1, default MambaRadixCache evicts aggressively enough that mamba_usage stays below threshold; Layer 1's HPB+K_BIG keeps high-value nodes resident, building up usage to the firing threshold.
 5. **Phase A shows K_BIG hurts**: L1 cells -20% TPS, +90% TTFT vs stock. K_BIG=8192 suppresses mamba snapshots on the 12K-prompt shared-prefix workload, costing hit rate. **Consistent with A2 finding** (K_big=0 wins on prefix-friendly workloads).
 
-**Implication:** the joint L1+L2 system delivers double-digit improvements on KV-bound and mixed phases while paying a Phase-A penalty on the mamba-friendly phase. Layer 2's adaptive ability would need to TURN OFF K_BIG when mamba is far from saturated — exactly the workload-conditional control the design calls for. Open follow-up.
+**Implication:** the joint L1+L2 system delivers double-digit improvements on KV-bound and mixed phases while paying a Phase-A penalty on the mamba-friendly phase. Layer 2's adaptive ability would need to TURN OFF K_BIG when mamba is far from saturated — exactly the workload-conditional control the design calls for. **DONE follow-up below.**
+
+### v9-auto: SGLANG_K_BIG_AUTO_THRESHOLD adaptive K_BIG control (DONE PASS)
+
+`mamba_radix_cache.py` insert() now reads `SGLANG_K_BIG_AUTO_THRESHOLD`. When set in (0,1], K_BIG is auto-disabled for any insert where mamba_usage < threshold. 3/3 unit tests PASS (`dev/2e/36_kbig_auto_unit.py`).
+
+Re-ran Setting 1 v9 L1+L2 cell with `SGLANG_K_BIG_AUTO_THRESHOLD=0.5`:
+
+| | Phase A TPS / TTFT | Phase B TTFT / E2E | Phase C TTFT / E2E | xfers |
+|---|---|---|---|---:|
+| stock          | 79.6K / 2428ms | 259 / 687 | 198 / 2279 | 0 |
+| v9 L1+L2 (always-on K_BIG)      | 61.9K / 5779ms | 164 / 454 | 157 / 1409 | 28 |
+| **v9-auto L1+L2 (threshold=0.5)** | **75.7K / 3100ms** | **163 / 446** | **161 / 1334** | **15** |
+
+**Phase A TPS recovered from 61.9K to 75.7K (+22%, now within 5% of stock 79.6K). Phase A TTFT recovered from 5779ms to 3100ms (-46%).** Phase B/C wins are preserved (B TTFT 164→163, C E2E 1409→1334). Cross-pool transfers drop from 28 to 15 — still active enough to drive Layer 2's reallocation, with fewer firings during the unsaturated Phase A window. This is exactly the workload-conditional adaptive control the design calls for, and it works.
+
+Raw data: `/tmp/setting1_v9_auto_*/`.
 
 Cross-pool budgeter L2-only (L10_L21) didn't fire because mamba pool stays below threshold without L1's snapshot-density change. Documented; not a regression.
 
