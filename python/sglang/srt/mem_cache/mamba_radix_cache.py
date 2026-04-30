@@ -550,6 +550,12 @@ class MambaRadixCache(BasePrefixCache):
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
+        if os.environ.get("SGLANG_RADIX_DEBUG") == "1":
+            logger.info(
+                "MambaRadixCache.match: key_len=%d, best_value_len=%d, "
+                "last_node_id=%s",
+                len(key), best_value_len, last_node.id if last_node else None,
+            )
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -566,6 +572,14 @@ class MambaRadixCache(BasePrefixCache):
         prefix_len, mamba_exist = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
+        # Phase 3 debug: log every insert at INFO level (gated by env
+        # SGLANG_RADIX_DEBUG=1 to keep prod logs clean).
+        if os.environ.get("SGLANG_RADIX_DEBUG") == "1":
+            logger.info(
+                "MambaRadixCache.insert: key_len=%d, prefix_len=%d, "
+                "mamba_exist=%s, chunked=%s, prev=%d",
+                len(key), prefix_len, mamba_exist, params.chunked, prev_prefix_len,
+            )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:

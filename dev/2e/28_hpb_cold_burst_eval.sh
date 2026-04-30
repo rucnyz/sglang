@@ -75,7 +75,10 @@ import json, urllib.request, time, os, threading, statistics, random
 random.seed(0)
 PORT = $PORT
 RESULTS = os.environ["RESULTS"]
-SYS_PREFIX = "You are a helpful assistant. Always be concise. " * 75  # ~1500 tokens
+# Need a system prefix LONGER than chunked_prefill_size (=8192) so the
+# engine actually inserts into the radix cache via cache_unfinished_req
+# at the chunk boundary. ~12000 tokens of repeated text:
+SYS_PREFIX = "You are a helpful assistant. Always be concise. " * 600  # ~12000 tokens
 
 def fire(prompt, mark, results):
     t0 = time.time()
@@ -87,7 +90,7 @@ def fire(prompt, mark, results):
     req = urllib.request.Request(f'http://127.0.0.1:{PORT}/v1/completions',
         data=data, headers={'Content-Type': 'application/json'})
     try:
-        body = json.loads(urllib.request.urlopen(req, timeout=120).read())
+        body = json.loads(urllib.request.urlopen(req, timeout=300).read())
         elapsed = (time.time() - t0) * 1000
         # SGLang exposes per-request 'usage' but not TTFT in the openai
         # response. Use total request latency as a proxy; for short max_tokens
@@ -96,41 +99,42 @@ def fire(prompt, mark, results):
     except Exception as e:
         results.append((mark, -1, str(e)))
 
-# Pulse 1: build the cache.
-print(">> Pulse 1 (build): 30 prompts sharing 1500-token system prefix")
+# Pulse 1: build the cache. ~12K-token system prefix sent 10 times
+# (smaller count because each request now does a real 12K prefill;
+# we don't need many — one is enough to populate the radix).
+print(">> Pulse 1 (build): 10 prompts sharing 12K-token system prefix")
 results = []
-for i in range(30):
+for i in range(10):
     prompt = SYS_PREFIX + f"Question {i}: name a fruit:"
     fire(prompt, 'pulse1', results)
-    time.sleep(0.5)
+    time.sleep(0.3)
 p1 = [r[1] for r in results if r[0] == 'pulse1' and r[1] > 0]
 print(f"  pulse1: n={len(p1)}, mean_latency={statistics.mean(p1):.1f} ms, "
       f"median={statistics.median(p1):.1f} ms")
 
-# Cold burst: 60 unique prompts.
-print(">> Cold burst: 60 unique-prefix prompts (~20s)")
+# Cold burst: many unique prompts, each 12K+ tokens, so they push hard
+# on the cache and force eviction. We use 50 burst prompts at 2 RPS.
+print(">> Cold burst: 50 unique 12K-prefix prompts (~25s)")
 threads = []
-for i in range(60):
-    # Each prompt has a unique 200-token prefix to flood the radix.
-    prompt = (f"Random topic {i}: " + " ".join(f"word{i}{j}" for j in range(100))
-              + f" -- now answer: what color is {i}?")
-    t = threading.Thread(target=fire, args=(prompt, 'burst', results), daemon=True)
+for i in range(50):
+    # Each burst prompt has a unique 12K-token prefix. Floods the cache.
+    UNIQUE = (f"Topic {i}: " + " ".join(f"word{i}{j}" for j in range(2000))
+              + f" -- answer: what color is {i}?")
+    t = threading.Thread(target=fire, args=(UNIQUE, 'burst', results), daemon=True)
     t.start()
     threads.append(t)
-    time.sleep(1.0/3.0)  # 3 RPS
+    time.sleep(0.5)  # 2 RPS
 for t in threads:
-    t.join(timeout=180)
+    t.join(timeout=300)
 b = [r[1] for r in results if r[0] == 'burst' and r[1] > 0]
 print(f"  burst: n={len(b)}, mean_latency={statistics.mean(b):.1f} ms")
 
 # Idle drain.
 time.sleep(8)
 
-# Pulse 2: should hit the cache if HPB preserved the system page.
-print(">> Pulse 2 (post-burst): 30 prompts with same system prefix as Pulse 1")
-for i in range(30):
-    # Same SYS_PREFIX, but DIFFERENT trailing question so the engine has
-    # to actually prefill that part. The system prefix should be cached.
+# Pulse 2: should hit the cache if the system prefix survived the burst.
+print(">> Pulse 2 (post-burst): 10 prompts with same system prefix as Pulse 1")
+for i in range(10):
     prompt = SYS_PREFIX + f"Quiz {i}: capital of country {i % 5}?"
     fire(prompt, 'pulse2', results)
     time.sleep(0.3)

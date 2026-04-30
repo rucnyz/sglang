@@ -1384,11 +1384,17 @@ pulse2_median_ms              115.92     115.10     -0.71%
    - The radix's split granularity (`page_size=1`) creates per-token nodes; matching across 1500 tokens is computationally fine but may have an exact-tokenization caveat.
    - The completion endpoint vs chat-completion endpoint may differ in caching behavior.
 
-**Next step.** Two paths to make this test produce a paper-grade signal:
-- **(A)** Tighten the cache: launch with `--max-mamba-cache-size 60` (or similar) so the cold burst genuinely floods mamba slots, forcing eviction. Then HPB vs recency makes a measurable difference.
-- **(B)** Investigate why the prefix isn't matching at all. If the engine isn't registering hits even without eviction, the test setup is wrong before HPB vs recency is even relevant.
+**Diagnosis (2026-04-30 second pass, post-instrumentation).** Added `SGLANG_RADIX_DEBUG=1` log lines to `MambaRadixCache.insert` and `match_prefix`. Sent two identical 12K-character prompts back-to-back. Findings:
 
-(B) is the prerequisite. Doing it autonomously without user input is risky (touches engine internals); deferring to a discussion. **The HPB LRU primitives themselves are still correct (Phase 3.a unit test passes); the production-scale empirical reproduction is what's blocked.**
+1. **The radix tree IS populating correctly.** Each request's `cache_finished_req` calls `insert()` with `prefix_len > 0` and creates a node with `mamba_value`. Visible in the debug log at `/tmp/cache_diag2.log`.
+
+2. **`match_prefix` returns `best_value_len=0` even when the cache contains a matching prefix.** Reason: `MambaRadixCache._match_prefix_helper` only updates `best_value_len` when the walk visits a node with `node.mamba_value is not None`. In SGLang, `mamba_value` is only set on (a) chunk-boundary insertions during chunked prefill (called in `cache_unfinished_req` at multiples of `chunked_prefill_size`) and (b) finished-request leaf insertions (called in `cache_finished_req` at total prompt+output length). Intermediate split nodes have `mamba_value=None`. **A match only counts as a hit if the searched prefix is long enough to reach a snapshot-bearing node.**
+
+3. **My test workload (`"You are a helpful assistant. " * 600`) tokenizes to ~3605 tokens, NOT 12000.** The tokenizer compresses repeated text. With `chunked_prefill_size=8192` (the default), no chunk-boundary snapshot was created. The only `mamba_value`-bearing node was at depth 3605 (the leaf), and the scheduler's match key was 3604 tokens (off-by-one with the leaf), so even an identical-prompt resend missed.
+
+4. **This is paper §4.2's "small-K-only" failure mode.** The current MambaRadixCache already exhibits the heterogeneous behavior the paper describes — but only because SGLang's `chunked_prefill_size` IS effectively `K_big`. The paper's contribution is making this explicit and combining it with hits-per-byte eviction.
+
+**Verdict for the empirical reproduction.** To produce a paper-grade cold-burst measurement, the workload must use prompts that *genuinely tokenize* to > `chunked_prefill_size` tokens (default 8192). Repeated-substring strings won't work because of tokenizer compression. A workload with 16K+ truly diverse-token prompts (e.g., real document excerpts) crossing the chunk boundary at 8192 would create a snapshot node at depth 8192; cold-burst prompts at the same depth would then evict it under recency LRU but preserve it under HPB. **HPB primitives + reporter are correct (Phase 3.a + 3.b unit tests pass); paper §4.2 reproduction is now blocked on workload choice, not implementation.**
 
 ## Phase 3.c — Layer 1 + Layer 2 combined integration trace (PASS, 2026-04-30)
 
