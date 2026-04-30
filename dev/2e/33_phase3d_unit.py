@@ -91,14 +91,10 @@ def test_kbig_alignment():
         f"depth-8 (aligned) insert should have mamba_value, got None"
     print(f"  → depth-8 node has mamba_value (snapshot taken). GOOD.")
 
-    # Now insert a different key at depth 5 (NOT aligned).
-    # Updated semantic (post-K_BIG-leak fix): non-aligned-depth inserts
-    # do NOT create a tombstone leaf. Instead, the trailing KV is freed
-    # in _insert_helper. Reason: a tombstone leaf with no snapshot
-    # ancestor breaks the cache_unfinished_req invariant
-    # `insert.prefix_len <= len(match_prefix.device_indices)` and is
-    # never reclaimable via full_lru (evict_leaf asserts mamba_value is
-    # not None). Net behavior: this prompt simply isn't cached.
+    # Now insert a different key at depth 5 (NOT aligned, but BELOW K_big=8).
+    # Heterogeneous-granularity semantic: depth < K_big → small-page caching
+    # (legacy behavior, snapshot kept). Only inserts past the first
+    # big-page boundary get suppressed.
     cache2 = make_cache()
     key5 = RadixKey(list(range(1, 6)), extra_key=None)  # 5 tokens
     value5 = torch.arange(1, 6, dtype=torch.int64)
@@ -106,15 +102,14 @@ def test_kbig_alignment():
     result2 = cache2.insert(InsertParams(
         key=key5, value=value5, mamba_value=mamba_slot2, prev_prefix_len=0,
     ))
-    print(f"  insert at depth 5 (NOT aligned): prefix_len={result2.prefix_len}, mamba_exist={result2.mamba_exist}")
+    print(f"  insert at depth 5 (depth<K_big, snapshot retained): prefix_len={result2.prefix_len}, mamba_exist={result2.mamba_exist}")
 
-    # No tombstone leaf created — root has no children for this key.
-    assert 1 not in cache2.root_node.children, \
-        f"depth-5 (non-aligned) insert should NOT create a leaf; got child {cache2.root_node.children.get(1)}"
-    assert result2.mamba_exist == True, \
-        f"suppressed insert must signal mamba_exist=True so caller frees the fork (got {result2.mamba_exist})"
-    print(f"  → depth-5 insert is dropped (no tombstone leaf). GOOD.")
-    print(f"  → mamba_exist=True signals caller to free its fork. GOOD.")
+    node5 = cache2.root_node.children[1]
+    assert node5.mamba_value is not None, \
+        f"depth-5 (depth<K_big) should retain its snapshot; got mamba_value=None"
+    assert result2.mamba_exist == False, \
+        f"depth-5 not suppressed → mamba_exist=False (got {result2.mamba_exist})"
+    print(f"  → depth-5 insert keeps its snapshot. GOOD.")
 
     print("PASS Test 1\n")
 

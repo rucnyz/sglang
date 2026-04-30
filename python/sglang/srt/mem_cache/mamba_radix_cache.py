@@ -583,12 +583,19 @@ class MambaRadixCache(BasePrefixCache):
         suppressed_mamba = False
         if k_big > 0 and mamba_value is not None:
             insert_depth = prev_prefix_len + len(key)
-            if insert_depth % k_big != 0:
-                # Heterogeneous granularity: only k_big-aligned depths get
-                # snapshots. Non-aligned inserts have their KV freed in
-                # _insert_helper (no tombstone leaf is created). The next
-                # request that walks this path will re-prefill the
-                # non-aligned tail from the deepest snapshot ancestor.
+            # Heterogeneous granularity (paper §4.2):
+            #   * insert_depth < k_big: small-page caching (legacy behavior,
+            #     keep the snapshot — short prompts still benefit from
+            #     per-turn caching).
+            #   * insert_depth >= k_big AND insert_depth % k_big != 0:
+            #     suppress. Past the first big-page boundary the deepest-
+            #     snapshot ancestor is at floor(insert_depth/k_big)*k_big,
+            #     so the trailing tail can be re-prefilled.
+            #   * insert_depth % k_big == 0: aligned, take the snapshot.
+            # When suppressed, _insert_helper frees the trailing KV
+            # instead of creating a tombstone leaf (would break match-
+            # prefix's `best_value_len` invariant).
+            if insert_depth >= k_big and insert_depth % k_big != 0:
                 suppressed_mamba = True
                 mamba_value = None
 
