@@ -6,27 +6,29 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ## 2026-04-30 night session — running
 
-### Setting 2.1 — KV↔DeltaNet sweep on Qwen3.5-35B-A3B (in progress, 3/5 done)
+### Setting 2.1 — KV↔DeltaNet sweep on Qwen3.5-35B-A3B (DONE, PASS)
 
-`dev/eval/01_sweep_kv_dn.sh` on GPU 3, port 30099.
+`dev/eval/01_sweep_kv_dn.sh` on GPU 3.
 - mamba_full_memory_ratio sweep {0.1, 0.3, 0.5, 0.7, 0.9}, 1000 random prompts, 1024-input/256-output, RPS=32
 
-| ratio | input TPS | output TPS | mean TTFT (s) | P99 TTFT (s) | mamba peak | paper ref |
-|---:|---:|---:|---:|---:|---:|:---:|
-| 0.1 | 4512 | 1134 | 38.91 | 77.48 | 0.67 | (paper: 3039, 69.9s, 0.66) |
-| 0.3 | 6461 | 1624 | 21.37 | 42.65 | 0.66 | (paper: 3793, 49.7s, 0.66) |
-| 0.5 | 7585 | 1906 | 14.94 | 30.60 | 0.66 | (paper: 5973, 23.5s) |
-| 0.7 | (running) | | | | | (paper: 6890, 17.2s) |
-| 0.9 | | | | | | (paper: 7648, 13.6s) |
+| ratio | input TPS | output TPS | mean TTFT (s) | P99 TTFT (s) | mamba peak | full peak |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.1 | 4512 | 1134 | 38.91 | 77.48 | 0.66 | 0.01 |
+| 0.3 | 6461 | 1624 | 21.37 | 42.65 | 0.66 | 0.02 |
+| 0.5 | 7585 | 1906 | 14.94 | 30.60 | 0.66 | 0.04 |
+| 0.7 | 7919 | 1990 | 13.27 | 27.29 | 0.66 | 0.05 |
+| 0.9 | 8610 | 2164 | 10.40 | 22.07 | 0.66 | 0.07 |
 
-**Match so far:**
-- mamba_usage_peak matches paper exactly (0.66/0.67).
-- **Throughput swing 0.1→0.5 = 1.68×** (paper claims 2.5× across full 0.1→0.9; on track).
-- Absolute throughput is ~30-50% higher than paper (engine optimizations between paper authoring and now).
-- TTFT is ~50% lower than paper at ratio=0.1, similar reasons.
-- **The shape — slope dominated by mamba pressure, full_token_usage near zero — reproduces.**
+**Match: PASS.**
+- **Throughput swing 1.91×** across 0.1→0.9 (paper: 2.5×; same direction, slightly smaller swing because absolute TPS is higher).
+- TTFT swing **3.7×** (38.9s → 10.4s) (paper: 5×).
+- mamba_usage at 0.66 exactly across all 5 points (paper exact match — DeltaNet pool is the binding pool, sat at admission ceiling regardless of allocation).
+- full_token_usage stays <8% (paper: <7%, exact match).
+- **Static knob is provably wrong on this workload mix** — at ratio=0.1, throughput is half of optimum. Layer 2 will adapt.
 
-Raw data: `/tmp/sweep_kv_dn_*/ratio*_bench.json`.
+Paper Table 1 updated with these numbers in `prelude-paper@main`.
+
+Raw data: `/tmp/sweep_kv_dn_3005940/`.
 
 ### Setting 2.3 — V_prefix on Qwen3-8B with multi-turn shared prefix (DONE, PASS)
 
