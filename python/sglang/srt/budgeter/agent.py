@@ -101,6 +101,17 @@ class BudgetAgent:
         self._arena_actuator = None
         self._arena_phase = 0  # for the oscillator
 
+        # Phase 2e.5.6.2 cross-pool transfer demo. Requires
+        # SGLANG_ARENA_SHARED=1 at engine boot. Each budgeter tick alternates
+        # 1 chunk KV→mamba and 1 chunk mamba→KV; the planner/policy logic
+        # for what to actually transfer is the next milestone (real
+        # pressure signals via LagrangePlanner).
+        self.xpool_demo = _env_flag("SGLANG_BUDGETER_XPOOL_DEMO", False)
+        self._xpool_actuator = None
+        self._xpool_phase = 0
+        # n_chunks_per_subpool transferred per call; conservatively 1.
+        self._xpool_unit = int(os.environ.get("SGLANG_BUDGETER_XPOOL_UNIT", "1"))
+
         if self.enabled:
             try:
                 self._log_fp = open(self.log_path, "a", buffering=1)
@@ -142,6 +153,13 @@ class BudgetAgent:
             except Exception as e:
                 logger.warning("BudgetAgent arena actuation failed: %s", e, exc_info=True)
 
+        # Phase 2e.5.6.2: cross-pool KV ↔ mamba transfer demo.
+        if self.xpool_demo:
+            try:
+                self._maybe_xpool_actuate(snapshot)
+            except Exception as e:
+                logger.warning("BudgetAgent xpool actuation failed: %s", e, exc_info=True)
+
         if self._log_fp is not None:
             try:
                 self._log_fp.write(json.dumps(snapshot, default=_json_default) + "\n")
@@ -181,6 +199,104 @@ class BudgetAgent:
             snapshot["budgeter_arena_target"] = target
             snapshot["budgeter_arena_actual"] = actual
             snapshot["budgeter_arena_phase"] = self._arena_phase
+
+    def _ensure_xpool_actuator(self) -> None:
+        """Phase 2e.5.6.2: lazily attach the cross-pool transfer actuator.
+
+        Walks the scheduler to find the hybrid pool (full_kv_pool +
+        mamba_pool), then wraps both arenas in a CrossPoolTransferActuator
+        that writes through the shared SharedHandlePool.
+        """
+        if self._xpool_actuator is not None:
+            return
+        sched = self.scheduler
+        alloc = getattr(sched, "token_to_kv_pool_allocator", None)
+        if alloc is None:
+            return
+        pool = alloc.get_kvcache() if hasattr(alloc, "get_kvcache") else None
+        if pool is None:
+            return
+        full_kv = getattr(pool, "full_kv_pool", None)
+        mamba_pool = getattr(pool, "mamba_pool", None)
+        if full_kv is None or mamba_pool is None:
+            return
+        kv_arena = getattr(full_kv, "_kv_arena", None)
+        mamba_arena = getattr(mamba_pool, "_mamba_temporal_arena", None)
+        if kv_arena is None or mamba_arena is None:
+            return
+        shared = kv_arena._arena._external_pool
+        if shared is None:
+            logger.warning(
+                "BudgetAgent xpool: KV arena has no external SharedHandlePool; "
+                "is SGLANG_ARENA_SHARED=1 set?"
+            )
+            return
+        if mamba_arena._arena._external_pool is not shared:
+            logger.warning(
+                "BudgetAgent xpool: KV and mamba arenas use different "
+                "SharedHandlePool instances — cross-pool transfer disabled."
+            )
+            return
+        from sglang.srt.arena.cross_pool_actuator import (
+            CrossPoolTransferActuator,
+        )
+        self._xpool_actuator = CrossPoolTransferActuator(
+            kv_arena=kv_arena,
+            mamba_arena=mamba_arena,
+            shared_pool=shared,
+        )
+        logger.info(
+            "BudgetAgent xpool: actuator attached, oscillator unit=%d",
+            self._xpool_unit,
+        )
+
+    def _maybe_xpool_actuate(self, snapshot: dict) -> None:
+        """Phase 2e.5.6.2 demo. Safe-by-design: only transfers when there are
+        zero running/queued requests (i.e., during warmup or quiescent
+        windows). Live-serving cross-pool resize requires the scheduler to
+        know about the shrunken capacity (via KVArenaActuator and a
+        not-yet-implemented MambaArenaActuator); that's the next milestone.
+        Until then we restrict to safe windows so the demo doesn't unmap
+        slots the engine is using.
+        """
+        self._ensure_xpool_actuator()
+        if self._xpool_actuator is None:
+            return
+
+        # Safety gate: only act when nothing is in flight. snapshot fields
+        # may be QueueCount objects with a `.total` attribute; unwrap to int.
+        def _to_int(v):
+            t = getattr(v, "total", None)
+            if isinstance(t, (int, float)):
+                return int(t)
+            try:
+                return int(v) if v is not None else 0
+            except (TypeError, ValueError):
+                return 0
+        n_running = _to_int(snapshot.get("num_running_reqs", 0))
+        n_queued = _to_int(snapshot.get("num_queue_reqs", 0))
+        if n_running > 0 or n_queued > 0:
+            snapshot["xpool_skipped"] = "engine_busy"
+            snapshot["xpool_state"] = self._xpool_actuator.state()
+            return
+
+        # Oscillator: kv→mamba, then mamba→kv, repeat. Each tick moves
+        # `_xpool_unit` chunks per source sub-pool. With the safety gate
+        # above this only fires during quiet windows, but it does fire
+        # repeatedly so we get multiple data points across the run.
+        self._xpool_phase = (self._xpool_phase + 1) % 2
+        if self._xpool_phase == 1:
+            stats = self._xpool_actuator.kv_to_mamba_chunks(self._xpool_unit)
+        else:
+            stats = self._xpool_actuator.mamba_to_kv_chunks(self._xpool_unit)
+
+        # Inline a few key fields into the snapshot for easy grep.
+        snapshot["xpool_direction"] = stats["direction"]
+        snapshot["xpool_unmapped_total"] = stats["unmapped_total"]
+        snapshot["xpool_granted_total"] = stats["granted_total"]
+        snapshot["xpool_kv_capacity_tokens"] = stats["kv_capacity_tokens"]
+        snapshot["xpool_mamba_capacity_tokens"] = stats["mamba_capacity_tokens"]
+        snapshot["xpool_free_handles"] = stats["free_after_grow"]
 
     def _maybe_evict(self, snapshot: dict) -> None:
         """Phase 2b actuation: ask the policy what to evict; call tree_cache.evict."""

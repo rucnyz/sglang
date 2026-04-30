@@ -100,9 +100,18 @@ class SharedHandlePool:
     Phase 2e.5.6: cross-arena (KV ↔ mamba) transfer needs both arenas to
     share a single bag of handles. `ChunkArena.__init__(external_handle_pool=...)`
     references this object instead of creating its own handle list.
+
+    The pool can be created empty and grown incrementally: each arena
+    calls `grow(n_handles_needed)` at its own init time, so the engine
+    doesn't need to pre-compute a total handle budget across pools.
     """
 
-    def __init__(self, device_id: int, chunk_size: int, n_handles: int) -> None:
+    def __init__(
+        self,
+        device_id: int,
+        chunk_size: int,
+        n_handles: int = 0,
+    ) -> None:
         self.device_id = device_id
         self.chunk_size = chunk_size
 
@@ -114,25 +123,58 @@ class SharedHandlePool:
         self._prop = prop  # kept for sanity-equality checks
 
         self.handles: List[int] = []
-        for _ in range(n_handles):
-            h = _HANDLE(0)
-            _check(CUDA.cuMemCreate(
-                ctypes.byref(h), chunk_size, ctypes.byref(prop), 0),
-                "cuMemCreate (SharedHandlePool)")
-            self.handles.append(h.value)
-
         # Free handles: indices into `self.handles` that are currently unmapped
         # *anywhere*. Both arenas pop/push on this list.
-        self.free: List[int] = list(range(n_handles))
+        self.free: List[int] = []
+
+        # C-side arena_multi64.so pool indices reserved by participating
+        # MultiTensorArenas. Each one calls `allocate_subpool_range(n)` to
+        # claim a disjoint range; the pool tracks the watermark so two
+        # arenas in the same process don't collide.
+        self._next_subpool_idx: int = 0
+
+        if n_handles > 0:
+            self.grow(n_handles)
+
+    def grow(self, n_more: int) -> None:
+        """Create `n_more` cuMemCreate'd handles, append to the pool."""
+        if n_more <= 0:
+            return
+        for _ in range(n_more):
+            h = _HANDLE(0)
+            _check(CUDA.cuMemCreate(
+                ctypes.byref(h), self.chunk_size, ctypes.byref(self._prop), 0),
+                "cuMemCreate (SharedHandlePool.grow)")
+            idx = len(self.handles)
+            self.handles.append(h.value)
+            self.free.append(idx)
+
+    def allocate_subpool_range(self, n: int) -> int:
+        """Reserve the next `n` C-side pool indices and return the start.
+
+        The C-side arena_multi64.so allocator has 64 fixed pool slots
+        (numbered 0..63). When two MultiTensorArenas live in one process
+        they must use disjoint sub-ranges; this helper hands them out
+        sequentially.
+        """
+        if n <= 0:
+            raise ValueError(f"allocate_subpool_range n={n} must be > 0")
+        offset = self._next_subpool_idx
+        self._next_subpool_idx += n
+        return offset
 
     def free_count(self) -> int:
         return len(self.free)
+
+    def total_count(self) -> int:
+        return len(self.handles)
 
     def cleanup(self) -> None:
         for h in self.handles:
             CUDA.cuMemRelease(h)
         self.handles.clear()
         self.free.clear()
+        self._next_subpool_idx = 0
 
 
 @dataclass
@@ -245,6 +287,14 @@ class ChunkArena:
                     f"external pool device {external_handle_pool.device_id} "
                     f"!= arena device {device_id}"
                 )
+            # Ensure the shared pool has enough free handles for this
+            # arena's full grow path (init plus any future planner-driven
+            # growth, depending on caller). If it doesn't, grow it. If it
+            # already does (e.g., pre-sized at construction or shared
+            # with a peer arena that has spare handles), no-op.
+            shortfall = n_handles - external_handle_pool.free_count()
+            if shortfall > 0:
+                external_handle_pool.grow(shortfall)
             self._owned_handles = []
             self._handles = external_handle_pool.handles
             self._free_handles = external_handle_pool.free

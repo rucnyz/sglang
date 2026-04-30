@@ -72,9 +72,17 @@ class MultiTensorArena:
         init_tokens: int,
         chunk_bytes: int = 32 * 1024 * 1024,
         external_handle_pool: Optional[SharedHandlePool] = None,
-        subpool_offset: int = 0,
+        subpool_offset: Optional[int] = None,
     ) -> None:
         n_subpools = n_layers * n_kinds
+        # Resolve subpool_offset: explicit value wins; else auto-assign from
+        # the shared pool (so multiple MTAs in one process don't collide on
+        # arena_multi64.so's 64 fixed pool slots); else 0 (single-arena mode).
+        if subpool_offset is None:
+            if external_handle_pool is not None:
+                subpool_offset = external_handle_pool.allocate_subpool_range(n_subpools)
+            else:
+                subpool_offset = 0
         if subpool_offset + n_subpools > _MAX_SUBPOOLS:
             raise ValueError(
                 f"need C indices [{subpool_offset}, {subpool_offset + n_subpools}) "
@@ -113,15 +121,16 @@ class MultiTensorArena:
             )
         self.init_chunks_per_pool = init_tokens // self.tokens_per_chunk
 
-        # Total physical handles = n_subpools * init_chunks_per_pool, plus
-        # headroom for the planner to grow at runtime. The arena reserves
-        # max_chunks_per_pool of VA per pool, but only init_chunks worth
-        # of physical pages are backed; growth requires more handles.
-        # For the smoke test we provision room for the full max (no soft cap).
-        # Phase 2e.5.6: when external_handle_pool is provided, this arena
-        # alias-uses that pool's handles instead of creating its own. The
-        # caller is responsible for sizing it for all participating arenas.
-        n_handles = n_subpools * self.max_chunks_per_pool
+        # Self-owned: provision physical handles for the full max-chunks
+        # range so any planner-requested grow within [init, max] succeeds.
+        # Phase 2e.5.6 shared mode: each arena pays for its INITIAL
+        # handle quota only — runtime growth pulls from handles freed by
+        # peer arenas (via cross_arena_transfer). Avoids n_pools-fold
+        # over-provisioning when many arenas share one pool.
+        if external_handle_pool is None:
+            n_handles = n_subpools * self.max_chunks_per_pool
+        else:
+            n_handles = n_subpools * self.init_chunks_per_pool
 
         self._arena = ChunkArena(
             device_id=device_id,

@@ -27,7 +27,8 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.5.5 | Migrate mamba pool to MultiTensorArena (depends on 2e.5.4 passing) | ~150 LoC | not started |
 | 2e.5.6.0 | Design note: `SharedHandlePool` + cross-arena transfer mechanism | doc | **done** 2026-04-30 |
 | 2e.5.6.1 | `SharedHandlePool` class + `ChunkArena` external-pool support + unit test | ~120 LoC | **PASS** 2026-04-30 |
-| 2e.5.6.2 | E2E hybrid workload-shift demo: KV ↔ mamba transfer driven by LagrangePlanner with real signals | 3–5 days | not started |
+| 2e.5.6.2 | E2E demo: KV ↔ mamba physical-handle migration during live serving (oscillator) | bench | **PASS** 2026-04-30 |
+| 2e.5.6.3 | LagrangePlanner with real per-pool pressure signals (KV preempt rate / mamba slot stall) | 3–5 days | not started |
 
 ## 2e.1.a — VMM smoke test (done)
 
@@ -918,4 +919,96 @@ PASS Test 3
 5. A `BudgetAgent` arm that wires real per-pool pressure signals into the existing `LagrangePlanner` and calls the actuator on plan-output decisions.
 
 The wiring is mechanical; the only research-y choice left is what pressure signal to use for "mamba pressure" (slot stall rate? Long-context request fraction?). 2e.5.6.2 will pick one and run a workload-shift trace on Qwen3.5-35B-A3B.
+
+## 2e.5.6.2 — KV ↔ mamba transfer demo on Qwen3.5-35B-A3B (PASS, 2026-04-30)
+
+**Goal.** Wire `SharedHandlePool` + `CrossPoolTransferActuator` into a live SGLang server and demonstrate physical-handle migration between the KV and mamba pools during real serving, without crashing the engine and without invalidating CUDA graphs.
+
+**Code.**
+
+- `python/sglang/srt/arena/chunk_arena.py`:
+  - `SharedHandlePool`: now creates the handle list lazily via `grow(n)`. Tracks the next free C-side sub-pool index via `allocate_subpool_range(n)` so multiple `MultiTensorArena`s in one process don't collide on `arena_multi64.so`'s 64 fixed pool slots.
+  - `ChunkArena.__init__` (with `external_handle_pool=...`): on construction, ensures the shared pool has at least `n_handles` free handles; pre-sized pools (or peers with spare handles) skip the grow.
+- `python/sglang/srt/arena/multi_tensor_arena.py`:
+  - `subpool_offset` now optional; auto-assigned from the shared pool's watermark when omitted.
+  - When external pool provided, `n_handles = n_subpools * init_chunks_per_pool` (not max-based) so we don't n-fold over-provision physical handles.
+- `python/sglang/srt/arena/shared_pool.py` (new): process-singleton `SharedHandlePool` getter, gated by `SGLANG_ARENA_SHARED=1`.
+- `python/sglang/srt/arena/cross_pool_actuator.py` (new): `CrossPoolTransferActuator` with `kv_to_mamba_chunks(n)` / `mamba_to_kv_chunks(n)`. The API is **destination-anchored** — caller specifies how many chunks each destination sub-pool should grow by, and the actuator computes `ceil(n × n_dst / n_src)` chunks per source sub-pool to free enough handles. This handles the asymmetry between KV (`n_layers × 2` sub-pools) and mamba (`n_layers × 1`).
+- `python/sglang/srt/mem_cache/memory_pool.py`:
+  - `MHATokenToKVPool._create_buffers` reads `SGLANG_ARENA_SHARED=1`, gets the singleton, and sets `max_tokens = init_tokens + 4*tokens_per_chunk` (4-chunk growth headroom per sub-pool) so the actuator can absorb handles from the mamba side.
+  - `MambaPool.__init__` does the symmetric thing.
+- `python/sglang/srt/budgeter/agent.py`: new `SGLANG_BUDGETER_XPOOL_DEMO=1` arm. Each tick alternates `kv_to_mamba(unit)` / `mamba_to_kv(unit)`. Safety gate: skip if `num_running_reqs > 0 || num_queue_reqs > 0` (the proper live-resize requires `MambaArenaActuator` parallel to `KVArenaActuator` with allocator-aware capacity caps; that's deferred to 2e.5.6.3).
+
+**Reproduce.**
+```bash
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=3 WARMUP_S=600 dev/2e/15_kv_mamba_xfer_demo.sh
+```
+
+**Result (2026-04-30, GPU 3, H200, Qwen3.5-35B-A3B TP=1).**
+
+Init logs (both arenas built on the shared singleton):
+```
+Arena shared mode: created process-singleton SharedHandlePool device=0, chunk_bytes=67108864
+MambaPool arena: tot=362 (aligned=384), tokens_per_chunk=32, ..., shared=True,
+                 subpool_offset=0, n_subpools=30
+MHATokenToKVPool arena: tot_tokens=1263073 (tot_aligned=1310720), tokens_per_chunk=65536,
+                 ..., shared=True, subpool_offset=30, n_subpools=20
+BudgetAgent xpool: actuator attached, oscillator unit=1
+```
+
+Mamba is constructed first (its temporal sub-pools claim C-side indices 0..29); KV second (claims 30..49). Total = 50 sub-pools, under the 64-slot limit of `arena_multi64.so`.
+
+First few cross-pool transfers logged:
+```
+CrossPoolTransferActuator.kv_to_mamba: shrank 2/src=20 → freed 40, grew 1/dst=30 →
+                                       consumed 30, leftover free 10 →
+                                       KV cap=1179648 tok, mamba cap=416 tok
+CrossPoolTransferActuator.mamba_to_kv: shrank 1/src=30 → freed 30, grew 1/dst=20 →
+                                       consumed 20, leftover free 20 →
+                                       KV cap=1245184 tok, mamba cap=384 tok
+```
+
+Each `kv_to_mamba(1)` shrinks each KV sub-pool by 2 chunks (40 freed) and grows each mamba sub-pool by 1 chunk (30 consumed). Each `mamba_to_kv(1)` does the symmetric thing (30 freed, 20 consumed). The math matches `ceil(n_dst × n_dst_subpools / n_src_subpools)`.
+
+Final tally:
+```
+budgeter ticks total:   21
+  kv→mamba transfers:   11
+  mamba→kv transfers:   10
+  skipped (engine busy): 0
+```
+
+All 8 completions returned coherent text:
+```
+The capital of France is →  Paris.\nThe capital of France is Paris.\n...
+def fibonacci(n):        → \n    if n == 0:\n        return 0\n    elif n == 1
+List three primes:       →  2, 3, 5.\nList three primes: 2, 3,
+Write a haiku about CUDA: → Parallel power,\nThreads dance in the GPU's heart,\nSpeeding up the code.
+...
+```
+
+`grep -iE "leak|RuntimeError|Traceback|CUDA error"` between "Server started" and "Shutting down": **no hits**. Engine survived 21 cross-pool physical-handle migrations during live serving.
+
+Evidence at `/tmp/kv_mamba_xfer_3822511/{server.log, completions.txt, budgeter_xpool_demo.jsonl}`.
+
+**Findings.**
+
+1. **Cross-pool physical migration works during live serving.** `cuMemUnmap` from KV's tail VA, `cuMemMap` into mamba's tail VA — bytes follow the handles, captured CUDA graphs (graphs were captured against `tensor.data_ptr()` which lives in the static-min region of each pool) replay fine. This is paper §4.4's load-bearing claim, demonstrated on a real hybrid model.
+
+2. **Asymmetric sub-pool counts handled correctly.** KV has 20 sub-pools (10 layers × k+v), mamba has 30 (30 layers × temporal). Naive "shrink N from each src sub-pool" doesn't yield enough handles to grow each dst sub-pool by 1 when n_src < n_dst. Destination-anchored API (`grow each dst by N, derive src shrink as ceil(N × n_dst / n_src)`) makes the math always work; leftover handles stay in the shared pool's free list for the next call.
+
+3. **C-side sub-pool index collision avoided via `subpool_offset` auto-assignment.** Mamba grabs indices 0..29 first, KV grabs 30..49. The shared pool's `_next_subpool_idx` watermark made this transparent — engine code didn't have to manually compute offsets.
+
+4. **Safety gate is necessary but currently slack.** The demo skips a transfer when `num_running_reqs > 0 || num_queue_reqs > 0`. In this run the snapshot reported 0 for both even when prompts were in flight (the snapshot timing vs prompt completion latency is flaky, and many ticks fell in the 3 s gaps between prompts the script imposes anyway). The latent risk: if we shrink KV below the slot index the scheduler is using, the next memory access faults. For 2e.5.6.2 this didn't trigger because (a) prompts were tiny (max 24 tokens) and (b) growth headroom was 4 chunks/sub-pool while transfers stayed near baseline.
+
+5. **For real serving safety, capacity-coordination is required.** The proper mechanism: cross-pool actuator → `KVArenaActuator.set_capacity_tokens(new_cap)` → `allocator.set_capacity_pages(new_pages)` (the same path 2e.4.d.3 already uses for KV-only resize). Mamba needs a parallel `MambaArenaActuator` plus `MambaPool.set_capacity_tokens`. Both wired into the actuator, the engine respects the live capacity at every allocation. This is 2e.5.6.3's first task (then layer the LagrangePlanner on top).
+
+6. **Process-exit cleanup still ugly.** `MemPool::~MemPool` segfaults at SIGTERM teardown (same as 2e.4.c / 2e.5.5). Doesn't affect correctness during serving; the engine doesn't tear these objects down at runtime.
+
+**Implication for 2e.5.6.3.** The mechanism is end-to-end: shared handles, cross-arena migration, scheduler observability. Remaining policy work:
+1. `MambaArenaActuator` + `MambaPool.set_capacity_tokens` (pattern from 2e.4.d).
+2. `CrossPoolTransferActuator` switches from raw `_arena.shrink/grow` to the two actuators' `set_capacity_tokens` so both pools' allocators learn about the new capacity in lockstep.
+3. Replace the oscillator with `LagrangePlanner` consuming real signals: KV preempt rate (already in scheduler stats), mamba slot saturation (`mamba_pool.available_size()`), and a queue-depth signal.
+4. Trace: a KV-bound workload (long context, dense token stream) yields chunks to mamba when slot stall rises; a mamba-bound workload (many short hybrid requests) reverses the flow. This is the paper's headline §4.3 + §4.4 demo.
 

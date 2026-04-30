@@ -285,16 +285,21 @@ class MambaPool:
             # SGLANG_MAMBA_PERLAYER=1), temporal_state's per-layer tensors
             # come from a MultiTensorArena, sharing the chunk-bitmap actuator
             # with the KV pool so cross-pool transfer can move physical bytes.
-            self._mamba_arena = os.environ.get("SGLANG_MAMBA_ARENA") == "1"
+            shared_arena = os.environ.get("SGLANG_ARENA_SHARED") == "1"
+            self._mamba_arena = (
+                os.environ.get("SGLANG_MAMBA_ARENA") == "1"
+                or shared_arena
+            )
             self._mamba_perlayer = (
                 self._mamba_arena
                 or os.environ.get("SGLANG_MAMBA_PERLAYER") == "1"
             )
             logger.info(
-                "MambaPool: temporal layout=%s, arena=%s, num_layers=%d, "
-                "size=%d, temporal_shape=%s, conv_shapes=%s",
+                "MambaPool: temporal layout=%s, arena=%s, shared=%s, "
+                "num_layers=%d, size=%d, temporal_shape=%s, conv_shapes=%s",
                 "per-layer-list" if self._mamba_perlayer else "stacked",
                 self._mamba_arena,
+                shared_arena,
                 num_mamba_layers, size, tuple(temporal_state_shape),
                 [tuple(s) for s in conv_state_shape],
             )
@@ -311,15 +316,34 @@ class MambaPool:
                 tot_aligned = (
                     (tot + tokens_per_chunk - 1) // tokens_per_chunk
                 ) * tokens_per_chunk
+
+                shared_pool = None
+                # Mamba growth headroom: in shared mode, allow up to 4
+                # extra chunks per sub-pool of growth via the cross-pool
+                # actuator. Mirrors the KV pool's headroom.
+                mamba_growth_chunks = 4 if shared_arena else 0
+                mamba_max_tokens = (
+                    tot_aligned + mamba_growth_chunks * tokens_per_chunk
+                )
+                if shared_arena:
+                    from sglang.srt.arena.shared_pool import (
+                        get_or_create_shared_handle_pool,
+                    )
+                    shared_pool = get_or_create_shared_handle_pool(
+                        device_id=torch.cuda.current_device(),
+                        chunk_bytes=chunk_bytes,
+                    )
+
                 self._mamba_temporal_arena = MultiTensorArena(
                     device_id=torch.cuda.current_device(),
                     n_layers=num_mamba_layers,
                     n_kinds=1,
                     per_token_shape=tuple(temporal_state_shape),
                     dtype=ssm_dtype,
-                    max_tokens=tot_aligned,
+                    max_tokens=mamba_max_tokens,
                     init_tokens=tot_aligned,
                     chunk_bytes=chunk_bytes,
+                    external_handle_pool=shared_pool,
                 )
                 temporal_state = [
                     self._mamba_temporal_arena.tensor(i, 0)
@@ -330,8 +354,12 @@ class MambaPool:
                     buf[:1].zero_()
                 logger.info(
                     "MambaPool arena: tot=%d (aligned=%d), tokens_per_chunk=%d, "
-                    "chunk_bytes=%d, per_token_bytes=%d",
-                    tot, tot_aligned, tokens_per_chunk, chunk_bytes, per_token_bytes,
+                    "chunk_bytes=%d, per_token_bytes=%d, shared=%s, "
+                    "subpool_offset=%d, n_subpools=%d",
+                    tot, tot_aligned, tokens_per_chunk, chunk_bytes,
+                    per_token_bytes, shared_arena,
+                    self._mamba_temporal_arena._subpool_offset,
+                    num_mamba_layers,
                 )
             elif self._mamba_perlayer:
                 temporal_state = [
@@ -998,17 +1026,24 @@ class MHATokenToKVPool(KVCache):
         # Phase 2e.4.c: optional ChunkArena-backed allocation. Gated by
         # SGLANG_KV_ARENA=1. Restricted to head_dim == v_head_dim for now;
         # falls through to default for the asymmetric case.
+        # Phase 2e.5.6: SGLANG_ARENA_SHARED=1 implies KV_ARENA=1 and routes
+        # this arena's MultiTensorArena onto the process-singleton
+        # SharedHandlePool so cross-pool (KV ↔ mamba) transfer can move
+        # physical handles between the two pools.
+        shared_arena = os.environ.get("SGLANG_ARENA_SHARED") == "1"
         use_arena = (
-            os.environ.get("SGLANG_KV_ARENA") == "1"
+            (os.environ.get("SGLANG_KV_ARENA") == "1" or shared_arena)
             and self.head_dim == self.v_head_dim
             and not self.enable_custom_mem_pool
         )
         logger.info(
             "MHATokenToKVPool buffers: backend=%s (SGLANG_KV_ARENA=%s, "
-            "head_dim==v_head_dim=%s, custom_mem_pool=%s), size=%d, page_size=%d, "
-            "layer_num=%d, head_num=%d, head_dim=%d",
+            "SGLANG_ARENA_SHARED=%s, head_dim==v_head_dim=%s, "
+            "custom_mem_pool=%s), size=%d, page_size=%d, layer_num=%d, "
+            "head_num=%d, head_dim=%d",
             "arena" if use_arena else "torch.zeros",
             os.environ.get("SGLANG_KV_ARENA", "<unset>"),
+            os.environ.get("SGLANG_ARENA_SHARED", "<unset>"),
             self.head_dim == self.v_head_dim,
             self.enable_custom_mem_pool,
             self.size, self.page_size, self.layer_num,
@@ -1031,20 +1066,41 @@ class MHATokenToKVPool(KVCache):
                 tot_aligned = (
                     (tot + tokens_per_chunk - 1) // tokens_per_chunk
                 ) * tokens_per_chunk
+
+                shared_pool = None
+                # In shared mode, leave growth headroom (max > init) so
+                # the cross-pool actuator can grow this pool by absorbing
+                # handles freed from the other pool.
+                kv_growth_chunks = 4 if shared_arena else 0
+                kv_max_tokens = tot_aligned + kv_growth_chunks * tokens_per_chunk
+                if shared_arena:
+                    from sglang.srt.arena.shared_pool import (
+                        get_or_create_shared_handle_pool,
+                    )
+                    shared_pool = get_or_create_shared_handle_pool(
+                        device_id=torch.cuda.current_device(),
+                        chunk_bytes=chunk_bytes,
+                    )
+
                 self._kv_arena = MultiTensorArena(
                     device_id=torch.cuda.current_device(),
                     n_layers=self.layer_num,
                     n_kinds=2,
                     per_token_shape=(self.head_num, self.head_dim),
                     dtype=self.store_dtype,
-                    max_tokens=tot_aligned,
+                    max_tokens=kv_max_tokens,
                     init_tokens=tot_aligned,
                     chunk_bytes=chunk_bytes,
+                    external_handle_pool=shared_pool,
                 )
                 logger.info(
                     "MHATokenToKVPool arena: tot_tokens=%d (tot_aligned=%d), "
-                    "tokens_per_chunk=%d, chunk_bytes=%d, per_token_bytes=%d",
-                    tot, tot_aligned, tokens_per_chunk, chunk_bytes, per_token_bytes,
+                    "tokens_per_chunk=%d, chunk_bytes=%d, per_token_bytes=%d, "
+                    "shared=%s, subpool_offset=%d, n_subpools=%d",
+                    tot, tot_aligned, tokens_per_chunk, chunk_bytes,
+                    per_token_bytes, shared_arena,
+                    self._kv_arena._subpool_offset,
+                    self.layer_num * 2,
                 )
             self.k_buffer = [self._kv_arena.tensor(i, 0) for i in range(self.layer_num)]
             self.v_buffer = [self._kv_arena.tensor(i, 1) for i in range(self.layer_num)]
