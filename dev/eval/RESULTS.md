@@ -91,7 +91,53 @@ pool (e.g., use long-input prompts in "kv phase").
 **Raw data:** /tmp/regsuite_v7/ ; per-job metrics.json + budgeter.jsonl +
 server.log + bench.log.
 
-### B2 cold_burst 4-replica validation (DONE — variance bands tight)
+### B2 cold_burst 4-cell joint ablation (DONE — paper Q1 structure, 1 cell rerunning)
+
+`/tmp/b2_4cell_v1/` — 4 parallel cells on GPUs 1-4, identical workload to v7
+B2 cold_burst, all at mem_fraction=0.8.
+
+| cell | L1 (HPB+K_BIG) | L2 (arena+budgeter) | mean ttft | p99 ttft | median e2e | xfers |
+|---|:-:|:-:|---:|---:|---:|---:|
+| 00 | 0 | 0 | 273.9 ms | 1101.6 ms | 2721.5 ms | 0 |
+| 10 | 1 | 0 | _rerunning_ | _rerunning_ | _rerunning_ | _rerunning_ |
+| 01 | 0 | 1 | 282.2 ms | 1144.5 ms | 2831.5 ms | 1 |
+| **11** | **1** | **1** | **212.3 ms** | **415.8 ms** | 2703.3 ms | 1 |
+
+**Critical finding:** the B2 cold-burst headline benefit comes from **L1+L2
+together, not L2 alone**. L2-only (cell_01) is essentially a no-op vs
+baseline (ttft +3%, p99 +4%); the −22.6% / −62.3% improvement only
+materializes when HPB-LRU prefix-cache eviction + K_BIG heterogeneous
+granularity are also on. Earlier interpretation (suite v7 prose claiming
+"single edge-triggered transfer absorbs cold-cache pressure") understated
+the L1 contribution. The transfer in cell_11 is necessary but not
+sufficient — without L1's signal-shaped prefix cache the transferred
+mamba pages don't get utilized for the recovery phase.
+
+**Runner bug found in flight:** cell_10 (L1-only) crashed in
+`scheduler_runtime_checker_mixin.on_idle` with a `pool memory leak
+detected` ValueError because my runner only set
+`SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0` in the L2 case. Per
+BLOCKERS.md "Phase 3.d residual: small idle-time leak (~80 KV slots /
+1.26M = 0.006%)", this env demotion is needed whenever K_BIG is on.
+Fixed in /tmp/b2_4cell_runner.sh; cell_10 rerunning on GPU 1 now.
+
+### B2 cold_burst 9-replica final variance bands (DONE)
+
+Combining suite v7 (1+1) + b2_replicas_v1 (2+2) + b2_extras_v1 (1+2) →
+n=4 baseline + n=5 prelude on the recovery phase:
+
+| metric | baseline (n=4) | prelude (n=5) | Δ |
+|---|---:|---:|---:|
+| mean ttft  | **279.4 ± 1.5 ms**  | **210.7 ± 3.5 ms**  | **−24.6%** |
+| p99 ttft   | **1101.2 ± 20.8 ms** | **419.2 ± 10.2 ms** | **−61.9%** |
+| median e2e | 2839.1 ± 77.0 ms | 2676.9 ± 15.7 ms | −5.7% |
+| mean e2e   | 3131.6 ± 49.8 ms | 2846.7 ± 25.4 ms | −9.1% |
+
+Within-arm σ is ~0.5–2% of mean; the prelude vs baseline gap is 30–60×
+the variance. The −24.6% mean TTFT / −61.9% p99 is reproducible to
+about ±1–2 percentage points across 9 independent runs.
+
+### B2 cold_burst 4-replica validation (superseded by 9-replica above)
 
 `/tmp/b2_replicas_v1/` — 2 baseline + 2 prelude on GPUs 3-6, identical config
 to v7 B2 cold_burst. Variance bands confirm v7 was not a fluke:
