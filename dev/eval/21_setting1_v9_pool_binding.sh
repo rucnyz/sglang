@@ -40,6 +40,13 @@ cell="L1${ONLY_L1}_L2${ONLY_L2}"
 extra_env=""
 if [ "$ONLY_L1" = "1" ]; then
   extra_env="$extra_env SGLANG_HPB_LRU=1 SGLANG_HPB_WINDOW_S=120.0 SGLANG_K_BIG=8192 SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0"
+  # K_BIG_AUTO_THRESHOLD: when set, K_BIG only activates if mamba_usage
+  # >= threshold. Fixes the Phase A regression observed in v9 first run
+  # (K_BIG hurts on prefix-friendly mamba-bound workloads where mamba
+  # isn't saturated).
+  if [ -n "${SGLANG_K_BIG_AUTO_THRESHOLD:-}" ]; then
+    extra_env="$extra_env SGLANG_K_BIG_AUTO_THRESHOLD=$SGLANG_K_BIG_AUTO_THRESHOLD"
+  fi
 fi
 if [ "$ONLY_L2" = "1" ]; then
   extra_env="$extra_env SGLANG_ARENA_SHARED=1 SGLANG_ARENA_FROM_BLOB=1 SGLANG_ARENA_CHUNK_BYTES=1073741824 SGLANG_BUDGETER=1 SGLANG_BUDGETER_XPOOL_PLANNER=1 SGLANG_BUDGETER_XPOOL_COORDINATED=1 SGLANG_BUDGETER_TICK_S=2.0 SGLANG_BUDGETER_LOG=$OUT_DIR/${cell}_budgeter.jsonl SGLANG_XPOOL_KV_HIGH=0.04 SGLANG_XPOOL_KV_LOW=0.015 SGLANG_XPOOL_MAMBA_HIGH=0.08 SGLANG_XPOOL_MAMBA_LOW=0.03 SGLANG_XPOOL_COOLDOWN=2"
@@ -50,10 +57,15 @@ echo "=== cell=$cell ($extra_env) ==="
 pkill -f "launch_server.*--port $PORT" 2>/dev/null || true
 sleep 6
 
+# L2-on cells need extra GPU headroom for arena/budgeter mappings;
+# drop mem-fraction-static to 0.7 when L2 is enabled.
+mem_frac="0.8"
+if [ "$ONLY_L2" = "1" ]; then mem_frac="0.7"; fi
+
 nohup env $extra_env \
   .venv/bin/python -m sglang.launch_server \
     --model-path "$MODEL" --host 127.0.0.1 --port $PORT \
-    --mem-fraction-static 0.8 --log-level info \
+    --mem-fraction-static $mem_frac --log-level info \
     --enforce-piecewise-cuda-graph \
     --reasoning-parser qwen3 \
     >"$log" 2>&1 &

@@ -580,6 +580,24 @@ class MambaRadixCache(BasePrefixCache):
         # We return mamba_exist=True when we suppress a snapshot so the
         # caller frees the forked mamba slot (it was for nothing).
         k_big = int(os.environ.get("SGLANG_K_BIG", "0"))
+        # Setting 1 v9 follow-up: K_BIG hurts on prefix-friendly mamba-
+        # bound workloads (Phase A regressed -20% TPS, +90% TTFT) because
+        # the mamba pool isn't pressured and snapshot suppression pure
+        # cost. Add an auto-disable threshold: when SGLANG_K_BIG_AUTO_THRESHOLD
+        # is set to a value v in (0,1], K_BIG only activates when current
+        # mamba_usage >= v. Default v=0 preserves the always-on behavior.
+        k_big_auto = float(os.environ.get("SGLANG_K_BIG_AUTO_THRESHOLD", "0"))
+        if k_big > 0 and k_big_auto > 0:
+            try:
+                mp = self.req_to_token_pool.mamba_pool
+                ms_size = getattr(mp, "size", 0)
+                ms_avail = mp.available_size() if hasattr(mp, "available_size") else ms_size
+                if ms_size > 0:
+                    mamba_usage_now = max(0.0, min(1.0, (ms_size - ms_avail) / ms_size))
+                    if mamba_usage_now < k_big_auto:
+                        k_big = 0  # auto-disable
+            except Exception:
+                pass  # if probing fails, fall through to legacy behavior
         suppressed_mamba = False
         if k_big > 0 and mamba_value is not None:
             insert_depth = prev_prefix_len + len(key)
