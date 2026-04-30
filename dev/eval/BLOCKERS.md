@@ -21,6 +21,15 @@ Each entry:
 - **Workaround:** none. Setting 5 cannot run until dispatcher exists.
 - **Resolved at:** —
 
+## Setting 2.2 (KV↔LoRA sweep) — **fixed and re-running 2026-04-30**
+
+- **Setting:** 2.2 (`dev/eval/05_sweep_lora.sh`)
+- **Original issue:** `--lora-name "lora_0,lora_1,..."` (comma-separated string) was sent to the server as ONE adapter name. The server logged `Got LoRA adapter that has never been loaded: lora_0,lora_1,lora_2,...,lora_31`. Bench reported `Mean TTFT: 0.00ms` because every request errored out fast.
+- **Fix:** SGLang `bench_serving` `--lora-name` uses `nargs="*"` (space-separated, not comma). Changed the script to `--lora-name lora_0 lora_1 lora_2 ... lora_31`.
+- **Status:** re-running on GPU 2.
+- **Date observed / fixed:** 2026-04-30 night.
+- **Resolved at:** 2026-04-30, after seeing server-side `Got LoRA adapter that has never been loaded` errors.
+
 ## Setting 1 (24-h phase-shift trace) — **partially blocked**
 
 - **Setting:** 1 (`dev/eval/01_phase_shift_trace.sh` not written)
