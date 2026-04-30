@@ -321,11 +321,23 @@ class MambaPool:
                 ) * tokens_per_chunk
 
                 shared_pool = None
-                # max_tokens == init_tokens: cross-pool transfer is zero-sum
-                # on physical handles (mamba grows X iff KV releases X), so
-                # max > init would only reserve VA the actuator can never
-                # back with physical memory. Symmetric on the KV side below.
-                mamba_max_tokens = tot_aligned
+                # max_tokens > init_tokens reserves VA past the initial
+                # physical mapping so cross-pool transfer can actually grow
+                # this arena: when peer releases a chunk, the freed handle
+                # gets cuMemMap'd into [init_chunks, max_chunks) of THIS
+                # arena's VA range. Without this headroom, max_chunks =
+                # init_chunks and the actuator's grow() returns 0 (B3 4-cell
+                # v1: 10 fires, all unmapped=0 granted=0 — pure overhead).
+                # The headroom is VA-only — no physical handles are
+                # allocated for [init, max), they only get mapped at
+                # transfer time. So this does NOT cost any KV/mamba budget.
+                mamba_growth_chunks = (
+                    int(os.environ.get("SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "4"))
+                    if shared_arena else 0
+                )
+                mamba_max_tokens = (
+                    tot_aligned + mamba_growth_chunks * tokens_per_chunk
+                )
                 if shared_arena:
                     from sglang.srt.arena.shared_pool import (
                         get_or_create_shared_handle_pool,
@@ -1165,8 +1177,12 @@ class MHATokenToKVPool(KVCache):
                 ) * tokens_per_chunk
 
                 shared_pool = None
-                # max_tokens == init_tokens — see MambaPool note above.
-                kv_max_tokens = tot_aligned
+                # See MambaPool note above: VA-only headroom for the actuator.
+                kv_growth_chunks = (
+                    int(os.environ.get("SGLANG_ARENA_KV_HEADROOM_CHUNKS", "4"))
+                    if shared_arena else 0
+                )
+                kv_max_tokens = tot_aligned + kv_growth_chunks * tokens_per_chunk
                 if shared_arena:
                     from sglang.srt.arena.shared_pool import (
                         get_or_create_shared_handle_pool,
