@@ -6,7 +6,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ## TL;DR — 2026-04-30 night session final summary
 
-**10 PASS, 3 INFORMATIVE, 1 NULL (control), 3 BLOCKED, +1 implementation fix landed.**
+**11 PASS, 3 INFORMATIVE, 2 NULL (control + composed), 3 BLOCKED, +1 implementation fix landed.**
 
 | setting | status | headline |
 |---|---|---|
@@ -23,6 +23,8 @@ Each entry: setting / date / what ran / result / location of raw data.
 | A5 VMM chunk-size | **PASS** (MAJOR) | 1GB chunks recover throughput within 1% of baseline; 64MB is 19× slower → paper Table~tab:a5 |
 | Q1 token-identity | **PASS** | 50/50 byte-identical default vs full prelude → paper §6.8 |
 | Q2 sampled-decoding KS | **PASS** | KS p=0.362, cosine 0.985 on char lengths default vs prelude → paper §6.8 |
+| Q3 classification accuracy | **PASS** | 49/50 (98%) on both arms, 50/50 byte-identical → paper §6.8 |
+| 3.C composed L1+L2 | NULL | 1 transfer per cell across all L1 configs (trace too smooth) → paper §6.3 |
 | 1 24-h phase-shift | NULL | Smooth control test (no regression). Compressed trace doesn't bind on different pools across phases → paper §6.2 honest reframe |
 | 5.A/5.B/A6 path-axis | BLOCKED | Path-axis dispatcher not implemented → BLOCKERS.md |
 | 3.C composed | TODO | Depends on Setting 1 + 3.A; Layer 2 fires once on Setting 1 trace |
@@ -162,6 +164,19 @@ Raw data: `/tmp/a1_kbig_only_*/`, plus reuses Q3.D, 3.A, 3.B raw data.
 This complements A3 (hyst sweep): together they verify that the planner's two main knobs (interval and threshold-band-width) modulate transfer-firing behavior in the expected directions.
 
 Raw data: `/tmp/a4_tau_*/`.
+
+### Quality preservation Q3 — per-task classification accuracy (DONE PASS)
+
+`dev/eval/15_Q3_classify_acc.sh` on GPU 2, port 30099. 50 multiple-choice questions on CS/networking/systems trivia at `temperature=0`, `seed=0`, `max_tokens=16` to default vs full prelude.
+
+| arm | accuracy | byte-identical to other arm |
+|---|---|---|
+| default | 49/50 (98.0%) | – |
+| prelude | 49/50 (98.0%) | 50/50 |
+
+**Delta: 0 answers, 0pp.** Both arms produce identical outputs and identical accuracy. The single missed question is the same in both arms (a model-level failure mode unrelated to prelude). This complements Q1/Q2 with a downstream-task quality number.
+
+Raw data: `/tmp/q3_classify_*/`.
 
 ### Quality preservation Q2 — sampled-decoding distribution match (DONE PASS)
 

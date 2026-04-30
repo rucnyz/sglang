@@ -305,7 +305,8 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | A6 | K=1 vs K=2 | not started | depends on 5.A |
 | Q1 | Quality preservation (temperature=0 token-identity) | **DONE PASS** — 50/50 byte-identical, default vs full prelude | — |
 | Q2 | Quality preservation (temp=1.0 KS test) | **DONE PASS** — KS p=0.362, cosine 0.985, len within 0.2% | — |
-| Q3-Q4 | Quality preservation (accuracy, ROUGE) | partial | extensions to Q1/Q2 |
+| Q3 | Quality preservation (classification accuracy) | **DONE PASS** — 49/50 = 98% on both arms, 50/50 byte-identical | — |
+| Q4 | Quality preservation (ROUGE on XSum) | not started | requires XSum dataset + reference summaries |
 
 ## Order of execution (proposed)
 
