@@ -547,6 +547,44 @@ The headline: paper §6.2 tab:headline-v9 now reflects the clean 4-cell numbers.
 
 Raw data: `/tmp/setting1_v9auto_full_*/`.
 
+### ⚠️ 2026-04-30 late-night re-interpretation: L1+L2 is NET NEGATIVE on v9-auto
+
+Re-reading the table after the regression+benefit suite v7 work shows two
+problems with the original "DONE PASS" framing:
+
+**Problem 1 — L2 is net-negative on v9-auto, not "L1 enables L2":**
+- L1-only Phase C P99 = 796 ms (−37% vs baseline)
+- L1+L2 Phase C P99 = 1134 ms (−11% vs baseline)
+- **L1+L2 is +42% WORSE than L1-only.** The 15 transfers L2 fires under
+  L1's mamba_usage signal are doing redundant work — L1's HPB-LRU
+  snapshot retention has already preserved the right working set, so
+  L2's `cuMemUnmap → cuMemMap` cycle is pure overhead, not a benefit.
+
+**Problem 2 — L2-only fires 0 transfers on v9-auto:**
+Stock MambaRadixCache evicts aggressively, so mamba_usage stays under the
+0.80 fire threshold. The cell_01 (L2-only) result therefore equals
+baseline at the metric level (0 transfers ⇒ no change). This means
+**v9-auto provides zero evidence of standalone L2 contribution** — which
+is exactly the paper's §4 claim.
+
+**Required follow-ups (2026-05-01):**
+1. **Make L1+L2 ≥ baseline in all conditions.** Tighten the planner: longer
+   cooldown (2 → 10 ticks), wider hysteresis band, and/or a
+   prefix_hit_rate_drop signal so the planner doesn't fire when L1's
+   snapshot work has already absorbed the binding shift. Re-run v9-auto
+   4-cell after the change and require L1+L2 ≤ L1-only Phase C P99.
+2. **Find a workload where L2 alone shows a real win.** The architectural
+   test is: long-context multi-turn (WildChat-style) where stock
+   MambaRadixCache *cannot* keep mamba_usage under the fire threshold
+   because the legitimate working set itself exceeds mamba pool capacity.
+   In that regime cell_01 should fire ≥ 5 transfers and beat baseline
+   by a measurable margin. Build the new workload, run a fresh 4-cell.
+
+**Status:** the original "DONE PASS" stands as evidence that L1 is
+strong (−37% Phase C P99) and that adaptive K_BIG removed Phase A
+regression. But the L1+L2 cell needs a fix before the paper can claim
+"L1+L2 strictly dominates other cells."
+
 ### v9-auto: SGLANG_K_BIG_AUTO_THRESHOLD adaptive K_BIG control (DONE PASS)
 
 `mamba_radix_cache.py` insert() now reads `SGLANG_K_BIG_AUTO_THRESHOLD`. When set in (0,1], K_BIG is auto-disabled for any insert where mamba_usage < threshold. 3/3 unit tests PASS (`dev/2e/36_kbig_auto_unit.py`).
