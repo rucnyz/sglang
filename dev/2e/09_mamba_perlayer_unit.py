@@ -203,6 +203,15 @@ def main() -> int:
     assert dims0 == dims1, f"state_dim_per_tensor differ: {dims0} vs {dims1}"
     print(f"get_state_dim_per_tensor: {dims0} (both)")
 
+    # ---- Test 6b: get_contiguous_buf_infos returns same per-layer counts.
+    dp0, dl0, il0 = p0.get_contiguous_buf_infos()
+    dp1, dl1, il1 = p1.get_contiguous_buf_infos()
+    assert len(dp0) == len(dp1), \
+        f"contiguous buf info data_ptr count differs: {len(dp0)} vs {len(dp1)}"
+    assert dl0 == dl1, f"contiguous buf info data_lens differ: {dl0} vs {dl1}"
+    assert il0 == il1, f"contiguous buf info item_lens differ: {il0} vs {il1}"
+    print(f"get_contiguous_buf_infos: {len(dp0)} ptrs, lens match (both)")
+
     # ---- Test 7: free returns slots to pool.
     p0.free(idx0)
     p1.free(idx1)

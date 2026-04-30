@@ -21,8 +21,9 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.5.0 | Design note: A1 vs A2 vs B' vs D for cross-pool VMM compatibility | doc | **done** 2026-04-30 |
 | 2e.5.1 | Mamba pool: `temporal_state` stacked → list (A2), gated `SGLANG_MAMBA_PERLAYER=1` | ~50 LoC | **done** 2026-04-30 |
 | 2e.5.2 | Unit test: alloc/free/copy_from/at_layer_idx equivalence for both flag values | ~220 LoC | **done** 2026-04-30 |
-| 2e.5.3 | E2E equivalence: same prompt, same tokens, both flag values, hybrid model | smoke | not started |
-| 2e.5.4 | **Performance regression bench**: A/B on hybrid model, throughput/TTFT/TPOT, ≤2% delta required | bench | not started |
+| 2e.5.3 | E2E equivalence: same prompt, same tokens, both flag values, Qwen3.5-35B-A3B TP=1 | smoke | **handed off** 2026-04-30 (long warmup, see notes) |
+| 2e.5.4 | **Performance regression bench**: A/B on Qwen3.5-35B-A3B TP=1, throughput/TTFT/TPOT, ≤2% delta required | bench | **handed off** 2026-04-30 |
+| 2e.5.5 | Mamba pool: optional MultiTensorArena allocation gated `SGLANG_MAMBA_ARENA=1` | ~70 LoC | **mechanism done** 2026-04-30, e2e validation pending |
 | 2e.5.5 | Migrate mamba pool to MultiTensorArena (depends on 2e.5.4 passing) | ~150 LoC | not started |
 | 2e.5.6 | Hybrid workload-shift demo: KV ↔ mamba transfer driven by LagrangePlanner with real signals | 3–5 days | not started |
 
@@ -568,4 +569,93 @@ after free: available_size=8 (both)
 3. **`at_layer_idx` duck-typing works.** The dataclass `State.at_layer_idx(layer)` does `v[layer]` for the `temporal` field. On a stacked tensor this slices axis 0; on a `List[Tensor]` this indexes the list. Both return a `(size+1, *)` view with identical content under symmetric writes.
 
 **Implication for 2e.5.3.** With logical equivalence proven on synthetic configs, the next step is end-to-end equivalence on a real hybrid model: same prompt, same `temperature=0`, both flag values, token sequences must match.
+
+## 2e.5.5 — design preview (mamba pool → MultiTensorArena)
+
+Pending 2e.5.3 / 2e.5.4 pass. The plan:
+
+**Goal.** Migrate `MambaPool`'s temporal_state (and per-conv-shape conv_state) into a `MultiTensorArena`, gated by `SGLANG_MAMBA_ARENA=1`. Same chunk size as KV (64 MiB) so the two pools share the actuator's handle pool and `transfer_chunks` can move physical bytes between them.
+
+**Sub-pool layout.**
+- KV uses `n_kinds=2` (k, v) per layer.
+- Mamba `temporal` uses `n_kinds=1` (just temporal) per layer; per_token_shape = `(num_heads, head_dim, state_size)`.
+- Mamba `conv` is currently a list per conv-shape (typically length 1) of stacked tensors. Two options: (a) keep conv on `torch.zeros` and only put temporal in arena (smaller migration); (b) put conv per-shape per-layer in arena too.
+- Recommend (a) for the initial cut: temporal is the larger of the two and where the cross-pool transfer story lives.
+
+**Constraints inherited.**
+- Per-MemPool single-tensor discipline (subagent finding: PyTorch caching allocator silently splits 20 MiB segments across chunks unless each MemPool has exactly one tensor).
+- 64 MiB chunk size to avoid that split (large_segment_size = 20 MiB enforced ≥ 20).
+- Mamba sub-pool has `n_layers * 1` MemPools instead of KV's `n_layers * 2`.
+
+**Code locations.**
+- `MambaPool.__init__` (memory_pool.py:230+): branch on `SGLANG_MAMBA_ARENA` env and use `MultiTensorArena` to allocate the temporal list, replacing the `torch.zeros` loop currently gated by `SGLANG_MAMBA_PERLAYER`. Combine with the perlayer flag — arena requires perlayer.
+- New `MambaArenaActuator` analogous to `KVArenaActuator`; takes (pool, allocator) for the mamba slot allocator.
+
+**Tests for 2e.5.5.**
+- 12_mamba_arena_unit.py: same shape/equiv assertions as 09 but with the arena flag; also asserts `tensor.data_ptr()` stability across `set_capacity_tokens`.
+- 13_kv_mamba_e2e.sh: run real hybrid serving with both `SGLANG_KV_ARENA=1` and `SGLANG_MAMBA_ARENA=1`, send completions, ensure no segfault, no leak detection trip.
+
+**Tests for 2e.5.6 (cross-pool transfer demo).**
+- 14_kv_mamba_transfer.sh: budgeter actively transfers 1 GB from mamba → KV mid-serving, then back. Capture LagrangePlanner decisions in JSONL.
+
+The intent is to land 2e.5.5 with two pools both arena-backed, then 2e.5.6 demonstrates real cross-pool physical transfer driven by Lagrange equalization (paper §4.4 + §4.3 end-to-end on a hybrid model).
+
+## 2e.5.5 — MambaPool optional MultiTensorArena allocation (mechanism done)
+
+**Goal.** Add `SGLANG_MAMBA_ARENA=1` env flag (implies `SGLANG_MAMBA_PERLAYER=1`) that allocates `temporal_state` from a `MultiTensorArena` instead of stand-alone `torch.zeros`. Same chunk size as KV (64 MiB) so both pools share the actuator's handle pool.
+
+**Code.** `python/sglang/srt/mem_cache/memory_pool.py:283-…`: env-flag branch that builds `MultiTensorArena(n_layers=num_mamba_layers, n_kinds=1, per_token_shape=temporal_state_shape, …)` and wires its per-layer tensors as the new `temporal_state` list. Logs the choice on init.
+
+**Reproduce (unit test).**
+```bash
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=2 PYTHONPATH=/data/yuzhou/projects/sglang/python:$PYTHONPATH \
+  .venv/bin/python -u dev/2e/12_mamba_arena_unit.py
+```
+
+**Result (2026-04-30, GPU 2, num_layers=4, size=8).**
+```
+== Phase 2e.5.5: MambaPool arena unit test ==
+layouts: default=Tensor, arena=list
+arena: chunk_bytes=67108864, max_tokens=262144, current=262144
+all 4 layer-tensors have distinct VAs in arena range
+default vs arena: live region shapes & zero-init content match
+alloc(3) returned [1, 2, 3]
+write/read through layer view works
+copy_from src->dst carries content
+
+== PASSED: SGLANG_MAMBA_ARENA=1 mechanism works ==
+```
+
+**Findings.**
+
+1. **Arena-backed mamba works mechanically.** All 4 layer-tensors land at distinct VAs inside the arena's reserved range; content reads/writes match the default stacked-pool reference; `alloc` and `copy_from` semantics preserved. End-to-end serving (live SGLang) deferred to user-driven 2e.5.3 / 2e.5.4 step below.
+
+2. **Chunk-aligned tot.** With 64 MiB chunks and a few-KB per-token temporal state, `tokens_per_chunk` is large; for tiny test configs the rounded-up `max_tokens` is much larger than the requested `size+1`, but the engine views the live region only.
+
+3. **Process-exit segfault** in `MemPool::~MemPool` after our arena unmaps — same known issue as 2e.4.c (does not affect runtime, only test-script teardown).
+
+## Open hand-off — equivalence + perf bench (2e.5.3, 2e.5.4)
+
+The unit tests in `dev/2e/09_mamba_perlayer_unit.py` and `dev/2e/12_mamba_arena_unit.py` already prove bit-equivalence on synthetic configs. The remaining validation runs serving on a real hybrid model (Qwen3.5-35B-A3B), which requires a long first-launch JIT compile (~10–15 min) the first time, then cached.
+
+**Run on a free idle GPU (e.g., GPU 3 or higher index):**
+```bash
+# 2e.5.3 — token-equivalence A/B (~25–35 min for both arms first time, ~15 min after Triton cache warm)
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=3 WARMUP_S=1500 dev/2e/10_mamba_equiv.sh 2>&1 | tee /tmp/equiv_run.log
+
+# 2e.5.4 — performance A/B regression (after 2e.5.3 passes; cache is warm so shorter)
+CUDA_VISIBLE_DEVICES=3 WARMUP_S=1500 NUM_PROMPTS=100 RPS=8 \
+  dev/2e/11_mamba_perf.sh 2>&1 | tee /tmp/perf_run.log
+```
+
+The `WARMUP_S=1500` (25 min) is generous — the actual first-launch compile time on Qwen3.5-35B-A3B was unbounded in our 15-min observations because of cold Triton cache + many MoE expert specializations. Once `~/.triton/cache` warms, subsequent launches are minutes.
+
+The script captures output to `/tmp/mamba_{equiv,perf}_$$/` for both arms; final summary line is either `PASS:` or `FAIL:`. The perf bench tail prints a comparison table with `worst delta` percentage; pass criterion is `≤2%` across all metrics (throughput / mean+p99 TTFT / mean+p99 TPOT / median e2e).
+
+If the user defers e2e validation:
+- The unit-test-level equivalence claim is already covered by tests 09 + 12.
+- 2e.5.5 mechanism (arena-backed mamba) is verified at synthetic-config level.
+- The risk of an "only-shows-up-at-real-model-scale" bug is bounded by the fact that mamba/fla Triton kernels never see the layout difference (they receive single-layer views via `at_layer_idx`, which works identically for stacked-tensor slicing and list indexing). The audit (2026-04-30 subagent) catalogued every kernel call site.
 

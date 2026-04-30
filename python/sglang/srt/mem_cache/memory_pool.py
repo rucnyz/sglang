@@ -280,15 +280,60 @@ class MambaPool:
             # a List[Tensor] of length num_mamba_layers, each shape
             # (size+1, *temporal_state_shape). Mirrors the per-layer KV pool
             # layout, makes the pool VMM-arena-friendly. Default off.
-            self._mamba_perlayer = os.environ.get("SGLANG_MAMBA_PERLAYER") == "1"
+            #
+            # Phase 2e.5.5 (A2 + arena): when SGLANG_MAMBA_ARENA=1 (implies
+            # SGLANG_MAMBA_PERLAYER=1), temporal_state's per-layer tensors
+            # come from a MultiTensorArena, sharing the chunk-bitmap actuator
+            # with the KV pool so cross-pool transfer can move physical bytes.
+            self._mamba_arena = os.environ.get("SGLANG_MAMBA_ARENA") == "1"
+            self._mamba_perlayer = (
+                self._mamba_arena
+                or os.environ.get("SGLANG_MAMBA_PERLAYER") == "1"
+            )
             logger.info(
-                "MambaPool: temporal layout=%s, num_layers=%d, size=%d, "
-                "temporal_shape=%s, conv_shapes=%s",
+                "MambaPool: temporal layout=%s, arena=%s, num_layers=%d, "
+                "size=%d, temporal_shape=%s, conv_shapes=%s",
                 "per-layer-list" if self._mamba_perlayer else "stacked",
+                self._mamba_arena,
                 num_mamba_layers, size, tuple(temporal_state_shape),
                 [tuple(s) for s in conv_state_shape],
             )
-            if self._mamba_perlayer:
+            if self._mamba_arena:
+                from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
+                # Compute chunk-aligned slot count.
+                chunk_bytes = 64 * 1024 * 1024
+                per_token_bytes = (
+                    int(np.prod(temporal_state_shape))
+                    * torch.tensor([], dtype=ssm_dtype).element_size()
+                )
+                tokens_per_chunk = max(1, chunk_bytes // per_token_bytes)
+                tot = size + 1
+                tot_aligned = (
+                    (tot + tokens_per_chunk - 1) // tokens_per_chunk
+                ) * tokens_per_chunk
+                self._mamba_temporal_arena = MultiTensorArena(
+                    device_id=torch.cuda.current_device(),
+                    n_layers=num_mamba_layers,
+                    n_kinds=1,
+                    per_token_shape=tuple(temporal_state_shape),
+                    dtype=ssm_dtype,
+                    max_tokens=tot_aligned,
+                    init_tokens=tot_aligned,
+                    chunk_bytes=chunk_bytes,
+                )
+                temporal_state = [
+                    self._mamba_temporal_arena.tensor(i, 0)
+                    for i in range(num_mamba_layers)
+                ]
+                # Match torch.zeros initial state for slot 0 (pad slot).
+                for buf in temporal_state:
+                    buf[:1].zero_()
+                logger.info(
+                    "MambaPool arena: tot=%d (aligned=%d), tokens_per_chunk=%d, "
+                    "chunk_bytes=%d, per_token_bytes=%d",
+                    tot, tot_aligned, tokens_per_chunk, chunk_bytes, per_token_bytes,
+                )
+            elif self._mamba_perlayer:
                 temporal_state = [
                     torch.zeros(
                         size=(size + 1,) + temporal_state_shape,
@@ -469,27 +514,43 @@ class MambaPool:
         Get buffer info for RDMA registration.
         Only returns conv and temporal state buffers, excluding intermediate buffers
         used for speculative decoding (intermediate_ssm, intermediate_conv_window).
-        """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            # Skip intermediate buffers used only for speculative decoding
-            # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
-                continue
-            value = getattr(self.mamba_cache, field)
-            if isinstance(value, list):
-                state_tensors.extend(value)
-            else:
-                state_tensors.append(value)
-        data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor in enumerate(state_tensors):
+        Phase 2e.5.1: when temporal is a per-layer-split List[Tensor]
+        (len == num_mamba_layers, entries don't carry a layer axis), the
+        entries are treated directly as per-layer buffers (no extra
+        layer-indexing).
+        """
+        # Per-logical-state list of "layer-indexable views"; each entry is
+        # something where `entry[layer_id]` returns the per-layer buffer.
+        # For stacked tensors and conv-shape lists this is the entry itself;
+        # for per-layer-split lists the wrapping list IS already layer-indexed.
+        state_views = []
+        for fname in vars(self.mamba_cache):
+            if fname in ("intermediate_ssm", "intermediate_conv_window"):
+                continue
+            value = getattr(self.mamba_cache, fname)
+            if isinstance(value, list):
+                if (
+                    len(value) == self.num_mamba_layers
+                    and value[0].shape[0] != self.num_mamba_layers
+                ):
+                    # Per-layer split: the list itself is the layer-indexed view.
+                    state_views.append(value)
+                else:
+                    # List of per-conv-shape stacked tensors.
+                    for v in value:
+                        state_views.append(v)
+            else:
+                state_views.append(value)
+
+        data_ptrs, data_lens, item_lens = [], [], []
+        for view in state_views:
             data_ptrs += [
-                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
+                view[i].data_ptr() for i in range(self.num_mamba_layers)
             ]
-            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
+            data_lens += [view[i].nbytes for i in range(self.num_mamba_layers)]
             item_lens += [
-                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
+                view[i][0].nbytes for i in range(self.num_mamba_layers)
             ]
         return data_ptrs, data_lens, item_lens
 
