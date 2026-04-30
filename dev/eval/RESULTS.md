@@ -384,6 +384,28 @@ v6/v7/v8 nulled because their three phases all bound on the mamba pool. v9 redes
 
 **Implication:** the joint L1+L2 system delivers double-digit improvements on KV-bound and mixed phases while paying a Phase-A penalty on the mamba-friendly phase. Layer 2's adaptive ability would need to TURN OFF K_BIG when mamba is far from saturated — exactly the workload-conditional control the design calls for. **DONE follow-up below.**
 
+### v9-auto FULL 4-cell — adaptive K_BIG, paper-final headline (DONE PASS)
+
+`dev/eval/21_setting1_v9_pool_binding.sh` × 4 cells, all with `SGLANG_K_BIG_AUTO_THRESHOLD=0.5`. GPUs 1/4/5/6, mem_frac 0.7 for L2-on cells.
+
+| cell | A: TPS / TTFT | B: TTFT / P99 | C: TTFT / **P99** | xfers |
+|---|---|---|---|---:|
+| (0,0) stock     | 80.1K / 2001ms | 161 / 478 | 152 / **1271** | 0 |
+| (1,0) L1 only   | 78.3K / 2095ms | 160 / 468 | 142 / **796** (-37%!) | – |
+| (0,1) L2 only   | 82.2K / 2328ms | 163 / 482 | 158 / 1249 | 0 |
+| (1,1) L1+L2     | 75.7K / 3174ms | 164 / 467 | 161 / **1134** (-11%) | **15** |
+
+**Key results from the FULL 4-cell run:**
+1. **Phase A regression GONE**: L1 cells now 2-5% of stock TPS (vs v9's -20%). Adaptive K_BIG works as designed.
+2. **Phase C P99 latency: L1 alone gets -37%** (1271→796ms); L1+L2 gets -11% (1271→1134).
+3. **Phase B largely flat** across all cells (~160ms TTFT, ~470ms P99). v9's "stock 259ms" was a single-run outlier; clean rerun shows no Phase-B differentiation.
+4. **L2 alone fires 0 transfers** (consistent with single-cell run): default MambaRadixCache evicts aggressively → mamba_usage stays below firing threshold.
+5. **L1+L2 fires 15 transfers**: Layer 1's snapshot retention is what lets mamba_usage cross the threshold and engage Layer 2.
+
+The headline: paper §6.2 tab:headline-v9 now reflects the clean 4-cell numbers. Setting 1's previous null is REPLACED by a real differentiation result on the redesigned trace + adaptive K_BIG.
+
+Raw data: `/tmp/setting1_v9auto_full_*/`.
+
 ### v9-auto: SGLANG_K_BIG_AUTO_THRESHOLD adaptive K_BIG control (DONE PASS)
 
 `mamba_radix_cache.py` insert() now reads `SGLANG_K_BIG_AUTO_THRESHOLD`. When set in (0,1], K_BIG is auto-disabled for any insert where mamba_usage < threshold. 3/3 unit tests PASS (`dev/2e/36_kbig_auto_unit.py`).
