@@ -306,7 +306,10 @@ class MambaPool:
             if self._mamba_arena:
                 from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
                 # Compute chunk-aligned slot count.
-                chunk_bytes = 64 * 1024 * 1024
+                # Phase A5: ablation honors SGLANG_ARENA_CHUNK_BYTES.
+                chunk_bytes = int(os.environ.get(
+                    "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
+                ))
                 per_token_bytes = (
                     int(np.prod(temporal_state_shape))
                     * torch.tensor([], dtype=ssm_dtype).element_size()
@@ -1155,7 +1158,10 @@ class MHATokenToKVPool(KVCache):
                 # set_capacity_tokens(n) will be added to enable runtime
                 # resize once the budgeter is wired in 2e.4.d.
                 tot = self.size + self.page_size
-                chunk_bytes = 64 * 1024 * 1024
+                # Phase A5: ablation honors SGLANG_ARENA_CHUNK_BYTES.
+                chunk_bytes = int(os.environ.get(
+                    "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
+                ))
                 per_token_bytes = (
                     self.head_num * self.head_dim
                     * torch.tensor([], dtype=self.store_dtype).element_size()
