@@ -39,6 +39,60 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ---
 
+## 2026-04-30 late-night session — regression+benefit suite v7
+
+### Layer 2 regression+benefit suite v7 (DONE — 4/5 PASS, 1 INFORMATIVE)
+
+`dev/eval/regression_suite/` — 5 workloads × {baseline, prelude} arms, GPUs 1–7,
+mem_fraction=0.8 both arms, prelude env = full L2 stack with edge-triggered
+planner + 256 MiB arena chunks (down from 1 GiB after chunk-rounding-OOM
+diagnosis below).
+
+| workload | baseline | prelude | Δ TPS / TTFT | xfers | gate |
+|---|---:|---:|---:|---:|---|
+| R1 steady random (Qwen3.5-35B-A3B mamba, 600 prompts random 512/128 RPS=32) | 8077 TPS, 10.4s ttft | 7873 TPS, 11.2s ttft | -2.5% TPS / +7% ttft | 1 | PASS (∈ ±5%) |
+| R2 steady GSP (Qwen3.5-35B-A3B mamba, 600 prompts gsp RPS=4) | 49486 TPS, 246ms ttft | 49409 TPS, 278ms ttft | -0.2% TPS / +13% ttft | 0 | PASS |
+| R3 LoRA (Qwen3-4B + 32 LoRAs r16, ml=8 RPS=16) | 3979 TPS, 879ms ttft | 3970 TPS, 939ms ttft | -0.2% TPS / +7% ttft | 0 | PASS |
+| B1 phase_shift (mamba↔KV alternation, 16 in-flight, 4×90s) | 1616 TPS, 974ms e2e | 1567 TPS, 1022ms e2e | -3.0% TPS / +4.8% e2e | 1 | **INFORMATIVE** (gate: ≤95%; got 105%) |
+| B2 cold_burst (build→burst→recover) | **279.6ms** ttft, 1083ms p99 | **205.7ms** ttft, 418ms p99 | **−26% ttft / −61% p99** | 1 | PASS (gate: ≤105% baseline mean ttft) |
+
+**Headline:** B2 cold_burst is the marquee benefit case — recovery TTFT mean
+**−26%** and p99 **−61%** with a single edge-triggered transfer. The L2 stack
+absorbs cold-cache pressure by giving the empty mamba pool memory pulled
+from a not-needed-yet KV pool the moment cold-cache mamba bind hits its
+high water mark.
+
+**B1 not actually phase-shifting (informative):** budgeter telemetry shows
+mamba_usage stays in [0.88, 0.99] for the entire B1 run while
+full_token_usage stays at ~0.00. Both "mamba phase" and "KV phase" of the
+dispatcher land on the mamba pool because the prompts are short and KV
+state is tiny. The edge-triggered planner correctly fires one
+`kv_to_mamba` transfer at tick 51 (mamba in_band→ABOVE_HIGH) and then
+goes silent — there's nothing more to do because KV is empty. The +4.8%
+e2e regression vs baseline is the cost of the transfer itself plus
+arena-mode partitioning overhead. Will rework B1 to actually toggle bind
+pool (e.g., use long-input prompts in "kv phase").
+
+**Engine fix applied (commit da326b1ed):**
+- Removed the `max_tokens > init_tokens` "growth window" — cross-pool
+  transfer is zero-sum on physical handles, so reserved-but-unmapped VA
+  past init can never be backed.
+- Removed per-pool headroom deduction from `_profile_available_bytes`.
+  Prelude now allocates the same `max_total_num_tokens` as baseline at
+  the same mem_fraction.
+- Reduced `SGLANG_ARENA_CHUNK_BYTES` from 1 GiB to 256 MiB. With 1 GiB
+  chunks, KV's 1.26M tokens rounded up to 2.10M (n_subpools=20 → ~10 GiB
+  excess physical memory) and mamba's 362 → 512 (n_subpools=30 → ~8.7
+  GiB excess), eating the activation reserve and OOM'ing FLA. Diagnosed
+  via `available_gpu_mem` falling from baseline 25.65 GB → prelude 0.97
+  GB. With 256 MiB chunks it's now baseline 25.65 GB → prelude 23.47 GB
+  (~2 GiB excess, well within reserve).
+
+**Raw data:** /tmp/regsuite_v7/ ; per-job metrics.json + budgeter.jsonl +
+server.log + bench.log.
+
+---
+
 ## 2026-04-30 night session — running
 
 ### Setting 2.1 — KV↔DeltaNet sweep on Qwen3.5-35B-A3B (DONE, PASS)

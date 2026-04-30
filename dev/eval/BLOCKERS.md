@@ -13,6 +13,16 @@ Each entry:
 
 ---
 
+## B1 phase_shift workload doesn't bind on different pools — **WORKLOAD, NOT ENGINE**
+
+- **Setting:** Layer 2 regression+benefit suite, B1 workload (`dev/eval/regression_suite/workloads/b1_phase_shift.sh`).
+- **Symptom:** suite v7 reports B1 prelude e2e 1022ms vs baseline 974ms (+4.8%), failing the ≤95% pass gate.
+- **Diagnosis:** budgeter.jsonl shows mamba_usage ∈ [0.88, 0.99] for the entire run while full_token_usage ≡ 0.00. Both "mamba phase" and "KV phase" of the dispatcher saturate mamba and leave KV idle. Edge-triggered planner correctly fires 1 kv_to_mamba transfer at tick 51 and then goes silent — KV has nothing to give.
+- **Why:** dispatcher's "kv-heavy" prompt source is too short. Short prompts produce tiny KV state and large mamba state. Need long-input prompts (4K+) in the kv-phase to actually load KV.
+- **Workaround:** treat current B1 result as informative. B2 cold_burst is the headline benefit (TTFT -26%, p99 -61%) and passes. Will rework B1 dispatcher to use 4K+ inputs in the kv phase.
+- **Date observed:** 2026-04-30 late night (suite v7).
+- **Resolved at:** —
+
 ## Path-axis dispatcher (Settings 5.A, 5.B, A6) — **BLOCKED**
 
 - **Setting:** 5.A (`dev/eval/09_path_dense.sh` not written), 5.B, A6
