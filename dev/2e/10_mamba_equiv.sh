@@ -41,7 +41,9 @@ run_arm() {
   sleep 3
   nohup env $extra_env .venv/bin/python -m sglang.launch_server \
     --model-path $MODEL --host 127.0.0.1 --port $PORT \
-    --mem-fraction-static 0.85 --log-level info \
+    --mem-fraction-static 0.8 --log-level info \
+    --enforce-piecewise-cuda-graph \
+    --reasoning-parser qwen3 \
     >"$log" 2>&1 &
   local pid=$!
   echo "server pid=$pid log=$log; waiting up to ${WARMUP_S}s for ready"
@@ -53,7 +55,8 @@ run_arm() {
   while [ $waited -lt $WARMUP_S ]; do
     sleep 10
     waited=$((waited + 10))
-    if curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q .; then
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+            "http://127.0.0.1:$PORT/health" 2>/dev/null)" = "200" ]; then
       kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
       echo
       echo "--- ready after ${waited}s ---"
@@ -63,7 +66,8 @@ run_arm() {
   if kill -0 $tailer 2>/dev/null; then
     kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
   fi
-  if ! curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q .; then
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+          "http://127.0.0.1:$PORT/health" 2>/dev/null)" != "200" ]; then
     echo "[$arm] server failed to start (waited ${WARMUP_S}s); tail of log:"
     tail -20 "$log"
     kill -9 $pid 2>/dev/null || true
@@ -80,7 +84,7 @@ data = json.dumps({
 }).encode()
 req = urllib.request.Request('http://127.0.0.1:$PORT/v1/completions',
     data=data, headers={'Content-Type': 'application/json'})
-r = urllib.request.urlopen(req, timeout=60)
+r = urllib.request.urlopen(req, timeout=300)
 print(json.loads(r.read())['choices'][0]['text'])
 " >>"$out" 2>&1
   done

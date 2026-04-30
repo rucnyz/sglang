@@ -21,8 +21,8 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.5.0 | Design note: A1 vs A2 vs B' vs D for cross-pool VMM compatibility | doc | **done** 2026-04-30 |
 | 2e.5.1 | Mamba pool: `temporal_state` stacked → list (A2), gated `SGLANG_MAMBA_PERLAYER=1` | ~50 LoC | **done** 2026-04-30 |
 | 2e.5.2 | Unit test: alloc/free/copy_from/at_layer_idx equivalence for both flag values | ~220 LoC | **done** 2026-04-30 |
-| 2e.5.3 | E2E equivalence: same prompt, same tokens, both flag values, Qwen3.5-35B-A3B TP=1 | smoke | **handed off** 2026-04-30 (long warmup, see notes) |
-| 2e.5.4 | **Performance regression bench**: A/B on Qwen3.5-35B-A3B TP=1, throughput/TTFT/TPOT, ≤2% delta required | bench | **handed off** 2026-04-30 |
+| 2e.5.3 | E2E equivalence: same prompt, same tokens, both flag values, Qwen3.5-35B-A3B TP=1 | smoke | **PASS** 2026-04-30 |
+| 2e.5.4 | **Performance regression bench**: A/B on Qwen3.5-35B-A3B TP=1, throughput/TTFT/TPOT, ≤2% delta required | bench | not started |
 | 2e.5.5 | Mamba pool: optional MultiTensorArena allocation gated `SGLANG_MAMBA_ARENA=1` | ~70 LoC | **mechanism done** 2026-04-30, e2e validation pending |
 | 2e.5.5 | Migrate mamba pool to MultiTensorArena (depends on 2e.5.4 passing) | ~150 LoC | not started |
 | 2e.5.6 | Hybrid workload-shift demo: KV ↔ mamba transfer driven by LagrangePlanner with real signals | 3–5 days | not started |
@@ -635,7 +635,52 @@ copy_from src->dst carries content
 
 3. **Process-exit segfault** in `MemPool::~MemPool` after our arena unmaps — same known issue as 2e.4.c (does not affect runtime, only test-script teardown).
 
-## Open hand-off — equivalence + perf bench (2e.5.3, 2e.5.4)
+## 2e.5.3 — E2E equivalence on Qwen3.5-35B-A3B (PASS, 2026-04-30)
+
+**Goal.** Verify that token output of `SGLANG_MAMBA_PERLAYER=1` is bit-identical to default on a real hybrid model under live serving.
+
+**Setup.** GPU 3, H200 BF16, TP=1, `--mem-fraction-static 0.8 --enforce-piecewise-cuda-graph --reasoning-parser qwen3`. The `--enforce-piecewise-cuda-graph` is required because SGLang auto-disables piecewise cuda graph for `Qwen3_5MoeForConditionalGeneration` (it lives in the multimodal arch list — `configs/model_config.py:1401`).
+
+**Prompts (temperature=0, max_tokens=20):**
+- "The capital of France is"
+- "Once upon a time"
+- "Q: 2 + 2 ="
+- "def fibonacci(n):"
+
+**Result.**
+```
+$ diff stacked_completions.txt perlayer_completions.txt
+$ echo $?
+0   # PASS — byte-identical
+```
+
+Both arms produced:
+```
+ Paris.
+The capital of France is Paris.
+The capital of France is Paris.
+The
+, in a world full of amazing science, there was a very special thing called a "molecule
+ 4. What is 2 + 2?
+
+The answer is 4. 
+
+In
+
+    if n == 0:
+        return 0
+    elif n == 1
+```
+
+Evidence at `/tmp/mamba_equiv_3192309/{stacked,perlayer}_completions.txt`.
+
+**Lessons learned during this run (now folded back into the scripts):**
+1. SGLang `/health` returns `200 OK` with **empty body**. Old `curl ... | grep -q .` check looked for non-empty body — the script's wait-for-ready loop never broke, even though the server was ready. Fixed: now check status code via `curl -s -o /dev/null -w '%{http_code}'`.
+2. SGLang's `Qwen3_5MoeForConditionalGeneration` arch is mis-classified as multimodal, auto-disabling piecewise cuda graph. Workaround: `--enforce-piecewise-cuda-graph`. (Not the cause of the 100× slowness we initially saw, which was actually cold Triton cache. cuda graph is at most 2-3×.)
+3. With piecewise cuda graph properly enabled, Qwen3.5-35B-A3B on H200 TP=1 BF16 reaches **~150-180 tok/s end-to-end** for short prompts.
+4. First-launch cold Triton cache compile takes 5-10 minutes; subsequent launches with the same model are <1 min.
+
+## 2e.5.4 — Performance regression bench (not started)
 
 The unit tests in `dev/2e/09_mamba_perlayer_unit.py` and `dev/2e/12_mamba_arena_unit.py` already prove bit-equivalence on synthetic configs. The remaining validation runs serving on a real hybrid model (Qwen3.5-35B-A3B), which requires a long first-launch JIT compile (~10–15 min) the first time, then cached.
 

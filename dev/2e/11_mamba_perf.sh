@@ -22,7 +22,7 @@ NUM_PROMPTS=${NUM_PROMPTS:-100}
 RPS=${RPS:-8}
 INPUT_LEN=${INPUT_LEN:-512}
 OUTPUT_LEN=${OUTPUT_LEN:-128}
-MEM_FRAC=${MEM_FRAC:-0.85}
+MEM_FRAC=${MEM_FRAC:-0.8}
 WARMUP_S=${WARMUP_S:-360}    # how long to wait for warmup (large hybrid models can take 5+ min)
 
 OUT_DIR=/tmp/mamba_perf_$$
@@ -42,7 +42,9 @@ run_arm() {
   nohup env CUDA_VISIBLE_DEVICES="$GPUS" $extra_env .venv/bin/python -m sglang.launch_server \
     --model-path "$MODEL" --host 127.0.0.1 --port $PORT \
     --tensor-parallel-size $TP \
-    --mem-fraction-static $MEM_FRAC --log-level warning \
+    --mem-fraction-static $MEM_FRAC --log-level info \
+    --enforce-piecewise-cuda-graph \
+    --reasoning-parser qwen3 \
     >"$log" 2>&1 &
   local pid=$!
   echo "server pid=$pid log=$log; waiting up to ${WARMUP_S}s for ready"
@@ -53,7 +55,8 @@ run_arm() {
   while [ $waited -lt $WARMUP_S ]; do
     sleep 10
     waited=$((waited + 10))
-    if curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q .; then
+    if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+            "http://127.0.0.1:$PORT/health" 2>/dev/null)" = "200" ]; then
       kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
       echo
       echo "--- ready after ${waited}s ---"
@@ -63,7 +66,8 @@ run_arm() {
   if kill -0 $tailer 2>/dev/null; then
     kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
   fi
-  if ! curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q .; then
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+          "http://127.0.0.1:$PORT/health" 2>/dev/null)" != "200" ]; then
     echo "[$arm] server failed to start (waited ${WARMUP_S}s)"
     tail -30 "$log"
     kill -9 $pid 2>/dev/null || true
