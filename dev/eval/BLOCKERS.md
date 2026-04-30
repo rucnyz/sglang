@@ -13,6 +13,16 @@ Each entry:
 
 ---
 
+## L2 actuator's lcm-aware unit is too coarse — **needs cost knob bump or per-subpool partial moves**
+
+- **Setting:** Layer 2 cross-pool transfer on any hybrid model (Qwen3.5-35B-A3B observed).
+- **Symptom:** B3 v2 cell_01: a single L2 fire moved 60 chunks (15 GB) from KV to mamba. KV pool dropped from 1.26M tokens to 524K. β phase's 96K-input × 8-concurrent requests overflowed → 40,201 dispatcher errors (~85% failure rate). v9-auto v4 cell_11_nb_v4: server SIGQUIT'd mid-Phase C after one big transfer.
+- **Root cause:** the actuator (`transfer_chunks`) operates in lcm-balanced units across all sub-pools. For Qwen3.5-35B-A3B with KV 20 sub-pools × mamba 30, lcm = 60, so each "1 unit" actuator move = 60 physical chunks × 50 ms cuMemUnmap+cuMemMap = ~3 s of GPU wall time per fire. The net-benefit gate's `nb_chunk_cost_us=50000` (one chunk's worth) under-cost transfers by 60×, letting through fires with B_persist=100 ms when actual cost is 3 s.
+- **Workaround landed (sglang 66e30e147):** raise `nb_chunk_cost_us` default 50_000 → 3_000_000 (lcm × per-chunk for Qwen3.5-A3B). Cooldown 3 → 16 ticks (32 s). Now requires ~55 retracted requests or 30 min sustained saturation before firing — only fires when overwhelming admission-pressure evidence exists. For other model topologies, operators must override `SGLANG_XPOOL_NB_CHUNK_COST_US` to match their lcm × per-chunk cost.
+- **Followups not yet landed:** (a) plumb actuator's chunks-per-unit into the planner so the gate uses real lcm rather than env knob; (b) post-fire monitor that reverses transfer if performance degrades within K ticks; (c) min-source-usage check refusing to shrink a pool already below e.g. 30% utilization; (d) per-subpool partial moves so the actuator can shift smaller increments than lcm.
+- **Date observed:** 2026-04-30 late night (B3 v2, v9-auto v4).
+- **Resolved at:** — (workaround in place; followups pending).
+
 ## B1 phase_shift workload — **architectural ceiling, not fixable with synthetic prompts**
 
 - **Setting:** Layer 2 regression+benefit suite, B1 workload (`dev/eval/regression_suite/workloads/b1_phase_shift.sh` + `dispatcher_b1.py`).
