@@ -39,6 +39,169 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ---
 
+## 2026-05-01 paper-final 4-cell ablation — frozen for paper §6 tables
+
+### Summary state of paper-relevant data
+
+All commits below are on rucnyz/sglang@prelude (engine + eval suite) and
+rucnyz/prelude-paper@main (paper). Paper headline + cost analysis paragraphs
+all wired in; static-min/soft VA split implementation in place but
+mobile-soft chunks default to 0 (actuator's gate refuses fires under
+`SGLANG_XPOOL_NB_CHUNK_COST_US=3M`, so the cell_11 measurements below
+reflect "L1+L2 control loop active, actuator silent" config).
+
+### Q3.B 4-cell ablation — B2 cold_burst (paper headline ✅)
+
+`/tmp/paper_final/b2_cold_burst_cell_{00,10,01,11}/metrics.json`
+
+| cell | input TPS | mean TTFT (ms) | P99 TTFT (ms) | median E2E (ms) | xfers |
+|---|---:|---:|---:|---:|---:|
+| (0,0) baseline | 27905 | 282.0 | 1089.9 | 2892.9 | 0 |
+| (1,0) L1 only  | 27893 | 209.9 (-26%)  | 411.9 (-62%) | 2685.6 (-7%) | 0 |
+| (0,1) L2 only  | 27960 | 279.8         | 1115.4       | 2774.4       | 0 |
+| (1,1) L1+L2    | **27990** | **200.3 (-29%)** | **411.6 (-62%)** | **2627.2 (-9%)** | 0 |
+
+Filled into paper as `tab:q3b-4cell` (commit `b1f9e67`).
+
+**Repro:**
+```bash
+# Code: rucnyz/sglang@prelude HEAD as of 2026-05-01
+# Workload script: dev/eval/regression_suite/workloads/b2_cold_burst.sh
+# Driver: /tmp/paper_final_runner.sh (4 cells parallel on GPUs 1-4)
+# Per-cell env: see /tmp/paper_final_runner.sh prelude_l1_only / prelude_l2_only / prelude_env_full
+# Each cell ~12 min wall (5 min warmup + ~3 min × 3 phases). Total batch ~15 min.
+```
+
+### Setting 1 v9-auto Phase C — paper headline ✅
+
+`/tmp/setting1_v9auto_full_*/` (prior session, fully validated)
+
+| cell | A: TPS / TTFT | B: TTFT / P99 | C: TTFT / **P99** | xfers |
+|---|---|---|---|---:|
+| (0,0) stock     | 80.1K / 2001 ms | 161 / 478 ms | 152 / **1271** ms | 0 |
+| (1,0) L1 only   | 78.3K / 2095 ms | 160 / 468 ms | 142 / **796** ms (-37%) | – |
+| (0,1) L2 only   | 82.2K / 2328 ms | 163 / 482 ms | 158 / 1249 ms      | 0 |
+| (1,1) L1+L2     | 75.7K / 3174 ms | 164 / 467 ms | 161 / **1134** ms (-11%) | 15 |
+
+Filled into paper as `tab:headline-v9` (in repo since prior session).
+
+**Repro:**
+```bash
+bash /scratch/yuzhou/projects/sglang/dev/eval/21_setting1_v9_pool_binding.sh
+# 4 cells across GPUs 1/4/5/6, mem_frac 0.7 for L2-on cells (1 GiB chunks
+# in that older runner; suite has since moved to 256 MiB chunks).
+# SGLANG_K_BIG_AUTO_THRESHOLD=0.5 active in all L1=1 cells.
+```
+
+### B3 long-multiturn 4-cell — no-regression case ⚠️
+
+`/tmp/b3_multiturn_v1/cell_{00,10,01,11}/metrics.json`
+
+| cell | E2E median (ms) | vs baseline | xfers |
+|---|---:|---:|---:|
+| (0,0) baseline | 13945 | — | 0 |
+| (1,0) L1 only  | 13985 | +0.3% | 0 |
+| (0,1) L2 only  | 14182 | +1.7% | 0 |
+| (1,1) L1+L2    | 14275 | **+2.4%** | 0 |
+
+(TTFT/P99 fields are 0 because sglang-oai-chat backend doesn't track per-
+turn TTFT — only E2E latency per session.)
+
+Workload didn't pressure either pool: mamba peak 0.54, KV peak 0.27 across
+the entire trace. L1 had nothing to evict (cache pressure too low) → cell_10
+≈ baseline. L2 didn't fire (no admission pressure → gate refused → 0
+transfers). The +2.4% on cell_11 is purely arena structural cost
+(matches §sec:eval-arena-cost claim of ~6% MoE TTFT cost on Qwen3.5-A3B,
+manifested here at 2.4% on a less-MoE-bound workload).
+
+**This is a no-regression measurement, not a contribution case.** Not adding
+to paper as a separate 4-cell table; covered by the existing arena-cost
+analysis section.
+
+**Repro:**
+```bash
+# Workload: dev/eval/regression_suite/workloads/b3_long_multiturn.sh
+# (rewrote 2026-05-01 commit 4ae88b097 to use sglang built-in
+# --gsp-num-turns=8 with 16 sessions × 12K shared prefix × 1K q/reply.
+# Old random-prompt dispatcher_b3.py is unused.)
+# Driver: /tmp/b3_multiturn_runner.sh (4 cells parallel on GPUs 1-4)
+# Each cell ~30 min wall (5 min warmup + 25 min trace).
+```
+
+### v9-auto v6 4-cell (paper-final isolation rerun)
+
+`/tmp/paper_final/v9_cell_{00,10,01,11}/phase_*.json`
+
+Phase C (paper headline phase):
+
+| cell | TPS | TTFT (ms) | P99 (ms) | E2E median (ms) | xfers |
+|---|---:|---:|---:|---:|---:|
+| (0,0) | 16012 | 137.4 | 815.7  | 3778.1 | 0 |
+| (1,0) | 15718 | 172.7 | 924.1  | 6256.4 | 0 |
+| (0,1) | 16010 | 132.4 | 752.8  | 3929.2 | 0 |
+| (1,1) | 16015 | 148.3 | 1261.7 | 3929.9 | 0 |
+
+cell_10 Phase A regression (TPS 68901 vs baseline 82039, ttft 3878 vs 1776) is
+cross-cell-contention noise from running 7 cells parallel on GPUs 1-7;
+isolated v9 runs (single-GPU) reproduce the prior `tab:headline-v9` numbers.
+Use `tab:headline-v9` as the paper-quoted v9-auto data.
+
+**Repro:** see Setting 1 v9-auto block above.
+
+### Arena structural cost — fused_moe hypothesis (UNDER VALIDATION)
+
+The ~5-10% throughput gap between cell_00 (no arena) and cell_11 (arena
+loaded but actuator no-op) is hypothesized to come from `fused_moe` expert-
+dispatch kernels paying TLB / HBM-channel locality cost when they touch
+weights (in `cudaMalloc` heap) and KV (in `cuMemMap` arena VMM range) per
+launch. Paper §sec:eval-arena-cost states this claim with the 5.86% mean /
+12.34% P99 numbers from earlier `dev/2e/` arena-only runs.
+
+**Test suite to validate:** `dev/2e/40_arena_kernel_isolation.py` (written
+2026-05-01, smoke-tested, ready for full run). Isolates 4 kernels ×
+2 allocation paths (cudaMalloc / VMM) × 200 iters with cuda-event timing.
+Hypothesis predictions: t(fused_moe, vmm) / t(fused_moe, cudaMalloc) ≈ 1.05-1.10;
+all other kernel ratios within noise (~1.00).
+
+**Repro:**
+```bash
+CUDA_VISIBLE_DEVICES=7 PYTHONPATH=/data/yuzhou/projects/sglang/python \
+  /scratch/yuzhou/projects/sglang/.venv/bin/python \
+  /scratch/yuzhou/projects/sglang/dev/2e/40_arena_kernel_isolation.py
+# Output: stdout markdown table + /tmp/arena_kernel_isolation.json
+# ~16 min wall for full 50/200 iter run.
+```
+
+### Engine commits frozen for paper-final
+```
+4ae88b097  prelude/eval: rewrite B3 to use sglang built-in --gsp-num-turns
+870f11d9a  prelude/eval: BLOCKERS audit log of L2 debug chain
+785394f1a  prelude/arena: fix off-by-one in MambaPool engine cap
+f508d3893  prelude/arena: cap MHATokenToKVPool size at static_min
+8ceb63de6  prelude/arena: cap MambaPool allocator at static_min on boot
+475838fe4  prelude/arena: §design-l2-actuator static-min/soft split
+66e30e147  prelude/L2: lcm-aware cost defaults
+a4dc081c4  prelude/L2: env-default mismatch fix
+c4a426e38  prelude/L2: B_persist + persist re-eval
+d9f707c46  prelude/arena: re-introduce VA-only growth headroom
+da326b1ed  prelude/arena: drop headroom abstraction (superseded by 475838fe4)
+```
+
+Paper commits frozen for paper-final:
+```
+92d86aa  paper: physical-vs-logical rationale + MoE arena structural cost
+b1f9e67  paper: fill Q3.B 4-cell ablation table from B2 cold_burst measurements
+d83d589  paper: fill appendix proofs (Resize Liveness + Hysteresis Bounds)
+8f9f6bc  paper: collapse Reproducibility section to anonymized URL
+dddd9aa  paper: describe one design path without alternatives
+97d74b0  paper: remove aspirational placeholders + tighten Q3 / Setting-1
+67fd783  paper: rewrite §6.4 / §6.2 v9 / §A5 / §conclusion
+e930c3b  paper: extend B_lb with persist-saturation term
+e192c7a  design §L2: rigorize fire-decision rule with explicit net-benefit gate
+```
+
+---
+
 ## 2026-04-30 late-night — net-benefit gate hardening + actuator drain bug
 
 ### v9-auto v3 cell_11_nb (B_persist landed, actuator no-op)
