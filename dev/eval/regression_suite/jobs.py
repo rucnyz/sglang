@@ -23,7 +23,12 @@ PRELUDE_ENV = {
     "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "0",
     "SGLANG_ARENA_SHARED": "1",
     "SGLANG_ARENA_FROM_BLOB": "1",
-    "SGLANG_ARENA_CHUNK_BYTES": str(1024**3),
+    # 256 MiB chunks: with 1 GiB chunks, KV's 1.26M tokens round up to 2.10M
+    # (n_subpools=20 → ~10 GiB excess) and mamba's 362 rounds to 512 (n_subpools=30
+    # → ~8.7 GiB excess), eating the activation reserve and OOM'ing FLA. Smaller
+    # chunks tighten ceil-to-chunk overhead to ~3 GiB total, well within the
+    # (1-mem_fraction)·pre band.
+    "SGLANG_ARENA_CHUNK_BYTES": str(256 * 1024 * 1024),
     "SGLANG_BUDGETER": "1",
     "SGLANG_BUDGETER_XPOOL_PLANNER": "1",
     "SGLANG_BUDGETER_XPOOL_COORDINATED": "1",

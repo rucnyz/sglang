@@ -2,14 +2,22 @@
 # R3 — LoRA-skewed (Qwen3-4B + 32 LoRA, ml=8). Non-mamba model.
 set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# Disable Qwen3.5-mamba-only flags BEFORE sourcing _common.sh — they break
-# the LoRA Triton dispatch on Qwen3-4B (assert x.shape[-1] == K).
+# Set MODEL and disable mamba-only flags BEFORE sourcing _common.sh.
+# _common.sh defaults MODEL to Qwen3.5-35B-A3B with ${MODEL:-...}; if we
+# don't set it first, our override later is a no-op.
+export MODEL=${MODEL:-Qwen/Qwen3-4B}
 export MAMBA_FLAGS=""
+# Disable arena+budgeter on the LoRA workload: (a) Qwen3-4B has 36 layers × 2
+# kinds = 72 KV subpools, exceeding arena_multi64.so's hardcoded 64-subpool limit;
+# (b) no mamba pool exists, so cross-pool transfer is N/A. We still want this
+# job in the prelude arm to verify L2 stays silent on non-mamba workloads.
+export SGLANG_ARENA_SHARED=0
+export SGLANG_ARENA_FROM_BLOB=0
+export SGLANG_BUDGETER_XPOOL_PLANNER=0
+export SGLANG_BUDGETER_XPOOL_COORDINATED=0
 source "$SCRIPT_DIR/_common.sh"
 export SGLANG_BUDGETER_LOG="$OUT_DIR/budgeter.jsonl"
 
-# Override model to Qwen3-4B for LoRA serving.
-MODEL=${MODEL:-Qwen/Qwen3-4B}
 LORA_DIR=${LORA_DIR:-/scratch/yuzhou/.cache/synthetic_loras/qwen3-4b-r16}
 
 LORA_PATHS=""

@@ -321,26 +321,11 @@ class MambaPool:
                 ) * tokens_per_chunk
 
                 shared_pool = None
-                # Mamba growth headroom: in shared mode, allow up to 4
-                # extra chunks per sub-pool of growth via the cross-pool
-                # actuator. Mirrors the KV pool's headroom.
-                # SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS overrides; set to 0
-                # to match baseline tensor shape (diagnostic for Triton
-                # shape-specialization overhead).
-                # Default 2 chunks per sub-pool (down from 4). At chunk_bytes=1GB
-                # this is 2 GiB headroom per sub-pool = 4 GiB total. Path A in
-                # _profile_available_bytes pulls this from the
-                # (1-mem_fraction)·pre reserve band; lowering the default leaves
-                # more room for activations/cuda-graph at mem_fraction=0.8 on H200.
-                # The regression suite's R2 GSP RPS=4 workload OOM'd at 4×2=8 GiB
-                # because peak FLA activations exceeded the remaining 20 GiB band.
-                mamba_growth_chunks = (
-                    int(os.environ.get("SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "2"))
-                    if shared_arena else 0
-                )
-                mamba_max_tokens = (
-                    tot_aligned + mamba_growth_chunks * tokens_per_chunk
-                )
+                # max_tokens == init_tokens: cross-pool transfer is zero-sum
+                # on physical handles (mamba grows X iff KV releases X), so
+                # max > init would only reserve VA the actuator can never
+                # back with physical memory. Symmetric on the KV side below.
+                mamba_max_tokens = tot_aligned
                 if shared_arena:
                     from sglang.srt.arena.shared_pool import (
                         get_or_create_shared_handle_pool,
@@ -1180,18 +1165,8 @@ class MHATokenToKVPool(KVCache):
                 ) * tokens_per_chunk
 
                 shared_pool = None
-                # In shared mode, leave growth headroom (max > init) so
-                # the cross-pool actuator can grow this pool by absorbing
-                # handles freed from the other pool.
-                # SGLANG_ARENA_KV_HEADROOM_CHUNKS overrides; set to 0 to
-                # match baseline tensor shape (diagnostic for Triton
-                # shape-specialization overhead).
-                # Default 2 chunks (down from 4). See MambaPool note above.
-                kv_growth_chunks = (
-                    int(os.environ.get("SGLANG_ARENA_KV_HEADROOM_CHUNKS", "2"))
-                    if shared_arena else 0
-                )
-                kv_max_tokens = tot_aligned + kv_growth_chunks * tokens_per_chunk
+                # max_tokens == init_tokens — see MambaPool note above.
+                kv_max_tokens = tot_aligned
                 if shared_arena:
                     from sglang.srt.arena.shared_pool import (
                         get_or_create_shared_handle_pool,

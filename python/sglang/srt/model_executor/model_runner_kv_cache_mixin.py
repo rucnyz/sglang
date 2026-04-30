@@ -65,23 +65,6 @@ class ModelRunnerKVCacheMixin:
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
-        # Arena memory transparency (issue #17, per-pool deduction). The arena
-        # reserves growth headroom (mamba_headroom + kv_headroom chunks) of
-        # PRE-MAPPED physical GPU memory so cross-pool transfers can swap pages
-        # at runtime without paying cuMemMap latency. We MUST NOT pull this
-        # from the user's (1-mem_fraction_static)·pre activations/cuda-graph
-        # reserve band — peak FLA activations under high concurrency need the
-        # full reserve, and shrinking it causes hard OOM (regression suite v3
-        # found this). Instead we shrink each pool's CACHE allocation by its
-        # own arena headroom: mamba pool gives up `mamba_headroom_gib` of
-        # cache slots so its arena can pre-map that much for growth, and KV
-        # pool does the same. Total physical = pool_caches + headrooms =
-        # baseline rest_memory (unchanged), but max_total_num_tokens is
-        # smaller by ~5% than baseline at the same mem_fraction. This is the
-        # correct trade: smaller cache → at worst more re-prefill (soft
-        # degradation), never OOM (hard failure). The deduction is applied
-        # inside `handle_max_mamba_cache` (per-pool: mamba's headroom from
-        # mamba's share, KV's headroom from KV's share).
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
@@ -135,44 +118,6 @@ class ModelRunnerKVCacheMixin:
                 * server_args.mamba_full_memory_ratio
                 / (1 + server_args.mamba_full_memory_ratio)
             )
-            # Arena memory transparency (issue #17, per-pool deduction):
-            # if SGLANG_ARENA_SHARED is on, mamba pool reserves
-            # `MAMBA_HEADROOM_CHUNKS × chunk_bytes` of pre-mapped GPU memory
-            # for cross-pool transfer growth. Take this from mamba's own
-            # share so the activation/cuda-graph reserve band stays untouched.
-            # (Same per-pool subtraction is applied to the KV portion below
-            # via the returned `total_rest_memory - mamba_state_memory`
-            # bookkeeping plus an analogous deduction in the KV sizing path —
-            # see _profile_available_bytes header comment.)
-            if os.environ.get("SGLANG_ARENA_SHARED") == "1":
-                chunk_bytes = int(os.environ.get(
-                    "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
-                ))
-                mamba_headroom_chunks = int(os.environ.get(
-                    "SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "2"
-                ))
-                mamba_headroom_gib = (
-                    mamba_headroom_chunks * chunk_bytes / (1 << 30)
-                )
-                if mamba_headroom_gib < mamba_state_memory_raw:
-                    logger.info(
-                        "Arena memory transparency: mamba pool yields "
-                        "%.2f GiB of its share (%.2f → %.2f GiB) for the "
-                        "cross-pool growth headroom. Activation reserve "
-                        "untouched.",
-                        mamba_headroom_gib, mamba_state_memory_raw,
-                        mamba_state_memory_raw - mamba_headroom_gib,
-                    )
-                    mamba_state_memory_raw -= mamba_headroom_gib
-                else:
-                    logger.warning(
-                        "Arena memory transparency: mamba pool share "
-                        "%.2f GiB is smaller than requested headroom "
-                        "%.2f GiB; skipping mamba-side deduction (will "
-                        "OOM at boot). Lower mem_fraction_static or "
-                        "SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS.",
-                        mamba_state_memory_raw, mamba_headroom_gib,
-                    )
             # calculate the max_mamba_cache_size based on the given total mamba memory
             server_args.max_mamba_cache_size = int(
                 (mamba_state_memory_raw * (1 << 30))
@@ -185,32 +130,6 @@ class ModelRunnerKVCacheMixin:
             / (1 << 30)
         )
         kv_remaining = total_rest_memory - mamba_state_memory
-        # Arena memory transparency: deduct KV pool's growth headroom from
-        # the KV side so KV physical = (cache slots) + (kv_headroom) =
-        # KV's share of total_rest_memory. Activation reserve untouched.
-        if os.environ.get("SGLANG_ARENA_SHARED") == "1":
-            chunk_bytes = int(os.environ.get(
-                "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
-            ))
-            kv_headroom_chunks = int(os.environ.get(
-                "SGLANG_ARENA_KV_HEADROOM_CHUNKS", "2"
-            ))
-            kv_headroom_gib = kv_headroom_chunks * chunk_bytes / (1 << 30)
-            if kv_headroom_gib < kv_remaining:
-                logger.info(
-                    "Arena memory transparency: KV pool yields %.2f GiB of "
-                    "its share (%.2f → %.2f GiB) for cross-pool growth "
-                    "headroom.",
-                    kv_headroom_gib, kv_remaining,
-                    kv_remaining - kv_headroom_gib,
-                )
-                kv_remaining -= kv_headroom_gib
-            else:
-                logger.warning(
-                    "Arena memory transparency: KV remainder %.2f GiB < "
-                    "headroom %.2f GiB; skipping KV-side deduction.",
-                    kv_remaining, kv_headroom_gib,
-                )
         return kv_remaining
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
