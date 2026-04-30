@@ -569,9 +569,34 @@ class MambaRadixCache(BasePrefixCache):
 
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
+
+        # Phase 3.d (paper §4.2 first refinement): heterogeneous granularity.
+        # Snapshots (mamba_value) are taken only at depths that are multiples
+        # of K_big. Small-page leaves (depth NOT aligned to K_big) get KV but
+        # no mamba snapshot. The engine's existing match-walk falls back to
+        # the nearest big-page ancestor's mamba_value automatically (mamba
+        # tombstone path), so no engine restore-path changes needed.
+        # SGLANG_K_BIG=0 (default) preserves current behavior.
+        # We return mamba_exist=True when we suppress a snapshot so the
+        # caller frees the forked mamba slot (it was for nothing).
+        k_big = int(os.environ.get("SGLANG_K_BIG", "0"))
+        suppressed_mamba = False
+        if k_big > 0 and mamba_value is not None:
+            insert_depth = prev_prefix_len + len(key)
+            if insert_depth % k_big != 0:
+                # Insert KV without the snapshot. We still need _insert_helper
+                # to walk the tree; pass mamba_value=None and a flag.
+                suppressed_mamba = True
+                mamba_value = None
+
         prefix_len, mamba_exist = self._insert_helper(
             self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
+        if suppressed_mamba:
+            # Tell the caller we didn't take the slot — it should free the
+            # fork it built. Same signal as "the radix already had a snapshot
+            # at this node", which is the existing semantics for `mamba_exist`.
+            mamba_exist = True
         # Phase 3 debug: log every insert at INFO level (gated by env
         # SGLANG_RADIX_DEBUG=1 to keep prod logs clean).
         if os.environ.get("SGLANG_RADIX_DEBUG") == "1":
@@ -1278,8 +1303,10 @@ class MambaRadixCache(BasePrefixCache):
         prev_prefix_len: int = 0,
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
-        # mamba will tombstone the node closer to root first
-        assert mamba_value is not None, "Mamba value should not be None here."
+        # mamba will tombstone the node closer to root first.
+        # Phase 3.d: mamba_value can now be None (heterogeneous granularity
+        # path suppresses snapshots at non-K_big-aligned depths). The leaf
+        # branches below treat None as "tombstone-on-create".
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
@@ -1314,6 +1341,11 @@ class MambaRadixCache(BasePrefixCache):
             if len(key):
                 child_key = key.child_key(self.page_size)
 
+        # Phase 3.d: mamba_value can be None (heterogeneous-granularity
+        # path suppresses the snapshot for non-K_big-aligned inserts).
+        # When None, we insert KV but skip mamba bookkeeping; the new
+        # node is a "tombstone" (the existing concept of a node with
+        # KV but no mamba state).
         mamba_value_exist = False
         if len(key):
             new_node = TreeNode()
@@ -1322,15 +1354,17 @@ class MambaRadixCache(BasePrefixCache):
             new_node.value = value.clone()
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)
-            self.mamba_lru_list.insert_mru(new_node)
+            if mamba_value is not None:
+                self.mamba_lru_list.insert_mru(new_node)
+                self.mamba_evictable_size_ += len(mamba_value)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
-            self.mamba_evictable_size_ += len(mamba_value)
-        elif node.mamba_value is None:  # add for mamba tombstone
-            node.mamba_value = mamba_value
+        elif node.mamba_value is None:  # add for mamba tombstone (or stay tombstone)
+            if mamba_value is not None:
+                node.mamba_value = mamba_value
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(mamba_value)
             self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.insert_mru(node)
-            self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
         else:  # mamba value already exists
             mamba_value_exist = True
