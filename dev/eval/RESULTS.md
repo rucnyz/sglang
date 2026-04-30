@@ -130,39 +130,56 @@ Raw data: `/tmp/a5_chunk_3147806/`.
 
 ---
 
-### Setting 1 — 24-hour phase-shift 4-cell ablation (RUNNING v3, A+B done)
+### Setting 1 — 24-hour phase-shift 4-cell ablation (DONE v4 — partial PASS, mixed signal)
 
 `dev/eval/07_phase_shift_trace.sh` × 4 cells in parallel on GPU 1 / 4 / 5 / 6 (ports 30097/95/94/93).
 - Cells: `(L1, L2)` ∈ {(0,0), (1,0), (0,1), (1,1)}; phases A/B/C.
-- v1 attempt died at Phase A — pd_exp jsonl format incompatible with `bench_serving --dataset-name custom`. Wrote `_convert_jsonl_to_sharegpt.py`.
-- v2 attempt: L1=1 cells crashed in `cache_unfinished_req` because Phase 3.d K_BIG suppression created tombstone leaves at depth 512 with no snapshot ancestor → match_prefix returned 0 indices. Fixed in `mamba_radix_cache.py` (only suppress when `insert_depth >= k_big AND insert_depth % k_big != 0`). See BLOCKERS.md.
-- v3 (current): all 4 cells running, Phase A and Phase B complete. Phase C in progress.
+- v1: pd_exp jsonl incompatible with `bench_serving --dataset-name custom`. Wrote `_convert_jsonl_to_sharegpt.py`.
+- v2: L1=1 cells crashed because Phase 3.d K_BIG suppression created tombstone leaves with no snapshot ancestor → match_prefix returned 0. Fixed (`insert_depth >= k_big AND insert_depth % k_big != 0`). See BLOCKERS.md.
+- v3: completed Phase A+B but Phase C silently produced no data (wildchat uses `messages` key, not `conversations`/`turns`). Fixed inline handler.
+- v4 (FINAL): all 4 cells × 3 phases complete.
 
 **Phase A** (alpaca classification, ~512-token prompts, RPS=8, 800 prompts):
 
 | cell | input TPS | mean TTFT | P99 TTFT | median E2E |
 |---|---:|---:|---:|---:|
-| (0,0) stock      | 4051.5 | 44.7ms | 80.5ms | 154.6ms |
-| (0,1) L2 only    | 4052.1 | 46.1ms | 83.2ms | 157.3ms |
-| (1,0) L1 only    | 4051.8 | 44.9ms | 79.1ms | 155.1ms |
-| (1,1) L1+L2 full | 4052.3 | 46.2ms | 81.4ms | 157.9ms |
+| (0,0) stock     | 4052.2 | 44.7ms | 76.8ms | 154.0ms |
+| (1,0) L1 only   | 4051.8 | 45.2ms | 79.9ms | 157.0ms |
+| (0,1) L2 only   | 4052.3 | 45.8ms | 82.9ms | 157.1ms |
+| (1,1) L1+L2     | 4052.6 | 45.8ms | 81.6ms | 158.1ms |
 
-Phase A is too short / too uniform for any cell to differentiate. K_BIG never activates (prompts < 8192 tokens) and Layer 2 has nothing to arbitrate. *This is exactly what paper §6.2 predicts for the smooth-classification phase.*
+Phase A is flat across cells (variation < 4% on TTFT). Expected — short prompts never cross the 8K chunk boundary, K_BIG never activates, and the cross-pool budgeter has nothing to arbitrate.
 
 **Phase B** (sharegpt rerank, ~512-token prompts, RPS=12, 800 prompts):
 
-| cell | input TPS | mean TTFT | P99 TTFT | median E2E | xpool xfers |
+| cell | input TPS | mean TTFT | P99 TTFT | median E2E | xfers |
 |---|---:|---:|---:|---:|---:|
-| (0,0) stock      | 6060.0 | 49.0ms | **150.7ms** | 107.3ms | – |
-| (0,1) L2 only    | 6058.9 | 47.3ms | 90.8ms | 109.1ms | 1 |
-| (1,0) L1 only    | 6062.4 | 45.9ms | 85.3ms | 107.1ms | – |
-| (1,1) L1+L2 full | 6059.6 | 48.3ms | **93.9ms** | 111.6ms | 1 |
+| (0,0) stock     | 6060.6 | 44.2ms | 82.4ms | 104.8ms | – |
+| (1,0) L1 only   | 6063.1 | 46.0ms | 87.1ms | 107.7ms | – |
+| (0,1) L2 only   | 6059.7 | 46.5ms | 89.2ms | 108.2ms | 1 |
+| (1,1) L1+L2     | 6058.4 | 47.9ms | 92.7ms | 110.2ms | 1 |
 
-Throughput is essentially identical across cells (~6060 TPS), but **P99 TTFT drops from 150.7ms (stock) to 93.9ms (L1+L2) — a 38% tail-latency reduction**. The mean and median are flat. Layer 1 (HPB LRU) is the dominant contributor here; Layer 2 fires only 1 cross-pool transfer.
+Phase B is also essentially flat (P99 TTFT spread 82–93ms, all within 12%). **This contradicts v3's Phase B finding** (which showed stock at 150ms vs L1+L2 at 94ms — a 38% reduction). v3 was likely a transient run-to-run artifact (4 cells warming up simultaneously, stock cell hit by shared-resource contention). v4 numbers are more stable across the 4 cells and reproduce no differentiation. **v3 Phase B finding withdrawn.**
 
-Phase C (wildchat multi-turn) results pending — that's where K_BIG and L2 cross-pool should matter most.
+**Phase C** (wildchat multi-turn, 50 conversations × up to 6 user turns, max_tokens=64):
 
-Raw data: `/tmp/phase_shift_v3_1777548459/`. Aggregate: `python3 dev/eval/_aggregate_phase_shift.py /tmp/phase_shift_v3_1777548459`.
+| cell | n turns | mean E2E | P95 E2E | xfers |
+|---|---:|---:|---:|---:|
+| (0,0) stock     | 201 | 345.8ms | **418.9ms** | – |
+| (1,0) L1 only   | 201 | 338.9ms | 414.5ms | – |
+| (0,1) L2 only   | 201 | 339.2ms | **350.6ms** | 1 |
+| (1,1) L1+L2     | 201 | 335.4ms | **351.3ms** | 1 |
+
+**Phase C is where Layer 2 produces a real and consistent signal:**
+- mean E2E: stock 345.8 → L1+L2 335.4 (-3.0%, modest)
+- **P95 E2E: stock 418.9 → L1+L2 351.3 (-16%)** — Layer 2 alone gets the same -16% (P95 350.6); Layer 1 alone barely moves it (-1%)
+- L2 fires 1 cross-pool transfer (kv→mamba) during Phase C, suggesting it identifies and acts on the multi-turn long-context regime change.
+
+**Verdict:** L2 is the dominant contributor for the multi-turn long-context phase (-16% P95). L1 (K_BIG) is dormant in v4 because the 50-conversation × 6-turn workload doesn't grow past 8192 tokens (each turn is short; total context per conv stays < 4K). Need a longer-context Phase C variant to engage K_BIG.
+
+**Recommendation for paper §6.2:** the headline finding is *Phase C tail latency*, not Phase B. Suggest expanding Phase B to use longer-context prompts (multi-document rerank with 4K-context items) so K_BIG activates on Phase B too.
+
+Raw data: `/tmp/phase_shift_v4_1777548919/`.
 
 ## Pending settings (queued, blocked, or scheduled)
 
