@@ -23,7 +23,7 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.5.2 | Unit test: alloc/free/copy_from/at_layer_idx equivalence for both flag values | ~220 LoC | **done** 2026-04-30 |
 | 2e.5.3 | E2E equivalence: same prompt, same tokens, both flag values, Qwen3.5-35B-A3B TP=1 | smoke | **PASS** 2026-04-30 |
 | 2e.5.4 | **Performance regression bench**: A/B on Qwen3.5-35B-A3B TP=1, throughput/TTFT/TPOT, ≤2% regression allowed | bench | **PASS** 2026-04-30 |
-| 2e.5.5 | Mamba pool: optional MultiTensorArena allocation gated `SGLANG_MAMBA_ARENA=1` | ~70 LoC | **mechanism done** 2026-04-30, e2e validation pending |
+| 2e.5.5 | Mamba pool: optional MultiTensorArena allocation gated `SGLANG_MAMBA_ARENA=1` | ~70 LoC | **PASS** 2026-04-30 (mechanism + e2e) |
 | 2e.5.5 | Migrate mamba pool to MultiTensorArena (depends on 2e.5.4 passing) | ~150 LoC | not started |
 | 2e.5.6 | Hybrid workload-shift demo: KV ↔ mamba transfer driven by LagrangePlanner with real signals | 3–5 days | not started |
 
@@ -634,6 +634,55 @@ copy_from src->dst carries content
 2. **Chunk-aligned tot.** With 64 MiB chunks and a few-KB per-token temporal state, `tokens_per_chunk` is large; for tiny test configs the rounded-up `max_tokens` is much larger than the requested `size+1`, but the engine views the live region only.
 
 3. **Process-exit segfault** in `MemPool::~MemPool` after our arena unmaps — same known issue as 2e.4.c (does not affect runtime, only test-script teardown).
+
+### 2e.5.5 e2e — both pools arena-backed under live serving (PASS, 2026-04-30)
+
+**Goal.** Boot a real hybrid model with **both** `SGLANG_KV_ARENA=1` and `SGLANG_MAMBA_ARENA=1` (latter implies `SGLANG_MAMBA_PERLAYER=1`), serve a handful of completions, prove the engine doesn't segfault during serving and doesn't trip its memory-leak detector.
+
+**Setup.** GPU 3, H200 BF16, Qwen3.5-35B-A3B, TP=1, `--mem-fraction-static 0.8 --enforce-piecewise-cuda-graph --reasoning-parser qwen3`. 5 prompts × `temperature=0` × `max_tokens=24`.
+
+**Reproduce.** [`13_kv_mamba_e2e.sh`](13_kv_mamba_e2e.sh) wraps the boot + sanity-check + 5 completions + error-grep + clean shutdown.
+```bash
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=3 WARMUP_S=600 dev/2e/13_kv_mamba_e2e.sh
+```
+
+**Result.** Server reached `/health=200` after 110 s (warm Triton cache). Init-time log lines confirm both arena paths are live:
+```
+MambaPool: temporal layout=per-layer-list, arena=True, num_layers=30, size=361,
+           temporal_shape=(32, 128, 128), conv_shapes=[(8192, 3)]
+MambaPool arena: tot=362 (aligned=384), tokens_per_chunk=32, chunk_bytes=67108864,
+                 per_token_bytes=2097152
+MHATokenToKVPool buffers: backend=arena (SGLANG_KV_ARENA=1, head_dim==v_head_dim=True,
+                          custom_mem_pool=False), size=1263072, page_size=1,
+                          layer_num=10, head_num=2, head_dim=256
+```
+
+All 5 completions returned coherent text, e.g.:
+```
+The capital of France is →  Paris.\nThe capital of France is Paris.\nThe capital of France is...
+Once upon a time         → , in a world full of amazing science, there was a very special...
+Q: 2 + 2 =               →  4. What is 2 + 2?\n\nThe answer is 4.\n\nIn mathematics, 2
+def fibonacci(n):        → \n    if n == 0:\n        return 0\n    elif n == 1:\n        return
+List three primes:       →  2, 3, 5.\nList three primes: 2, 3, 5.
+```
+
+`grep -iE "leak|RuntimeError|Traceback|CUDA error" server.log` between the "Server started" and "Shutting down" markers: **no hits**. Engine ran the entire serving window with both KV (10 layers × 2 kinds × 1.26M tokens worth of capacity) and mamba (30 layers, 384 slots aligned) backed by separate `MultiTensorArena` instances; neither arena's chunk-bitmap path produced an observable error, and the scheduler's leak detector stayed quiet.
+
+Evidence at `/tmp/kv_mamba_e2e_3459484/{server.log, completions.txt}`.
+
+**Findings.**
+
+1. **Two arenas in one process work.** KV and mamba arenas are independent `ChunkArena` instances with their own VA reservations; they don't share handles yet (that's 2e.5.6). The fact that both can co-exist under live serving — same scheduler, same cuda graphs, same prefill+decode loop — clears the path for the cross-pool actuator: 2e.5.6 only needs to introduce a *single shared* handle pool plus a `transfer_chunks(from_kv, to_mamba, n)` operation.
+
+2. **Init-time logs are sufficient for diagnosis.** `MambaPool: temporal layout=...` and `MHATokenToKVPool buffers: backend=...` are the load-bearing lines for "is the feature flag actually doing what I think." The script greps for both as a sanity guard against silently falling through to the default code path on a config mismatch.
+
+3. **DeltaNet hybrid exercises the per-layer mamba path.** Qwen3.5-35B-A3B has 30 mamba (DeltaNet) layers + 10 attention layers; the engine's mamba_indices / KV layer ids correctly route allocations to the matching pool. With per-layer-split temporal, `at_layer_idx(layer_id)` returns one of the 30 list elements; with arena, that element is a tensor inside the `MultiTensorArena` reserved range. Both layers of indirection were exercised on every prefill / decode tick.
+
+**Implication for 2e.5.6.** Pre-conditions met: two arenas live, flags stable across boot+serve+shutdown, no leak/correctness signal triggered. Next is the policy step:
+1. Replace the two independent `ChunkArena`s with a single shared `ChunkArena` (or extend the existing one to host two `MultiTensorArena`-backed sub-pools);
+2. Wire real per-pool pressure signals (KV preemption rate / mamba slot stall) into `LagrangePlanner.value_at`;
+3. Reproduce the paper §4.4 + §4.3 headline trace: a hybrid workload starts KV-bound, the planner moves chunks KV→mamba, traffic shifts to a long-context regime, planner moves chunks mamba→KV — all without re-capturing CUDA graphs.
 
 ## 2e.5.3 — E2E equivalence on Qwen3.5-35B-A3B (PASS, 2026-04-30)
 
