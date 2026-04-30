@@ -114,12 +114,6 @@ def _to_turns(conv):
         return conv
     return []
 
-# Sort conversations by total content length, longest first, so the
-# accumulated multi-turn prefix actually crosses the 8K chunk boundary
-# (otherwise K_big never activates and the L1 contribution stays dormant).
-data.sort(key=lambda c: -sum(len(m.get('content',''))
-                             for m in _to_turns(c)))
-
 results = []
 errors = 0
 N = min(50, len(data))
@@ -129,13 +123,13 @@ for conv in data[:N]:
     if len(user_turns) < 2:
         continue
     history = ""
-    for t in user_turns[:16]:  # use all available turns up to 16
+    for t in user_turns[:6]:  # 6-turn cap matches the v4 clean Phase C run
         content = t.get('content', '')
         if not content or len(content) < 30:
             continue
         prompt = (history + content + "\n")[:30000]
         t0 = time.time()
-        body = json.dumps({'model': MODEL, 'prompt': prompt, 'max_tokens': 256,
+        body = json.dumps({'model': MODEL, 'prompt': prompt, 'max_tokens': 64,
                            'temperature': 0}).encode()
         try:
             r = json.loads(urllib.request.urlopen(urllib.request.Request(
