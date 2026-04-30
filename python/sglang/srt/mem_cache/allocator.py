@@ -182,10 +182,25 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def clear(self):
+        # Phase 2e.5.6.3.c: respect the budgeter's capacity cap if set.
+        # Without this, /flush_cache (or scheduler.flush_cache) would
+        # reinstate ALL pages 1..size into free_pages, including ones
+        # whose underlying chunks have been unmapped by the cross-pool
+        # actuator. Subsequent leak check trips because available > live.
+        cap = getattr(self, "_cap", None)
+        upper = cap if cap is not None else self.size
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
+            1, upper + 1, dtype=torch.int64, device=self.device
         )
+        # Pages above the cap (id in (upper, self.size]) belong in
+        # _capped_pages so a subsequent grow can restore them.
+        if cap is not None and cap < self.size:
+            self._capped_pages = torch.arange(
+                cap + 1, self.size + 1, dtype=torch.int64, device=self.device
+            )
+        else:
+            self._capped_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)

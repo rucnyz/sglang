@@ -504,9 +504,21 @@ class MambaPool:
         self.free_slots = torch.cat((self.free_slots, free_index))
 
     def clear(self):
+        # Phase 2e.5.6.3.c: respect the budgeter's capacity cap, mirroring
+        # BaseTokenToKVPoolAllocator.clear's fix. Without this, flush_cache
+        # would reinstate slots above the cap whose underlying mamba arena
+        # chunks have been unmapped by the cross-pool actuator.
+        cap = getattr(self, "_cap_slots", None)
+        upper = cap if cap is not None else self.size
         self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device=self.device
+            1, upper + 1, dtype=torch.int64, device=self.device
         )
+        if cap is not None and cap < self.size:
+            self._capped_slots = torch.arange(
+                cap + 1, self.size + 1, dtype=torch.int64, device=self.device
+            )
+        else:
+            self._capped_slots = torch.empty((0,), dtype=torch.int64, device=self.device)
 
     @property
     def live_size(self) -> int:

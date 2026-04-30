@@ -120,6 +120,12 @@ class BudgetAgent:
         # windows.
         self.xpool_coordinated = _env_flag("SGLANG_BUDGETER_XPOOL_COORDINATED", False)
 
+        # Phase 2e.5.6.3.c: planner-driven cross-pool transfers based on
+        # real per-pool pressure signals (replaces the oscillator).
+        # Requires xpool actuator + per-pool actuators to be useful.
+        self.xpool_planner_enabled = _env_flag("SGLANG_BUDGETER_XPOOL_PLANNER", False)
+        self._xpool_planner = None  # lazy-built on first tick
+
         if self.enabled:
             try:
                 self._log_fp = open(self.log_path, "a", buffering=1)
@@ -167,6 +173,13 @@ class BudgetAgent:
                 self._maybe_xpool_actuate(snapshot)
             except Exception as e:
                 logger.warning("BudgetAgent xpool actuation failed: %s", e, exc_info=True)
+
+        # Phase 2e.5.6.3.c: planner-driven cross-pool transfers.
+        if self.xpool_planner_enabled:
+            try:
+                self._maybe_xpool_planner(snapshot)
+            except Exception as e:
+                logger.warning("BudgetAgent xpool planner failed: %s", e, exc_info=True)
 
         if self._log_fp is not None:
             try:
@@ -323,6 +336,104 @@ class BudgetAgent:
             stats = self._xpool_actuator.balanced_mamba_to_kv(self._xpool_unit)
 
         # Inline a few key fields into the snapshot for easy grep.
+        snapshot["xpool_direction"] = stats["direction"]
+        snapshot["xpool_unmapped_total"] = stats["unmapped_total"]
+        snapshot["xpool_granted_total"] = stats["granted_total"]
+        snapshot["xpool_kv_capacity_tokens"] = stats["kv_capacity_tokens"]
+        snapshot["xpool_mamba_capacity_tokens"] = stats["mamba_capacity_tokens"]
+        snapshot["xpool_free_handles"] = stats["free_after_grow"]
+
+    def _maybe_xpool_planner(self, snapshot: dict) -> None:
+        """Phase 2e.5.6.3.c: planner-driven cross-pool transfers.
+
+        Reuses `_ensure_xpool_actuator` to attach the cross-pool actuator,
+        then a CrossPoolPlanner reads pressure signals from the snapshot
+        and decides direction. Compared to the oscillator
+        (SGLANG_BUDGETER_XPOOL_DEMO=1), transfers are now sparse — only
+        when a pool is actually stressed.
+
+        Safety: same gate as the oscillator path — skip when engine is
+        busy. Capacity-coordinated path (the actuator updates per-pool
+        allocators) is implied by SGLANG_BUDGETER_XPOOL_COORDINATED=1.
+        """
+        self._ensure_xpool_actuator()
+        if self._xpool_actuator is None:
+            return
+        if self._xpool_planner is None:
+            from sglang.srt.budgeter.cross_pool_planner import CrossPoolPlanner
+            self._xpool_planner = CrossPoolPlanner()
+
+        # Pressure-signal extraction. Snapshot's `token_usage` and
+        # `mamba_usage` are sampled instantaneously; under low-frequency
+        # ticking they often miss in-flight bursts. Read directly from
+        # the pools/allocators to get the LIVE state at tick time, then
+        # peak-track across consecutive ticks (peaks decay exponentially)
+        # so the planner sees the recent maximum, not the just-now zero.
+        sched = self.scheduler
+        alloc = getattr(sched, "token_to_kv_pool_allocator", None)
+        kv_pool = alloc.get_kvcache() if alloc and hasattr(alloc, "get_kvcache") else None
+        mamba_pool = None
+        if kv_pool is not None:
+            mamba_pool = getattr(kv_pool, "mamba_pool", None)
+
+        usage_kv_inst = 0.0
+        usage_mamba_inst = 0.0
+        if alloc is not None:
+            live = getattr(alloc, "live_size", alloc.size)
+            avail = alloc.available_size()
+            if live > 0:
+                usage_kv_inst = max(0.0, min(1.0, (live - avail) / live))
+        if mamba_pool is not None:
+            ms_live = getattr(mamba_pool, "live_size", mamba_pool.size)
+            ms_avail = mamba_pool.available_size()
+            if ms_live > 0:
+                usage_mamba_inst = max(0.0, min(1.0, (ms_live - ms_avail) / ms_live))
+
+        # Exponential decay for peak tracking. Per-tick decay; with
+        # 0.5s tick and decay=0.6, half-life ~1 tick (0.5s) — fast enough
+        # that an idle phase clears stale peaks but slow enough that
+        # short bursts are still visible.
+        if not hasattr(self, "_xpool_peak_kv"):
+            self._xpool_peak_kv = 0.0
+            self._xpool_peak_mamba = 0.0
+        decay = float(os.environ.get("SGLANG_XPOOL_PEAK_DECAY", "0.6"))
+        self._xpool_peak_kv = max(usage_kv_inst, self._xpool_peak_kv * decay)
+        self._xpool_peak_mamba = max(usage_mamba_inst, self._xpool_peak_mamba * decay)
+        usage_kv = self._xpool_peak_kv
+        usage_mamba = self._xpool_peak_mamba
+        snapshot["xpool_plan_usage_kv_inst"] = usage_kv_inst
+        snapshot["xpool_plan_usage_mamba_inst"] = usage_mamba_inst
+
+        decision = self._xpool_planner.decide(usage_kv, usage_mamba)
+        snapshot["xpool_plan_direction"] = decision.direction or "none"
+        snapshot["xpool_plan_reason"] = decision.reason
+        snapshot["xpool_plan_usage_kv"] = decision.usage_kv
+        snapshot["xpool_plan_usage_mamba"] = decision.usage_mamba
+
+        if decision.direction is None:
+            return
+
+        # Engine-busy safety gate (same as oscillator path).
+        def _to_int(v):
+            t = getattr(v, "total", None)
+            if isinstance(t, (int, float)):
+                return int(t)
+            try:
+                return int(v) if v is not None else 0
+            except (TypeError, ValueError):
+                return 0
+        n_running = _to_int(snapshot.get("num_running_reqs", 0))
+        n_queued = _to_int(snapshot.get("num_queue_reqs", 0))
+        if n_running > 0 or n_queued > 0:
+            snapshot["xpool_plan_skipped"] = "engine_busy"
+            return
+
+        unit = self._xpool_planner.config.dst_chunks_per_action
+        if decision.direction == "mamba_to_kv":
+            stats = self._xpool_actuator.balanced_mamba_to_kv(unit)
+        else:  # kv_to_mamba
+            stats = self._xpool_actuator.balanced_kv_to_mamba(unit)
+        snapshot["xpool_plan_executed"] = True
         snapshot["xpool_direction"] = stats["direction"]
         snapshot["xpool_unmapped_total"] = stats["unmapped_total"]
         snapshot["xpool_granted_total"] = stats["granted_total"]

@@ -145,10 +145,56 @@ class CrossPoolTransferActuator:
         n_src = len(src_names)
         n_dst = len(dst_names)
 
+        # Phase 2e.5.6.3.c bug fix: bail when dst is already at max OR
+        # src is already at min. Without this, we'd shrink src for nothing
+        # (dst can't grow, all the freed handles get stranded in the
+        # shared free pool, src capacity collapses toward 0).
+        dst_min_mapped = min(
+            dst._arena.pool_mapped_chunks(name) for name in dst_names
+        )
+        if dst_min_mapped + n_per_dst_subpool > dst.max_chunks_per_pool:
+            return {
+                "direction": direction_label,
+                "n_per_src_subpool": 0,
+                "n_per_dst_subpool": n_per_dst_subpool,
+                "src_subpools": n_src,
+                "dst_subpools": n_dst,
+                "unmapped_total": 0,
+                "granted_total": 0,
+                "free_before": self.shared.free_count(),
+                "free_after_shrink": self.shared.free_count(),
+                "free_after_grow": self.shared.free_count(),
+                "kv_capacity_tokens": self.kv.current_capacity_tokens(),
+                "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
+                "skipped": "dst_at_max",
+            }
+
         # How many chunks must each src sub-pool shed to free enough
         # handles for the dst grow? ceil(needed / n_src).
         needed = n_per_dst_subpool * n_dst
         n_per_src_subpool = (needed + n_src - 1) // n_src
+
+        src_min_mapped = min(
+            src._arena.pool_mapped_chunks(name) for name in src_names
+        )
+        if src_min_mapped < n_per_src_subpool + 1:
+            # Refuse to drop src below 1 chunk per sub-pool (capacity 0
+            # would crash the engine). Safety floor.
+            return {
+                "direction": direction_label,
+                "n_per_src_subpool": 0,
+                "n_per_dst_subpool": n_per_dst_subpool,
+                "src_subpools": n_src,
+                "dst_subpools": n_dst,
+                "unmapped_total": 0,
+                "granted_total": 0,
+                "free_before": self.shared.free_count(),
+                "free_after_shrink": self.shared.free_count(),
+                "free_after_grow": self.shared.free_count(),
+                "kv_capacity_tokens": self.kv.current_capacity_tokens(),
+                "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
+                "skipped": f"src_at_min (would drop to {src_min_mapped - n_per_src_subpool} chunks)",
+            }
 
         # Phase 2e.5.6.3: if per-pool actuators are wired, coordinate
         # with the allocators. The contract:
