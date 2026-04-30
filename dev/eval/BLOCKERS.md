@@ -13,6 +13,17 @@ Each entry:
 
 ---
 
+## L2 actuator's cuMemUnmap breaks captured CUDA graphs — **paper's static-min region not implemented**
+
+- **Setting:** Layer 2 cross-pool transfer when transfers actually move bytes (after VA-headroom restored in d9f707c46).
+- **Symptom:** B3 v3 cell_01/cell_11 + v9-auto v5 cell_11_nb_v5 all crashed with `CUDA error: an illegal memory access was encountered` ~1 second after the actuator's first 60-chunk transfer. cell_00 (no arena) ran cleanly through the same workload.
+- **Root cause:** the actuator's `cuMemUnmap` removes physical pages from the source pool's VA range. CUDA graphs captured at engine startup were captured against the full pre-shrink tensor (`shape=(max_tokens, *)`); after shrink they reference unmapped pages → illegal access on next decode/forward replay.
+- **Paper §design-l2-actuator (line 133-135) explicitly addresses this:** "Each pool's VA range is split at startup into a guaranteed-mapped *static-min* region ... CUDA graphs are captured exclusively against offsets in this region. The budgeter's `transfer_chunks` actuator operates only on the *soft* region." Our impl maps `init_chunks_per_pool` at startup and lets the actuator unmap from the same range — there is no static-min/soft separation.
+- **Workaround landed (sglang a4dc081c4):** raise cost-knob defaults so the net-benefit gate refuses to fire under any normal pressure (3 s cost × 1.5 margin needs 900 sustained ABOVE_HIGH ticks = 30 min). Effectively L2 stays silent; "全开 ≥ baseline" is met because no transfer = no crash. Full L2 metric demonstration requires the static-min plumbing.
+- **Followups not yet landed:** (a) split arena's `init_chunks_per_pool` into `static_min_chunks + soft_chunks`, only static_min mapped at startup, soft initially unmapped, CUDA graph capture sees only static_min range. (b) actuator drains in-flight requests' KV blocks above new cap before cuMemUnmap (paper §design-l2-actuator drain protocol). (c) refuse cross-pool transfer if it would shrink any pool below its static_min.
+- **Date observed:** 2026-04-30 late night (B3 v3, v9-auto v5).
+- **Resolved at:** — (workaround in place: gate refuses all fires; full fix is paper-design-aligned static-min plumbing).
+
 ## L2 actuator's lcm-aware unit is too coarse — **needs cost knob bump or per-subpool partial moves**
 
 - **Setting:** Layer 2 cross-pool transfer on any hybrid model (Qwen3.5-35B-A3B observed).
