@@ -304,7 +304,8 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | A5 | VMM chunk-size sweep | **DONE MAJOR** — 1GB chunks fix TTFT, paper §6.7 updated | — |
 | A6 | K=1 vs K=2 | not started | depends on 5.A |
 | Q1 | Quality preservation (temperature=0 token-identity) | **DONE PASS** — 50/50 byte-identical, default vs full prelude | — |
-| Q2–Q4 | Quality preservation (KS test, accuracy, ROUGE) | partial | extensions to Q1 baseline |
+| Q2 | Quality preservation (temp=1.0 KS test) | **DONE PASS** — KS p=0.362, cosine 0.985, len within 0.2% | — |
+| Q3-Q4 | Quality preservation (accuracy, ROUGE) | partial | extensions to Q1/Q2 |
 
 ## Order of execution (proposed)
 
