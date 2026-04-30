@@ -494,33 +494,41 @@ class MambaPool:
         return data_ptrs, data_lens, item_lens
 
     def get_state_dim_per_tensor(self):
-        """Get the sliceable dimension size for each state tensor.
+        """Get the sliceable dimension size for each (state-tensor, layer).
 
         For mamba state, the layout is:
         - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
         - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
 
-        The 3rd dimension (index 2) is the one that gets sliced by TP.
-        Returns the size of this dimension for each tensor (repeated for each layer).
-        """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            value = getattr(self.mamba_cache, field)
-            if isinstance(value, list):
-                state_tensors.extend(value)
-            else:
-                state_tensors.append(value)
+        Each logical state-tensor contributes num_mamba_layers entries.
 
-        dim_per_tensor = []
-        for state_tensor in state_tensors:
-            if isinstance(state_tensor, list):
-                # Per-layer split (Phase 2e.5.1): each entry shape (size+1, sliceable_dim, ...)
-                sliceable_dim = state_tensor[0].shape[1]
+        Phase 2e.5.1 (SGLANG_MAMBA_PERLAYER=1): when temporal is a
+        List[Tensor] of length num_mamba_layers (each entry shape
+        (size+1, sliceable_dim, ...)), it counts as ONE logical
+        state-tensor (sliceable_dim = entry[0].shape[1], repeated
+        num_mamba_layers times).
+        """
+        sliceable_dims = []
+        for fname in vars(self.mamba_cache):
+            value = getattr(self.mamba_cache, fname)
+            if isinstance(value, list):
+                # Distinguish "list of conv-shape tensors, each layer-stacked"
+                # from "per-layer-split temporal (one tensor per layer)".
+                if (
+                    len(value) == self.num_mamba_layers
+                    and value[0].shape[0] != self.num_mamba_layers
+                ):
+                    sliceable_dims.append(value[0].shape[1])
+                else:
+                    for v in value:
+                        sliceable_dims.append(v.shape[2])
             else:
                 # Stacked: [num_layers, size+1, sliceable_dim, ...]
-                sliceable_dim = state_tensor.shape[2]
-            # Repeat for each layer since we have per-layer data_ptrs
-            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+                sliceable_dims.append(value.shape[2])
+
+        dim_per_tensor = []
+        for d in sliceable_dims:
+            dim_per_tensor += [d] * self.num_mamba_layers
         return dim_per_tensor
 
 

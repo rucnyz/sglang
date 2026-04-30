@@ -18,9 +18,9 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.4.d.1 | `MHATokenToKVPool.set_capacity_tokens` + allocator `set_capacity_pages` (unit test passes) | ~80 LoC | **done** 2026-04-30 |
 | 2e.4.d.2 | `KVArenaActuator` + `BudgetAgent` arena path + scheduler leak-check live-aware | ~120 LoC | **done** 2026-04-30 |
 | 2e.4.d.3 | End-to-end: server + 2× oscillator + 10 completions across phases | smoke | **done** 2026-04-30 |
-| 2e.5.0 | Design note: A1 vs A2 vs B' vs D for cross-pool VMM compatibility | doc | **in progress** 2026-04-30 |
-| 2e.5.1 | Mamba pool: `temporal_state` stacked → list (A2), gated `SGLANG_MAMBA_PERLAYER=1` | ~30 LoC | not started |
-| 2e.5.2 | Unit test: alloc/free/copy_from/at_layer_idx equivalence for both flag values | ~80 LoC | not started |
+| 2e.5.0 | Design note: A1 vs A2 vs B' vs D for cross-pool VMM compatibility | doc | **done** 2026-04-30 |
+| 2e.5.1 | Mamba pool: `temporal_state` stacked → list (A2), gated `SGLANG_MAMBA_PERLAYER=1` | ~50 LoC | **done** 2026-04-30 |
+| 2e.5.2 | Unit test: alloc/free/copy_from/at_layer_idx equivalence for both flag values | ~220 LoC | **done** 2026-04-30 |
 | 2e.5.3 | E2E equivalence: same prompt, same tokens, both flag values, hybrid model | smoke | not started |
 | 2e.5.4 | **Performance regression bench**: A/B on hybrid model, throughput/TTFT/TPOT, ≤2% delta required | bench | not started |
 | 2e.5.5 | Migrate mamba pool to MultiTensorArena (depends on 2e.5.4 passing) | ~150 LoC | not started |
@@ -513,4 +513,59 @@ Per the user's directive on 2026-04-30: every sub-step (2e.5.1 through 2e.5.6) l
 - Is "Qwen3.5-1.5B" the right hybrid bench model, or do we have a faster one already cached locally? (Need to check `~/.cache/huggingface` or wherever sglang pulls weights.)
 - Should we also bench Qwen3-Next (larger, slower iteration but closer to the paper's headline workload)? Or defer that to 2e.5.6?
 - Performance budget: 2% delta tolerance. If the per-layer split costs e.g. 0.5%, do we accept and move on, or chase down the cause? My view: 2% is the merge gate, but anything > 0.3% should at least have an explanation in the doc.
+
+## 2e.5.1 — MambaPool temporal_state stacked → list (done)
+
+**Goal.** Add `SGLANG_MAMBA_PERLAYER=1` env flag that switches `temporal_state` from a single stacked `(num_layers, size+1, *)` tensor to a `List[Tensor]` of length `num_mamba_layers`, each of shape `(size+1, *)`. Default off; bit-for-bit unchanged when flag is unset.
+
+**Code.**
+- `python/sglang/srt/mem_cache/memory_pool.py`:
+  - `MambaPool.__init__`: env-flag branch; logger info on which layout is active.
+  - `alloc()`: dispatches on `isinstance(self.mamba_cache.temporal, list)`.
+  - `copy_from()`, `get_cpu_copy()`, `load_cpu_copy()`: same dispatch.
+  - `get_state_dim_per_tensor()`: detects per-layer-split temporal via `len(value) == num_mamba_layers and value[0].shape[0] != num_mamba_layers`, treats it as one logical state-tensor (sliceable_dim taken from `entry[0].shape[1]`, repeated `num_mamba_layers` times).
+- `python/sglang/srt/mem_cache/memory_pool_host.py`: `MambaPoolHost.__init__` now reads temporal shape/dtype from either the stacked tensor or the first list element.
+
+**Logging:** `MambaPool: temporal layout=per-layer-list, num_layers=N, size=M, ...` printed at init.
+
+**No kernel changes.** Audit confirmed mamba/fla Triton kernels receive single-layer views (`v[layer]`) from callers, which works identically for stacked-tensor slicing (`tensor[layer]` → axis-0 slice) and list indexing (`list[layer]` → element). `at_layer_idx()` is layout-blind.
+
+## 2e.5.2 — Unit test: bit-equivalence between layouts (done)
+
+**Goal.** Verify alloc / copy_from / at_layer_idx / get_cpu_copy / load_cpu_copy / get_state_dim_per_tensor all produce identical observable behavior between `SGLANG_MAMBA_PERLAYER=0` and `=1`.
+
+**Code.** [`09_mamba_perlayer_unit.py`](09_mamba_perlayer_unit.py) (~220 LoC).
+
+**Reproduce.**
+```bash
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=3 PYTHONPATH=/data/yuzhou/projects/sglang/python:$PYTHONPATH \
+  .venv/bin/python -u dev/2e/09_mamba_perlayer_unit.py
+```
+
+**Result (2026-04-30, GPU 3, num_layers=4, size=8).**
+```
+== Phase 2e.5.2: MambaPool perlayer-split unit test ==
+layouts: stacked=Tensor, perlayer=list
+initial: available_size=8 (both)
+alloc(3) indices: [1, 2, 3], post-state equal
+layer isolation: each layer's write stays in its layer (both)
+copy_from(2->5) carries content correctly (both)
+get_cpu_copy: layouts differ but contents match per-layer
+load_cpu_copy round-trip: both pools end in the same state
+get_state_dim_per_tensor: [16, 16, 16, 16, 2, 2, 2, 2] (both)
+after free: available_size=8 (both)
+
+== PASSED: SGLANG_MAMBA_PERLAYER=1 is bit-equivalent to default ==
+```
+
+**Findings.**
+
+1. **Bug caught by the unit test.** First run failed with `state_dim_per_tensor differ: [16, 16, 16, 16, 2, 2, 2, 2] vs [16, 16, 16, 16, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8]`. Root cause: my initial fix to `get_state_dim_per_tensor` had dead code — the `isinstance(state_tensor, list)` check inside the inner loop never fires because the outer loop already extends list-valued fields. The fix was to detect "per-layer-split temporal" at the outer loop, distinguishing it from "list of conv-shape stacked tensors" via `value[0].shape[0] != num_mamba_layers`. This was caught before any production run — exactly the value of unit-testing layout migrations.
+
+2. **Layouts are observable equivalent.** All seven assertions pass: shape, dtype, content under writes, layer isolation, copy_from semantics, CPU roundtrip, sliceable-dim reporting, free behavior. The flag is safe to flip at higher levels.
+
+3. **`at_layer_idx` duck-typing works.** The dataclass `State.at_layer_idx(layer)` does `v[layer]` for the `temporal` field. On a stacked tensor this slices axis 0; on a `List[Tensor]` this indexes the list. Both return a `(size+1, *)` view with identical content under symmetric writes.
+
+**Implication for 2e.5.3.** With logical equivalence proven on synthetic configs, the next step is end-to-end equivalence on a real hybrid model: same prompt, same `temperature=0`, both flag values, token sequences must match.
 
