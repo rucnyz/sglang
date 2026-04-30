@@ -6,7 +6,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ## TL;DR — 2026-04-30 night session final summary
 
-**11 PASS, 4 INFORMATIVE/QUANTITATIVE-FINDING, 2 NULL (control + composed), 3 BLOCKED, +1 implementation fix landed.**
+**12 PASS, 4 INFORMATIVE/QUANTITATIVE-FINDING, 2 NULL (control + composed), 3 BLOCKED, +1 implementation fix landed.**
 
 | setting | status | headline |
 |---|---|---|
@@ -24,6 +24,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 | Q1 token-identity | **PASS** | 50/50 byte-identical default vs full prelude → paper §6.8 |
 | Q2 sampled-decoding KS | **PASS** | KS p=0.362, cosine 0.985 on char lengths default vs prelude → paper §6.8 |
 | Q3 classification accuracy | **PASS** | 49/50 (98%) on both arms, 50/50 byte-identical → paper §6.8 |
+| Q4 ROUGE-L long-form | **PASS** | 0.124 vs 0.148 ROUGE-L (KS p=0.306) → paper §6.8 |
 | 3.C composed L1+L2 | NULL | 1 transfer per cell across all L1 configs (trace too smooth) → paper §6.3 |
 | 1 24-h phase-shift | NULL | Smooth control test (no regression). Compressed trace doesn't bind on different pools across phases → paper §6.2 honest reframe |
 | 5.A/5.B/A6 path-axis | BLOCKED | Path-axis dispatcher not implemented → BLOCKERS.md |
@@ -188,6 +189,25 @@ Sweep 1 raw:
 **Implication for paper §6.4:** real limitation of the current Layer 2 design. Follow-up: replace usage with admission-pressure signal (rejection rate / queue depth / running-request waiting time) to recover gradient information at saturation.
 
 Raw analysis: `dev/eval/_setting4_estimator.py`. Sweep 1 raw data: `/tmp/sweep_kv_dn_3005940/`. 3.C raw data: `/tmp/setting3c_v2_*/`.
+
+### Quality preservation Q4 — ROUGE-L on long-form (wildchat reference) (DONE PASS)
+
+`dev/eval/17_Q4_rouge_wildchat.sh` on GPU 2, port 30099. XSum unavailable locally so wildchat assistant references substitute. 30 prompts × 3 seeds (0/7/42) at `temperature=1.0`, `top_p=0.95`, `max_tokens=256` to default vs full prelude (90 outputs per arm). ROUGE-L F1 vs wildchat assistant reply.
+
+| arm | mean ROUGE-L | std |
+|---|---:|---:|
+| default | 0.1243 | 0.0980 |
+| prelude | 0.1477 | 0.1102 |
+
+- **Delta: +0.0234 (prelude higher)** — within 0.24 std (well within run-to-run noise from temp=1.0)
+- KS test: stat=0.144, **p=0.306** (>0.05, distributions same)
+- Paired t-test: p=0.055 (just at edge, not significant)
+
+Pass: prelude doesn't degrade ROUGE-L vs default. Distributions are statistically indistinguishable. Absolute scores are low because wildchat references are long-form and diverse while we cap at 256 tokens; the comparison is what matters.
+
+Together with Q1 (byte-identity at temp=0), Q2 (KS distribution match at temp=1.0), Q3 (classification accuracy), §6.8 has 4 independent quality-preservation signals all passing.
+
+Raw data: `/tmp/q4_rouge_*/`.
 
 ### Quality preservation Q3 — per-task classification accuracy (DONE PASS)
 

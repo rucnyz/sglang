@@ -306,7 +306,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | Q1 | Quality preservation (temperature=0 token-identity) | **DONE PASS** — 50/50 byte-identical, default vs full prelude | — |
 | Q2 | Quality preservation (temp=1.0 KS test) | **DONE PASS** — KS p=0.362, cosine 0.985, len within 0.2% | — |
 | Q3 | Quality preservation (classification accuracy) | **DONE PASS** — 49/50 = 98% on both arms, 50/50 byte-identical | — |
-| Q4 | Quality preservation (ROUGE on XSum) | not started | requires XSum dataset + reference summaries |
+| Q4 | Quality preservation (ROUGE-L vs wildchat ref) | **DONE PASS** — mean ROUGE 0.124 vs 0.148, KS p=0.306, t-test p=0.055 | XSum substitute |
 
 ## Order of execution (proposed)
 
