@@ -86,10 +86,10 @@ class ModelRunnerKVCacheMixin:
                 "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
             ))
             mamba_headroom_chunks = int(os.environ.get(
-                "SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "4"
+                "SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "2"
             ))
             kv_headroom_chunks = int(os.environ.get(
-                "SGLANG_ARENA_KV_HEADROOM_CHUNKS", "4"
+                "SGLANG_ARENA_KV_HEADROOM_CHUNKS", "2"
             ))
             arena_headroom_gib = (
                 (mamba_headroom_chunks + kv_headroom_chunks) * chunk_bytes

@@ -327,8 +327,15 @@ class MambaPool:
                 # SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS overrides; set to 0
                 # to match baseline tensor shape (diagnostic for Triton
                 # shape-specialization overhead).
+                # Default 2 chunks per sub-pool (down from 4). At chunk_bytes=1GB
+                # this is 2 GiB headroom per sub-pool = 4 GiB total. Path A in
+                # _profile_available_bytes pulls this from the
+                # (1-mem_fraction)·pre reserve band; lowering the default leaves
+                # more room for activations/cuda-graph at mem_fraction=0.8 on H200.
+                # The regression suite's R2 GSP RPS=4 workload OOM'd at 4×2=8 GiB
+                # because peak FLA activations exceeded the remaining 20 GiB band.
                 mamba_growth_chunks = (
-                    int(os.environ.get("SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "4"))
+                    int(os.environ.get("SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "2"))
                     if shared_arena else 0
                 )
                 mamba_max_tokens = (
@@ -1179,8 +1186,9 @@ class MHATokenToKVPool(KVCache):
                 # SGLANG_ARENA_KV_HEADROOM_CHUNKS overrides; set to 0 to
                 # match baseline tensor shape (diagnostic for Triton
                 # shape-specialization overhead).
+                # Default 2 chunks (down from 4). See MambaPool note above.
                 kv_growth_chunks = (
-                    int(os.environ.get("SGLANG_ARENA_KV_HEADROOM_CHUNKS", "4"))
+                    int(os.environ.get("SGLANG_ARENA_KV_HEADROOM_CHUNKS", "2"))
                     if shared_arena else 0
                 )
                 kv_max_tokens = tot_aligned + kv_growth_chunks * tokens_per_chunk

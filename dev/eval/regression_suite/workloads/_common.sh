@@ -18,7 +18,9 @@ SERVER_LOG="$OUT_DIR/server.log"
 # Qwen3.5-mamba-only flags (piecewise CUDA graph + qwen3 reasoning parser).
 # Workloads using non-mamba models (e.g. R3 LoRA on Qwen3-4B) override
 # MAMBA_FLAGS="" so these stay off — they break the LoRA Triton dispatch.
-MAMBA_FLAGS=${MAMBA_FLAGS:---enforce-piecewise-cuda-graph --reasoning-parser qwen3}
+# Use ${VAR-default} (no colon) so an explicitly-set empty string disables
+# the flags. ${VAR:-default} would treat empty as "unset" and re-apply default.
+MAMBA_FLAGS=${MAMBA_FLAGS---enforce-piecewise-cuda-graph --reasoning-parser qwen3}
 
 boot_server() {
   pkill -f "launch_server.*--port $PORT" 2>/dev/null || true
