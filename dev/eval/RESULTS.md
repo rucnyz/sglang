@@ -130,14 +130,48 @@ Raw data: `/tmp/a5_chunk_3147806/`.
 
 ---
 
-### Setting 1 — 24-hour phase-shift 4-cell ablation (DONE v4 — partial PASS, mixed signal)
+### Setting 1 — 24-hour phase-shift 4-cell ablation (DONE v6 — null result, honest)
+
+**TL;DR.** Across 6 attempts (v1–v6), no cell-vs-cell differentiation reproduces stably. The compressed trace's phases (alpaca classification / sharegpt rerank / wildchat multi-turn 6-turn) are too uniform within-phase and too short across-phase to drive the binding pool to shift. Layer 2 fires exactly 1 cross-pool transfer per L2-on cell — it detects the steady state but never has cause to re-arbitrate. Layer 1's K_BIG path is broken on chunked-prefill workloads (see BLOCKERS.md) and is disabled; HPB LRU alone produces no measurable phase-trace improvement.
+
+**v6 4-cell × 3-phase table** (HPB-only Layer 1, K_BIG disabled):
+
+| cell | Phase A TPS / TTFT | Phase B TPS / P99 TTFT | Phase C mean E2E / P95 |
+|---|---|---|---|
+| (0,0) stock     | 4051.0 / 43.1ms | 6058.3 / 82.2ms | 333.3ms / **345.1ms** |
+| (1,0) HPB only  | 4051.9 / 45.2ms | 6060.9 / 86.4ms | 332.8ms / 349.2ms |
+| (0,1) L2 only   | 4051.3 / 46.2ms | 6058.9 / 89.6ms | 340.6ms / 352.6ms |
+| (1,1) HPB+L2    | 4052.2 / 46.9ms | 6056.9 / 96.8ms | 337.5ms / 352.9ms |
+
+All 4 cells are within 4% on every metric. v4 (a previous run) produced stock P95=418.9ms (a 21% outlier above v6's 345.1) and L1+L2 P95=351.3ms — taken as a -16% reduction at the time. v6 reproduces neither the stock outlier nor the differentiation. **The v4 -16% headline is withdrawn as run-to-run noise.**
+
+**Original v4 Setting 1 results, retained for archival comparison:**
+
+| cell | Phase A TPS | Phase B P99 TTFT | Phase C mean / P95 |
+|---|---:|---:|---:|
+| (0,0) v4   | 4052.2 | 82.4ms | 345.8ms / 418.9ms |
+| (1,0) v4   | 4051.8 | 87.1ms | 338.9ms / 414.5ms |
+| (0,1) v4   | 4052.3 | 89.2ms | 339.2ms / 350.6ms |
+| (1,1) v4   | 4052.6 | 92.7ms | 335.4ms / 351.3ms |
+
+**Implications.**
+- Setting 1's compressed trace is too synthetic; the binding pool never genuinely shifts mid-phase. To produce paper-grade differentiation we need a workload with **explicit phase transitions in pool demand** — e.g., Phase A (LoRA-bound) → Phase B (KV-bound long-context) → Phase C (mamba-bound multi-turn). Our current Phase A/B/C are all ~512-token short-prompt workloads using the same pool mix.
+- Layer 1's HPB LRU contribution IS verified: see §6.3 Q3.D (Table~tab:hpb-gsp on GSP, -19.77% mean TTFT) — but only on the focused GSP shared-prefix workload, not on Setting 1.
+- Layer 2's actuator works: 1 cross-pool transfer fires per L2-on cell. The actuator-level correctness is verified by Setting 2.1 (Sweep 1: 1.91× throughput swing) — not by Setting 1.
+- Phase 3.d (heterogeneous granularity, K_BIG) is broken on chunked-prefill (BLOCKERS.md). Disabled.
+
+**Recommendation for paper §6.2.** Acknowledge Setting 1 as a *control test* (system does not regress on a smooth synthetic trace) rather than a *headline win*. The actual contributions of L1 and L2 should remain the V_σ sweeps (§6.2 Table 1/2/3, all PASS), Q3.D (HPB LRU isolation), and §6.7 chunk-size ablation. Replace the headline ablation in §6.2 with a longer-context multi-axis trace as future work.
+
+Raw data: v4 `/tmp/phase_shift_v4_1777548919/`, v6 `/tmp/phase_shift_v6_1777550297/`.
 
 `dev/eval/07_phase_shift_trace.sh` × 4 cells in parallel on GPU 1 / 4 / 5 / 6 (ports 30097/95/94/93).
 - Cells: `(L1, L2)` ∈ {(0,0), (1,0), (0,1), (1,1)}; phases A/B/C.
 - v1: pd_exp jsonl incompatible with `bench_serving --dataset-name custom`. Wrote `_convert_jsonl_to_sharegpt.py`.
-- v2: L1=1 cells crashed because Phase 3.d K_BIG suppression created tombstone leaves with no snapshot ancestor → match_prefix returned 0. Fixed (`insert_depth >= k_big AND insert_depth % k_big != 0`). See BLOCKERS.md.
-- v3: completed Phase A+B but Phase C silently produced no data (wildchat uses `messages` key, not `conversations`/`turns`). Fixed inline handler.
-- v4 (FINAL): all 4 cells × 3 phases complete.
+- v2: L1=1 cells crashed because Phase 3.d K_BIG suppression created tombstone leaves with no snapshot ancestor. Partial fix (`insert_depth >= k_big AND insert_depth % k_big != 0`).
+- v3: completed Phase A+B but Phase C silently produced no data (wildchat uses `messages` key). Fixed inline handler.
+- v4: all 4 cells × 3 phases complete. Reported P95 -16% on Phase C; later withdrawn as noise (not reproduced in v6).
+- v5: longer-context Phase C attempt. L1=1 cells re-crashed on K_BIG (the depth-9K-with-no-depth-8K-ancestor case). K_BIG disabled.
+- v6 (FINAL): all 4 cells × 3 phases, K_BIG disabled, HPB LRU only for L1. Result: NULL — no cell-vs-cell differentiation reproduces.
 
 **Phase A** (alpaca classification, ~512-token prompts, RPS=8, 800 prompts):
 
