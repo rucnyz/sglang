@@ -46,15 +46,23 @@ run_arm() {
     >"$log" 2>&1 &
   local pid=$!
   echo "server pid=$pid log=$log; waiting up to ${WARMUP_S}s for ready"
+  echo "--- live server log ---"
+  tail -F "$log" 2>/dev/null &
+  local tailer=$!
   local waited=0
   while [ $waited -lt $WARMUP_S ]; do
     sleep 10
     waited=$((waited + 10))
     if curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q .; then
-      echo "ready after ${waited}s"
+      kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
+      echo
+      echo "--- ready after ${waited}s ---"
       break
     fi
   done
+  if kill -0 $tailer 2>/dev/null; then
+    kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
+  fi
   if ! curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -q .; then
     echo "[$arm] server failed to start (waited ${WARMUP_S}s)"
     tail -30 "$log"
