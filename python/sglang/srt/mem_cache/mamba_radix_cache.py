@@ -583,16 +583,12 @@ class MambaRadixCache(BasePrefixCache):
         suppressed_mamba = False
         if k_big > 0 and mamba_value is not None:
             insert_depth = prev_prefix_len + len(key)
-            # Only suppress when (a) the insert is past the first big-page
-            # boundary (so there IS a depth-k_big ancestor that match_prefix
-            # can fall back to) AND (b) the insert depth is not itself
-            # aligned. Otherwise we'd create a tombstone leaf with no
-            # snapshot ancestor, which match_prefix returns as 0-len match
-            # — the unfinished_req path then asserts because new_prefix_len
-            # > len(new_indices).
-            if insert_depth >= k_big and insert_depth % k_big != 0:
-                # Insert KV without the snapshot. We still need _insert_helper
-                # to walk the tree; pass mamba_value=None and a flag.
+            if insert_depth % k_big != 0:
+                # Heterogeneous granularity: only k_big-aligned depths get
+                # snapshots. Non-aligned inserts have their KV freed in
+                # _insert_helper (no tombstone leaf is created). The next
+                # request that walks this path will re-prefill the
+                # non-aligned tail from the deepest snapshot ancestor.
                 suppressed_mamba = True
                 mamba_value = None
 
@@ -1325,6 +1321,16 @@ class MambaRadixCache(BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
+        # Phase 3.d: track the deepest-snapshot depth during traversal so
+        # that the value we return mirrors what _match_prefix_helper would
+        # return (it stops updating best_value_len at the deepest mamba_value
+        # node). Required for the cache_unfinished_req invariant
+        # `insert.prefix_len <= len(match_prefix.device_indices)` to hold
+        # when the path goes through tombstone-internal-nodes past the
+        # deepest snapshot.
+        deepest_snapshot_depth = (
+            total_prefix_length if node.mamba_value is not None else 0
+        )
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
@@ -1345,32 +1351,56 @@ class MambaRadixCache(BasePrefixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
+            # After potential split, `node` is the matched-up-to-here node.
+            # Update deepest_snapshot_depth if this node carries a snapshot.
+            if node.mamba_value is not None:
+                deepest_snapshot_depth = total_prefix_length
+
             if len(key):
                 child_key = key.child_key(self.page_size)
 
         # Phase 3.d: mamba_value can be None (heterogeneous-granularity
         # path suppresses the snapshot for non-K_big-aligned inserts).
-        # When None, we insert KV but skip mamba bookkeeping; the new
-        # node is a "tombstone" (the existing concept of a node with
-        # KV but no mamba state).
+        # When None AND we'd be creating a NEW leaf, we do NOT create a
+        # tombstone leaf. Two reasons:
+        #   1. _match_prefix_helper only updates `best_value_len` at nodes
+        #      with mamba_value not None, so a tombstone leaf at depth N
+        #      past the deepest snapshot would make insert.prefix_len = N
+        #      while match_prefix returns indices up to the snapshot depth
+        #      M < N — the cache_unfinished_req invariant new_prefix_len <=
+        #      len(new_indices) breaks.
+        #   2. _evict_leaf_node asserts `mamba_value is not None`, so a
+        #      tombstone leaf can never be evicted via full_lru, which
+        #      leaks its KV indefinitely.
+        # Instead we free the trailing KV. The engine's next request that
+        # walks this path will re-prefill those tokens from the snapshot
+        # ancestor — exactly the design intent of K_big.
         mamba_value_exist = False
         if len(key):
-            new_node = TreeNode()
-            new_node.parent = node
-            new_node.key = key
-            new_node.value = value.clone()
-            new_node.mamba_value = mamba_value
-            self.full_lru_list.insert_mru(new_node)
-            if mamba_value is not None:
+            if mamba_value is None:
+                # Suppressed-snapshot path: don't create a tombstone leaf.
+                # Free the trailing KV that would have been stored in it.
+                self.token_to_kv_pool_allocator.free(value)
+                # No new node created; the engine sees this as a match
+                # truncated at total_prefix_length, which is the deepest
+                # snapshot ancestor's depth (or close to it).
+            else:
+                new_node = TreeNode()
+                new_node.parent = node
+                new_node.key = key
+                new_node.value = value.clone()
+                new_node.mamba_value = mamba_value
+                self.full_lru_list.insert_mru(new_node)
                 self.mamba_lru_list.insert_mru(new_node)
                 self.mamba_evictable_size_ += len(mamba_value)
-            node.children[child_key] = new_node
-            self.full_evictable_size_ += len(value)
+                node.children[child_key] = new_node
+                self.full_evictable_size_ += len(value)
         elif node.mamba_value is None:  # add for mamba tombstone (or stay tombstone)
             if mamba_value is not None:
                 node.mamba_value = mamba_value
                 self.mamba_lru_list.insert_mru(node)
                 self.mamba_evictable_size_ += len(mamba_value)
+                deepest_snapshot_depth = total_prefix_length
             self.full_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
         else:  # mamba value already exists
@@ -1378,7 +1408,18 @@ class MambaRadixCache(BasePrefixCache):
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
+            deepest_snapshot_depth = total_prefix_length
 
+        # Phase 3.d: when k_big suppression is active we never create a
+        # tombstone leaf (see above), so the only remaining concern is
+        # existing tombstone-internal-nodes in the traversal path.
+        # `total_prefix_length` is the full traversal depth; the engine's
+        # match_prefix only sees up to the deepest snapshot. Return the
+        # latter when it differs (suppression path) so the assertion in
+        # cache_unfinished_req holds.
+        k_big_active = int(os.environ.get("SGLANG_K_BIG", "0")) > 0
+        if k_big_active and deepest_snapshot_depth < total_prefix_length:
+            return deepest_snapshot_depth, mamba_value_exist
         return total_prefix_length, mamba_value_exist
 
     def _iteratively_delete_tombstone_leaf(

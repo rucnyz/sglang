@@ -92,6 +92,13 @@ def test_kbig_alignment():
     print(f"  → depth-8 node has mamba_value (snapshot taken). GOOD.")
 
     # Now insert a different key at depth 5 (NOT aligned).
+    # Updated semantic (post-K_BIG-leak fix): non-aligned-depth inserts
+    # do NOT create a tombstone leaf. Instead, the trailing KV is freed
+    # in _insert_helper. Reason: a tombstone leaf with no snapshot
+    # ancestor breaks the cache_unfinished_req invariant
+    # `insert.prefix_len <= len(match_prefix.device_indices)` and is
+    # never reclaimable via full_lru (evict_leaf asserts mamba_value is
+    # not None). Net behavior: this prompt simply isn't cached.
     cache2 = make_cache()
     key5 = RadixKey(list(range(1, 6)), extra_key=None)  # 5 tokens
     value5 = torch.arange(1, 6, dtype=torch.int64)
@@ -101,15 +108,12 @@ def test_kbig_alignment():
     ))
     print(f"  insert at depth 5 (NOT aligned): prefix_len={result2.prefix_len}, mamba_exist={result2.mamba_exist}")
 
-    # Should be a tombstone — node has KV value but no mamba_value.
-    node5 = cache2.root_node.children[1]
-    assert node5.value is not None and len(node5.value) == 5, \
-        f"depth-5 node should have KV value of length 5, got {node5.value}"
-    assert node5.mamba_value is None, \
-        f"depth-5 (non-aligned) insert should NOT have mamba_value, got {node5.mamba_value}"
+    # No tombstone leaf created — root has no children for this key.
+    assert 1 not in cache2.root_node.children, \
+        f"depth-5 (non-aligned) insert should NOT create a leaf; got child {cache2.root_node.children.get(1)}"
     assert result2.mamba_exist == True, \
-        f"non-aligned insert must signal mamba_exist=True so caller frees the fork (got {result2.mamba_exist})"
-    print(f"  → depth-5 node is a tombstone (KV yes, mamba no). GOOD.")
+        f"suppressed insert must signal mamba_exist=True so caller frees the fork (got {result2.mamba_exist})"
+    print(f"  → depth-5 insert is dropped (no tombstone leaf). GOOD.")
     print(f"  → mamba_exist=True signals caller to free its fork. GOOD.")
 
     print("PASS Test 1\n")
@@ -143,41 +147,45 @@ def test_kbig_default_off():
 
 
 def test_kbig_match_falls_back():
-    print("== Test 3: match walks past tombstone to nearest big-page ancestor ==")
+    print("== Test 3: insert past big-page boundary preserves prefix_len consistency ==")
     cache = make_cache()
     # Insert at depth 8 (big-page snapshot).
     key8 = RadixKey(list(range(1, 9)), extra_key=None)
     value8 = torch.arange(1, 9, dtype=torch.int64)
     cache.insert(InsertParams(key=key8, value=value8, mamba_value=torch.tensor([1]), prev_prefix_len=0))
 
-    # Now extend with a tombstone leaf at depth 13 (not aligned, K_big=8).
+    # Now insert a longer key at depth 13 (not aligned, K_big=8) — the
+    # post-fix semantic is that the trailing 5 tokens past depth 8 are
+    # freed and no extension node is created. The tree should remain
+    # depth-8 only.
     key13 = RadixKey(list(range(1, 14)), extra_key=None)
     value13 = torch.arange(1, 14, dtype=torch.int64)
-    cache.insert(InsertParams(key=key13, value=value13, mamba_value=torch.tensor([2]), prev_prefix_len=0))
+    result = cache.insert(InsertParams(
+        key=key13, value=value13, mamba_value=torch.tensor([2]), prev_prefix_len=0,
+    ))
+    print(f"  insert key_len=13 (suppressed): prefix_len={result.prefix_len}, mamba_exist={result.mamba_exist}")
 
-    # Use the lower-level _match_prefix_helper to avoid global_server_args
-    # dependency. It returns (value_list, last_node, best_value_len). We
-    # care about best_value_len: with K_big=8, only the depth-8 ancestor
-    # has mamba_value, so best_value_len should be 8 not 13.
+    # The depth-8 node should be unchanged; no depth-13 child.
+    depth8_node = cache.root_node.children[1]
+    assert depth8_node.mamba_value is not None, \
+        f"depth-8 ancestor should still have mamba_value"
+    assert len(depth8_node.children) == 0, \
+        f"depth-8 node should have no children (suppressed insert dropped); got {list(depth8_node.children.keys())}"
+    # insert.prefix_len should be 8 (deepest snapshot depth), not 13.
+    assert result.prefix_len == 8, \
+        f"insert.prefix_len should be 8 (deepest snapshot depth), got {result.prefix_len}"
+
+    # Match with the same depth-13 key: should return up to depth 8.
     value, last_node, best_value_len = cache._match_prefix_helper(
         RadixKey(list(range(1, 14)), extra_key=None)
     )
     print(f"  match key_len=13 → best_value_len = {best_value_len}, last_node has mamba_value? {last_node.mamba_value is not None}")
-    # best_value_len is the count of value-list entries up to the deepest
-    # ancestor with mamba_value, NOT the token depth. With our two inserts
-    # (depth-8 with snapshot, depth-13 tombstone), value=[d8_tensor, d13_tensor]
-    # and best_last_node = depth-8 node. best_value_len = 1 (only d8 entry
-    # was accumulated before we passed the snapshot-bearing node).
     assert last_node.mamba_value is not None, \
-        f"match should land at the big-page ancestor (depth 8), got tombstone"
-    assert best_value_len == 1, \
-        f"value-list length up to big-page ancestor should be 1, got {best_value_len}"
-    # The big-page node's KV tensor has 8 tokens — verify by summing
-    # the matched value tensors.
+        f"match should land at the depth-8 ancestor"
     matched_kv_len = sum(t.numel() for t in value[:best_value_len])
     assert matched_kv_len == 8, \
         f"matched KV token count should be 8, got {matched_kv_len}"
-    print(f"  → match falls back to depth-8 big-page ancestor (KV length 8). GOOD.")
+    print(f"  → insert.prefix_len (8) == match.matched_kv_len (8). Invariant held. GOOD.")
     print("PASS Test 3\n")
 
 
