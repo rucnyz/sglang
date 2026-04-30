@@ -95,6 +95,27 @@ Raw data: `/tmp/sweep_lora_3157665/ml*_bench.json`. Updated `evaluation.tex` Tab
 
 Raw data: `/tmp/a3_hyst_3195814/hyst*_budgeter.jsonl`.
 
+### Setting 3.A — V_prefix' faithful slope (Q3.A, 3-arm subset, DONE)
+
+`dev/eval/09_setting3a_vprefix_faithful.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B + GSP shared-prefix workload (8 groups × 10 prompts, 12K system prompt, RPS=2). Three mamba prefix-cache configurations:
+
+| arm | input TPS | mean TTFT | P99 TTFT | median E2E | cache-hit batches |
+|---|---:|---:|---:|---:|---:|
+| **default** (`MambaRadixCache`, page_size=1, no_buffer) | 27 915 | **284.5ms** | **1094.0** | 2 875.1 | 71/86 (82.6%) |
+| **extra_buffer** (page_size=8192, mamba_scheduler_strategy=extra_buffer) | 28 023 | 335.5 (+18%) | 1 272.1 (+16%) | **2 753.4** (-4%) | 73/91 (80.2%) |
+| **layer1** (HPB LRU + K_big=8192, page_size=1) | 27 878 | 328.8 (+16%) | 1 104.4 | 3 419.4 (+19%) | 70/87 (80.5%) |
+
+Naive RadixCache (no mamba state recovery) skipped because it requires a non-mamba model.
+
+**Headline:** on this prefix-cache-friendly GSP workload, all three configurations achieve essentially the same hit rate (80-83%). The differences are in latency distribution:
+- **Default wins on TTFT** (284ms vs ~330ms for the other two).
+- **extra_buffer wins on median E2E** (2753ms vs 2875ms default, 3419ms layer1) — likely because page_size=8192 reduces page-table overhead during decode.
+- **Layer 1 doesn't dominate** — its K_big=8192 suppresses inserts at non-aligned depths past 8192, causing the slight hit-rate dip (80.5% vs 82.6% default) and the corresponding TTFT/E2E penalty.
+
+**Implication for paper §6.3 Q3.A.** The paper's expected narrative ("Layer 1's V_prefix' is smooth and high; default is flat from host-tier offload; extra_buffer is step-function") doesn't hold on this 80-prompt GSP workload because the mamba pool isn't pressured (max usage <2%) and the hierarchical-host-tier (HiMambaRadixCache) is OFF by default. To exhibit the V_prefix' shape claims, a longer-running workload that pressures the mamba pool (200+ unique 50K-token prompts, or `--enable-hierarchical-cache` for the host-tier slope) is needed. We should reframe Q3.A as "Layer 1 doesn't break the engine baseline on prefix-friendly workloads" rather than a headline win, and add the host-tier-on configuration as a separate point.
+
+Raw data: `/tmp/setting3a_*/`.
+
 ### Ablation A2 — K_big granularity sweep (DONE — workload-dependent)
 
 `dev/eval/08_A2_kbig_sweep.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B + GSP shared-prefix workload (8 groups × 10 prompts, 12K system prompt, RPS=2). K_big sweep ∈ {0, 2K, 4K, 8K, 16K}; K_small=512 (default page_size).
