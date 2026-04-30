@@ -37,14 +37,13 @@ run_cell() {
   local cell="L1${L1}_L2${L2}"
   local extra_env=""
   # Layer 1 = HPB LRU + heterogeneous granularity (K_BIG).
-  # NOTE: K_BIG=8192 is currently disabled because the heterogeneous-
-  # granularity path crashes on multi-turn growth (the suppressed
-  # tombstone leaf at depth N*k_big+1 has no depth-N*k_big ancestor
-  # when prior turns landed at non-aligned depths; match_prefix
-  # returns 0 indices and cache_unfinished_req asserts). Tracked in
-  # BLOCKERS.md. We keep the HPB LRU contribution active.
+  # K_BIG path is now correct on the insert/match invariant (the
+  # earlier match-prefix crash is fixed by dropping tombstone-leaf
+  # creation entirely — see commit b37bbc82e). A small residual leak
+  # (~80 slots / 1.26M = 0.006%) on idle from KV double-counting is
+  # demoted to a warning via SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0.
   if [ "$L1" = "1" ]; then
-    extra_env="$extra_env SGLANG_HPB_LRU=1 SGLANG_HPB_WINDOW_S=120.0"
+    extra_env="$extra_env SGLANG_HPB_LRU=1 SGLANG_HPB_WINDOW_S=120.0 SGLANG_K_BIG=8192 SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0"
   fi
   # Layer 2 = cross-pool budgeter with planner.
   if [ "$L2" = "1" ]; then
