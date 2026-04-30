@@ -52,6 +52,13 @@ class CrossPoolPolicyConfig:
     # watermark. This recovers gradient information at saturation: a
     # rising queue is the signal that pool capacity is the bottleneck.
     qdepth_trigger: int = 0        # 0 = disabled; e.g. 4 enables the new rule
+    # Setting 1 v9 follow-up: level-triggered planning fires repeatedly
+    # while usage stays above the high watermark (cooldown-bounded),
+    # accumulating actuator overhead even on steady-state workloads.
+    # Edge-triggered mode fires ONLY at state transitions (BELOW_LOW ↔
+    # IN_BAND ↔ ABOVE_HIGH). Steady state above high → 0 transfers
+    # after the first crossing → 0 actuator overhead.
+    edge_trigger: bool = False     # gate via SGLANG_XPOOL_EDGE_TRIGGER=1
 
 
 def _policy_from_env() -> CrossPoolPolicyConfig:
@@ -63,6 +70,7 @@ def _policy_from_env() -> CrossPoolPolicyConfig:
         cooldown_ticks=int(os.environ.get("SGLANG_XPOOL_COOLDOWN", "3")),
         dst_chunks_per_action=int(os.environ.get("SGLANG_XPOOL_UNIT", "1")),
         qdepth_trigger=int(os.environ.get("SGLANG_XPOOL_QDEPTH_TRIGGER", "0")),
+        edge_trigger=bool(int(os.environ.get("SGLANG_XPOOL_EDGE_TRIGGER", "0"))),
     )
 
 
@@ -83,6 +91,11 @@ class CrossPoolPlanner:
     (e.g., gating on `num_running_reqs == 0` for safety in this milestone).
     """
 
+    # Per-pool state machine constants for edge-triggered mode.
+    BELOW_LOW = "below_low"
+    IN_BAND = "in_band"
+    ABOVE_HIGH = "above_high"
+
     def __init__(
         self,
         config: Optional[CrossPoolPolicyConfig] = None,
@@ -90,13 +103,27 @@ class CrossPoolPlanner:
         self.config = config if config is not None else _policy_from_env()
         self._cooldown_remaining: int = 0
         self._tick_count: int = 0
+        # Edge-triggered state per pool. Initialized to IN_BAND so the
+        # very first tick's reading establishes the baseline state without
+        # forcing a transfer at startup.
+        self._kv_state: str = self.IN_BAND
+        self._mamba_state: str = self.IN_BAND
         logger.info(
             "CrossPoolPlanner: kv_high=%.2f kv_low=%.2f mamba_high=%.2f "
-            "mamba_low=%.2f cooldown=%d unit=%d",
+            "mamba_low=%.2f cooldown=%d unit=%d edge_trigger=%s",
             self.config.kv_high_water, self.config.kv_low_water,
             self.config.mamba_high_water, self.config.mamba_low_water,
             self.config.cooldown_ticks, self.config.dst_chunks_per_action,
+            self.config.edge_trigger,
         )
+
+    def _classify(self, usage: float, low: float, high: float) -> str:
+        """Map a usage value to a discrete state for edge-triggered mode."""
+        if usage >= high:
+            return self.ABOVE_HIGH
+        if usage <= low:
+            return self.BELOW_LOW
+        return self.IN_BAND
 
     def decide(
         self,
@@ -117,6 +144,87 @@ class CrossPoolPlanner:
                 queue_depth=queue_depth,
             )
 
+        # Edge-triggered mode: only fire on state transitions. Steady state
+        # (no transition) → 0 transfers → 0 actuator overhead. This is the
+        # property that lets Layer 2 not regress on common-case workloads.
+        if c.edge_trigger:
+            new_kv = self._classify(usage_kv, c.kv_low_water, c.kv_high_water)
+            new_mamba = self._classify(usage_mamba, c.mamba_low_water, c.mamba_high_water)
+            kv_changed = new_kv != self._kv_state
+            mamba_changed = new_mamba != self._mamba_state
+            old_kv, old_mamba = self._kv_state, self._mamba_state
+            # Update state BEFORE returning so next tick sees the new state.
+            self._kv_state, self._mamba_state = new_kv, new_mamba
+            if not (kv_changed or mamba_changed):
+                return PlanDecision(
+                    direction=None,
+                    reason=f"edge: stable kv={new_kv} mamba={new_mamba} "
+                           f"(kv={usage_kv:.2f} mamba={usage_mamba:.2f})",
+                    usage_kv=usage_kv,
+                    usage_mamba=usage_mamba,
+                    queue_depth=queue_depth,
+                )
+            # Mamba just crossed into ABOVE_HIGH — fire kv→mamba once.
+            if mamba_changed and new_mamba == self.ABOVE_HIGH and \
+               new_kv != self.ABOVE_HIGH:
+                self._cooldown_remaining = c.cooldown_ticks
+                return PlanDecision(
+                    direction="kv_to_mamba",
+                    reason=f"edge: mamba {old_mamba}→ABOVE_HIGH ({usage_mamba:.2f}); "
+                           f"kv={new_kv} ({usage_kv:.2f})",
+                    usage_kv=usage_kv,
+                    usage_mamba=usage_mamba,
+                    queue_depth=queue_depth,
+                )
+            # KV just crossed into ABOVE_HIGH — fire mamba→kv once.
+            if kv_changed and new_kv == self.ABOVE_HIGH and \
+               new_mamba != self.ABOVE_HIGH:
+                self._cooldown_remaining = c.cooldown_ticks
+                return PlanDecision(
+                    direction="mamba_to_kv",
+                    reason=f"edge: kv {old_kv}→ABOVE_HIGH ({usage_kv:.2f}); "
+                           f"mamba={new_mamba} ({usage_mamba:.2f})",
+                    usage_kv=usage_kv,
+                    usage_mamba=usage_mamba,
+                    queue_depth=queue_depth,
+                )
+            # Reverse trigger: a pool just dropped to BELOW_LOW while the
+            # other pool is ABOVE_HIGH — opportunity to undo a prior transfer.
+            if mamba_changed and new_mamba == self.BELOW_LOW and \
+               new_kv == self.ABOVE_HIGH:
+                self._cooldown_remaining = c.cooldown_ticks
+                return PlanDecision(
+                    direction="mamba_to_kv",
+                    reason=f"edge: mamba {old_mamba}→BELOW_LOW ({usage_mamba:.2f}); "
+                           f"kv ABOVE_HIGH ({usage_kv:.2f})",
+                    usage_kv=usage_kv,
+                    usage_mamba=usage_mamba,
+                    queue_depth=queue_depth,
+                )
+            if kv_changed and new_kv == self.BELOW_LOW and \
+               new_mamba == self.ABOVE_HIGH:
+                self._cooldown_remaining = c.cooldown_ticks
+                return PlanDecision(
+                    direction="kv_to_mamba",
+                    reason=f"edge: kv {old_kv}→BELOW_LOW ({usage_kv:.2f}); "
+                           f"mamba ABOVE_HIGH ({usage_mamba:.2f})",
+                    usage_kv=usage_kv,
+                    usage_mamba=usage_mamba,
+                    queue_depth=queue_depth,
+                )
+            # State transition exists but doesn't match any actionable
+            # pattern (e.g., IN_BAND→BELOW_LOW with the other pool also
+            # IN_BAND or BELOW_LOW). No-op.
+            return PlanDecision(
+                direction=None,
+                reason=f"edge: transition {old_kv}→{new_kv} mamba "
+                       f"{old_mamba}→{new_mamba} (no actionable pattern)",
+                usage_kv=usage_kv,
+                usage_mamba=usage_mamba,
+                queue_depth=queue_depth,
+            )
+
+        # ---- LEGACY level-triggered path (preserved when edge_trigger=False) ----
         # KV-stressed, mamba-relaxed → take from mamba.
         if usage_kv >= c.kv_high_water and usage_mamba <= c.mamba_low_water:
             self._cooldown_remaining = c.cooldown_ticks
