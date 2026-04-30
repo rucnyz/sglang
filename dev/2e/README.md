@@ -1396,6 +1396,33 @@ pulse2_median_ms              115.92     115.10     -0.71%
 
 **Verdict for the empirical reproduction.** To produce a paper-grade cold-burst measurement, the workload must use prompts that *genuinely tokenize* to > `chunked_prefill_size` tokens (default 8192). Repeated-substring strings won't work because of tokenizer compression. A workload with 16K+ truly diverse-token prompts (e.g., real document excerpts) crossing the chunk boundary at 8192 would create a snapshot node at depth 8192; cold-burst prompts at the same depth would then evict it under recency LRU but preserve it under HPB. **HPB primitives + reporter are correct (Phase 3.a + 3.b unit tests pass); paper §4.2 reproduction is now blocked on workload choice, not implementation.**
 
+## Phase 3.a eval v6 — GSP (generated-shared-prefix) production bench (PASS, 2026-04-30)
+
+**Goal.** Use SGLang's built-in `generated-shared-prefix` dataset to test HPB LRU vs recency LRU on a paper-grade workload with chunk-crossing prompts. GSP is the workload structure paper §4.2 describes: groups of prompts share a long system prefix.
+
+**Setup.** GSP `num_groups=8 × prompts_per_group=10 × system_prompt_len=12000 × question_len=64` = 80 prompts, request-rate=2, Qwen3.5-35B-A3B. Each system prompt > 8192 tokens so chunk-boundary mamba snapshots ARE created — the precondition v3/v4/v5 missed.
+
+**Reproduce.** `dev/2e/32_hpb_gsp_bench.sh`.
+
+**Result.**
+
+| metric | recency | hpb | delta |
+|---|---:|---:|---:|
+| input toks/s | 27870.91 | 27913.71 | +0.15% |
+| output toks/s | 552.42 | 553.27 | +0.15% |
+| **mean TTFT** | 351.70 | 282.18 | **−19.77%** |
+| **median TTFT** | 294.37 | 212.21 | **−27.91%** |
+| P99 TTFT | 1166.50 | 1101.46 | −5.58% |
+| **mean TPOT** | 13.78 | 11.45 | **−16.88%** |
+| **median TPOT** | 12.49 | 10.73 | **−14.11%** |
+| **median E2E** | 3453.24 | 2890.19 | **−16.30%** |
+
+Both arms produced near-identical cache-hit coverage in the prefill log (recency: 70/86 batches with cached-token>0; HPB: 71/87). **HPB doesn't improve hit rate; it improves latency on the hits/misses that occur.** Likely mechanisms (paper-relevant for the eval discussion):
+- HPB evicts smaller cumulative mamba bytes per eviction (preferentially evicts low-hit small-footprint nodes), reducing re-prefill cost when a request misses.
+- HPB keeps high-hit big-page snapshots resident, so the prefix matches that *do* hit go *deeper* — saving more prefill tokens per hit.
+
+**This is the first production-scale evidence for paper §4.2's Layer 1 claim.** Phase 3.a now has two verifications: synthetic unit test (4/4 pass) + this production bench (~20% mean TTFT and ~16% median E2E improvement).
+
 ## Phase 3.c — Layer 1 + Layer 2 combined integration trace (PASS, 2026-04-30)
 
 **Goal.** Verify Layer 1 (HPB LRU + V_prefix' reporter) and Layer 2 (cross-pool actuator + planner) coexist cleanly under live serving on the same Qwen3.5-35B-A3B engine. Both signal-shaping and capacity-shifting must work concurrently without one breaking the other.
