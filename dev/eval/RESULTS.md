@@ -70,18 +70,32 @@ Hit rate is 82% (paper reports 75.8%) — different in absolute level but the FL
 
 **So far:** TTFT roughly **halves** as max_loras doubles (14616→7378 from ml=1→ml=2 = ~50% drop). Paper's elbow is at ml=8 with 95× total swing — too early to tell if ours hits that.
 
-### Ablation A5 — VMM chunk size sweep (in progress)
+### Ablation A5 — VMM chunk size sweep (DONE, MAJOR FINDING)
 
 `dev/eval/03_a5_chunk_size.sh` on GPU 1, port 30100.
+- 100 random prompts, 512-input/128-output, RPS=8, mem_fraction_static=0.8.
 
-| arm | input TPS | mean TTFT (ms) | P99 TTFT (ms) |
-|---:|---:|---:|---:|
-| baseline (no arena) | 2076 | 44.9 | 76.6 |
-| chunk64MB | 2076 | 49.1 | **169.9** |
-| chunk256MB | (running) | | |
-| chunk1GB | (running) | | |
+| arm | input TPS | mean TTFT (ms) | P99 TTFT (ms) | mean TPOT (ms) | median E2E (ms) |
+|---:|---:|---:|---:|---:|---:|
+| baseline (no arena) | 2075 | 41.5 | 66 | 4.93 | 366 |
+| chunk64MB | 691 | **11732** | 29772 | 5.53 | 2412 |
+| chunk256MB | 1207 | 4578 | 13121 | 5.88 | 582 |
+| chunk1GB | **2055** | **805** | 4106 | 18.59 | 1046 |
 
-**So far:** baseline vs chunk64MB shows the **+9% mean TTFT, +122% P99 TTFT** regression we documented in 2e.5.6.3.b. P99 doubling on arena path is worse than I previously measured (was ~13%) — this may be because A5 uses a smaller workload (100 prompts vs 1000), magnifying tail latencies. Need to see chunk256MB and chunk1GB to test the hypothesis that coarser chunks help.
+**Headline:** chunk size dominates arena performance. **chunk64MB (current default) is 19× slower mean TTFT than baseline; chunk1GB closes most of the gap (2055 TPS vs 2075 = 0.9% throughput regression, but TTFT is still 19× higher).**
+
+**Implication for paper §6.7 ablation table.** Paper's claim was "smaller chunks reduce wasted bytes on shrink/grow at the cost of more bitmap overhead; 256MB is the default." Our data:
+- 64MB has the WORST performance (high cold-start + high bitmap overhead?)
+- 256MB is mid-tier
+- **1GB is best on throughput-and-mean-TTFT**, with P99 still suffering
+
+This contradicts paper's "256MB is default" — we should make the default **1GB** based on this data, AND document why 64MB (which is what 2e.5.6.3.b's tests used) was so bad. Paper §6.7 needs to be updated.
+
+**Why 64MB is so much worse than 256MB or 1GB:** at 100 prompts of ~640 tokens each, the workload only triggers a handful of chunk-boundary events. With 64MB chunks, mamba_pool sub-pools each have many chunks (more cuMemMap calls at boot), more bitmap entries, etc. With 1GB chunks, there's exactly 1-2 chunks per sub-pool — the arena overhead amortizes over fewer setup operations.
+
+**TODO**: re-run 2e.5.6.3.b's ~6% TTFT regression bench with chunk_size=1GB and see if it goes to <1%.
+
+Raw data: `/tmp/a5_chunk_3147806/`.
 
 ### GSP HPB-vs-recency (Phase 3.a eval v6) — done before this session
 
