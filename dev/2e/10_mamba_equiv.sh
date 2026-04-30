@@ -57,14 +57,16 @@ run_arm() {
     waited=$((waited + 10))
     if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
             "http://127.0.0.1:$PORT/health" 2>/dev/null)" = "200" ]; then
-      kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
+      kill $tailer 2>/dev/null || true
+      wait $tailer 2>/dev/null || true
       echo
       echo "--- ready after ${waited}s ---"
       break
     fi
   done
   if kill -0 $tailer 2>/dev/null; then
-    kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
+    kill $tailer 2>/dev/null || true
+    wait $tailer 2>/dev/null || true
   fi
   if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
           "http://127.0.0.1:$PORT/health" 2>/dev/null)" != "200" ]; then

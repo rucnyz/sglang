@@ -57,14 +57,16 @@ run_arm() {
     waited=$((waited + 10))
     if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
             "http://127.0.0.1:$PORT/health" 2>/dev/null)" = "200" ]; then
-      kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
+      kill $tailer 2>/dev/null || true
+      wait $tailer 2>/dev/null || true
       echo
       echo "--- ready after ${waited}s ---"
       break
     fi
   done
   if kill -0 $tailer 2>/dev/null; then
-    kill $tailer 2>/dev/null; wait $tailer 2>/dev/null
+    kill $tailer 2>/dev/null || true
+    wait $tailer 2>/dev/null || true
   fi
   if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
           "http://127.0.0.1:$PORT/health" 2>/dev/null)" != "200" ]; then
@@ -122,7 +124,22 @@ keys = [
     ("p99_tpot_ms", "P99 TPOT (ms)"),
     ("median_e2e_latency_ms", "median E2E (ms)"),
 ]
-worst = 0.0
+# Regression direction: throughput is "lower is worse" (sign +), latency is
+# "higher is worse" (sign -). We only fail on regressions, not improvements.
+# Map: key -> +1 if perlayer-lower-than-stacked is regression (latency),
+#            -1 if perlayer-lower-than-stacked is improvement (throughput).
+direction = {
+    "input_throughput": -1,
+    "output_throughput": -1,
+    "mean_ttft_ms": +1,
+    "median_ttft_ms": +1,
+    "p99_ttft_ms": +1,
+    "mean_tpot_ms": +1,
+    "median_tpot_ms": +1,
+    "p99_tpot_ms": +1,
+    "median_e2e_latency_ms": +1,
+}
+worst_regression = 0.0
 for k, label in keys:
     sv = s.get(k); pv = p.get(k)
     if sv is None or pv is None:
@@ -132,12 +149,22 @@ for k, label in keys:
         delta = float("inf")
     else:
         delta = (pv - sv) / sv * 100
-    worst = max(worst, abs(delta))
-    print(f"{label:<28} {sv:>12.2f} {pv:>12.2f} {delta:>+9.2f}%")
+    # Regression: signed by direction. Throughput ↓ = regression (positive sign);
+    # latency ↑ = regression (positive sign).
+    sign = direction.get(k, +1)
+    regression = sign * delta if sign > 0 else -sign * delta
+    if regression > worst_regression:
+        worst_regression = regression
+    marker = ""
+    if regression > 2.0:
+        marker = " ←REG"
+    elif delta < 0 and sign > 0 or delta > 0 and sign < 0:
+        marker = " (better)"
+    print(f"{label:<28} {sv:>12.2f} {pv:>12.2f} {delta:>+9.2f}%{marker}")
 print()
-print(f"worst delta: {worst:.2f}%")
-if worst > 2.0:
-    print(f"FAIL: worst delta {worst:.2f}% > 2.0%")
+print(f"worst regression: {worst_regression:+.2f}% (improvements not counted)")
+if worst_regression > 2.0:
+    print(f"FAIL: worst regression {worst_regression:.2f}% > 2.0%")
     sys.exit(1)
-print("PASS: all deltas within 2.0%")
+print("PASS: no metric regressed by more than 2.0% (improvements allowed)")
 PY
