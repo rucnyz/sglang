@@ -297,7 +297,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | 4 | Estimator accuracy | not started | depends on 1 + 2 |
 | 5.A | Path-axis dense | not started | **path-axis dispatcher implementation** |
 | 5.B | Path-axis hybrid | not started | depends on 5.A |
-| A1 | L1 sub-features | not started | depends on 3.A and 3.B |
+| A1 | L1 sub-features | **DONE PASS** — cross-workload table, HPB dominant on smooth, full Layer 1 wins on cold-burst → paper tab:a1 | — |
 | A2 | K_big sweep | **DONE INFORMATIVE** — K_big=0 best on prefix-friendly GSP; tradeoff only when snapshot mem pressured | — |
 | A3 | Hysteresis sweep | **DONE INFORMATIVE** — workload too monotone for thrash | depends on 1's actual phase-shift trace |
 | A4 | Tau sweep | **DONE PASS** — smooth monotone curve, paper tab:a4 | — |

@@ -16,6 +16,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 | 3.A V_prefix' faithful | INFORMATIVE | Default wins TTFT (284ms); 3 configs in 80-83% hit-rate band → paper tab:q3a |
 | 3.B cold-burst stability | **PASS** | HPB recovery TTFT -18%, P99 -50%, median E2E -12% vs recency → paper tab:q3b |
 | 3.D HPB-vs-recency on GSP | **PASS** | -19.77% mean TTFT, -27.91% median TTFT, -16.30% median E2E → paper tab:hpb-gsp |
+| A1 L1 sub-features | **PASS** | HPB best on smooth (-20%); full Layer 1 best on cold-burst (-18%) → paper tab:a1 |
 | A2 K_big sweep | INFORMATIVE | K_big=0 wins on prefix-friendly workload (workload-conditional tradeoff) → paper tab:a2 |
 | A3 hysteresis sweep | INFORMATIVE | Workload-monotone, no thrash to dampen → paper tab:a3 |
 | A4 tau sweep | **PASS** | Smooth monotone curve, τ=0.5→21 transfers, τ=15→1 → paper tab:a4 |
@@ -123,6 +124,26 @@ Raw data: `/tmp/sweep_lora_3157665/ml*_bench.json`. Updated `evaluation.tex` Tab
 **Implication for paper §A.3.** The hysteresis claim ("dampens reversals") needs a workload that genuinely oscillates around the threshold. The 24-h phase-shift trace (Setting 1) likely will: phase A (KV-heavy) ↔ phase B (mamba-heavy) ↔ phase C (long-context KV-heavy) is exactly the regime that pushes the budgeter back-and-forth. Re-run A3 against the phase-shift trace and report reversals there.
 
 Raw data: `/tmp/a3_hyst_3195814/hyst*_budgeter.jsonl`.
+
+### Ablation A1 — Layer 1 sub-features (DONE PASS, cross-workload)
+
+`dev/eval/14_A1_kbig_only_smooth.sh` filled in the missing K_big-only-on-smooth arm. Combined with prior data:
+
+| Layer 1 config | smooth GSP TTFT | cold-burst recovery TTFT | source |
+|---|---:|---:|---|
+| no Layer 1 (recency, K_big=0) | 351.7ms | — | Q3.D recency arm |
+| K_big=8192 alone (recency LRU) | **317.7ms** (-10%) | **320.5ms** | A1 (this) + 3.B recency arm |
+| HPB LRU alone (K_big=0) | **282.2ms** (-20%) | — | Q3.D hpb arm |
+| full Layer 1 (HPB + K_big=8192) | 328.8ms (-7%) | **262.5ms** (-18% vs K_big-only) | 3.A layer1 arm + 3.B hpb arm |
+
+**Headline (cross-workload):**
+- Smooth GSP: HPB-only is best (-20% vs baseline). Adding K_big on top costs hit-rate yield → full Layer 1 is slightly worse than HPB-only on this prefix-friendly workload.
+- Cold-burst: full Layer 1 wins on recovery TTFT. HPB's eviction priority protects the shared-prefix snapshot during the burst; K_big-only with recency LRU loses it.
+- Conclusion: HPB LRU is the dominant ingredient. K_big is workload-conditional — helps only when snapshot memory binds. Layer 2 should auto-disable K_big based on mamba pool utilization.
+
+This populates the A1 table (paper §6.7 tab:a1) directly from already-collected data + one new arm.
+
+Raw data: `/tmp/a1_kbig_only_*/`, plus reuses Q3.D, 3.A, 3.B raw data.
 
 ### Ablation A4 — Layer 2 control interval (τ) sweep (DONE PASS)
 
