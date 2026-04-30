@@ -23,6 +23,10 @@ def cfg(**kw):
         mamba_high_water=0.80, mamba_low_water=0.40,
         cooldown_ticks=0, dst_chunks_per_action=1,
         edge_trigger=True,
+        # Tests run against the unit chunk cost (50 ms) to keep numbers
+        # easy to reason about. Production default is 3,000,000 us to
+        # absorb the lcm-aware actuator unit (60 chunks for Qwen3.5-A3B).
+        nb_chunk_cost_us=50_000.0,
     )
     base.update(kw)
     return CrossPoolPolicyConfig(**base)

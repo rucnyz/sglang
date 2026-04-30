@@ -42,8 +42,12 @@ class CrossPoolPolicyConfig:
     kv_low_water: float = 0.50     # KV usage below this → KV-relaxed
     mamba_high_water: float = 0.80
     mamba_low_water: float = 0.40
-    cooldown_ticks: int = 3        # Don't fire two transfers in a row;
-                                   # let the system settle.
+    cooldown_ticks: int = 16       # Don't fire two transfers in a row.
+                                   # 16 ticks × 2 s = 32 s — enough for an
+                                   # lcm-aware transfer (~3 s GPU time) to
+                                   # settle, request queue to drain, and a
+                                   # post-fire effect to manifest before
+                                   # the next decision.
     dst_chunks_per_action: int = 1  # In balanced units (lcm-aware).
     # Setting 4 follow-up: V_σ' ≈ usage_σ is saturation-blind. When
     # qdepth_trigger > 0, the planner ALSO fires a transfer when one
@@ -74,7 +78,15 @@ class CrossPoolPolicyConfig:
     nb_avg_prefill_tokens: int = 4096  # avg input length used for benefit est
     nb_prefill_tps: float = 50000.0    # prefill throughput est (H200 default)
     nb_pause_penalty_us: float = 1000.0  # cost of one paused-req tick
-    nb_chunk_cost_us: float = 50000.0  # cuMemUnmap+cuMemMap per chunk (~50ms)
+    # Actuator moves chunks in lcm-balanced units across all sub-pools — for
+    # Qwen3.5-35B-A3B (KV 20 sub-pools × mamba 30 = lcm 60), one logical "unit"
+    # actually moves 60 chunks at ~50 ms cuMemUnmap+cuMemMap each = ~3 s of GPU
+    # time per fire. The default is set to that worst-case so the gate doesn't
+    # under-cost transfers and trigger a death spiral (B3 v2 cell_01: one fire
+    # shifted 15 GB from KV to mamba, KV dropped from 1.26M to 524K tokens, β
+    # phase's 96K-input requests overflowed → 40k errors). Operators with a
+    # different model topology should override SGLANG_XPOOL_NB_CHUNK_COST_US.
+    nb_chunk_cost_us: float = 3000000.0  # ≈ lcm(20,30) × 50 ms for Qwen3.5-A3B
     nb_margin: float = 1.5             # benefit must exceed cost * margin
     # Persistent-saturation lower bound on benefit (Setting 1 v9-auto v2
     # follow-up). The original B_lb (paused, retracted) is zero on workloads
