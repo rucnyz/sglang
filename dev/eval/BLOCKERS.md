@@ -13,6 +13,88 @@ Each entry:
 
 ---
 
+## 2026-04-30 late-night L2 debug chain — audit log
+
+This section is for me-later-or-anyone-else to audit the chain of fixes
+landed on the prelude branch tonight. For each commit: what was wrong,
+what change addresses it, and whether the change is a real fix or a
+workaround (and if a workaround, the followup that turns it into a real
+fix).
+
+**Default behavior is unchanged for any user not opting into the new
+features.** All the engineering tonight is gated either on `mobile_soft_chunks > 0`
+(off by default) or behaves identically to prior commits when the new
+env vars are unset.
+
+| commit | summary | status | notes |
+|---|---|---|---|
+| `c4a426e38` | net-benefit gate B_persist + stable-state re-eval | **real fix** | Paper §design-l2 Eq.~\ref{eq:nb-lb} third term. Unit-tested in `dev/2e/38_planner_netbenefit_unit.py` (T9, T10). Off by default (`SGLANG_XPOOL_NET_BENEFIT=0` is default; persist re-eval period env-tunable). |
+| `d9f707c46` | re-introduce VA-only growth headroom | **real fix** | Reverts an over-zealous removal in `da326b1ed`. Comment in `multi_tensor_arena.py:218` documents that VA past init is reserved-but-unmapped — pure VA, no physical cost. Backward-compat default is 4 chunks of headroom. |
+| `66e30e147` | bump `nb_chunk_cost_us` default 50 ms → 3 s, `cooldown_ticks` 3 → 16 | **half-workaround, half-fix** | The 50 ms/chunk was correct for a single physical chunk, but the actuator moves chunks in lcm-balanced units (lcm(20, 30) = 60 chunks for Qwen3.5-A3B), so a single fire's actual GPU cost is ~3 s. Bumping the default makes the gate's math match Qwen3.5-A3B reality, but other model topologies (Qwen3-Next-80B, etc.) have different lcm and want a different default. **Followup (a):** plumb the actuator's chunks-per-balanced-unit count to the planner so the gate computes cost from real lcm × per-chunk wall-time rather than an env knob. |
+| `a4dc081c4` | sync env-reader string defaults to dataclass defaults | **real fix** | Bug: `_policy_from_env()` was reading `os.environ.get("SGLANG_XPOOL_NB_CHUNK_COST_US", "50000")` while the dataclass default had been bumped to 3 000 000 in `66e30e147`. Runtime configs were unaffected by the dataclass bump. Trivial typo class. Now all `_policy_from_env` string defaults match dataclass defaults. |
+| `7490e5ed5` | actuator floor at `init_chunks_per_pool` (then `static_min_chunks_per_pool` after `475838fe4`) | **real fix** | Paper §design-l2-actuator (line 133-135) explicitly requires this. Without it the actuator could shrink any pool to 1 chunk per sub-pool, breaking captured CUDA graphs. |
+| `475838fe4` | arena static-min/soft VA partitioning | **real fix** | First proper implementation of paper §design-l2-actuator's static-min/soft split. New `MultiTensorArena` parameter `static_min_tokens` (default = `init_tokens` ⇒ no behavior change). `SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS` and `_MAMBA_MOBILE_SOFT_CHUNKS` env vars (default 0) opt into mobile soft. Boot maps only static_min; actuator can grow soft via `cuMemMap` from shared free queue. |
+| `8ceb63de6` | `MambaPool.__init__` caps engine-side mamba allocator at static_min | **real fix** | Static-min/soft split exposed an engine-side gap: the engine's `MambaPool` initialized `free_slots = arange(1, init_tokens + 1)` even though only static_min was physically mapped, so the allocator handed out unmapped slot ids → `cudaErrorIllegalAddress` in `MambaPool.alloc → torch.zeros`. Fix uses the existing `set_capacity_slots` API to cap the free-slot head at static_min. Backward-compat: when `mobile_soft_chunks=0`, static_min == init, the call is a no-op. |
+| `f508d3893` | `MHATokenToKVPool` overrides `self.size` for KV mobile-soft | **real fix, partial** | Mirrors the MambaPool fix for KV. Sets `self.size = static_min_tokens - page_size` when `kv_mobile_chunks > 0` so the engine's downstream KV allocator caps at static_min. **Followup (b):** when actuator later maps mobile soft via `cuMemMap`, it must propagate that to `pool.size` (or a dynamic capacity getter) so the engine's scheduler exposes the new allocatable range. The cap_allocator_only path on the KV-side actuator already updates the allocator's internal cap; what's missing is the pool's `self.size` reflecting that for `max_total_num_tokens` reporting. Not a hidden bug — at most, mobile soft chunks stay dormant if the gate fires; that's safe (no crash) and no worse than today's L2-silent default. |
+| `785394f1a` | off-by-one in MambaPool's `set_capacity_slots` argument | **real fix** | `set_capacity_slots(n_slots)` produces `free_slots = [1, n_slots]` inclusive; I passed `static_min_tokens` (= 128 = mapped-region size), so slot id 128 — the first byte of the unmapped chunk past static-min — was allocatable. Fixed by passing `static_min_tokens − 1`. Slot 0 is the padding slot, slots [1, static_min_tokens − 1] are the usable positions within the mapped region. |
+
+### Audit checklist (run anytime)
+
+```bash
+# 1. Defaults unchanged unless explicitly opted in
+grep -E "MOBILE_SOFT_CHUNKS\|NET_BENEFIT" python/sglang/srt/budgeter/cross_pool_planner.py \
+    python/sglang/srt/mem_cache/memory_pool.py
+# Expect:    default = "0"   (off-by-default)
+
+# 2. No silent except clauses around CUDA errors
+git log --since='2026-04-30' --oneline --all | head -20 \
+    | xargs -I{} git show {} -- python/sglang/srt/ | grep -A2 -B2 "except.*Exception\|except:" | head -40
+# Expect: no try/except wrappers around the actuator or arena code
+
+# 3. Unit tests still pass
+.venv/bin/python dev/2e/37_planner_edge_unit.py | tail -3
+.venv/bin/python dev/2e/38_planner_netbenefit_unit.py | tail -3
+# Expect: ALL PASS for both
+
+# 4. Backward-compat smoke (env unset → identical to baseline)
+unset SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS \
+      SGLANG_XPOOL_NET_BENEFIT
+# launch server with SGLANG_ARENA_SHARED=1 only — should match v7's
+# default-arena behavior (~5-7% overhead vs no-arena baseline, no
+# crashes, gate fires never)
+```
+
+### Known followups (real fixes that turn workarounds into real fixes)
+
+(a) **Plumb actuator's lcm-aware chunks-per-balanced-unit into the planner.**
+The gate's cost should be `chunks_per_unit × c_chunk_us` derived from
+arena state, not an env knob. Right now the env knob default is correct
+for Qwen3.5-A3B but not generic.
+
+(b) **Dynamic `pool.size` propagation when actuator grows soft.** When
+the actuator `cuMemMap`s mobile soft chunks into a pool, the engine's
+scheduler should see `max_total_num_tokens` rise so it can schedule
+into the new range. Currently the actuator updates the allocator's
+internal cap but the pool's `self.size` is static. Without (b), mobile
+soft chunks are dormant — fires happen but engine doesn't use the new
+slots. Safe (no crash), but L2's metric demonstration is gated on (b).
+
+(c) **Per-pool drain protocol for shrink.** Paper §design-l2-actuator
+specifies "mark blocks above the new cap as 'draining,' release blocks
+as their owning requests complete". Today the actuator caps the
+allocator and immediately unmaps; in-flight requests are protected
+only by the engine_busy gate (which itself reads `num_running_reqs`
+from the snapshot — see open issue below). Currently the static_min
+floor + dormant soft makes this moot (actuator never actually
+unmaps), but if (b) lands, this becomes load-bearing.
+
+(d) **engine_busy gate reads stale snapshot fields.** Diagnosed in
+B3 v3: `num_running_reqs = 0` in `xpool_*` budgeter snapshot even when
+24 requests were running. Current static_min floor masks this — fires
+that get past the gate are no-ops anyway. If (b) lands, this surfaces.
+
+---
+
 ## L2 actuator's cuMemUnmap breaks captured CUDA graphs — **paper's static-min region not implemented**
 
 - **Setting:** Layer 2 cross-pool transfer when transfers actually move bytes (after VA-headroom restored in d9f707c46).
