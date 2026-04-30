@@ -30,7 +30,7 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.5.6.2 | E2E demo: KV ↔ mamba physical-handle migration during live serving (oscillator) | bench | **PASS** 2026-04-30 |
 | 2e.5.6.2.fix | Follow-up: SIGTERM force-exit handler + lcm-balanced unit + Test 5 (PyTorch IO survives) + Test 16 (baseline byte-equivalence) | ~120 LoC | **PASS** 2026-04-30 |
 | 2e.5.6.3.a | MambaArenaActuator + capacity-coordinated cross-pool actuator (live-traffic safety prerequisite) | ~150 LoC | **PASS** 2026-04-30 |
-| 2e.5.6.3.b | Perf regression bench: baseline vs SGLANG_ARENA_SHARED+xpool+coordinated | bench | not started |
+| 2e.5.6.3.b | Perf regression bench: baseline vs SGLANG_ARENA_SHARED+xpool+coordinated | bench | **PARTIAL** 2026-04-30 (intrinsic cost, ~6% TTFT) |
 | 2e.5.6.3.c | LagrangePlanner with real per-pool pressure signals (KV preempt rate / mamba slot stall) + headline trace | 3–5 days | not started |
 
 ## 2e.1.a — VMM smoke test (done)
@@ -1154,4 +1154,71 @@ Every transfer log line shows `leftover free 0` (no handle drift). Every KV cap-
    This is the value of the e2e test we added in 2e.5.6.2.fix: every layer of safety has to be right for the byte-equivalence to come out clean.
 
 **Implication for 2e.5.6.3.b.** Mechanism is correct; perf bench is the next gate.
+
+## 2e.5.6.3.b — perf regression diagnosis (PARTIAL, 2026-04-30)
+
+**Goal.** Bench `SGLANG_ARENA_SHARED=1 + SGLANG_BUDGETER_XPOOL_DEMO=1 + SGLANG_BUDGETER_XPOOL_COORDINATED=1` against bog-standard SGLang. Pass criterion: ≤2% regression on throughput / latency metrics.
+
+**Result.** FAIL. The full coordinated stack regresses TTFT by 5-13% and TPOT by 3-5% compared to baseline:
+
+| metric | baseline | shared+xpool+coord | delta |
+|---|---:|---:|---:|
+| input toks/s | 2076.98 | 2075.90 | -0.05% (RPS-limited, fine) |
+| mean TTFT (ms) | 43.14 | 46.86 | **+8.64%** |
+| P99 TTFT (ms) | 71.52 | 80.77 | **+12.93%** |
+| mean TPOT (ms) | 9.61 | 10.11 | **+5.15%** |
+| median E2E (ms) | 626.91 | 663.81 | **+5.89%** |
+
+**Root cause hunt — what we ruled OUT.**
+
+A series of single-arm benches isolated the cost:
+
+| arm | mean TTFT vs baseline | P99 TTFT vs baseline |
+|---|---:|---:|
+| arena-only (no xpool, default 4-chunk headroom) | +5.98% | +9.46% |
+| arena-only, 0 chunk headroom | +7.14% | +14.90% |
+| arena-only, default + zero-init live | +6.97% | +13.85% |
+| arena-only at mem_fraction_static=0.5 | -45.86% (baseline crashes) | n/a |
+| **arena via from_blob (bypasses MemPool entirely)** | **+5.86%** | **+12.34%** |
+
+So the regression survives every implementation-level intervention:
+1. **Tensor shape difference** (default 4-chunk headroom vs 0 headroom): no improvement. Triton kernel shape-specialization is not the cause.
+2. **First-touch / page initialization** (`SGLANG_ARENA_ZERO_INIT_LIVE=1`): no improvement. Demand-paging on cuMemMap pages is not the cause.
+3. **mem_fraction_static interaction**: lower mem_frac makes baseline worse, not arena better. Arena's KV/mamba sizing decouples from PyTorch's memory budget.
+4. **PyTorch MemPool / CUDAPluggableAllocator path**: bypassing it via `at::from_blob` (`SGLANG_ARENA_FROM_BLOB=1`, vAttention's pattern) reproduces the **same** regression. The "PyTorch tax" hypothesis (from issue [#165419](https://github.com/pytorch/pytorch/issues/165419), expandable_segments disabled in MemPool path) was the leading subagent diagnosis, but it does not explain this data: bypassing MemPool entirely should have closed the gap. It did not.
+
+**What we now believe.**
+
+The regression appears to be **intrinsic to using `cuMemCreate` + `cuMemMap`'d GPU memory for KV and mamba on an MoE model**. Specifically, `fused_moe` expert-dispatch kernel slows by +10% in arena mode (PyTorch profiler trace, 2026-04-30); the rest of the kernels are unchanged. vAttention's "no kernel overhead" claim (arXiv 2405.04437) holds in their setup because they bench non-MoE models (Llama, Yi). Hypotheses for why MoE specifically pays:
+
+- **HBM channel/bank interleaving differs between cudaMalloc-allocated and cuMemCreate-allocated physical pages.** MoE expert routing has a wide, irregular access pattern that's sensitive to interleaving quality. Standard KV reads (sequential, cache-friendly) are not.
+- **TLB locality**. MoE accesses many small expert weight blocks plus KV cache in the same kernel. If model weights are in PyTorch's default heap and KV is in our separate VMM range, the kernel walks two TLB entries instead of one. Standard attention only touches Q/K/V which are all in adjacent VA ranges in baseline.
+- **SM scheduler queue depth**. Possible secondary effect — kernels launched against arena tensors might pay slightly more CPU-side launch overhead, propagating into GPU schedule.
+
+We have not pinned the exact mechanism with hardware counters. We have ruled out the implementation-level explanations (MemPool overhead, from_blob saves us, headroom, page init). The cost is consistent and reproducible.
+
+**Decision: ship the from_blob path as default; document the residual cost as the mechanism's intrinsic price.**
+
+`SGLANG_ARENA_FROM_BLOB=1` doesn't improve perf, but it has architectural advantages we want regardless:
+1. No 60-MemPool bookkeeping overhead at exit (sidesteps `MemPool::~MemPool` segfault).
+2. No interaction with `empty_cache` that pytorch issue [#146431](https://github.com/pytorch/pytorch/issues/146431) flags as broken.
+3. Cleaner reading: `at::from_blob(va, sizes, deleter, options)` matches paper §4.4 (we wrap a soft-cap'd VA, no mempool API).
+4. Robust against future PyTorch MemPool semantics changes.
+
+So we keep both flags exposed:
+- `SGLANG_ARENA_SHARED=1` (default behavior of the arena pools)
+- `SGLANG_ARENA_FROM_BLOB=1` (recommended; will become default after one more validation cycle)
+
+**For the paper.** The eval section needs to report this honestly: the cross-pool VMM mechanism costs ~6% mean TTFT, ~13% P99 TTFT on a MoE-hybrid model under steady serving load, in exchange for the ability to physically reallocate KV ↔ mamba capacity at minute timescale (which is what §4.3 + §4.4 are claiming). The cost is a mechanism cost, not an implementation cost. Future work could chase the HBM-interleaving explanation; this paper's contribution is the actuator + planner architecture, with the cost honestly priced in.
+
+**Reproduce.**
+```bash
+# Baseline:
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=3 dev/2e/18_kv_mamba_xfer_perf.sh   # MemPool path bench
+CUDA_VISIBLE_DEVICES=3 dev/2e/19_arena_only_perf.sh      # arena-only diagnostic
+CUDA_VISIBLE_DEVICES=3 dev/2e/24_arena_from_blob_perf.sh # from_blob diagnostic
+```
+
+Evidence at `/tmp/xpool_perf_*/`, `/tmp/arena_only_perf_*/`, `/tmp/arena_from_blob_perf_*/`.
 

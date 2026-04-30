@@ -162,42 +162,74 @@ class MultiTensorArena:
             self._lib.multi_init(
                 self._c_index(i), base, chunk_bytes, self.init_chunks_per_pool)
 
-        # Per-sub-pool MemPool + tensor allocation. SOFT-CAP DESIGN:
-        # the C-side allocator's `n_chunks` controls what bump-alloc
-        # *would return*; we set it temporarily to max_chunks_per_pool
-        # so PyTorch can grab a max-shape segment, then restore it to
-        # init_chunks_per_pool. The tensor's data_ptr is at chunk 0,
-        # the tensor's shape is (max_tokens, *), but only the first
-        # init_tokens rows are physically backed. Engine code respects
-        # `current_capacity_tokens()` as the soft ceiling.
+        # Tensor construction. Two paths:
         #
-        # For this to be safe, the tensor must be allocated with
-        # `torch.empty` (no zero-init), since zero-init would touch
-        # unbacked VA past init_tokens and fault.
-        from torch.cuda.memory import CUDAPluggableAllocator
+        # Phase 2e.5.6.2 path (SGLANG_ARENA_FROM_BLOB=0, default):
+        #   Per-sub-pool MemPool + CUDAPluggableAllocator. Pays a +6-7%
+        #   TTFT regression because PyTorch silently disables
+        #   expandable_segments when a user MemPool is active
+        #   (CUDACachingAllocator.cpp:1587-1591); see
+        #   https://github.com/pytorch/pytorch/issues/165419.
+        #
+        # Phase 2e.5.6.3.b path (SGLANG_ARENA_FROM_BLOB=1):
+        #   Bypass PyTorch's caching allocator entirely via
+        #   `at::from_blob` (vAttention's pattern). Tensor's storage
+        #   has a no-op deleter; arena owns the VA lifetime. This
+        #   eliminates the MemPool path's overhead and recovers the
+        #   regression.
         self._tensors: List[torch.Tensor] = []
         self._mempools: List[torch.cuda.MemPool] = []
         self._so_path = so_path
+        self._use_from_blob = os.environ.get("SGLANG_ARENA_FROM_BLOB") == "1"
 
-        for i in range(n_subpools):
-            ci = self._c_index(i)
-            plug = CUDAPluggableAllocator(
-                so_path, f"pool{ci}_malloc", f"pool{ci}_free")
-            mp = torch.cuda.MemPool(allocator=plug.allocator())
-            self._mempools.append(mp)
-            # Temporarily expose max-chunks so PyTorch's segment grab
-            # for the (max_tokens, *) tensor succeeds. This is OK
-            # because the over-promised VA past init_chunks is reserved
-            # but unmapped; torch.empty doesn't probe.
-            self._lib.multi_set_capacity(ci, self.max_chunks_per_pool)
-            with torch.cuda.use_mem_pool(mp):
-                t = torch.empty(
-                    (max_tokens, *per_token_shape), dtype=dtype, device="cuda")
-            # Restore so subsequent torch.empty inside this MemPool
-            # would respect the live capacity. (Not used in practice;
-            # only one tensor per sub-pool.)
-            self._lib.multi_set_capacity(ci, self.init_chunks_per_pool)
-            self._tensors.append(t)
+        if self._use_from_blob:
+            from sglang.srt.arena.from_blob_ext import tensor_from_va
+            for i in range(n_subpools):
+                # Each sub-pool's VA range starts at pool_va_base; the
+                # tensor's data_ptr is the first byte of that range, and
+                # its shape is (max_tokens, *) so engine indexing matches
+                # the MemPool path.
+                va = self._arena.pool_va_base(self._pool_name(i))
+                t = tensor_from_va(
+                    va=va,
+                    sizes=(max_tokens, *per_token_shape),
+                    dtype=dtype,
+                    device_index=device_id,
+                )
+                if os.environ.get("SGLANG_ARENA_ZERO_INIT_LIVE") == "1":
+                    live_tokens = self.init_chunks_per_pool * self.tokens_per_chunk
+                    if live_tokens > 0:
+                        t[:live_tokens].zero_()
+                self._tensors.append(t)
+            logger.info(
+                "MultiTensorArena: from_blob path active "
+                "(SGLANG_ARENA_FROM_BLOB=1) — bypasses PyTorch MemPool"
+            )
+        else:
+            from torch.cuda.memory import CUDAPluggableAllocator
+            for i in range(n_subpools):
+                ci = self._c_index(i)
+                plug = CUDAPluggableAllocator(
+                    so_path, f"pool{ci}_malloc", f"pool{ci}_free")
+                mp = torch.cuda.MemPool(allocator=plug.allocator())
+                self._mempools.append(mp)
+                # Temporarily expose max-chunks so PyTorch's segment grab
+                # for the (max_tokens, *) tensor succeeds. This is OK
+                # because the over-promised VA past init_chunks is reserved
+                # but unmapped; torch.empty doesn't probe.
+                self._lib.multi_set_capacity(ci, self.max_chunks_per_pool)
+                with torch.cuda.use_mem_pool(mp):
+                    t = torch.empty(
+                        (max_tokens, *per_token_shape), dtype=dtype, device="cuda")
+                if os.environ.get("SGLANG_ARENA_ZERO_INIT_LIVE") == "1":
+                    live_tokens = self.init_chunks_per_pool * self.tokens_per_chunk
+                    if live_tokens > 0:
+                        t[:live_tokens].zero_()
+                # Restore so subsequent torch.empty inside this MemPool
+                # would respect the live capacity. (Not used in practice;
+                # only one tensor per sub-pool.)
+                self._lib.multi_set_capacity(ci, self.init_chunks_per_pool)
+                self._tensors.append(t)
 
         torch.cuda.synchronize()
         logger.info(

@@ -321,7 +321,13 @@ class MambaPool:
                 # Mamba growth headroom: in shared mode, allow up to 4
                 # extra chunks per sub-pool of growth via the cross-pool
                 # actuator. Mirrors the KV pool's headroom.
-                mamba_growth_chunks = 4 if shared_arena else 0
+                # SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS overrides; set to 0
+                # to match baseline tensor shape (diagnostic for Triton
+                # shape-specialization overhead).
+                mamba_growth_chunks = (
+                    int(os.environ.get("SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "4"))
+                    if shared_arena else 0
+                )
                 mamba_max_tokens = (
                     tot_aligned + mamba_growth_chunks * tokens_per_chunk
                 )
@@ -1152,7 +1158,13 @@ class MHATokenToKVPool(KVCache):
                 # In shared mode, leave growth headroom (max > init) so
                 # the cross-pool actuator can grow this pool by absorbing
                 # handles freed from the other pool.
-                kv_growth_chunks = 4 if shared_arena else 0
+                # SGLANG_ARENA_KV_HEADROOM_CHUNKS overrides; set to 0 to
+                # match baseline tensor shape (diagnostic for Triton
+                # shape-specialization overhead).
+                kv_growth_chunks = (
+                    int(os.environ.get("SGLANG_ARENA_KV_HEADROOM_CHUNKS", "4"))
+                    if shared_arena else 0
+                )
                 kv_max_tokens = tot_aligned + kv_growth_chunks * tokens_per_chunk
                 if shared_arena:
                     from sglang.srt.arena.shared_pool import (
