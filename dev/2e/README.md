@@ -1352,6 +1352,44 @@ ALL PASS
 
 **Implication.** Paper §4.2 (Layer 1's signal-shaping contribution) is now end-to-end: HPB LRU enforces stable signal shape; the reporter surfaces the V_prefix' that Layer 2 §4.3 needs. The remaining Layer 1 work is the "heterogeneous granularity" framing (Phase 3.c, larger refactor); that is design-level distinct from the existing chunked-prefill snapshot policy and would require radix-tree restructuring + engine restore-path changes.
 
+## Phase 3.a eval — empirical cold-burst test (INCONCLUSIVE, 2026-04-30)
+
+**Goal.** Reproduce paper §4.2's cold-burst narrative on a real Qwen3.5-35B-A3B serving instance: under a workload pattern of (build cache → cold burst → reuse), HPB LRU should preserve the system-prompt cache and recency LRU should evict it.
+
+**Setup.** Two arms back-to-back on the same engine config (`mem_fraction_static=0.8`, default mamba size). Each arm: 30 prompts with shared 1500-token system prefix (Pulse 1), 60 unique-prefix prompts at 3 RPS (cold burst), 30 prompts with same system prefix (Pulse 2). Compare Pulse 2 mean / median latency.
+
+**Reproduce.**
+```bash
+cd /scratch/yuzhou/projects/sglang
+CUDA_VISIBLE_DEVICES=3 dev/2e/28_hpb_cold_burst_eval.sh
+```
+
+**Result.**
+```
+metric                       recency        hpb     delta%
+------------------------------------------------------------
+pulse1_mean_ms                118.64     114.98     -3.08%
+burst_mean_ms                 111.68     109.08     -2.33%
+pulse2_mean_ms                119.18     115.18     -3.36%
+pulse2_median_ms              115.92     115.10     -0.71%
+```
+
+**Verdict: inconclusive.** The 3% Pulse 2 advantage on HPB is the same as the 3% Pulse 1 advantage — i.e., it's within-arm noise, not the paper's claimed effect.
+
+**Diagnosis.** Server log shows `#cached-token: 0` on every request in **both** arms. The KV pool (1.3M tokens) is far from full and nothing evicts under this load. The eviction-policy difference (HPB vs recency) is irrelevant when the cache isn't pressured. Two issues:
+
+1. **No eviction pressure.** Default `mem_fraction_static=0.8` gives a 1.3M-token KV pool. The whole workload (Pulse 1 + burst + Pulse 2 = ~120 requests × 760 tokens = 91K tokens) doesn't approach capacity. Nothing gets evicted; no eviction-policy decision matters.
+2. **No cache hit at all on Pulse 2.** Even without eviction, Pulse 2 should hit the radix because the 1500-token system prefix is shared. The log says it doesn't. Three plausible reasons:
+   - The engine's cache insertion path isn't running on these short requests (max_tokens=16 may be below some threshold).
+   - The radix's split granularity (`page_size=1`) creates per-token nodes; matching across 1500 tokens is computationally fine but may have an exact-tokenization caveat.
+   - The completion endpoint vs chat-completion endpoint may differ in caching behavior.
+
+**Next step.** Two paths to make this test produce a paper-grade signal:
+- **(A)** Tighten the cache: launch with `--max-mamba-cache-size 60` (or similar) so the cold burst genuinely floods mamba slots, forcing eviction. Then HPB vs recency makes a measurable difference.
+- **(B)** Investigate why the prefix isn't matching at all. If the engine isn't registering hits even without eviction, the test setup is wrong before HPB vs recency is even relevant.
+
+(B) is the prerequisite. Doing it autonomously without user input is risky (touches engine internals); deferring to a discussion. **The HPB LRU primitives themselves are still correct (Phase 3.a unit test passes); the production-scale empirical reproduction is what's blocked.**
+
 ## Phase 3.c — Layer 1 + Layer 2 combined integration trace (PASS, 2026-04-30)
 
 **Goal.** Verify Layer 1 (HPB LRU + V_prefix' reporter) and Layer 2 (cross-pool actuator + planner) coexist cleanly under live serving on the same Qwen3.5-35B-A3B engine. Both signal-shaping and capacity-shifting must work concurrently without one breaking the other.
