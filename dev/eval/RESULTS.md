@@ -39,6 +39,76 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ---
 
+## 2026-04-30 late-night — net-benefit gate hardening + actuator drain bug
+
+### v9-auto v3 cell_11_nb (B_persist landed, actuator no-op)
+
+`/tmp/v9auto_nb_v3/cell_11_nb_v3/` — first L1+L2 cell with B_persist
+enabled. Phase C p99 = 1199 ms (vs cell_10 L1-only 961 ms = +25%
+regression). Budgeter showed 5 fires from persist re-eval — but
+**actuator's `unmapped_total = granted_total = 0` for all 5**, KV/mamba
+capacities unchanged. The fires were no-ops because of `da326b1ed`'s
+collapse of `max_tokens = init_tokens` — destination pool's VA window
+was capped at init, `arena.grow()` returned 0. Fires cost cycles, moved
+no bytes, server crashed mid-Phase C.
+
+### B3 v1 4-cell (same actuator no-op + workload designed for L2 shift)
+
+`/tmp/b3_4cell_v1/`. cell_11 fired 10 transfers — all `unmapped=0
+granted=0`. cell_11 throughput 7024 vs baseline 7895 = -11%, β phase
+p99 9478 ms vs baseline 8703 = +9%. **L2 fires were pure overhead.**
+Confirmed the actuator-no-op diagnosis.
+
+### Engine fix: VA-only headroom restored (sglang d9f707c46)
+
+Re-introduced `max_tokens > init_tokens` (default 4 chunks × 256 MiB =
+1 GiB VA past init per pool). VA-only — no physical-memory deduction
+from KV/mamba budget. Actuator can now grow destination past init.
+
+### B3 v2 + v9-auto v4 (actuator works → catastrophic CUDA crash)
+
+After d9f707c46:
+- **B3 v2 cell_01:** one fire moved 60 chunks (lcm(20, 30) actuator
+  unit, 15 GB), KV pool dropped 1.26M → 524K, β phase 96K-input
+  requests overflowed → 40 201 dispatcher errors out of ~6 000
+  expected.
+- **v9-auto v4 cell_11_nb_v4:** Phase A and B clean; one fire mid-
+  trace → server SIGQUIT'd at `next_token_ids.tolist()` with
+  `CUDA error: an illegal memory access was encountered`.
+
+Two distinct bugs surfaced in same crash:
+
+1. **Env-default mismatch** (sglang `a4dc081c4`): `_policy_from_env()`
+   was reading `SGLANG_XPOOL_NB_CHUNK_COST_US` with string default
+   `"50000"` even though the dataclass default in `66e30e147` had been
+   bumped to 3 000 000. So gate's effective cost stayed at 50 ms — way
+   under-cost the lcm-aware actuator's real ~3 s wall time. Gate
+   approved fires it should have refused. Fixed: env defaults now
+   match dataclass.
+
+2. **Static-min region missing** — paper §design-l2-actuator (line
+   133–135) requires "static-min region's physical pages mapped at
+   startup and never unmapped; CUDA graphs captured exclusively
+   against offsets in this region." Our impl maps `init_chunks_per_pool`
+   at boot, lets actuator unmap from same range. After cuMemUnmap,
+   captured graphs reference removed pages → CUDA illegal access on
+   next decode replay. Logged in BLOCKERS.md (`63c595d63`); full fix is
+   plumbing static_min/soft split into multi_tensor_arena.
+
+### B3 v4 + v9-auto v6 (env-default fix in flight)
+
+Re-launched with corrected env defaults. With cost=3 s × margin=1.5 the
+gate needs B_persist ≥ 4.5 s = 900 sustained ABOVE_HIGH ticks (= 30 min
+at tau=2 s) to fire — effectively never fires on a 6-min trace. L2
+should stay silent → "全开 ≥ baseline" property holds because no
+transfer = no crash.
+
+The L2 metric demonstration (transfer fires safely + delivers benefit)
+is gated on the static-min implementation, which is logged as paper-
+required engineering follow-up.
+
+---
+
 ## 2026-04-30 late-night session — regression+benefit suite v7
 
 ### Layer 2 regression+benefit suite v7 (DONE — 4/5 PASS, 1 INFORMATIVE)
