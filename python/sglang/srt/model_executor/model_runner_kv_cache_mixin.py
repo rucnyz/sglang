@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -64,6 +65,38 @@ class ModelRunnerKVCacheMixin:
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
+        # Arena memory transparency (issue #17): when SGLANG_ARENA_SHARED is on,
+        # MambaPool and KV pool each reserve `*_HEADROOM_CHUNKS × chunk_bytes`
+        # of unmapped VA so the cross-pool actuator can grow them at runtime.
+        # This headroom is GPU memory the pools end up consuming, but until this
+        # fix it was reserved on top of `rest_memory`, silently eating ~5–10 %
+        # of the user's mem_fraction_static budget and causing OOM at 0.8 on
+        # H200. Subtract the headroom from rest_memory before pool sizing so
+        # the user-set mem_fraction stays meaningful.
+        if os.environ.get("SGLANG_ARENA_SHARED") == "1":
+            chunk_bytes = int(os.environ.get(
+                "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
+            ))
+            mamba_headroom_chunks = int(os.environ.get(
+                "SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "4"
+            ))
+            kv_headroom_chunks = int(os.environ.get(
+                "SGLANG_ARENA_KV_HEADROOM_CHUNKS", "4"
+            ))
+            arena_headroom_bytes = (
+                (mamba_headroom_chunks + kv_headroom_chunks) * chunk_bytes
+            )
+            arena_headroom_gib = arena_headroom_bytes / (1 << 30)
+            logger.info(
+                "Arena memory transparency: subtracting %.2f GiB "
+                "(mamba=%d × %.0f MiB + kv=%d × %.0f MiB) from rest_memory "
+                "(%.2f → %.2f GiB) so user-set mem_fraction_static stays honored.",
+                arena_headroom_gib,
+                mamba_headroom_chunks, chunk_bytes / (1 << 20),
+                kv_headroom_chunks, chunk_bytes / (1 << 20),
+                rest_memory, rest_memory - arena_headroom_gib,
+            )
+            rest_memory -= arena_headroom_gib
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 

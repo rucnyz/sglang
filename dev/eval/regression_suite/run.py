@@ -78,7 +78,9 @@ def discover_free_gpus(reserved: set[int]) -> list[int]:
 
 
 def run_job(job: Job, gpu: int, out_dir: Path) -> JobResult:
-    job_dir = out_dir / job.name
+    # Per-arm directory so baseline and prelude don't overwrite each
+    # other's metrics.json (job.name is shared across arms by design).
+    job_dir = out_dir / f"{job.name}__{job.arm}"
     job_dir.mkdir(parents=True, exist_ok=True)
     log_path = job_dir / "run.log"
     metrics_path = job_dir / "metrics.json"
