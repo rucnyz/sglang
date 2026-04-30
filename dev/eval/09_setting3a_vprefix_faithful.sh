@@ -37,7 +37,8 @@ run_arm() {
       ;;
     extra_buffer)
       # Alternative: extra_buffer with page_size=8192.
-      extra_flags="--mamba-scheduler-strategy extra_buffer --page-size 8192"
+      # mamba_track_interval must be divisible by page_size, so set both to 8192.
+      extra_flags="--mamba-scheduler-strategy extra_buffer --page-size 8192 --mamba-track-interval 8192"
       ;;
     layer1)
       # Layer 1: HPB LRU + K_big=8192 on default page_size=1.
@@ -75,6 +76,7 @@ run_arm() {
   done
 
   echo "[$arm] running GSP bench..."
+  # Tolerate per-arm bench failure so other arms still run (set -e would otherwise kill the script).
   .venv/bin/python -m sglang.bench_serving \
     --backend sglang --host 127.0.0.1 --port $PORT \
     --model "$MODEL" --tokenizer "$MODEL" \
@@ -84,7 +86,7 @@ run_arm() {
     --gsp-output-len 256 \
     --request-rate 2 \
     --output-file "$bench_out" \
-    >"$OUT_DIR/${arm}_bench.log" 2>&1
+    >"$OUT_DIR/${arm}_bench.log" 2>&1 || echo "[$arm] bench FAILED (server may have crashed)"
   echo "[$arm] bench done"
 
   local hit=$(grep "Prefill batch" "$log" | grep -v "cached-token: 0" | wc -l)
