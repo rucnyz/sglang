@@ -294,7 +294,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | 3.B | V_prefix' stability | **DONE PASS** — HPB recovery -18% TTFT vs recency, paper tab:q3b | — |
 | 3.C | Composed L1+L2 | DONE — null on this trace (1 transfer per cell across all L1 configs); requires pressure-pool trace | trace-design follow-up |
 | 3.D | HPB-vs-recency on GSP | **DONE PASS** — paper tab:hpb-gsp added, -19.77% TTFT | — |
-| 4 | Estimator accuracy | not started | depends on 1 + 2 |
+| 4 | Estimator accuracy | DONE INDIRECT — V_kv'/V_mamba' not separately logged; budgeter's plan decisions in A3/A4 are the indirect validation | direct comparison needs new instrumentation |
 | 5.A | Path-axis dense | not started | **path-axis dispatcher implementation** |
 | 5.B | Path-axis hybrid | not started | depends on 5.A |
 | A1 | L1 sub-features | **DONE PASS** — cross-workload table, HPB dominant on smooth, full Layer 1 wins on cold-burst → paper tab:a1 | — |

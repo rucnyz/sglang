@@ -28,7 +28,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 | 1 24-h phase-shift | NULL | Smooth control test (no regression). Compressed trace doesn't bind on different pools across phases → paper §6.2 honest reframe |
 | 5.A/5.B/A6 path-axis | BLOCKED | Path-axis dispatcher not implemented → BLOCKERS.md |
 | 3.C composed | TODO | Depends on Setting 1 + 3.A; Layer 2 fires once on Setting 1 trace |
-| 4 estimator | TODO | Requires EWMA-vs-ground-truth comparison harness |
+| 4 estimator | INDIRECT VALIDATION | V_kv'/V_mamba' not separately logged; A3/A4 actuator behavior + Sweep 1 are the indirect signals → paper §6.4 honest reframe |
 
 **Implementation fix landed**: Phase 3.d K_BIG match-prefix invariant break (commits b37bbc82e + 325f25334). Drops tombstone-leaf creation; tracks deepest_snapshot_depth for insert.prefix_len consistency. 3/3 unit tests + Setting 1 v8 + A2 sweep all run end-to-end.
 
