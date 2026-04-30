@@ -303,7 +303,8 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | A4 | Tau sweep | not started | depends on 1 |
 | A5 | VMM chunk-size sweep | **DONE MAJOR** — 1GB chunks fix TTFT, paper §6.7 updated | — |
 | A6 | K=1 vs K=2 | not started | depends on 5.A |
-| Q1–Q4 | Quality preservation | partial | 16/17 cover Layer 2; Layer 1 token-identical TBD |
+| Q1 | Quality preservation (temperature=0 token-identity) | **DONE PASS** — 50/50 byte-identical, default vs full prelude | — |
+| Q2–Q4 | Quality preservation (KS test, accuracy, ROUGE) | partial | extensions to Q1 baseline |
 
 ## Order of execution (proposed)
 

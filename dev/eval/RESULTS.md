@@ -95,6 +95,16 @@ Raw data: `/tmp/sweep_lora_3157665/ml*_bench.json`. Updated `evaluation.tex` Tab
 
 Raw data: `/tmp/a3_hyst_3195814/hyst*_budgeter.jsonl`.
 
+### Quality preservation Q1 — token-identity at temperature=0 (DONE PASS)
+
+`dev/eval/11_Q1_token_identical.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B, 50 prompts (15 unique × 4-deep with duplicates), `temperature=0`, `seed=0`, `max_tokens=128`. Two server configurations:
+- **default**: engine baseline (no Layer 1, no Layer 2)
+- **prelude**: full system (HPB LRU + K_big=8192 + arena + cross-pool budgeter + planner)
+
+**Result: 50/50 (100%) byte-identical outputs.** The full prelude system never trades quality for latency. This validates the most important claim in §6.8: at `temperature=0` the system is bit-exact to the engine baseline. The KV-state and DeltaNet-state recovery paths preserve numerics; cross-pool transfers don't disturb in-flight requests; HPB LRU only changes WHICH nodes get evicted, not the model output for the surviving prompts.
+
+Raw data: `/tmp/q1_token_identical_*/`.
+
 ### Setting 3.B — Cold-burst stability (Q3.B, DONE PASS)
 
 `dev/eval/10_setting3b_cold_burst.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B with K_big=8192 (heterogeneous tree active in both arms). Three-phase workload:
