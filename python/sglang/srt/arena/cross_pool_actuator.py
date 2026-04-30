@@ -28,6 +28,7 @@ The planner is policy-side; this actuator only handles the mechanical
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from sglang.srt.arena.chunk_arena import cross_arena_transfer
@@ -61,11 +62,31 @@ class CrossPoolTransferActuator:
         self.n_kv_subpools = kv_arena.n_layers * kv_arena.n_kinds
         self.n_mamba_subpools = mamba_arena.n_layers * mamba_arena.n_kinds
 
+        # Balanced unit (lcm-aware): the smallest dst_per_subpool that
+        # makes the transfer leftover-free (= no handles accumulate in
+        # the shared pool after a round-trip). For dst with n_dst sub-pools
+        # and src with n_src, we need n_per_dst * n_dst == n_per_src * n_src
+        # to balance. The smallest n_per_dst integer satisfying this is
+        # n_src // gcd(n_src, n_dst); the corresponding n_per_src is
+        # n_dst // gcd(n_src, n_dst).
+        g = math.gcd(self.n_kv_subpools, self.n_mamba_subpools)
+        # kv → mamba: dst=mamba (count=n_mamba), src=kv (count=n_kv).
+        self.balanced_unit_kv_to_mamba_dst = self.n_kv_subpools // g
+        self.balanced_unit_kv_to_mamba_src = self.n_mamba_subpools // g
+        # mamba → kv: dst=kv, src=mamba.
+        self.balanced_unit_mamba_to_kv_dst = self.n_mamba_subpools // g
+        self.balanced_unit_mamba_to_kv_src = self.n_kv_subpools // g
+
         logger.info(
             "CrossPoolTransferActuator: kv_subpools=%d, mamba_subpools=%d, "
-            "shared_handles=%d, free=%d",
+            "shared_handles=%d, free=%d, balanced_unit_kv2m=(dst=%d,src=%d), "
+            "balanced_unit_m2kv=(dst=%d,src=%d)",
             self.n_kv_subpools, self.n_mamba_subpools,
             self.shared.total_count(), self.shared.free_count(),
+            self.balanced_unit_kv_to_mamba_dst,
+            self.balanced_unit_kv_to_mamba_src,
+            self.balanced_unit_mamba_to_kv_dst,
+            self.balanced_unit_mamba_to_kv_src,
         )
 
     # ------------------------------------------------------------------
@@ -178,6 +199,27 @@ class CrossPoolTransferActuator:
             src=self.mamba, dst=self.kv,
             n_per_dst_subpool=n_per_kv_subpool,
             direction_label="mamba_to_kv",
+        )
+
+    # ---- Balanced (leftover-free) wrappers ---------------------------
+
+    def balanced_kv_to_mamba(self, multiplier: int = 1) -> dict:
+        """`kv_to_mamba_chunks` at the balanced unit, scaled by `multiplier`.
+
+        Balanced means the source-shrink and destination-grow consume
+        exactly the same number of handles, so the shared pool's free
+        count doesn't drift. Use this in oscillator-style demos where
+        every kv_to_mamba is matched by a balanced_mamba_to_kv: round-trip
+        leaves both pools and the free pool at their starting state.
+        """
+        return self.kv_to_mamba_chunks(
+            self.balanced_unit_kv_to_mamba_dst * multiplier
+        )
+
+    def balanced_mamba_to_kv(self, multiplier: int = 1) -> dict:
+        """Symmetric balanced wrapper. See `balanced_kv_to_mamba`."""
+        return self.mamba_to_kv_chunks(
+            self.balanced_unit_mamba_to_kv_dst * multiplier
         )
 
     # ------------------------------------------------------------------

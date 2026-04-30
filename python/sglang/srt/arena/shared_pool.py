@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import threading
 from typing import Optional
 
@@ -31,6 +32,42 @@ _SINGLETON_LOCK = threading.Lock()
 _SINGLETON: Optional[SharedHandlePool] = None
 _SINGLETON_DEVICE: Optional[int] = None
 _SINGLETON_CHUNK_BYTES: Optional[int] = None
+_SIGTERM_HANDLER_INSTALLED: bool = False
+
+
+def _install_sigterm_force_exit() -> None:
+    """Install a SIGTERM handler that hard-exits via os._exit(0).
+
+    Why: PyTorch's `MemPool::~MemPool` walks the caching allocator's
+    cached blocks at process teardown and tries to release them — but
+    the blocks point at VAs we have just `cuMemUnmap`'d, so the
+    destructor faults. Bypassing all Python/C++ destructors at SIGTERM
+    avoids this entirely. The runtime state we'd "leak" (VA reservation,
+    handles, GPU memory) is reclaimed by the kernel at process exit
+    anyway, so the trade is purely cosmetic (clean log) for free.
+
+    Idempotent: only installs the handler once per process.
+    """
+    global _SIGTERM_HANDLER_INSTALLED
+    if _SIGTERM_HANDLER_INSTALLED:
+        return
+
+    def _force_exit(signum, _frame):
+        # Print one diagnostic line so the operator sees what happened.
+        # logger.info may not flush before _exit, so write directly.
+        try:
+            os.write(2, b"[shared_pool] SIGTERM: os._exit(0) to skip "
+                       b"PyTorch MemPool::~MemPool VMM-unsafe teardown\n")
+        except Exception:
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _force_exit)
+    _SIGTERM_HANDLER_INSTALLED = True
+    logger.info(
+        "shared_pool: installed SIGTERM force-exit handler "
+        "(skips PyTorch MemPool destructors at process teardown)"
+    )
 
 
 def is_shared_arena_enabled() -> bool:
@@ -63,6 +100,7 @@ def get_or_create_shared_handle_pool(
             )
             _SINGLETON_DEVICE = device_id
             _SINGLETON_CHUNK_BYTES = chunk_bytes
+            _install_sigterm_force_exit()
             logger.info(
                 "Arena shared mode: created process-singleton SharedHandlePool "
                 "device=%d, chunk_bytes=%d",

@@ -103,13 +103,14 @@ class BudgetAgent:
 
         # Phase 2e.5.6.2 cross-pool transfer demo. Requires
         # SGLANG_ARENA_SHARED=1 at engine boot. Each budgeter tick alternates
-        # 1 chunk KV→mamba and 1 chunk mamba→KV; the planner/policy logic
-        # for what to actually transfer is the next milestone (real
-        # pressure signals via LagrangePlanner).
+        # one balanced kv→mamba and one balanced mamba→kv transfer; the
+        # planner/policy logic for what to actually transfer is the next
+        # milestone (real pressure signals via LagrangePlanner).
         self.xpool_demo = _env_flag("SGLANG_BUDGETER_XPOOL_DEMO", False)
         self._xpool_actuator = None
         self._xpool_phase = 0
-        # n_chunks_per_subpool transferred per call; conservatively 1.
+        # Balanced-unit multiplier. Default 1 → smallest leftover-free
+        # round-trip the actuator supports (uses lcm of sub-pool counts).
         self._xpool_unit = int(os.environ.get("SGLANG_BUDGETER_XPOOL_UNIT", "1"))
 
         if self.enabled:
@@ -280,15 +281,15 @@ class BudgetAgent:
             snapshot["xpool_state"] = self._xpool_actuator.state()
             return
 
-        # Oscillator: kv→mamba, then mamba→kv, repeat. Each tick moves
-        # `_xpool_unit` chunks per source sub-pool. With the safety gate
-        # above this only fires during quiet windows, but it does fire
-        # repeatedly so we get multiple data points across the run.
+        # Oscillator: balanced kv→mamba, then balanced mamba→kv, repeat.
+        # Balanced wrappers use lcm-aware sub-pool unit sizes so a
+        # round-trip leaves both pools and the shared free list at their
+        # starting state — no drift, no leftover handles accumulating.
         self._xpool_phase = (self._xpool_phase + 1) % 2
         if self._xpool_phase == 1:
-            stats = self._xpool_actuator.kv_to_mamba_chunks(self._xpool_unit)
+            stats = self._xpool_actuator.balanced_kv_to_mamba(self._xpool_unit)
         else:
-            stats = self._xpool_actuator.mamba_to_kv_chunks(self._xpool_unit)
+            stats = self._xpool_actuator.balanced_mamba_to_kv(self._xpool_unit)
 
         # Inline a few key fields into the snapshot for easy grep.
         snapshot["xpool_direction"] = stats["direction"]

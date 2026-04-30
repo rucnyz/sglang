@@ -322,6 +322,215 @@ def test_multi_tensor_arenas_share_pool() -> None:
     print("PASS Test 3\n")
 
 
+def test_balanced_actuator_roundtrip() -> None:
+    print("== Test 4: balanced wrappers preserve handle count across round-trip ==")
+    # Mimic Qwen3.5-35B-A3B asymmetry: KV has 4 sub-pools (2 layers × 2 kinds),
+    # mamba has 6 (6 layers × 1 kind). gcd(4, 6) = 2 → balanced kv→mamba grows
+    # mamba by 4/2=2 chunks/sub-pool, shrinks KV by 6/2=3 chunks/sub-pool.
+    n_layers_kv, n_kinds_kv = 2, 2
+    n_layers_mamba, n_kinds_mamba = 6, 1
+    chunk_bytes = 64 * 1024 * 1024
+    per_token_shape = (8, 16)
+    dtype = torch.bfloat16
+    per_token_bytes = 8 * 16 * 2
+    tokens_per_chunk = chunk_bytes // per_token_bytes
+    # Need enough headroom for balanced kv→mamba(1×) which grows mamba by 2/sub.
+    init_tokens = 4 * tokens_per_chunk
+    max_tokens = 6 * tokens_per_chunk
+
+    n_kv_subpools = n_layers_kv * n_kinds_kv      # 4
+    n_mamba_subpools = n_layers_mamba * n_kinds_mamba  # 6
+    n_handles = (n_kv_subpools + n_mamba_subpools) * 4
+
+    pool = SharedHandlePool(
+        device_id=torch.cuda.current_device(),
+        chunk_size=chunk_bytes,
+        n_handles=n_handles,
+    )
+
+    kv = MultiTensorArena(
+        device_id=torch.cuda.current_device(),
+        n_layers=n_layers_kv, n_kinds=n_kinds_kv,
+        per_token_shape=per_token_shape, dtype=dtype,
+        max_tokens=max_tokens, init_tokens=init_tokens,
+        chunk_bytes=chunk_bytes,
+        external_handle_pool=pool,
+        subpool_offset=0,
+    )
+    mamba = MultiTensorArena(
+        device_id=torch.cuda.current_device(),
+        n_layers=n_layers_mamba, n_kinds=n_kinds_mamba,
+        per_token_shape=per_token_shape, dtype=dtype,
+        max_tokens=max_tokens, init_tokens=init_tokens,
+        chunk_bytes=chunk_bytes,
+        external_handle_pool=pool,
+        subpool_offset=n_kv_subpools,
+    )
+
+    from sglang.srt.arena.cross_pool_actuator import CrossPoolTransferActuator
+    act = CrossPoolTransferActuator(kv_arena=kv, mamba_arena=mamba, shared_pool=pool)
+
+    # Sanity: balanced units pre-computed correctly.
+    assert act.balanced_unit_kv_to_mamba_dst == 2, \
+        f"expected balanced_unit_kv_to_mamba_dst=2, got {act.balanced_unit_kv_to_mamba_dst}"
+    assert act.balanced_unit_kv_to_mamba_src == 3, \
+        f"expected balanced_unit_kv_to_mamba_src=3, got {act.balanced_unit_kv_to_mamba_src}"
+    print(f"  balanced units: kv→mamba dst=2 src=3, mamba→kv dst=3 src=2")
+
+    free_start = pool.free_count()
+    kv_cap_start = kv.current_capacity_tokens()
+    mamba_cap_start = mamba.current_capacity_tokens()
+    print(f"  start: free={free_start}, kv_cap={kv_cap_start}, "
+          f"mamba_cap={mamba_cap_start}")
+
+    # Forward + reverse balanced transfer should net to zero.
+    s1 = act.balanced_kv_to_mamba()
+    assert s1["unmapped_total"] == s1["granted_total"], \
+        f"kv_to_mamba leftover! freed={s1['unmapped_total']} consumed={s1['granted_total']}"
+    print(f"  after balanced kv→mamba: free={pool.free_count()}, "
+          f"kv_cap={kv.current_capacity_tokens()}, mamba_cap={mamba.current_capacity_tokens()}")
+
+    s2 = act.balanced_mamba_to_kv()
+    assert s2["unmapped_total"] == s2["granted_total"], \
+        f"mamba_to_kv leftover! freed={s2['unmapped_total']} consumed={s2['granted_total']}"
+
+    # After round-trip: free, KV cap, mamba cap all back to starting values.
+    free_end = pool.free_count()
+    kv_cap_end = kv.current_capacity_tokens()
+    mamba_cap_end = mamba.current_capacity_tokens()
+    print(f"  after balanced mamba→kv: free={free_end}, "
+          f"kv_cap={kv_cap_end}, mamba_cap={mamba_cap_end}")
+
+    assert free_end == free_start, \
+        f"free drifted: start={free_start} end={free_end}"
+    assert kv_cap_end == kv_cap_start, \
+        f"KV capacity drifted: start={kv_cap_start} end={kv_cap_end}"
+    assert mamba_cap_end == mamba_cap_start, \
+        f"mamba capacity drifted: start={mamba_cap_start} end={mamba_cap_end}"
+    print("  round-trip preserves all state. GOOD.")
+
+    _KEEPALIVE.extend([kv, mamba, pool, act])
+    print("PASS Test 4\n")
+
+
+def test_pytorch_io_survives_roundtrip() -> None:
+    """Real-tensor smoke: write/read via PyTorch tensors should survive a
+    cross-arena roundtrip. This is what Test 3 doesn't verify — it only
+    checks data_ptr stability, not that the underlying memory still
+    accepts PyTorch reads/writes after transfer."""
+    print("== Test 5: PyTorch tensor IO survives balanced roundtrip ==")
+    n_layers_kv, n_kinds_kv = 2, 2
+    n_layers_mamba, n_kinds_mamba = 6, 1
+    chunk_bytes = 64 * 1024 * 1024
+    per_token_shape = (8, 16)
+    dtype = torch.bfloat16
+    per_token_bytes = 8 * 16 * 2
+    tokens_per_chunk = chunk_bytes // per_token_bytes
+    init_tokens = 4 * tokens_per_chunk
+    max_tokens = 6 * tokens_per_chunk
+
+    n_kv_subpools = n_layers_kv * n_kinds_kv
+    n_mamba_subpools = n_layers_mamba * n_kinds_mamba
+    n_handles = (n_kv_subpools + n_mamba_subpools) * 4
+
+    pool = SharedHandlePool(
+        device_id=torch.cuda.current_device(),
+        chunk_size=chunk_bytes,
+        n_handles=n_handles,
+    )
+    kv = MultiTensorArena(
+        device_id=torch.cuda.current_device(),
+        n_layers=n_layers_kv, n_kinds=n_kinds_kv,
+        per_token_shape=per_token_shape, dtype=dtype,
+        max_tokens=max_tokens, init_tokens=init_tokens,
+        chunk_bytes=chunk_bytes,
+        external_handle_pool=pool, subpool_offset=0,
+    )
+    mamba = MultiTensorArena(
+        device_id=torch.cuda.current_device(),
+        n_layers=n_layers_mamba, n_kinds=n_kinds_mamba,
+        per_token_shape=per_token_shape, dtype=dtype,
+        max_tokens=max_tokens, init_tokens=init_tokens,
+        chunk_bytes=chunk_bytes,
+        external_handle_pool=pool, subpool_offset=n_kv_subpools,
+    )
+    from sglang.srt.arena.cross_pool_actuator import CrossPoolTransferActuator
+    act = CrossPoolTransferActuator(kv_arena=kv, mamba_arena=mamba, shared_pool=pool)
+
+    # Pre-write distinguishable patterns into front slots of every sub-tensor
+    # via PyTorch fill_. Front slot = row 0 of each tensor; this is in the
+    # always-mapped chunk-0 of each sub-pool, so it's never disturbed by
+    # tail-evict shrink. It's the load-bearing path for the engine.
+    KV_PATTERN = torch.tensor(1.5, dtype=dtype)
+    MAMBA_PATTERN = torch.tensor(2.5, dtype=dtype)
+    for li in range(n_layers_kv):
+        for ki in range(n_kinds_kv):
+            kv.tensor(li, ki)[0].fill_(KV_PATTERN.item())
+    for li in range(n_layers_mamba):
+        for ki in range(n_kinds_mamba):
+            mamba.tensor(li, ki)[0].fill_(MAMBA_PATTERN.item())
+    torch.cuda.synchronize()
+    print("  pre-wrote front-slot patterns through PyTorch fill_")
+
+    # Verify patterns landed via PyTorch read (sanity).
+    for li in range(n_layers_kv):
+        for ki in range(n_kinds_kv):
+            t = kv.tensor(li, ki)
+            assert (t[0] == KV_PATTERN.item()).all(), f"KV ({li},{ki}) front-slot pre-write failed"
+    for li in range(n_layers_mamba):
+        for ki in range(n_kinds_mamba):
+            t = mamba.tensor(li, ki)
+            assert (t[0] == MAMBA_PATTERN.item()).all(), f"mamba ({li},{ki}) front-slot pre-write failed"
+    print("  pre-write readback OK")
+
+    # Now do a full balanced roundtrip — and verify front-slot patterns
+    # are still readable through PyTorch tensor indexing afterwards.
+    act.balanced_kv_to_mamba()
+    torch.cuda.synchronize()
+    act.balanced_mamba_to_kv()
+    torch.cuda.synchronize()
+
+    # PyTorch read after roundtrip — this is the property the engine
+    # relies on. If the caching allocator's cached blocks were
+    # invalidated by the unmap/remap, this read would fault or return
+    # garbage.
+    for li in range(n_layers_kv):
+        for ki in range(n_kinds_kv):
+            t = kv.tensor(li, ki)
+            actual = t[0]
+            assert (actual == KV_PATTERN.item()).all(), \
+                f"KV ({li},{ki}) front-slot CORRUPTED after roundtrip: {actual[0,0].item()}"
+    for li in range(n_layers_mamba):
+        for ki in range(n_kinds_mamba):
+            t = mamba.tensor(li, ki)
+            actual = t[0]
+            assert (actual == MAMBA_PATTERN.item()).all(), \
+                f"mamba ({li},{ki}) front-slot CORRUPTED after roundtrip: {actual[0,0].item()}"
+    print("  PyTorch tensor reads through every front slot match after roundtrip. GOOD.")
+
+    # And one more roundtrip to make sure the pattern survives multiple
+    # cycles (catches cumulative drift / handle-mismatch bugs that only
+    # show up on the second cycle).
+    for cycle in range(3):
+        act.balanced_kv_to_mamba()
+        act.balanced_mamba_to_kv()
+        torch.cuda.synchronize()
+    for li in range(n_layers_kv):
+        for ki in range(n_kinds_kv):
+            t = kv.tensor(li, ki)
+            assert (t[0] == KV_PATTERN.item()).all(), \
+                f"KV ({li},{ki}) corrupted after 3 cycles"
+    for li in range(n_layers_mamba):
+        for ki in range(n_kinds_mamba):
+            t = mamba.tensor(li, ki)
+            assert (t[0] == MAMBA_PATTERN.item()).all(), \
+                f"mamba ({li},{ki}) corrupted after 3 cycles"
+    print("  3 additional cycles: still good. GOOD.")
+
+    _KEEPALIVE.extend([kv, mamba, pool, act])
+    print("PASS Test 5\n")
+
+
 def main() -> int:
     # Initialize the driver and force the PyTorch primary context to come up
     # before any cuMemsetD8_v2 / cuMemcpyDtoH_v2 calls. Otherwise those raw
@@ -333,6 +542,8 @@ def main() -> int:
     test_basic_cross_arena_transfer()
     test_legacy_self_owned_path()
     test_multi_tensor_arenas_share_pool()
+    test_balanced_actuator_roundtrip()
+    test_pytorch_io_survives_roundtrip()
     print("== ALL PASS: SharedHandlePool + cross_arena_transfer ready ==")
     return 0
 

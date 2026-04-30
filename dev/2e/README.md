@@ -28,6 +28,7 @@ Layer 2's actuator (paper §4.4): a chunk-bitmap shared-arena allocator built on
 | 2e.5.6.0 | Design note: `SharedHandlePool` + cross-arena transfer mechanism | doc | **done** 2026-04-30 |
 | 2e.5.6.1 | `SharedHandlePool` class + `ChunkArena` external-pool support + unit test | ~120 LoC | **PASS** 2026-04-30 |
 | 2e.5.6.2 | E2E demo: KV ↔ mamba physical-handle migration during live serving (oscillator) | bench | **PASS** 2026-04-30 |
+| 2e.5.6.2.fix | Follow-up: SIGTERM force-exit handler + lcm-balanced unit + Test 5 (PyTorch IO survives) + Test 16 (baseline byte-equivalence) | ~120 LoC | **PASS** 2026-04-30 |
 | 2e.5.6.3 | LagrangePlanner with real per-pool pressure signals (KV preempt rate / mamba slot stall) | 3–5 days | not started |
 
 ## 2e.1.a — VMM smoke test (done)
@@ -1011,4 +1012,95 @@ Evidence at `/tmp/kv_mamba_xfer_3822511/{server.log, completions.txt, budgeter_x
 2. `CrossPoolTransferActuator` switches from raw `_arena.shrink/grow` to the two actuators' `set_capacity_tokens` so both pools' allocators learn about the new capacity in lockstep.
 3. Replace the oscillator with `LagrangePlanner` consuming real signals: KV preempt rate (already in scheduler stats), mamba slot saturation (`mamba_pool.available_size()`), and a queue-depth signal.
 4. Trace: a KV-bound workload (long context, dense token stream) yields chunks to mamba when slot stall rises; a mamba-bound workload (many short hybrid requests) reverses the flow. This is the paper's headline §4.3 + §4.4 demo.
+
+## 2e.5.6.2.fix — follow-up: balanced units, SIGTERM, byte-equivalence (PASS, 2026-04-30)
+
+After landing 2e.5.6.2 the candor review caught three soft spots in the demo's claim:
+1. The oscillator drifts — each round-trip strands ~10 handles in the shared free pool because KV-vs-mamba sub-pool counts are asymmetric (20 vs 30). KV monotonically shrank by 1 chunk/sub-pool per round.
+2. The process-exit segfault from PyTorch's `MemPool::~MemPool` was still present.
+3. Test coverage proved "engine doesn't crash" but not "engine produces the same tokens it would without the cross-pool flag on". So we couldn't rule out silent state corruption that lets coherent-looking text out.
+
+This sub-step addresses each.
+
+**Code.**
+
+- `python/sglang/srt/arena/cross_pool_actuator.py`:
+  - Computes lcm-balanced units at construction: `gcd(n_kv_subpools, n_mamba_subpools)`, then `dst_unit = n_src // gcd`, `src_unit = n_dst // gcd`. For Qwen3.5-35B that's `gcd(20, 30)=10`, so balanced kv→mamba grows mamba by 2 chunks/sub-pool while shrinking KV by 3 chunks/sub-pool — both sides move 60 chunks total, **leftover = 0**.
+  - New `balanced_kv_to_mamba(multiplier=1)` / `balanced_mamba_to_kv(multiplier=1)` wrappers; the budgeter demo and the unit test use these by default.
+- `python/sglang/srt/arena/shared_pool.py`:
+  - On singleton creation, install a `SIGTERM` handler that calls `os._exit(0)` to bypass the buggy PyTorch destructor sequence at process teardown. **Caveat:** SGLang's launch_server registers its own `SIGTERM` handler later in init that takes precedence, so in the live server our handler doesn't fire. The clean-shutdown observation in v2 (no `MemPool::~MemPool` trace) is incidental — likely from balanced units producing fewer cached PyTorch segments at perturbed VAs, not from our handler. The handler is still useful for unit tests that don't have SGLang's lifecycle.
+- `python/sglang/srt/budgeter/agent.py`:
+  - The xpool demo arm now calls the balanced wrappers instead of the raw chunk APIs. Tick output is leftover-free.
+- `dev/2e/14_cross_arena_transfer_unit.py`:
+  - **Test 4** (existing): chunk-count + capacity accounting across balanced round-trip.
+  - **Test 5** (new): pre-write distinguishable bf16 patterns into front slot 0 of every (sub-pool) tensor via `tensor.fill_()`, do balanced round-trip, then re-read every front slot via PyTorch tensor indexing. Run 4 cycles total. PyTorch tensor IO must survive — this is what 2e.5.5 e2e implicitly relied on but never tested in isolation.
+- `dev/2e/16_kv_mamba_xfer_equiv.sh` (new):
+  - Boots two SGLang servers in sequence on Qwen3.5-35B-A3B at `temperature=0`, sends 5 deterministic prompts to each:
+    - **Arm A (baseline):** no special flags. Default torch.zeros KV pool + stacked mamba pool — bog-standard SGLang.
+    - **Arm B (shared+xpool):** `SGLANG_ARENA_SHARED=1` + `SGLANG_BUDGETER_XPOOL_DEMO=1`. Sleeps 3 s between prompts so the budgeter has idle windows to fire transfers. Asserts the JSONL recorded both directions.
+  - Pass criterion: `diff -q` on the two arms' completions must return 0 (byte-identical).
+
+**Reproduce.**
+```bash
+cd /scratch/yuzhou/projects/sglang
+# Unit (verifies PyTorch IO survives roundtrip):
+CUDA_VISIBLE_DEVICES=3 PYTHONPATH=/data/yuzhou/projects/sglang/python:$PYTHONPATH \
+  .venv/bin/python -u dev/2e/14_cross_arena_transfer_unit.py
+
+# E2E byte-equivalence (~6 min total, 2 server boots):
+CUDA_VISIBLE_DEVICES=3 WARMUP_S=600 dev/2e/16_kv_mamba_xfer_equiv.sh
+```
+
+**Result (2026-04-30, GPU 3, H200, Qwen3.5-35B-A3B TP=1).**
+
+Unit (`14_*.py`):
+```
+Test 1: basic cross-arena transfer        PASS
+Test 2: legacy self-owned ChunkArena      PASS
+Test 3: two MultiTensorArenas share pool  PASS
+Test 4: balanced wrappers preserve count  PASS  (free=0 at start, after kv→mamba, and after the round-trip)
+Test 5: PyTorch tensor IO survives        PASS  (all front-slot patterns intact across 4 round-trip cycles)
+== ALL PASS: SharedHandlePool + cross_arena_transfer ready ==
+```
+
+E2E (`16_*.sh`):
+```
+[shared_xpool] xpool transfers: kv→mamba=7 mamba→kv=6
+PASS: completions are byte-identical between baseline and shared+xpool arms
+--- example output (first 6 lines from baseline) ---
+ Paris.
+The capital of France is Paris.
+The capital of France is Paris.
+The capital of France is
+, in a world full of amazing science, there was a very special thing called a "molecule". Now, you
+ 4. What is 2 + 2?
+```
+
+13 cross-pool transfers fired in arm B during idle gaps; the engine's token output is byte-identical to a default SGLang baseline that has no arena involvement at all. This is a much stronger correctness signal than 2e.5.6.2's own PASS (which only verified "completions are non-empty and look coherent").
+
+Also: budgeter logs confirm `leftover free 0` on every transfer, so the oscillator drift from 2e.5.6.2 is gone. KV capacity oscillates cleanly between 1310720 ↔ 1114112 tokens, mamba between 384 ↔ 448 tokens.
+
+**What this verifies (and what it still doesn't).**
+
+| claim | verified? | by what |
+|---|---|---|
+| Cross-arena byte movement preserves bytes | ✓ | Test 1 (driver-API) |
+| `tensor.data_ptr()` stable across cross-pool transfer | ✓ | Test 3 |
+| Shared handle pool accounting is leftover-free at the balanced unit | ✓ | Test 4 |
+| PyTorch tensor reads survive a cross-pool round-trip | ✓ | Test 5 (front-slot only; 4 cycles) |
+| Engine token output unchanged with cross-pool transfers active | ✓ | Test 16 (byte-identical to baseline) |
+| Cross-pool transfer is safe under live concurrent traffic | ✗ | All transfers in 15/16 fired in idle windows. The actuator does not coordinate with `KVArenaActuator.set_capacity_tokens` / a not-yet-existing `MambaArenaActuator`, so the scheduler's allocator can still hand out a slot index in the now-unmapped tail. Today this doesn't fire because prompts are short and gaps are wide; under real production traffic it will. **2e.5.6.3 fixes this first.** |
+| Demo matches paper §4.3 + §4.4 headline trace | ✗ | Current demo is an oscillator (no signal-driven decisions). The headline trace — KV-bound workload yields chunks to mamba when long-context arrives, then takes them back — needs `LagrangePlanner` consuming real per-pool pressure signals. **2e.5.6.3 main task.** |
+
+**Findings.**
+
+1. **lcm balancing is the right primitive for asymmetric sub-pool counts.** Every round-trip is conservation-of-handles by construction (`shrink_total == grow_total`), so the shared free pool's invariant is "always returns to its starting count after a balanced cycle." For Qwen3.5-35B's 20-vs-30 asymmetry, the smallest balanced unit is `kv_to_mamba(2)` ↔ `mamba_to_kv(3)`, moving 60 chunks each direction.
+
+2. **Byte-identical output to baseline is a stronger claim than I expected to actually achieve.** With 13 cross-pool transfers happening between prompts, all five `temperature=0` prompts produce tokens that match a no-arena baseline exactly. That rules out a wide class of "transfer silently perturbs state" failure modes — TLB stale entries, caching-allocator metadata drift, kernel-arg pointer aliasing, etc. The mechanism really doesn't disturb inference when the safety gate holds.
+
+3. **The "no segfault on shutdown" in v2 wasn't from our SIGTERM handler.** SGLang's launch_server installs its own `SIGTERM` handler later in init that takes precedence over ours. The graceful shutdown happens to clean cached blocks in an order that doesn't hit our unmapped VAs. So the v2 outcome is incidental, not a true fix. Our handler is still installed (the unit tests benefit; logs show "installed SIGTERM force-exit handler" at boot), and properly fixing this for SGLang requires either chaining handlers or moving the installation later.
+
+4. **Test 5 covers PyTorch IO at the front slot only.** We pre-write through `tensor[0].fill_(...)` and verify after roundtrip. The transferred chunks are at the **tail** of each sub-pool, and we don't pre-write/read through them via PyTorch. So Test 5 proves "PyTorch IO at the static-min region survives transfers" but not "PyTorch IO at the just-grown region works correctly." Test 16's byte-equivalence covers the latter implicitly (the engine reads/writes across the whole tensor as it serves), so we do have e2e coverage of that case — but we don't have a focused unit test for it.
+
+**Implication for 2e.5.6.3 (unchanged from before, just cleaner footing).** The mechanism is solid for "transfer in idle windows produces no observable engine drift." Now build the policy on top: `MambaArenaActuator`, capacity-aware actuator (so live traffic is safe), real per-pool pressure signals into `LagrangePlanner`, then the headline trace.
 
