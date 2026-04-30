@@ -347,6 +347,29 @@ class MambaPool:
                         chunk_bytes=chunk_bytes,
                     )
 
+                # Static-min/soft split (paper §design-l2-actuator). Of
+                # the init_tokens worth of physical handles funded at
+                # boot, only static_min worth are cuMemMap'd into this
+                # arena; the rest stay as mobile soft chunks in the
+                # shared free queue, available to either pool's actuator.
+                # Default 0 mobile chunks → static_min == init → today's
+                # behavior. SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS=N
+                # carves N chunks per sub-pool out of init into the
+                # mobile pool. CUDA graphs only see static_min so the
+                # cross-pool actuator can map/unmap soft chunks safely.
+                mamba_mobile_chunks = (
+                    int(os.environ.get("SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS", "0"))
+                    if shared_arena else 0
+                )
+                init_chunks = tot_aligned // tokens_per_chunk
+                if mamba_mobile_chunks > init_chunks:
+                    raise ValueError(
+                        f"SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS={mamba_mobile_chunks} "
+                        f"exceeds init_chunks={init_chunks}"
+                    )
+                mamba_static_min_tokens = (
+                    tot_aligned - mamba_mobile_chunks * tokens_per_chunk
+                )
                 self._mamba_temporal_arena = MultiTensorArena(
                     device_id=torch.cuda.current_device(),
                     n_layers=num_mamba_layers,
@@ -355,6 +378,7 @@ class MambaPool:
                     dtype=ssm_dtype,
                     max_tokens=mamba_max_tokens,
                     init_tokens=tot_aligned,
+                    static_min_tokens=mamba_static_min_tokens,
                     chunk_bytes=chunk_bytes,
                     external_handle_pool=shared_pool,
                 )
@@ -1192,6 +1216,20 @@ class MHATokenToKVPool(KVCache):
                         chunk_bytes=chunk_bytes,
                     )
 
+                # Static-min/soft split — see MambaPool note above.
+                kv_mobile_chunks = (
+                    int(os.environ.get("SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS", "0"))
+                    if shared_arena else 0
+                )
+                init_chunks = tot_aligned // tokens_per_chunk
+                if kv_mobile_chunks > init_chunks:
+                    raise ValueError(
+                        f"SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS={kv_mobile_chunks} "
+                        f"exceeds init_chunks={init_chunks}"
+                    )
+                kv_static_min_tokens = (
+                    tot_aligned - kv_mobile_chunks * tokens_per_chunk
+                )
                 self._kv_arena = MultiTensorArena(
                     device_id=torch.cuda.current_device(),
                     n_layers=self.layer_num,
@@ -1200,6 +1238,7 @@ class MHATokenToKVPool(KVCache):
                     dtype=self.store_dtype,
                     max_tokens=kv_max_tokens,
                     init_tokens=tot_aligned,
+                    static_min_tokens=kv_static_min_tokens,
                     chunk_bytes=chunk_bytes,
                     external_handle_pool=shared_pool,
                 )

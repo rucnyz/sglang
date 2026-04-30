@@ -73,6 +73,21 @@ class MultiTensorArena:
         chunk_bytes: int = 32 * 1024 * 1024,
         external_handle_pool: Optional[SharedHandlePool] = None,
         subpool_offset: Optional[int] = None,
+        # Paper §design-l2-actuator (line 133-135) static-min/soft split:
+        # at boot, only `static_min_tokens` worth of physical pages are
+        # cuMemMap'd into each sub-pool; CUDA graphs are captured against
+        # this range and the engine's allocator initially caps at
+        # static_min_tokens so block-table allocations never escape it.
+        # The remaining (init_tokens - static_min_tokens) worth of physical
+        # handles stay in the shared free pool as MOBILE SOFT chunks that
+        # the cross-pool actuator can cuMemMap into either pool's
+        # [V_σ + s_σ_min, ...) range. This is what makes cross-pool
+        # transfer SAFE under captured CUDA graphs (B3 v3 / v9-auto v5
+        # crashed because the prior impl mapped all `init_tokens` at boot
+        # and then unmapped from there, dereferencing pages graphs needed).
+        # Default: static_min == init (= today's behavior, no soft, no
+        # transfer freedom).
+        static_min_tokens: Optional[int] = None,
     ) -> None:
         n_subpools = n_layers * n_kinds
         # Resolve subpool_offset: explicit value wins; else auto-assign from
@@ -121,12 +136,28 @@ class MultiTensorArena:
             )
         self.init_chunks_per_pool = init_tokens // self.tokens_per_chunk
 
+        # static_min defaults to init (= boot maps everything, no soft).
+        if static_min_tokens is None:
+            static_min_tokens = init_tokens
+        if static_min_tokens > init_tokens:
+            raise ValueError(
+                f"static_min_tokens {static_min_tokens} > init_tokens {init_tokens}"
+            )
+        if static_min_tokens % self.tokens_per_chunk != 0:
+            raise ValueError(
+                f"static_min_tokens {static_min_tokens} not a multiple of "
+                f"tokens_per_chunk {self.tokens_per_chunk}"
+            )
+        self.static_min_chunks_per_pool = static_min_tokens // self.tokens_per_chunk
+
         # Self-owned: provision physical handles for the full max-chunks
         # range so any planner-requested grow within [init, max] succeeds.
         # Phase 2e.5.6 shared mode: each arena pays for its INITIAL
-        # handle quota only — runtime growth pulls from handles freed by
-        # peer arenas (via cross_arena_transfer). Avoids n_pools-fold
-        # over-provisioning when many arenas share one pool.
+        # handle quota — these are cuMemCreate'd at boot. Of these,
+        # `static_min_chunks_per_pool` worth are cuMemMap'd into each
+        # sub-pool's static-min region; the remaining (init - static_min)
+        # × n_subpools handles live in the shared pool's free queue as
+        # mobile soft chunks the actuator can map/unmap.
         if external_handle_pool is None:
             n_handles = n_subpools * self.max_chunks_per_pool
         else:
@@ -143,12 +174,20 @@ class MultiTensorArena:
             external_handle_pool=external_handle_pool,
         )
 
-        # Initial mapping: init_chunks_per_pool to each sub-pool.
+        # Initial mapping: ONLY static_min_chunks_per_pool to each
+        # sub-pool. The remaining (init - static_min) chunks worth of
+        # handles stay in the shared pool's free queue as mobile soft
+        # chunks. CUDA graphs captured at warmup will see allocator
+        # capacity = static_min and never issue offsets beyond it, which
+        # is what makes the actuator's later cuMemMap/cuMemUnmap of soft
+        # chunks safe.
         for i in range(n_subpools):
-            granted = self._arena.grow(self._pool_name(i), self.init_chunks_per_pool)
-            if granted != self.init_chunks_per_pool:
+            granted = self._arena.grow(
+                self._pool_name(i), self.static_min_chunks_per_pool)
+            if granted != self.static_min_chunks_per_pool:
                 raise RuntimeError(
-                    f"sub-pool {i} only got {granted} of {self.init_chunks_per_pool} init chunks"
+                    f"sub-pool {i} only got {granted} of "
+                    f"{self.static_min_chunks_per_pool} static-min chunks"
                 )
 
         # Hand each sub-pool to the C-side allocator.
@@ -160,7 +199,8 @@ class MultiTensorArena:
         for i in range(n_subpools):
             base = self._arena.pool_va_base(self._pool_name(i))
             self._lib.multi_init(
-                self._c_index(i), base, chunk_bytes, self.init_chunks_per_pool)
+                self._c_index(i), base, chunk_bytes,
+                self.static_min_chunks_per_pool)
 
         # Tensor construction. Two paths:
         #
@@ -197,7 +237,7 @@ class MultiTensorArena:
                     device_index=device_id,
                 )
                 if os.environ.get("SGLANG_ARENA_ZERO_INIT_LIVE") == "1":
-                    live_tokens = self.init_chunks_per_pool * self.tokens_per_chunk
+                    live_tokens = self.static_min_chunks_per_pool * self.tokens_per_chunk
                     if live_tokens > 0:
                         t[:live_tokens].zero_()
                 self._tensors.append(t)
@@ -222,23 +262,26 @@ class MultiTensorArena:
                     t = torch.empty(
                         (max_tokens, *per_token_shape), dtype=dtype, device="cuda")
                 if os.environ.get("SGLANG_ARENA_ZERO_INIT_LIVE") == "1":
-                    live_tokens = self.init_chunks_per_pool * self.tokens_per_chunk
+                    live_tokens = self.static_min_chunks_per_pool * self.tokens_per_chunk
                     if live_tokens > 0:
                         t[:live_tokens].zero_()
                 # Restore so subsequent torch.empty inside this MemPool
-                # would respect the live capacity. (Not used in practice;
-                # only one tensor per sub-pool.)
-                self._lib.multi_set_capacity(ci, self.init_chunks_per_pool)
+                # would respect the live (static-min) capacity.
+                self._lib.multi_set_capacity(
+                    ci, self.static_min_chunks_per_pool)
                 self._tensors.append(t)
 
         torch.cuda.synchronize()
         logger.info(
             "MultiTensorArena initialized: n_layers=%d, n_kinds=%d, "
             "n_subpools=%d, chunk_bytes=%d, max_tokens=%d, init_tokens=%d, "
-            "tokens_per_chunk=%d, va_base=0x%x",
+            "static_min_tokens=%d, tokens_per_chunk=%d, va_base=0x%x, "
+            "boot_mapped=%d, mobile_soft_chunks=%d (per sub-pool)",
             self.n_layers, self.n_kinds, n_subpools, chunk_bytes,
-            max_tokens, init_tokens, self.tokens_per_chunk,
+            max_tokens, init_tokens, static_min_tokens, self.tokens_per_chunk,
             self._arena.va_base,
+            self.static_min_chunks_per_pool,
+            self.init_chunks_per_pool - self.static_min_chunks_per_pool,
         )
 
     # ------------------------------------------------------------------

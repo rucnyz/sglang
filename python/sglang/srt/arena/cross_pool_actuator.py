@@ -170,25 +170,31 @@ class CrossPoolTransferActuator:
             }
 
         # How many chunks must each src sub-pool shed to free enough
-        # handles for the dst grow? ceil(needed / n_src).
+        # handles for the dst grow? Subtract whatever's already free in
+        # the shared pool first — under the mobile-soft split, that's
+        # where (init − static_min) chunks per arena live initially, so
+        # in many cases dst can grow purely from mobile soft without
+        # touching src. Whatever remains is divided equally across src
+        # sub-pools (ceil so dst grows fully).
         needed = n_per_dst_subpool * n_dst
-        n_per_src_subpool = (needed + n_src - 1) // n_src
+        shared_free = self.shared.free_count()
+        needed_from_src = max(0, needed - shared_free)
+        n_per_src_subpool = (needed_from_src + n_src - 1) // n_src if n_src > 0 else 0
 
         src_min_mapped = min(
             src._arena.pool_mapped_chunks(name) for name in src_names
         )
         # Static-min floor: paper §design-l2-actuator (line 133-135) requires
         # a static-min region whose physical pages are mapped at startup and
-        # NEVER unmapped, against which CUDA graphs are captured. Our impl
-        # currently treats `init_chunks_per_pool` as the static-min boundary:
-        # the actuator may grow into soft (init, max] via cross-pool transfer
-        # but must never shrink below init, otherwise captured CUDA graphs
-        # reference unmapped pages → cudaErrorIllegalAddress on next decode
-        # replay (B3 v2 cell_01 + v9-auto v4 cell_11_nb_v4 crashed exactly
-        # this way after a 60-chunk lcm transfer dropped KV from 5 to 2
-        # chunks per sub-pool). Operators wanting non-trivial soft headroom
-        # must over-provision init at boot via SGLANG_ARENA_*_HEADROOM_CHUNKS.
-        static_min = src.init_chunks_per_pool
+        # NEVER unmapped, against which CUDA graphs are captured. The arena
+        # exposes `static_min_chunks_per_pool` as that floor; the actuator
+        # refuses any shrink that would drop a sub-pool below it. With the
+        # mobile-soft split (SGLANG_ARENA_*_MOBILE_SOFT_CHUNKS), boot-time
+        # mapped chunks = static_min, and (init - static_min) chunks live in
+        # the shared free queue as transferable mobile soft. Without the
+        # split (default), static_min == init and the actuator effectively
+        # can't shrink — transfers must come from peer's free handles.
+        static_min = src.static_min_chunks_per_pool
         if src_min_mapped - n_per_src_subpool < static_min:
             return {
                 "direction": direction_label,
