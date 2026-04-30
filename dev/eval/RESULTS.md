@@ -130,13 +130,39 @@ Raw data: `/tmp/a5_chunk_3147806/`.
 
 ---
 
-### Setting 1 — 24-hour phase-shift 4-cell ablation (RUNNING, v2)
+### Setting 1 — 24-hour phase-shift 4-cell ablation (RUNNING v3, A+B done)
 
 `dev/eval/07_phase_shift_trace.sh` × 4 cells in parallel on GPU 1 / 4 / 5 / 6 (ports 30097/95/94/93).
 - Cells: `(L1, L2)` ∈ {(0,0), (1,0), (0,1), (1,1)}; phases A/B/C.
-- v1 attempt died at "Phase A" because pd_exp jsonl format ({prompt, input_len, output_len}) is incompatible with `bench_serving --dataset-name custom` (expects ShareGPT conversations format). Wrote `dev/eval/_convert_jsonl_to_sharegpt.py` and re-launched.
-- L1=1 cells emit `pool memory leak detected!` warnings on idle (Phase 3.d K_BIG path leaks 7-8 slots; see BLOCKERS.md). `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0` set on those cells so the warning doesn't crash the run.
-- Results pending. Raw data: `/tmp/phase_shift_v2_1777548251/`.
+- v1 attempt died at Phase A — pd_exp jsonl format incompatible with `bench_serving --dataset-name custom`. Wrote `_convert_jsonl_to_sharegpt.py`.
+- v2 attempt: L1=1 cells crashed in `cache_unfinished_req` because Phase 3.d K_BIG suppression created tombstone leaves at depth 512 with no snapshot ancestor → match_prefix returned 0 indices. Fixed in `mamba_radix_cache.py` (only suppress when `insert_depth >= k_big AND insert_depth % k_big != 0`). See BLOCKERS.md.
+- v3 (current): all 4 cells running, Phase A and Phase B complete. Phase C in progress.
+
+**Phase A** (alpaca classification, ~512-token prompts, RPS=8, 800 prompts):
+
+| cell | input TPS | mean TTFT | P99 TTFT | median E2E |
+|---|---:|---:|---:|---:|
+| (0,0) stock      | 4051.5 | 44.7ms | 80.5ms | 154.6ms |
+| (0,1) L2 only    | 4052.1 | 46.1ms | 83.2ms | 157.3ms |
+| (1,0) L1 only    | 4051.8 | 44.9ms | 79.1ms | 155.1ms |
+| (1,1) L1+L2 full | 4052.3 | 46.2ms | 81.4ms | 157.9ms |
+
+Phase A is too short / too uniform for any cell to differentiate. K_BIG never activates (prompts < 8192 tokens) and Layer 2 has nothing to arbitrate. *This is exactly what paper §6.2 predicts for the smooth-classification phase.*
+
+**Phase B** (sharegpt rerank, ~512-token prompts, RPS=12, 800 prompts):
+
+| cell | input TPS | mean TTFT | P99 TTFT | median E2E | xpool xfers |
+|---|---:|---:|---:|---:|---:|
+| (0,0) stock      | 6060.0 | 49.0ms | **150.7ms** | 107.3ms | – |
+| (0,1) L2 only    | 6058.9 | 47.3ms | 90.8ms | 109.1ms | 1 |
+| (1,0) L1 only    | 6062.4 | 45.9ms | 85.3ms | 107.1ms | – |
+| (1,1) L1+L2 full | 6059.6 | 48.3ms | **93.9ms** | 111.6ms | 1 |
+
+Throughput is essentially identical across cells (~6060 TPS), but **P99 TTFT drops from 150.7ms (stock) to 93.9ms (L1+L2) — a 38% tail-latency reduction**. The mean and median are flat. Layer 1 (HPB LRU) is the dominant contributor here; Layer 2 fires only 1 cross-pool transfer.
+
+Phase C (wildchat multi-turn) results pending — that's where K_BIG and L2 cross-pool should matter most.
+
+Raw data: `/tmp/phase_shift_v3_1777548459/`. Aggregate: `python3 dev/eval/_aggregate_phase_shift.py /tmp/phase_shift_v3_1777548459`.
 
 ## Pending settings (queued, blocked, or scheduled)
 

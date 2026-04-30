@@ -88,33 +88,65 @@ run_cell() {
     if [ "$phase" = "C" ]; then
       # Phase C is multi-turn; use custom dispatcher (not sglang.bench_serving).
       INPUT_FILE=$input_file PORT=$PORT MODEL=$MODEL CELL=$cell PHASE=$phase OUT_DIR=$OUT_DIR \
-      .venv/bin/python <<PY 2>&1 | tail -5
-import json, urllib.request, time, statistics
-data = json.load(open("$input_file"))
+      .venv/bin/python <<'PY' 2>&1 | tail -8
+import json, os, urllib.request, time, statistics
+PORT = os.environ['PORT']
+MODEL = os.environ['MODEL']
+CELL = os.environ['CELL']
+OUT_DIR = os.environ['OUT_DIR']
+INPUT_FILE = os.environ['INPUT_FILE']
+data = json.load(open(INPUT_FILE))
+# Normalize each item to a list of {role, content} turns regardless of source format.
+def _to_turns(conv):
+    # wildchat export: {id, messages: [{role, content}]}
+    if isinstance(conv, dict) and isinstance(conv.get('messages'), list):
+        return conv['messages']
+    # ShareGPT-style: {conversations: [{from/role, value/content}]}
+    if isinstance(conv, dict) and isinstance(conv.get('conversations'), list):
+        return [{'role': t.get('from', t.get('role', 'user')),
+                 'content': t.get('value', t.get('content', ''))}
+                for t in conv['conversations']]
+    if isinstance(conv, list):
+        return conv
+    return []
+
 results = []
-for conv in data[:50]:  # cap for runtime
-    turns = conv.get("conversations") or conv if isinstance(conv, list) else conv.get("turns", [])
-    if not turns: continue
+errors = 0
+N = min(50, len(data))
+for conv in data[:N]:
+    turns = _to_turns(conv)
+    user_turns = [t for t in turns if t.get('role') == 'user']
+    if len(user_turns) < 2:
+        continue
     history = ""
-    for t in turns[:6]:
-        prompt = history + t.get("value", "") + "\n"
-        if len(prompt) < 50: continue
+    for t in user_turns[:6]:
+        content = t.get('content', '')
+        if not content or len(content) < 30:
+            continue
+        prompt = (history + content + "\n")[:30000]
         t0 = time.time()
-        body = json.dumps({'model': '$MODEL', 'prompt': prompt[:30000], 'max_tokens': 64, 'temperature': 0}).encode()
+        body = json.dumps({'model': MODEL, 'prompt': prompt, 'max_tokens': 64,
+                           'temperature': 0}).encode()
         try:
             r = json.loads(urllib.request.urlopen(urllib.request.Request(
-                'http://127.0.0.1:$PORT/v1/completions', data=body, headers={'Content-Type':'application/json'}),
+                f'http://127.0.0.1:{PORT}/v1/completions', data=body,
+                headers={'Content-Type': 'application/json'}),
                 timeout=120).read())
             elapsed = (time.time() - t0) * 1000
             results.append(elapsed)
             history = prompt + r['choices'][0]['text']
         except Exception as e:
+            errors += 1
             print(f"  err: {e}")
             break
-print(f"  Phase C: n={len(results)}, mean_latency={statistics.mean(results):.1f}ms")
-import os
-with open(os.environ['OUT_DIR'] + f"/{os.environ['CELL']}_phase_C_summary.txt", 'w') as f:
-    f.write(f"n={len(results)}\nmean_ms={statistics.mean(results):.2f}\n")
+mean_ms = statistics.mean(results) if results else 0.0
+p95_ms = statistics.quantiles(results, n=20)[-1] if len(results) >= 20 else 0.0
+print(f"  Phase C: n={len(results)}, mean={mean_ms:.1f}ms, p95={p95_ms:.1f}ms, errors={errors}")
+with open(f"{OUT_DIR}/{CELL}_phase_C_summary.txt", 'w') as f:
+    f.write(f"n={len(results)}\n")
+    f.write(f"mean_ms={mean_ms:.2f}\n")
+    f.write(f"p95_ms={p95_ms:.2f}\n")
+    f.write(f"errors={errors}\n")
 PY
     else
       .venv/bin/python -m sglang.bench_serving \
