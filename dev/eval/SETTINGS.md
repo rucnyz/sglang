@@ -291,7 +291,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | 2.2 | KV↔LoRA sweep | **DONE PASS** — paper Table 2 updated, 192× swing | — |
 | 2.3 | Prefix sweep | **DONE PASS** — paper Table 3 updated, V_prefix flat | — |
 | 3.A | V_prefix' faithful | **DONE PARTIAL (3-arm)** — default best on TTFT, all configs in 80-83% hit band | host-tier-on arm + pressured-pool workload future work |
-| 3.B | V_prefix' stability | not started | UNBLOCKED — needs cold-burst driver |
+| 3.B | V_prefix' stability | **DONE PASS** — HPB recovery -18% TTFT vs recency, paper tab:q3b | — |
 | 3.C | Composed L1+L2 | not started | depends on 1 + 3.A |
 | 3.D | HPB-vs-recency on GSP | **DONE PASS** — paper tab:hpb-gsp added, -19.77% TTFT | — |
 | 4 | Estimator accuracy | not started | depends on 1 + 2 |

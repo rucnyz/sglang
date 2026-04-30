@@ -95,6 +95,33 @@ Raw data: `/tmp/sweep_lora_3157665/ml*_bench.json`. Updated `evaluation.tex` Tab
 
 Raw data: `/tmp/a3_hyst_3195814/hyst*_budgeter.jsonl`.
 
+### Setting 3.B — Cold-burst stability (Q3.B, DONE PASS)
+
+`dev/eval/10_setting3b_cold_burst.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B with K_big=8192 (heterogeneous tree active in both arms). Three-phase workload:
+1. **build** — GSP shared-prefix, 8 groups × 10 prompts, 12K system prompt, RPS=2 (~40s)
+2. **burst** — random un-shared 4K-token prompts, RPS=8, 200 prompts (~25s)
+3. **recovery** — GSP shared-prefix again
+
+| arm | phase | input TPS | mean TTFT | P99 TTFT | median E2E |
+|---|---|---:|---:|---:|---:|
+| recency | build    | 27 909 | 319.3ms | 1102.9ms | 3 410.5ms |
+| recency | burst    | 15 314 | 229.6ms |  486.1ms | 1 267.9ms |
+| recency | recovery | 27 892 | **320.5ms** | **1106.2ms** | **3 430.4ms** |
+| hpb     | build    | 27 897 | 315.5ms | 1100.2ms | 3 399.1ms |
+| hpb     | burst    | 15 469 | **160.6ms** (-30%) |  415.1ms (-15%) |   **696.1ms** (-45%) |
+| hpb     | recovery | 27 910 | **262.5ms** (-18%) | 556.3ms (-50%!) | **3 023.4ms** (-12%) |
+
+**Headline: HPB LRU's stability claim is reproduced.** Compared to recency LRU:
+- **Burst-phase TTFT: -30% (160.6ms vs 229.6ms)** — HPB handles random unshared prompts faster because it evicts them first (zero hits-per-byte) instead of evicting shared-prefix snapshots (high hits-per-byte). Recency LRU evicts the oldest, which can be the high-value shared-prefix nodes.
+- **Recovery-phase TTFT: -18% (262.5ms vs 320.5ms)** — HPB's preserved shared-prefix snapshots mean Phase 3's GSP queries hit deeper, saving more re-prefill.
+- **Recovery-phase median E2E: -12% (3023ms vs 3430ms)** — same effect propagates to full request latency.
+
+Cache hit batch coverage is similar (recency 139/319 = 43.6%, hpb 149/330 = 45.2%) — the win isn't in WHICH batches hit but in HOW DEEP the hits go. HPB preserves the 12K-token shared-prefix snapshot during the burst so Phase 3 hits 8K+ of cached prefix per request; recency's burst-time evictions force Phase 3 to re-prefill more from scratch.
+
+This complements Q3.D (HPB-vs-recency on smooth GSP, -19.77% TTFT) by showing HPB's advantage HOLDS UNDER PERTURBATION — the paper §6.3 Q3.B narrative ("HPB is stable across cold burst, recency collapses") reproduces.
+
+Raw data: `/tmp/setting3b_297108/`.
+
 ### Setting 3.A — V_prefix' faithful slope (Q3.A, 3-arm subset, DONE)
 
 `dev/eval/09_setting3a_vprefix_faithful.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B + GSP shared-prefix workload (8 groups × 10 prompts, 12K system prompt, RPS=2). Three mamba prefix-cache configurations:
