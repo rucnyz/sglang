@@ -284,6 +284,7 @@ Raw data: `/tmp/setting3b_297108/`.
 | arm | input TPS | mean TTFT | P99 TTFT | median E2E | cache-hit batches |
 |---|---:|---:|---:|---:|---:|
 | **default** (`MambaRadixCache`, page_size=1, no_buffer) | 27 915 | **284.5ms** | **1094.0** | 2 875.1 | 71/86 (82.6%) |
+| **default + host tier** (`HiMambaRadixCache`, hicache_ratio=2.0) | 27 811 | 304.2ms (+7%) | 1 212.1 (+11%) | 3 200.3 (+11%) | 71/86 (82.6%) |
 | **extra_buffer** (page_size=8192, mamba_scheduler_strategy=extra_buffer) | 28 023 | 335.5 (+18%) | 1 272.1 (+16%) | **2 753.4** (-4%) | 73/91 (80.2%) |
 | **layer1** (HPB LRU + K_big=8192, page_size=1) | 27 878 | 328.8 (+16%) | 1 104.4 | 3 419.4 (+19%) | 70/87 (80.5%) |
 

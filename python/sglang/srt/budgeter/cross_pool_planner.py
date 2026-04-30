@@ -45,6 +45,13 @@ class CrossPoolPolicyConfig:
     cooldown_ticks: int = 3        # Don't fire two transfers in a row;
                                    # let the system settle.
     dst_chunks_per_action: int = 1  # In balanced units (lcm-aware).
+    # Setting 4 follow-up: V_σ' ≈ usage_σ is saturation-blind. When
+    # qdepth_trigger > 0, the planner ALSO fires a transfer when one
+    # pool is saturated (above its high watermark) and the queue depth
+    # exceeds qdepth_trigger — even if the other pool is above its low
+    # watermark. This recovers gradient information at saturation: a
+    # rising queue is the signal that pool capacity is the bottleneck.
+    qdepth_trigger: int = 0        # 0 = disabled; e.g. 4 enables the new rule
 
 
 def _policy_from_env() -> CrossPoolPolicyConfig:
@@ -55,6 +62,7 @@ def _policy_from_env() -> CrossPoolPolicyConfig:
         mamba_low_water=float(os.environ.get("SGLANG_XPOOL_MAMBA_LOW", "0.40")),
         cooldown_ticks=int(os.environ.get("SGLANG_XPOOL_COOLDOWN", "3")),
         dst_chunks_per_action=int(os.environ.get("SGLANG_XPOOL_UNIT", "1")),
+        qdepth_trigger=int(os.environ.get("SGLANG_XPOOL_QDEPTH_TRIGGER", "0")),
     )
 
 
@@ -64,6 +72,7 @@ class PlanDecision:
     reason: str
     usage_kv: float
     usage_mamba: float
+    queue_depth: int = 0        # admission-pressure signal at decision time
 
 
 class CrossPoolPlanner:
@@ -93,6 +102,7 @@ class CrossPoolPlanner:
         self,
         usage_kv: float,
         usage_mamba: float,
+        queue_depth: int = 0,
     ) -> PlanDecision:
         self._tick_count += 1
         c = self.config
@@ -104,6 +114,7 @@ class CrossPoolPlanner:
                 reason=f"cooldown ({self._cooldown_remaining} left)",
                 usage_kv=usage_kv,
                 usage_mamba=usage_mamba,
+                queue_depth=queue_depth,
             )
 
         # KV-stressed, mamba-relaxed → take from mamba.
@@ -115,6 +126,7 @@ class CrossPoolPlanner:
                        f"mamba={usage_mamba:.2f}<={c.mamba_low_water:.2f}",
                 usage_kv=usage_kv,
                 usage_mamba=usage_mamba,
+                queue_depth=queue_depth,
             )
         # Mamba-stressed, KV-relaxed → take from KV.
         if usage_mamba >= c.mamba_high_water and usage_kv <= c.kv_low_water:
@@ -125,10 +137,41 @@ class CrossPoolPlanner:
                        f"kv={usage_kv:.2f}<={c.kv_low_water:.2f}",
                 usage_kv=usage_kv,
                 usage_mamba=usage_mamba,
+                queue_depth=queue_depth,
             )
+        # Setting 4 follow-up: at saturation, V_σ' ≈ usage_σ is blind to
+        # which pool is the bottleneck. Add a queue-depth-driven rule:
+        # when one pool is saturated and queue is non-trivial, fire a
+        # transfer toward the saturated pool. This rule is gated on
+        # SGLANG_XPOOL_QDEPTH_TRIGGER > 0 to preserve the legacy default.
+        if c.qdepth_trigger > 0 and queue_depth >= c.qdepth_trigger:
+            if usage_mamba >= c.mamba_high_water and usage_kv < c.kv_high_water:
+                self._cooldown_remaining = c.cooldown_ticks
+                return PlanDecision(
+                    direction="kv_to_mamba",
+                    reason=f"saturation+queue: mamba={usage_mamba:.2f}>="
+                           f"{c.mamba_high_water:.2f} & qdepth={queue_depth}>="
+                           f"{c.qdepth_trigger}",
+                    usage_kv=usage_kv,
+                    usage_mamba=usage_mamba,
+                    queue_depth=queue_depth,
+                )
+            if usage_kv >= c.kv_high_water and usage_mamba < c.mamba_high_water:
+                self._cooldown_remaining = c.cooldown_ticks
+                return PlanDecision(
+                    direction="mamba_to_kv",
+                    reason=f"saturation+queue: kv={usage_kv:.2f}>="
+                           f"{c.kv_high_water:.2f} & qdepth={queue_depth}>="
+                           f"{c.qdepth_trigger}",
+                    usage_kv=usage_kv,
+                    usage_mamba=usage_mamba,
+                    queue_depth=queue_depth,
+                )
+
         return PlanDecision(
             direction=None,
             reason=f"both within band: kv={usage_kv:.2f} mamba={usage_mamba:.2f}",
             usage_kv=usage_kv,
             usage_mamba=usage_mamba,
+            queue_depth=queue_depth,
         )

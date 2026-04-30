@@ -404,11 +404,21 @@ class BudgetAgent:
         snapshot["xpool_plan_usage_kv_inst"] = usage_kv_inst
         snapshot["xpool_plan_usage_mamba_inst"] = usage_mamba_inst
 
-        decision = self._xpool_planner.decide(usage_kv, usage_mamba)
+        # Setting 4 follow-up: pass queue_depth so the planner has an
+        # admission-pressure signal at saturation (V≈usage proxy alone
+        # is saturation-blind).
+        _q = snapshot.get("num_queue_reqs", 0)
+        _qt = getattr(_q, "total", None)
+        qdepth = int(_qt) if isinstance(_qt, (int, float)) else (
+            int(_q) if isinstance(_q, (int, float)) else 0
+        )
+
+        decision = self._xpool_planner.decide(usage_kv, usage_mamba, queue_depth=qdepth)
         snapshot["xpool_plan_direction"] = decision.direction or "none"
         snapshot["xpool_plan_reason"] = decision.reason
         snapshot["xpool_plan_usage_kv"] = decision.usage_kv
         snapshot["xpool_plan_usage_mamba"] = decision.usage_mamba
+        snapshot["xpool_plan_queue_depth"] = decision.queue_depth
 
         if decision.direction is None:
             return
