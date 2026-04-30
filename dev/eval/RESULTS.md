@@ -547,6 +547,55 @@ The headline: paper §6.2 tab:headline-v9 now reflects the clean 4-cell numbers.
 
 Raw data: `/tmp/setting1_v9auto_full_*/`.
 
+### v9-auto 6-cell ablation v2 (栓3 net-benefit gate validation, 2026-04-30 night)
+
+`/tmp/v9auto_nb_v2/` — fresh 6-cell ablation on Setting 1 v9 trace
+(GSP/random-8K/random-4K) with edge_trigger × net_benefit knobs:
+
+| cell | L1 | L2 | edge | nb | Phase A TPS | Phase C ttft | Phase C **p99** | xfers |
+|---|:-:|:-:|:-:|:-:|---:|---:|---:|---:|
+| cell_00 | 0 | 0 | – | – | 82523 | 142 ms | 1128 ms | 0 |
+| cell_10 | 1 | 0 | – | – | 79180 | 144 ms | 961 ms | 0 |
+| cell_01 | 0 | 1 | 1 | 1 | 81112 | 133 ms | 706 ms | 0 |
+| cell_11_lvl | 1 | 1 | 0 | 0 | 78505 | 148 ms | 1014 ms | 8 |
+| cell_11_edge | 1 | 1 | 1 | 0 | 79777 | 140 ms | 982 ms | 2 |
+| cell_11_nb | 1 | 1 | 1 | 1 | 78582 | 147 ms | **1223 ms** | **0** |
+
+**Findings:**
+1. `cell_11_lvl` (legacy level-trigger) fires 8 transfers and is +5%
+   Phase C P99 over `cell_10` L1-only — confirms the original
+   "L1+L2 net-negative" finding, smaller magnitude than v9-auto v1
+   (which was +42%) but same direction.
+2. `cell_11_edge` (栓1+栓2 edge-trigger only) fires 2 transfers and is
+   +2% over L1-only — the edge-trigger alone gets most of the way.
+3. **`cell_11_nb` (栓3 with original B_lb) fires 0 transfers and is +27%
+   WORSE than L1-only.** Budgeter telemetry: 125 ticks of mamba in
+   ABOVE_HIGH (0.84-1.00) but `num_paused = num_retracted = 0`
+   throughout — stock MambaRadixCache evicts aggressively enough that
+   the scheduler never paused/retracted, so B_lb collapses to 0 and the
+   gate refuses every fire. Result: arena partitioning + budgeter tick
+   overhead with zero L2 benefit.
+4. cell_01 (L2-only) p99 = 706 ms is suspicious — fired 0 transfers, so
+   the apparent –37% is run-to-run noise in a single 50-second Phase C.
+
+**Diagnosis:** the original B_lb formula (paused + retracted only) is
+zero on workloads where stock cache absorbs sustained pool pressure
+silently via aggressive eviction. The cost is real (every miss = a
+re-prefill) but doesn't surface as paused/retracted. Need a third term
+that scores sustained ABOVE_HIGH directly.
+
+**Fix landed (sglang fork c4a426e38, paper e930c3b):** B_lb extended
+with `(kv_above_consec + mamba_above_consec) * c_persist_tick` and a
+stable-state re-evaluation branch every `nb_persist_eval_period` ticks
+so edge-trigger gets a chance to fire under sustained pressure.
+Defaults: `c_persist_tick = 5 ms`, `nb_persist_eval_period = 10` ticks
+(20 s wall under tau=2 s control interval). Unit tests T9+T10 in
+`dev/2e/38_planner_netbenefit_unit.py` validate B_persist accumulates
+to clear the gate margin at `consec=20` (= 100 ms benefit ≥ 50 ms ×
+1.5 cost).
+
+Re-run cell_11_nb v3 in flight at `/tmp/v9auto_nb_v3/cell_11_nb_v3/`.
+
 ### ⚠️ 2026-04-30 late-night re-interpretation: L1+L2 is NET NEGATIVE on v9-auto
 
 Re-reading the table after the regression+benefit suite v7 work shows two
