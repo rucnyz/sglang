@@ -53,11 +53,35 @@ Hit rate is 82% (paper reports 75.8%) — different in absolute level but the FL
 
 **Raw data:** `/tmp/sweep_prefix_3048500/mf*_bench.json`.
 
-### Setting 2.2 — KV↔LoRA sweep on Qwen3-4B + 32 adapters (in progress)
+### Setting 2.2 — KV↔LoRA sweep on Qwen3-4B + 32 adapters (in progress, 2/6 done)
 
-`dev/eval/05_sweep_lora.sh` on GPU 2, port 30101. Just started.
+`dev/eval/05_sweep_lora.sh` on GPU 2, port 30101. After --lora-name flag fix.
 - 32 synthetic LoRA adapters at `/scratch/yuzhou/.cache/synthetic_loras/qwen3-4b-r16/`
-- max_loras_per_batch sweep {1, 2, 4, 8, 16, 32}
+- max_loras_per_batch sweep {1, 2, 4, 8, 16, 32}, 1000 random prompts, 512-input/128-output, RPS=32
+
+| max_loras | input TPS | mean TTFT (ms) | paper ref |
+|---:|---:|---:|:---:|
+| 1 | 4406 | 14616 | (paper: 5652, 7047) |
+| 2 | 5614 | 7378 | (paper: 6442, 3586) |
+| 4 | (running) | | (paper: 7072, 1861) |
+| 8 | | | (paper: 7258, 1006) |
+| 16 | | | (paper: 7462, 309) |
+| 32 | | | (paper: 7556, 74) |
+
+**So far:** TTFT roughly **halves** as max_loras doubles (14616→7378 from ml=1→ml=2 = ~50% drop). Paper's elbow is at ml=8 with 95× total swing — too early to tell if ours hits that.
+
+### Ablation A5 — VMM chunk size sweep (in progress)
+
+`dev/eval/03_a5_chunk_size.sh` on GPU 1, port 30100.
+
+| arm | input TPS | mean TTFT (ms) | P99 TTFT (ms) |
+|---:|---:|---:|---:|
+| baseline (no arena) | 2076 | 44.9 | 76.6 |
+| chunk64MB | 2076 | 49.1 | **169.9** |
+| chunk256MB | (running) | | |
+| chunk1GB | (running) | | |
+
+**So far:** baseline vs chunk64MB shows the **+9% mean TTFT, +122% P99 TTFT** regression we documented in 2e.5.6.3.b. P99 doubling on arena path is worse than I previously measured (was ~13%) — this may be because A5 uses a smaller workload (100 prompts vs 1000), magnifying tail latencies. Need to see chunk256MB and chunk1GB to test the hypothesis that coarser chunks help.
 
 ### GSP HPB-vs-recency (Phase 3.a eval v6) — done before this session
 
