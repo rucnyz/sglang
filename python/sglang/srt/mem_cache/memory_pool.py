@@ -470,6 +470,26 @@ class MambaPool:
             self.free_slots = torch.arange(
                 1, self.size + 1, dtype=torch.int64, device=self.device
             )
+            # Static-min/soft engine plumbing: when mobile_soft_chunks > 0,
+            # the arena boots with only static_min worth of physical pages
+            # mapped. The engine's allocator must NOT hand out slot ids in
+            # the soft (initially unmapped) tail or the next decode write
+            # → cudaErrorIllegalAddress (B3 v5 cell_01 crashed exactly this
+            # way after 48 reqs). Cap the allocator at static_min slots
+            # initially; the cross-pool actuator's `cap_allocator_only`
+            # path bumps the cap when soft chunks get mapped.
+            arena = getattr(self, "_mamba_temporal_arena", None)
+            if arena is not None:
+                static_min_slots = (
+                    arena.static_min_chunks_per_pool * arena.tokens_per_chunk
+                )
+                if static_min_slots < self.size:
+                    self.set_capacity_slots(static_min_slots)
+                    logger.info(
+                        "MambaPool engine-allocator cap: %d/%d slots "
+                        "(static_min) — soft tail reserved for actuator",
+                        static_min_slots, self.size,
+                    )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
