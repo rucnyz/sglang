@@ -95,17 +95,62 @@ Two distinct bugs surfaced in same crash:
    next decode replay. Logged in BLOCKERS.md (`63c595d63`); full fix is
    plumbing static_min/soft split into multi_tensor_arena.
 
-### B3 v4 + v9-auto v6 (env-default fix in flight)
+### B3 v4 + v9-auto v6 (env-default fix VALIDATED — no crashes, no fires)
 
-Re-launched with corrected env defaults. With cost=3 s × margin=1.5 the
-gate needs B_persist ≥ 4.5 s = 900 sustained ABOVE_HIGH ticks (= 30 min
-at tau=2 s) to fire — effectively never fires on a 6-min trace. L2
-should stay silent → "全开 ≥ baseline" property holds because no
-transfer = no crash.
+Both runs completed cleanly with the env-default fix (`a4dc081c4`).
+Net-benefit gate refused every potential fire (B_persist max ≈ 0.75 s
+on 150-tick traces vs cost × margin = 4.5 s).
 
-The L2 metric demonstration (transfer fires safely + delivers benefit)
-is gated on the static-min implementation, which is logged as paper-
-required engineering follow-up.
+**B3 v4 4-cell ablation:**
+| cell | L1 | L2 | n_total | ttft (ms) | p99 (ms) | e2e_med (ms) | xfers |
+|---|:-:|:-:|---:|---:|---:|---:|---:|
+| 00 | 0 | 0 | 8415 | 642 | 7064 | 467 | 0 |
+| 10 | 1 | 0 | 8158 | 668 | 7199 | 482 | 0 |
+| 01 | 0 | 1 | 7736 | 699 | 7178 | 498 | 0 |
+| 11 | 1 | 1 | 7836 | 688 | 7134 | 499 | 0 |
+
+vs cell_00 baseline:
+- L1 alone: −3.0% n_total, +4.0% ttft (K_BIG/HPB hash overhead).
+- L2 alone (arena, no fire): −8.1% n_total, +8.8% ttft (arena tensor
+  layout overhead — long-context β phase sensitive).
+- **L1+L2: −6.9% n_total, +7.2% ttft, +1.0% p99**.
+
+**v9-auto v6 Phase C (paper Q1 headline metric):**
+| cell | TPS | ttft (ms) | p99 (ms) | e2e_med (ms) |
+|---|---:|---:|---:|---:|
+| 10 (L1 only) | 16022 | 140 | 984 | 3775 |
+| 11_nb (L1+L2, 0 fires) | 16010 | 148 | 1222 | 3936 |
+
+L1+L2 vs L1-only on v9-auto Phase C: −0.1% TPS, +5.7% ttft, +24.2% p99,
++4.3% e2e — the +24% p99 is the largest residual gap.
+
+**Goal "全开任何 workload ≥ baseline" status:** **partially met.** No
+crashes (the catastrophic v3/v5 outcome is gone). Throughput stays
+within −7% of baseline. But there's a structural ~5–8% arena-overhead
+floor (not from L2 transfers — they fired 0 times — but from arena's
+`at::from_blob` tensor layout vs PyTorch's caching allocator). On
+B3 β phase (96K-input long-context decode) and v9-auto Phase C the gap
+opens to +24% p99.
+
+**Two remaining gaps to close before paper claims "L1+L2 ≥ baseline":**
+1. **Arena overhead reduction.** PyTorch's caching allocator can reuse
+   transient pages across KV/mamba/activations; the arena pins each
+   pool's bytes into a fixed VA range, so PyTorch loses ~50 GB of
+   fungibility. This shows up as activation/temp pressure on long-
+   context kernels (B3 β +9%, v9 Phase C +24%). A possible mitigation
+   is restoring some of the activation budget by lowering arena's
+   physical footprint via under-init (kv_init = 0.9 × baseline) and
+   trusting the planner to grow under pressure — but that requires
+   the static-min split first.
+2. **Static-min split for safe transfer.** Paper §design-l2-actuator's
+   static-min/soft separation is the prerequisite for *any* fire to
+   move bytes without crashing CUDA graphs. Until landed, L2 is by
+   construction a no-op on metric-level workloads.
+
+**Pushed:** `7490e5ed5` (actuator static-min floor at init_chunks_per_pool)
+prevents future crashes if someone overrides cost/margin to force a fire.
+The defaults keep L2 silent in production until the paper-design split
+is implemented.
 
 ---
 
