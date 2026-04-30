@@ -6,7 +6,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ## TL;DR — 2026-04-30 night session final summary
 
-**8 PASS, 3 INFORMATIVE, 1 NULL (control), 3 BLOCKED, +1 implementation fix landed.**
+**10 PASS, 3 INFORMATIVE, 1 NULL (control), 3 BLOCKED, +1 implementation fix landed.**
 
 | setting | status | headline |
 |---|---|---|
@@ -30,7 +30,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 **Implementation fix landed**: Phase 3.d K_BIG match-prefix invariant break (commits b37bbc82e + 325f25334). Drops tombstone-leaf creation; tracks deepest_snapshot_depth for insert.prefix_len consistency. 3/3 unit tests + Setting 1 v8 + A2 sweep all run end-to-end.
 
-**Paper updates committed to rucnyz/prelude-paper@main**: Tables 1, 2, 3, tab:hpb-gsp, tab:q3a, tab:q3b, tab:a2, tab:a3, tab:a4, tab:a5, §6.2 Setting 1 honest reframe, §6.8 Q1 PASS.
+**Paper updates committed to rucnyz/prelude-paper@main**: Tables 1, 2, 3, tab:hpb-gsp, tab:q3a, tab:q3b, tab:a1, tab:a2, tab:a3, tab:a4, tab:a5, §6.2 Setting 1 honest reframe, §6.8 Q1+Q2 PASS.
 
 ---
 
