@@ -357,6 +357,35 @@ Raw data: `/tmp/a5_chunk_3147806/`.
 
 ---
 
+### Setting 1 v9 — pool-binding-shift trace (DONE — real differentiation)
+
+`dev/eval/21_setting1_v9_pool_binding.sh` × 4 cells parallel on GPU 1/4/5/6 (mem_frac 0.7 for L2-on cells to fit arena overhead).
+
+v6/v7/v8 nulled because their three phases all bound on the mamba pool. v9 redesigns phases to bind on DIFFERENT pools within a single Qwen3.5-35B-A3B server:
+- Phase A (mamba-bound): GSP shared-prefix, 16 groups × 10 prompts, 12K system prompt, RPS=8
+- Phase B (KV-bound): random 8192-token prompts at RPS=4
+- Phase C (mixed): random 4096-token prompts at RPS=8
+
+| cell | A: TPS / TTFT / E2E | B: TPS / TTFT / E2E | C: TPS / TTFT / E2E | xfers |
+|---|---|---|---|---:|
+| (0,0) stock     | 79.6K / 2428ms / 11333ms | 14.98K / 259ms / 687ms | 16.33K / 198ms / **2279ms** | 0 |
+| (1,0) L1 only   | 63.9K / 4606ms / 16064ms | 15.20K / 182ms / 461ms | 16.35K / 168ms / 1645ms | – |
+| (0,1) L2 only   | 82.1K / 2830ms / 10354ms | 15.27K / **170ms** / 457ms | 16.43K / 174ms / 1431ms | 0 |
+| (1,1) L1+L2     | 61.9K / 5779ms / 16046ms | 15.27K / **164ms** / 454ms | 16.41K / **157ms** / **1409ms** | **28** |
+
+**Headline findings:**
+1. **Layer 2 fires 28 transfers in the full system** (vs v8's 1) — the redesigned trace genuinely creates pool-binding shifts.
+2. **L1+L2 wins on Phase B**: TTFT 164ms vs stock 259ms (**-37%**); median E2E 454ms vs 687ms (**-34%**).
+3. **L1+L2 wins on Phase C**: TTFT 157ms vs stock 198ms (**-20%**); median E2E **1409ms vs 2279ms (-38%)**.
+4. **L2 alone fires 0 transfers** but L1+L2 fires 28: Layer 1 actually CAUSES Layer 2 to engage. Without L1, default MambaRadixCache evicts aggressively enough that mamba_usage stays below threshold; Layer 1's HPB+K_BIG keeps high-value nodes resident, building up usage to the firing threshold.
+5. **Phase A shows K_BIG hurts**: L1 cells -20% TPS, +90% TTFT vs stock. K_BIG=8192 suppresses mamba snapshots on the 12K-prompt shared-prefix workload, costing hit rate. **Consistent with A2 finding** (K_big=0 wins on prefix-friendly workloads).
+
+**Implication:** the joint L1+L2 system delivers double-digit improvements on KV-bound and mixed phases while paying a Phase-A penalty on the mamba-friendly phase. Layer 2's adaptive ability would need to TURN OFF K_BIG when mamba is far from saturated — exactly the workload-conditional control the design calls for. Open follow-up.
+
+Cross-pool budgeter L2-only (L10_L21) didn't fire because mamba pool stays below threshold without L1's snapshot-density change. Documented; not a regression.
+
+Raw data: `/tmp/setting1_v9_*/`.
+
 ### Setting 1 — 24-hour phase-shift 4-cell ablation (DONE v6 — null result, honest)
 
 **TL;DR.** Across 6 attempts (v1–v6), no cell-vs-cell differentiation reproduces stably. The compressed trace's phases (alpaca classification / sharegpt rerank / wildchat multi-turn 6-turn) are too uniform within-phase and too short across-phase to drive the binding pool to shift. Layer 2 fires exactly 1 cross-pool transfer per L2-on cell — it detects the steady state but never has cause to re-arbitrate. Layer 1's K_BIG path is broken on chunked-prefill workloads (see BLOCKERS.md) and is disabled; HPB LRU alone produces no measurable phase-trace improvement.

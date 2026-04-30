@@ -286,7 +286,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 
 | Setting | Description | Status | Blocker |
 |---|---|---|---|
-| 1 | 24-h phase-shift trace | **DONE v4** + v5 longer-context running | Phase C truncation needs longer multi-turn |
+| 1 | 24-h phase-shift trace | **DONE v6 NULL + v9 PASS** — v9 pool-binding-shift trace shows full system Phase B -37% TTFT, Phase C -38% E2E, fires 28 transfers; Phase A regresses (K_BIG hurts mamba-bound shared-prefix) → paper tab:headline-v9 | adaptive K_BIG follow-up |
 | 2.1 | KV↔DN sweep | **DONE PASS** — paper Table 1 updated | — |
 | 2.2 | KV↔LoRA sweep | **DONE PASS** — paper Table 2 updated, 192× swing | — |
 | 2.3 | Prefix sweep | **DONE PASS** — paper Table 3 updated, V_prefix flat | — |
