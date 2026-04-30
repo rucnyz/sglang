@@ -177,9 +177,19 @@ class CrossPoolTransferActuator:
         src_min_mapped = min(
             src._arena.pool_mapped_chunks(name) for name in src_names
         )
-        if src_min_mapped < n_per_src_subpool + 1:
-            # Refuse to drop src below 1 chunk per sub-pool (capacity 0
-            # would crash the engine). Safety floor.
+        # Static-min floor: paper §design-l2-actuator (line 133-135) requires
+        # a static-min region whose physical pages are mapped at startup and
+        # NEVER unmapped, against which CUDA graphs are captured. Our impl
+        # currently treats `init_chunks_per_pool` as the static-min boundary:
+        # the actuator may grow into soft (init, max] via cross-pool transfer
+        # but must never shrink below init, otherwise captured CUDA graphs
+        # reference unmapped pages → cudaErrorIllegalAddress on next decode
+        # replay (B3 v2 cell_01 + v9-auto v4 cell_11_nb_v4 crashed exactly
+        # this way after a 60-chunk lcm transfer dropped KV from 5 to 2
+        # chunks per sub-pool). Operators wanting non-trivial soft headroom
+        # must over-provision init at boot via SGLANG_ARENA_*_HEADROOM_CHUNKS.
+        static_min = src.init_chunks_per_pool
+        if src_min_mapped - n_per_src_subpool < static_min:
             return {
                 "direction": direction_label,
                 "n_per_src_subpool": 0,
@@ -193,7 +203,7 @@ class CrossPoolTransferActuator:
                 "free_after_grow": self.shared.free_count(),
                 "kv_capacity_tokens": self.kv.current_capacity_tokens(),
                 "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
-                "skipped": f"src_at_min (would drop to {src_min_mapped - n_per_src_subpool} chunks)",
+                "skipped": f"src_at_static_min (would drop {src_min_mapped} → {src_min_mapped - n_per_src_subpool} below static_min={static_min})",
             }
 
         # Phase 2e.5.6.3: if per-pool actuators are wired, coordinate
