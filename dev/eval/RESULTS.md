@@ -148,20 +148,33 @@ Use `tab:headline-v9` as the paper-quoted v9-auto data.
 
 **Repro:** see Setting 1 v9-auto block above.
 
-### Arena structural cost — fused_moe hypothesis (UNDER VALIDATION)
+### Arena structural cost — fused_moe hypothesis (REFUTED)
 
 The ~5-10% throughput gap between cell_00 (no arena) and cell_11 (arena
-loaded but actuator no-op) is hypothesized to come from `fused_moe` expert-
-dispatch kernels paying TLB / HBM-channel locality cost when they touch
-weights (in `cudaMalloc` heap) and KV (in `cuMemMap` arena VMM range) per
-launch. Paper §sec:eval-arena-cost states this claim with the 5.86% mean /
-12.34% P99 numbers from earlier `dev/2e/` arena-only runs.
+loaded but actuator no-op) was initially hypothesized to come from
+`fused_moe` expert-dispatch kernels paying TLB / HBM-channel locality cost
+when they touch weights (in `cudaMalloc` heap) and KV (in `cuMemMap` arena
+VMM range) per launch.
 
-**Test suite to validate:** `dev/2e/40_arena_kernel_isolation.py` (written
-2026-05-01, smoke-tested, ready for full run). Isolates 4 kernels ×
-2 allocation paths (cudaMalloc / VMM) × 200 iters with cuda-event timing.
-Hypothesis predictions: t(fused_moe, vmm) / t(fused_moe, cudaMalloc) ≈ 1.05-1.10;
-all other kernel ratios within noise (~1.00).
+**Result: hypothesis REFUTED.** Kernel-level isolation micro-benchmark
+(`dev/2e/40_arena_kernel_isolation.py`, 50 warmup + 200 timed iters per
+kernel × 2 allocation paths, cuda-event timing) shows all four hot kernels
+run within ±1% across cudaMalloc / VMM paths:
+
+| kernel                | mean cudaMalloc (µs) | mean VMM (µs) | ratio (VMM / cudaMalloc) |
+|-----------------------|---------------------:|--------------:|-------------------------:|
+| fused_moe             |               228.6  |        226.9  |                  0.9925  |
+| FlashAttention decode |                29.0  |         28.9  |                  0.9934  |
+| RMSNorm               |                13.5  |         11.9  |                  0.8859  |
+| GEMM 2048×2048        |                46.8  |         46.6  |                  0.9965  |
+
+The arena-on / cudaMalloc gap is therefore **not on the kernel datapath**.
+Paper §sec:eval-arena-cost has been rewritten to attribute the gap to
+scheduler-side bookkeeping (budgeter snapshot collection, sub-pool capacity
+reads, allocator capacity updates, planner traversal), with the
+micro-bench table moved to §sec:appendix-arena-microbench. Next: bisect
+which scheduler-side component dominates by disabling components one-by-
+one (large-to-small).
 
 **Repro:**
 ```bash
