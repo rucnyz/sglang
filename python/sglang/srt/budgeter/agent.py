@@ -533,6 +533,18 @@ class BudgetAgent:
         )
         snap["lora_present"] = self._lora_manager is not None
 
+        # Phase 3.b (paper §4.2 Eq 4.4): V_prefix' marginal-value report.
+        # Available on MambaRadixCache (and Hi*); other tree caches don't
+        # expose this signal yet.
+        if (
+            self._tree_cache is not None
+            and hasattr(self._tree_cache, "estimate_v_prefix_marginal")
+        ):
+            try:
+                snap["v_prefix_marginal"] = self._tree_cache.estimate_v_prefix_marginal()
+            except Exception as e:  # never break the snapshot path
+                snap["v_prefix_marginal_error"] = str(e)
+
         return snap
 
     def close(self) -> None:

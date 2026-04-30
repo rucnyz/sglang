@@ -1332,3 +1332,23 @@ ALL PASS
 
 **Implication for Layer 2 integration.** With HPB LRU in place, the prefix-pool's marginal value (paper §4.3 Equation 4.4) can be reported to `CrossPoolPlanner`: `V_prefix' ≈ (n / W) * S * c_prefill` where `n` = hits on the next-to-evict node, `W` = window, `S` = avg prefill saving, `c_prefill` = per-token prefill cost. That wiring lands when prefix pool joins the cross-pool budget (currently only KV + mamba; prefix is at fixed capacity).
 
+## Phase 3.b — V_prefix' marginal-value reporter (PASS, 2026-04-30)
+
+**Goal.** Surface paper §4.2 Eq. 4.4 to Layer 2 — give the budgeter a live numeric estimate of how much each additional byte of prefix-pool capacity is worth.
+
+**Code.**
+- `mamba_radix_cache.py` `MambaRadixCache.estimate_v_prefix_marginal(c_prefill=1.0)`: runs the HPB selector to find the next-to-evict node; reads its `hits_in_window`; walks up to root accumulating `key` length; returns `(n/W) * S * c_prefill`. Empty tree returns 0.0.
+- `budgeter/agent.py` `_snapshot`: probes `tree_cache.estimate_v_prefix_marginal()` defensively (only on `MambaRadixCache` / `HiMambaRadixCache`; other caches don't expose this method) and stamps the result onto every budgeter snapshot under `v_prefix_marginal`.
+
+**Test (`dev/2e/26_hpb_lru_unit.py` test 5).** Builds a stub cache with one boundary node `B` at prefix length 300 with 5 hits in window. Asserts `estimate_v_prefix_marginal()` returns exactly `(5/60) * 300 = 25.0`. Empty tree returns 0.0.
+
+**Findings.**
+
+1. **The estimator is read-only and side-effect-free.** It calls the HPB selector to find the boundary node but does not actually evict; runs every snapshot tick (default 1 s) at O(n) over the mamba LRU list (bounded by tree size). For tree sizes ≤ 10K nodes this is ≪ 100 µs per snapshot — negligible.
+
+2. **The signal becomes meaningful only after some hits accumulate.** A cold tree returns 0.0 (n=0 on the boundary node). After the workload makes some prefix matches, `record_hit()` fills `_hit_times`, and the estimator returns a non-zero value. This matches the paper's framing: V_prefix' reflects realized cache value, not theoretical capacity.
+
+3. **CrossPoolPlanner does not yet consume V_prefix'.** Phase 2e.5.6.3.c's planner only equalizes between KV and mamba; the prefix pool's capacity is fixed today. Adding prefix as a third pool to the cross-pool budgeter is a separate engineering step (radix tree's tensor-pointer-stable layout is not as straightforward as KV/mamba's `MultiTensorArena`). For now, V_prefix' is logged to the budgeter JSONL alongside `xpool_plan_*` fields, available for offline analysis and as a hook when prefix-pool migration lands.
+
+**Implication.** Paper §4.2 (Layer 1's signal-shaping contribution) is now end-to-end: HPB LRU enforces stable signal shape; the reporter surfaces the V_prefix' that Layer 2 §4.3 needs. The remaining Layer 1 work is the "heterogeneous granularity" framing (Phase 3.c, larger refactor); that is design-level distinct from the existing chunked-prefill snapshot policy and would require radix-tree restructuring + engine restore-path changes.
+

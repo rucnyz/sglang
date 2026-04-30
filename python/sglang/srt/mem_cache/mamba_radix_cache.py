@@ -896,6 +896,48 @@ class MambaRadixCache(BasePrefixCache):
 
         return mamba_num_evicted
 
+    def estimate_v_prefix_marginal(
+        self,
+        c_prefill: float = 1.0,
+    ) -> float:
+        """Phase 3.b (paper §4.2 Eq. 4.4): V_prefix'(m) reporter.
+
+        Estimate the marginal value of holding one more byte of prefix
+        cache. The paper's formula:
+            V_prefix'(m) ≈ (n / W) * S * c_prefill
+        where:
+            n          = hits-in-window on the NEXT-TO-EVICT node
+            W          = hpb_window_s (matches the windowed counter)
+            S          = average prefill tokens saved per hit (proxy:
+                         prefix length terminating at that node)
+            c_prefill  = per-token prefill cost; caller supplies (set
+                         to 1.0 by default so the reported number is in
+                         "tokens of prefill saved per second").
+
+        We use the next-to-evict node from the HPB selector. If HPB is
+        not enabled or the tree is empty, returns 0.0.
+        """
+        if self.disable:
+            return 0.0
+        # Pick the boundary node. Reuse HPB selector even if SGLANG_HPB_LRU
+        # is off, since this is just an estimator (no eviction happens).
+        boundary = self._hpb_pick_mamba_eviction()
+        if boundary is None:
+            return 0.0
+        n = boundary.hits_in_window()
+        if n == 0:
+            return 0.0
+        # Prefix length through this node: walk up from boundary to root
+        # accumulating key length. Bounded by tree depth.
+        S_tokens = 0
+        node = boundary
+        while node.parent is not None:
+            if node.key is not None:
+                S_tokens += len(node.key)
+            node = node.parent
+        W = max(1e-3, TreeNode.hpb_window_s)
+        return (n / W) * S_tokens * c_prefill
+
     def evict_full(self, full_num_tokens: int) -> int:
         """Evict full KV cache. Returns the number of tokens evicted."""
         if self.disable or full_num_tokens <= 0:

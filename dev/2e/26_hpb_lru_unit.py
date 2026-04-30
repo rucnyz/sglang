@@ -143,12 +143,57 @@ def test_zero_size_guard():
     print("PASS Test 4\n")
 
 
+def test_estimate_v_prefix_marginal():
+    print("== Test 5: V_prefix' marginal-value reporter (paper §4.2 Eq 4.4) ==")
+    # Stubbed cache class with the bare minimum the estimator needs.
+    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, RadixKey
+
+    # Patch enough of MambaRadixCache to skip __init__ heavy machinery.
+    cache = MambaRadixCache.__new__(MambaRadixCache)
+    cache.disable = False
+    # Need a mamba_lru_list whose `cache` dict the HPB selector iterates.
+    class StubLRU:
+        def __init__(self): self.cache = {}
+    cache.mamba_lru_list = StubLRU()
+
+    # Build a small tree: root -> A -> B (B is the boundary)
+    # boundary has 5 hits, prefix length up to root = 100 + 200 = 300 tokens.
+    root = TreeNode()
+    A = TreeNode()
+    A.parent = root
+    A.key = RadixKey([0]*100, extra_key=None)
+    B = make_node(mamba_size=1, value_size=512)
+    B.parent = A
+    B.key = RadixKey([0]*200, extra_key=None)
+    for _ in range(5):
+        B.record_hit()
+
+    cache.mamba_lru_list.cache = {id(B): B}
+
+    # Use a small window for predictable arithmetic.
+    TreeNode.hpb_window_s = 60.0
+    v = cache.estimate_v_prefix_marginal(c_prefill=1.0)
+    # Expected: (5 / 60) * 300 * 1.0 = 25.0 tokens-prefill-saved/s
+    expected = (5.0 / 60.0) * 300.0
+    print(f"  V_prefix' = {v:.4f} (expected ~{expected:.4f})")
+    assert abs(v - expected) < 1e-3, f"expected {expected}, got {v}"
+    print("  V_prefix' arithmetic matches paper §4.2 Eq 4.4. GOOD.")
+
+    # Empty tree → 0.
+    cache.mamba_lru_list.cache = {}
+    v0 = cache.estimate_v_prefix_marginal()
+    assert v0 == 0.0, f"empty tree should report 0.0, got {v0}"
+    print("  empty tree reports 0.0. GOOD.")
+    print("PASS Test 5\n")
+
+
 def main() -> int:
     test_priority_ranking()
     test_hpb_picks_cold_first()
     test_window_decay()
     test_zero_size_guard()
-    print("== ALL PASS: hits-per-byte LRU primitives ready ==")
+    test_estimate_v_prefix_marginal()
+    print("== ALL PASS: hits-per-byte LRU primitives + V_prefix reporter ==")
     return 0
 
 
