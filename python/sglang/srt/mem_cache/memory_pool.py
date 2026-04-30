@@ -1262,6 +1262,22 @@ class MHATokenToKVPool(KVCache):
                     chunk_bytes=chunk_bytes,
                     external_handle_pool=shared_pool,
                 )
+                # Static-min/soft engine plumbing: cap pool's engine-visible
+                # size at static_min when mobile-soft is active. Mirrors the
+                # MambaPool fix (sglang 8ceb63de6). Without this, the engine's
+                # KV allocator (created against self.size = init_tokens) would
+                # hand out positions in the unmapped soft tail → CUDA illegal
+                # access on the next decode write.
+                if kv_mobile_chunks > 0:
+                    new_size = kv_static_min_tokens - self.page_size
+                    logger.info(
+                        "MHATokenToKVPool engine-allocator cap: size %d → %d "
+                        "(static_min - page_size); soft tail %d tokens "
+                        "reserved for actuator",
+                        self.size, new_size,
+                        kv_mobile_chunks * tokens_per_chunk,
+                    )
+                    self.size = new_size
                 logger.info(
                     "MHATokenToKVPool arena: tot_tokens=%d (tot_aligned=%d), "
                     "tokens_per_chunk=%d, chunk_bytes=%d, per_token_bytes=%d, "
