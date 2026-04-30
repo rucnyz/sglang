@@ -91,6 +91,47 @@ pool (e.g., use long-input prompts in "kv phase").
 **Raw data:** /tmp/regsuite_v7/ ; per-job metrics.json + budgeter.jsonl +
 server.log + bench.log.
 
+### B2 cold_burst 4-replica validation (DONE — variance bands tight)
+
+`/tmp/b2_replicas_v1/` — 2 baseline + 2 prelude on GPUs 3-6, identical config
+to v7 B2 cold_burst. Variance bands confirm v7 was not a fluke:
+
+| metric | baseline (n=2) | prelude (n=2) | Δ |
+|---|---:|---:|---:|
+| mean TTFT (recovery) | 278.7 ± 2.2 ms | **210.5 ± 3.0 ms** | **−24.5%** |
+| p99 TTFT (recovery)  | 1114.9 ± 22.9 ms | **419.3 ± 17.0 ms** | **−62.4%** |
+| median e2e (recovery) | 2797.5 ± 104.1 ms | 2687.8 ± 15.0 ms | −3.9% |
+| mean e2e (recovery)   | 3101.2 ± 60.7 ms | 2861.4 ± 14.6 ms | **−7.7%** |
+| xpool transfers       | 0 | 1 (each replica) | — |
+
+The prelude vs baseline gap is 10-30× the within-arm variance on every
+metric — the L2 cold-burst benefit is reproducible.
+
+### B1 v8 (per-phase concurrency) — STILL not phase-shifting (architectural finding)
+
+`/tmp/b1_only_v8/` — fixed dispatcher (mamba phase: 32 concurrent × short
+prompts; kv phase: 4 concurrent × 8K-token prompts × 512 output). Result:
+prelude TPS 3914 vs baseline 4379 = −10.6%, mamba phase ttft +12% slower.
+Only 1 transfer fired (the initial mamba ABOVE_HIGH edge).
+
+Budgeter telemetry: mamba_usage peak 0.99 (179/183 ticks > 0.8), KV
+peak 0.39 (0/183 ticks > 0.5). The kv-phase still doesn't fill KV
+because 4 reqs × 8K input + 512 output = 34K active KV tokens, but the
+KV pool size is 1.26M tokens — only 2.7% utilization.
+
+**Architectural finding for the paper:** in Qwen3.5-35B-A3B, mamba
+saturates at ~18 concurrent reqs (slot-bounded), but KV needs ~120
+concurrent reqs to saturate (token-bounded × per-req tokens). For any
+synthetic workload at concurrency in the 4–60 range, mamba is the
+*only* practical bottleneck. Genuine phase-shift between bind pools
+requires either (a) extreme long-context per req (200K+ tokens) at
+sub-mamba concurrency, or (b) multi-turn accumulating-KV conversation
+(WildChat-style). B1's synthetic 8K kv-phase isn't enough.
+
+This is consistent with the paper's argument that **hybrid pool
+imbalance is real and shifts only emerge in realistic long-context
+workloads** — which is exactly what Setting 1 v9-auto exercises.
+
 ---
 
 ## 2026-04-30 night session — running

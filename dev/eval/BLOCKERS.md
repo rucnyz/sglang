@@ -13,15 +13,16 @@ Each entry:
 
 ---
 
-## B1 phase_shift workload doesn't bind on different pools — **WORKLOAD, NOT ENGINE**
+## B1 phase_shift workload — **architectural ceiling, not fixable with synthetic prompts**
 
-- **Setting:** Layer 2 regression+benefit suite, B1 workload (`dev/eval/regression_suite/workloads/b1_phase_shift.sh`).
-- **Symptom:** suite v7 reports B1 prelude e2e 1022ms vs baseline 974ms (+4.8%), failing the ≤95% pass gate.
-- **Diagnosis:** budgeter.jsonl shows mamba_usage ∈ [0.88, 0.99] for the entire run while full_token_usage ≡ 0.00. Both "mamba phase" and "KV phase" of the dispatcher saturate mamba and leave KV idle. Edge-triggered planner correctly fires 1 kv_to_mamba transfer at tick 51 and then goes silent — KV has nothing to give.
-- **Why:** dispatcher's "kv-heavy" prompt source is too short. Short prompts produce tiny KV state and large mamba state. Need long-input prompts (4K+) in the kv-phase to actually load KV.
-- **Workaround:** treat current B1 result as informative. B2 cold_burst is the headline benefit (TTFT -26%, p99 -61%) and passes. Will rework B1 dispatcher to use 4K+ inputs in the kv phase.
-- **Date observed:** 2026-04-30 late night (suite v7).
-- **Resolved at:** —
+- **Setting:** Layer 2 regression+benefit suite, B1 workload (`dev/eval/regression_suite/workloads/b1_phase_shift.sh` + `dispatcher_b1.py`).
+- **Original symptom (v7):** B1 prelude e2e 1022ms vs baseline 974ms (+4.8%), 1 transfer fired, mamba_usage stayed [0.88, 0.99] both phases.
+- **v8 dispatcher fix attempted (commit fd64c6413):** per-phase concurrency (32 mamba × short / 4 kv × 8K-input + 512-output). Result: prelude TPS 3914 vs baseline 4379 = −10.6%, still 1 transfer.
+- **Budgeter telemetry v8:** mamba peak 0.99 (179/183 ticks > 0.8), KV peak 0.39 (0/183 ticks > 0.5). 4 reqs × 8.5K KV = 34K active vs pool size 1.26M tokens (2.7% utilization).
+- **Architectural finding:** Qwen3.5-35B-A3B has 18 mamba slots and 1.26M KV tokens. Mamba saturates at ~18 concurrent reqs; KV needs ~120 concurrent reqs to saturate. For any concurrency 4-60, mamba is the *only* practical bottleneck. Synthetic short/long prompt workloads cannot phase-shift bind pool on this architecture. Genuine shifts only emerge in (a) extreme long-context per req (200K+ tokens) at low concurrency, or (b) multi-turn accumulating-KV conversation (WildChat-style — what Setting 1 v9-auto already exercises).
+- **Workaround:** treat B1 as informative; the headline benefit is captured by B2 cold_burst (TTFT −24.5% ± 3 ms across 4-replicas, p99 −62.4%). Setting 1 v9-auto separately validates phase-shift on a realistic workload.
+- **Date observed:** 2026-04-30 late night (suite v7+v8).
+- **Resolved at:** — (architectural; not fixable by tweaking the dispatcher)
 
 ## Path-axis dispatcher (Settings 5.A, 5.B, A6) — **BLOCKED**
 
