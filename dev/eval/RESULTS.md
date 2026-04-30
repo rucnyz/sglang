@@ -152,6 +152,58 @@ prevents future crashes if someone overrides cost/margin to force a fire.
 The defaults keep L2 silent in production until the paper-design split
 is implemented.
 
+### B2 cold_burst 4-cell v2 (DONE — paper headline confirmed)
+
+`/tmp/b2_4cell_v2/` — 4-cell ablation on B2 cold_burst with the env-default
+fix (a4dc081c4). cell_01 / cell_11 each fired 1 transfer, but the
+actuator's static-min floor (= init_chunks_per_pool) refused the shrink —
+result: `unmapped=0, granted=0`, no physical move, no crash.
+
+| cell | L1 | L2 | ttft (ms) | p99 (ms) | e2e_med (ms) | xfers logical / physical |
+|---|:-:|:-:|---:|---:|---:|---|
+| 00 | 0 | 0 | 291 | 1101 | 2930 | 0 / 0 |
+| 10 | 1 | 0 | **211** | **404** | 2683 | 0 / 0 |
+| 01 | 0 | 1 | 286 | 1120 | 2927 | 1 / 0 |
+| 11 | 1 | 1 | **206** | **427** | 2679 | 1 / 0 |
+
+**cell_11 (L1+L2) vs cell_00 (baseline):** ttft **−29.3%**, p99 **−61.2%**,
+e2e_med **−8.6%**. **cell_11 vs cell_10 (L1 only):** ttft −2.4% (within
+noise). The cold_burst recovery headline is **L1's contribution**
+(HPB-LRU prefix retention + K_BIG snapshot recovery); L2 is a no-op
+on this workload because mamba's transient ABOVE_HIGH at the burst-
+recovery boundary doesn't sustain past one tick. The static-min floor
+prevented the no-op fire from breaking anything.
+
+**Goal "全开 ≥ baseline" status on B2:** PASS. cell_11 strictly better
+than baseline on every metric.
+
+### Static-min/soft split implementation (sglang 475838fe4)
+
+Implemented paper §design-l2-actuator (line 133-135) properly:
+- `MultiTensorArena(static_min_tokens=...)` parameter added.
+- At boot, only `static_min_chunks_per_pool` worth of physical pages are
+  cuMemMap'd into each sub-pool. The remaining
+  `(init_chunks - static_min_chunks) × n_subpools` worth of cuMemCreate'd
+  handles stay in the shared free queue as MOBILE SOFT chunks.
+- CUDA graphs at warmup see allocator capacity = static_min, so block-
+  table allocations stay in [0, static_min × tokens_per_chunk) — this is
+  the invariant that makes cross-pool cuMemUnmap/cuMemMap safe under
+  active workload.
+- New env vars `SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS` and
+  `_MAMBA_MOBILE_SOFT_CHUNKS` (default 0 → no soft → backward compat).
+- Actuator floor changed from `init_chunks_per_pool` to
+  `static_min_chunks_per_pool`; with mobile-soft active, the actuator can
+  legitimately shrink src down to static_min and grow dst by mapping
+  shared-free handles into its soft region.
+- Actuator's `_do_transfer` now checks shared-free count first: when
+  enough free handles exist, n_per_src_subpool=0 → no src shrink, dst
+  grows directly from mobile pool. Common case under the split.
+
+**Validation pending:** re-run B3/v9-auto with `MOBILE_SOFT_CHUNKS=2` to
+confirm actuator can fire real (non-no-op) transfers without crashing
+captured CUDA graphs, and measure whether L2 actually delivers metric
+value on a workload where the binding pool genuinely shifts.
+
 ---
 
 ## 2026-04-30 late-night session — regression+benefit suite v7
