@@ -95,6 +95,29 @@ Raw data: `/tmp/sweep_lora_3157665/ml*_bench.json`. Updated `evaluation.tex` Tab
 
 Raw data: `/tmp/a3_hyst_3195814/hyst*_budgeter.jsonl`.
 
+### Ablation A2 — K_big granularity sweep (DONE — workload-dependent)
+
+`dev/eval/08_A2_kbig_sweep.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B + GSP shared-prefix workload (8 groups × 10 prompts, 12K system prompt, RPS=2). K_big sweep ∈ {0, 2K, 4K, 8K, 16K}; K_small=512 (default page_size).
+
+| K_big | input TPS | mean TTFT | P99 TTFT | median E2E | cache-hit batches |
+|---:|---:|---:|---:|---:|---:|
+| 0 (no suppression) | 27 903 | **282.2ms** | 1 110.8 | **2 920.7** | 71/86 (82.6%) |
+| 2 048 | 27 869 | 379.3 (+35%) | 1 099.2 | 4 008.1 (+37%) | 68/87 (78.2%) |
+| 4 096 | 27 903 | 316.8 (+12%) | 1 100.8 | 3 478.2 (+19%) | 67/88 (76.1%) |
+| 8 192 | 27 917 | 321.2 (+14%) | 1 094.3 | 3 344.2 (+15%) | 69/87 (79.3%) |
+| 16 384 | 27 911 | 321.4 (+14%) | 1 101.1 | 3 341.0 (+14%) | 69/87 (79.3%) |
+
+**Headline: on this GSP workload, K_big=0 (no suppression — full snapshots) is optimal.**
+- K_big=2048 is the WORST (+35% mean TTFT, +37% median E2E) — too aggressive, drops too many cacheable inserts.
+- K_big=8K matches the chunked-prefill boundary, so inserts at depth 8192 are aligned and only the trailing 12064-8192 = ~4K-token tail past the boundary gets suppressed. Better than 2K but still 14% slower than no suppression.
+- K_big=16K → no inserts in this workload exceed 16K, so no suppression triggers; identical to K_big=8K.
+
+**Why K_big=0 wins here:** the GSP workload has heavy shared-prefix reuse (cache hit rate ~80%); the mamba pool is far from saturated (max mamba_usage in log is <2%). Without snapshot-memory pressure, K_big's only effect is *losing* cache benefit for non-aligned-depth inserts. K_big is workload-dependent: it should help when snapshot memory is the binding constraint, but on prefix-cache-friendly workloads it just costs hit rate.
+
+Raw data: `/tmp/a2_kbig_4127068/`. Server logs confirm cache-hit batch counts: K_big=2048 has 78.2% hit rate vs baseline 82.6%.
+
+**Implication for paper §6.2 / §A.2 (K_big ablation).** The hetero-granularity claim is "K_big trades memory for accuracy on the V_prefix' signal". On this workload that tradeoff is purely negative because memory isn't the binding constraint. A workload designed to pressure the mamba pool (e.g. 200+ unique 50K-token system prompts) would likely show K_big helping. Add this as a tradeoff disclosure in the paper rather than a headline win.
+
 ### Ablation A5 — VMM chunk size sweep (DONE, MAJOR FINDING)
 
 `dev/eval/03_a5_chunk_size.sh` on GPU 1, port 30100.

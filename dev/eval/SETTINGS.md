@@ -298,7 +298,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | 5.A | Path-axis dense | not started | **path-axis dispatcher implementation** |
 | 5.B | Path-axis hybrid | not started | depends on 5.A |
 | A1 | L1 sub-features | not started | depends on 3.A and 3.B |
-| A2 | K_big sweep | **RUNNING** GPU 3 (5 arms × 5 min) | unblocked by Phase 3.d fix |
+| A2 | K_big sweep | **DONE INFORMATIVE** — K_big=0 best on prefix-friendly GSP; tradeoff only when snapshot mem pressured | — |
 | A3 | Hysteresis sweep | **DONE INFORMATIVE** — workload too monotone for thrash | depends on 1's actual phase-shift trace |
 | A4 | Tau sweep | not started | depends on 1 |
 | A5 | VMM chunk-size sweep | **DONE MAJOR** — 1GB chunks fix TTFT, paper §6.7 updated | — |
