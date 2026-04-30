@@ -300,7 +300,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | A1 | L1 sub-features | not started | depends on 3.A and 3.B |
 | A2 | K_big sweep | **DONE INFORMATIVE** — K_big=0 best on prefix-friendly GSP; tradeoff only when snapshot mem pressured | — |
 | A3 | Hysteresis sweep | **DONE INFORMATIVE** — workload too monotone for thrash | depends on 1's actual phase-shift trace |
-| A4 | Tau sweep | not started | depends on 1 |
+| A4 | Tau sweep | **DONE PASS** — smooth monotone curve, paper tab:a4 | — |
 | A5 | VMM chunk-size sweep | **DONE MAJOR** — 1GB chunks fix TTFT, paper §6.7 updated | — |
 | A6 | K=1 vs K=2 | not started | depends on 5.A |
 | Q1 | Quality preservation (temperature=0 token-identity) | **DONE PASS** — 50/50 byte-identical, default vs full prelude | — |

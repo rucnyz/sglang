@@ -95,6 +95,24 @@ Raw data: `/tmp/sweep_lora_3157665/ml*_bench.json`. Updated `evaluation.tex` Tab
 
 Raw data: `/tmp/a3_hyst_3195814/hyst*_budgeter.jsonl`.
 
+### Ablation A4 — Layer 2 control interval (τ) sweep (DONE PASS)
+
+`dev/eval/12_A4_tau_sweep.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B + Phase 1+2+3 long/short/long compressed trace (same as A3). Sweep `SGLANG_BUDGETER_TICK_S` ∈ {0.5, 1, 2, 5, 15}s.
+
+| τ (s) | total transfers | kv→mamba | mamba→kv |
+|---:|---:|---:|---:|
+| 0.5 | 21 | 21 | 0 |
+| 1 | 11 | 11 | 0 |
+| 2 | 6 | 6 | 0 |
+| 5 | 2 | 2 | 0 |
+| 15 | 1 | 1 | 0 |
+
+**Headline: smooth monotone curve.** Smaller τ catches more transient pressure crossings, larger τ misses them. The default τ=2 catches 6 of the 21 transitions detectable at τ=0.5 — a reasonable accuracy/overhead point. The full 24-hour-trace spec was τ ∈ {5, 15, 30, 60, 300}s; we rescaled to fit our ~3-minute compressed bench.
+
+This complements A3 (hyst sweep): together they verify that the planner's two main knobs (interval and threshold-band-width) modulate transfer-firing behavior in the expected directions.
+
+Raw data: `/tmp/a4_tau_*/`.
+
 ### Quality preservation Q1 — token-identity at temperature=0 (DONE PASS)
 
 `dev/eval/11_Q1_token_identical.sh` on GPU 2, port 30099. Qwen3.5-35B-A3B, 50 prompts (15 unique × 4-deep with duplicates), `temperature=0`, `seed=0`, `max_tokens=128`. Two server configurations:
