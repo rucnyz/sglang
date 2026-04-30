@@ -6,7 +6,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ## TL;DR — 2026-04-30 night session final summary
 
-**11 PASS, 3 INFORMATIVE, 2 NULL (control + composed), 3 BLOCKED, +1 implementation fix landed.**
+**11 PASS, 4 INFORMATIVE/QUANTITATIVE-FINDING, 2 NULL (control + composed), 3 BLOCKED, +1 implementation fix landed.**
 
 | setting | status | headline |
 |---|---|---|
@@ -28,7 +28,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 | 1 24-h phase-shift | NULL | Smooth control test (no regression). Compressed trace doesn't bind on different pools across phases → paper §6.2 honest reframe |
 | 5.A/5.B/A6 path-axis | BLOCKED | Path-axis dispatcher not implemented → BLOCKERS.md |
 | 3.C composed | TODO | Depends on Setting 1 + 3.A; Layer 2 fires once on Setting 1 trace |
-| 4 estimator | INDIRECT VALIDATION | V_kv'/V_mamba' not separately logged; A3/A4 actuator behavior + Sweep 1 are the indirect signals → paper §6.4 honest reframe |
+| 4 estimator | **DONE QUANTITATIVE** | Proxy V≈usage is **saturation-blind**: flat 0.66 across Sweep 1's 5 points while true V_mamba' swings 5.8× (1670→9745). Works in unsaturated regime (3.C: usage 0.006-0.427 + 21 correct transfers). Real limitation, paper §6.4 tab:sweep4 added |
 
 **Implementation fix landed**: Phase 3.d K_BIG match-prefix invariant break (commits b37bbc82e + 325f25334). Drops tombstone-leaf creation; tracks deepest_snapshot_depth for insert.prefix_len consistency. 3/3 unit tests + Setting 1 v8 + A2 sweep all run end-to-end.
 
@@ -164,6 +164,30 @@ Raw data: `/tmp/a1_kbig_only_*/`, plus reuses Q3.D, 3.A, 3.B raw data.
 This complements A3 (hyst sweep): together they verify that the planner's two main knobs (interval and threshold-band-width) modulate transfer-firing behavior in the expected directions.
 
 Raw data: `/tmp/a4_tau_*/`.
+
+### Setting 4 — estimator accuracy (DONE — saturation-blindness finding)
+
+`dev/eval/_setting4_estimator.py` analyzes existing Sweep 1 data + Setting 3.C budgeter logs.
+
+**Finding: the current Layer 2 proxy `V_σ' ≈ usage_σ` (cross_pool_planner.py L26) is saturation-blind.**
+
+Sweep 1 raw:
+
+| ratio | input TPS | usage_mamba | true V_mamba' (ΔTPS/Δratio) |
+|---:|---:|---:|---:|
+| 0.1 | 4512 | 0.66 | – |
+| 0.3 | 6461 | 0.66 | 9745 |
+| 0.5 | 7585 | 0.66 | 5620 |
+| 0.7 | 7919 | 0.66 | 1670 |
+| 0.9 | 8610 | 0.66 | 3455 |
+
+`usage_mamba` is FLAT at 0.66 across all 5 points (admission ceiling — mamba pool is saturated regardless of allocation). True V_mamba' varies between 1670 and 9745 (5.8× swing). Pearson correlation is undefined because the proxy is constant.
+
+**Where the proxy works:** the unsaturated regime. Setting 3.C's stress trace has usage_mamba varying 0.006-0.427 across ticks; the planner fires 21 correct kv→mamba transfers (no spurious reversals). The threshold-with-hysteresis logic only requires "is mamba above the high watermark" — that signal is correct even when the proxy is saturation-blind for its quantitative gradient.
+
+**Implication for paper §6.4:** real limitation of the current Layer 2 design. Follow-up: replace usage with admission-pressure signal (rejection rate / queue depth / running-request waiting time) to recover gradient information at saturation.
+
+Raw analysis: `dev/eval/_setting4_estimator.py`. Sweep 1 raw data: `/tmp/sweep_kv_dn_3005940/`. 3.C raw data: `/tmp/setting3c_v2_*/`.
 
 ### Quality preservation Q3 — per-task classification accuracy (DONE PASS)
 
