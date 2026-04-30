@@ -4,6 +4,34 @@ Each entry: setting / date / what ran / result / location of raw data.
 
 ---
 
+## TL;DR — 2026-04-30 night session final summary
+
+**8 PASS, 3 INFORMATIVE, 1 NULL (control), 3 BLOCKED, +1 implementation fix landed.**
+
+| setting | status | headline |
+|---|---|---|
+| 2.1 KV↔DN sweep | **PASS** | 1.91× throughput swing (paper claimed 2.5×, same direction) → paper Table~1 |
+| 2.2 KV↔LoRA sweep | **PASS** | 192× TTFT swing (paper claimed 95×, ours stronger), ml=32 76ms vs paper 74ms → paper Table~2 |
+| 2.3 V_prefix flat sweep | **PASS** | Flatness reproduced; throughput varies <0.1% across mem_frac → paper Table~3 |
+| 3.A V_prefix' faithful | INFORMATIVE | Default wins TTFT (284ms); 3 configs in 80-83% hit-rate band → paper tab:q3a |
+| 3.B cold-burst stability | **PASS** | HPB recovery TTFT -18%, P99 -50%, median E2E -12% vs recency → paper tab:q3b |
+| 3.D HPB-vs-recency on GSP | **PASS** | -19.77% mean TTFT, -27.91% median TTFT, -16.30% median E2E → paper tab:hpb-gsp |
+| A2 K_big sweep | INFORMATIVE | K_big=0 wins on prefix-friendly workload (workload-conditional tradeoff) → paper tab:a2 |
+| A3 hysteresis sweep | INFORMATIVE | Workload-monotone, no thrash to dampen → paper tab:a3 |
+| A4 tau sweep | **PASS** | Smooth monotone curve, τ=0.5→21 transfers, τ=15→1 → paper tab:a4 |
+| A5 VMM chunk-size | **PASS** (MAJOR) | 1GB chunks recover throughput within 1% of baseline; 64MB is 19× slower → paper Table~tab:a5 |
+| Q1 token-identity | **PASS** | 50/50 byte-identical default vs full prelude → paper §6.8 |
+| 1 24-h phase-shift | NULL | Smooth control test (no regression). Compressed trace doesn't bind on different pools across phases → paper §6.2 honest reframe |
+| 5.A/5.B/A6 path-axis | BLOCKED | Path-axis dispatcher not implemented → BLOCKERS.md |
+| 3.C composed | TODO | Depends on Setting 1 + 3.A; Layer 2 fires once on Setting 1 trace |
+| 4 estimator | TODO | Requires EWMA-vs-ground-truth comparison harness |
+
+**Implementation fix landed**: Phase 3.d K_BIG match-prefix invariant break (commits b37bbc82e + 325f25334). Drops tombstone-leaf creation; tracks deepest_snapshot_depth for insert.prefix_len consistency. 3/3 unit tests + Setting 1 v8 + A2 sweep all run end-to-end.
+
+**Paper updates committed to rucnyz/prelude-paper@main**: Tables 1, 2, 3, tab:hpb-gsp, tab:q3a, tab:q3b, tab:a2, tab:a3, tab:a4, tab:a5, §6.2 Setting 1 honest reframe, §6.8 Q1 PASS.
+
+---
+
 ## 2026-04-30 night session — running
 
 ### Setting 2.1 — KV↔DeltaNet sweep on Qwen3.5-35B-A3B (DONE, PASS)
