@@ -37,38 +37,39 @@ assert "nb=off" in d.reason, f"reason should mark nb=off: {d.reason}"
 print(f"  fire on edge: {d.direction} ({d.reason})")
 print("  → PASS")
 
-print("\n== T2: nb=on, no paused/retracted → block fire ==")
+print("\n== T2: nb=on, no paused/retracted, persist=1 → block fire ==")
 p = CrossPoolPlanner(cfg(net_benefit_enabled=True))
 p.decide(usage_kv=0.20, usage_mamba=0.50)
 d = p.decide(usage_kv=0.20, usage_mamba=0.92,
              num_paused_reqs=0, num_retracted_reqs=0)
+# B_persist = 1*5000us = 5000us, still < cost 50000us × margin 1.5
 assert d.direction is None, f"should block, got {d.direction}"
-assert "no admission pressure" in d.reason, d.reason
+assert "benefit 5000us" in d.reason or "no pressure" in d.reason, d.reason
 print(f"  blocked: {d.reason}")
-print("  → PASS (this is the v9-auto failure mode we're suppressing)")
+print("  → PASS (mamba just transitioned, persist=1, B_lb too small)")
 
-print("\n== T3: nb=on, 1 retracted req → benefit > cost → allow fire ==")
+print("\n== T3: nb=on, 1 retracted req + persist=1 → benefit > cost → allow fire ==")
 p = CrossPoolPlanner(cfg(net_benefit_enabled=True))
 p.decide(usage_kv=0.20, usage_mamba=0.50)
-# benefit = 1 * 4096 * 1e6 / 50000 = 81920 us
-# cost   = 1 * 50000 = 50000 us
-# benefit / cost = 1.64 > margin 1.5 → allow
+# benefit_retracted = 1 * 4096 * 1e6 / 50000 = 81920 us
+# benefit_persist   = (0+1) * 5000 = 5000 us
+# total benefit = 86920 us; cost*margin = 75000 us → allow
 d = p.decide(usage_kv=0.20, usage_mamba=0.92,
              num_paused_reqs=0, num_retracted_reqs=1)
 assert d.direction == "kv_to_mamba", f"should fire, got {d.direction}"
-assert "benefit" in d.reason and "81920" in d.reason, d.reason
+assert "86920us" in d.reason, d.reason
 print(f"  fired: {d.direction}")
 print("  → PASS")
 
-print("\n== T4: nb=on, only 1 paused → benefit << cost → block ==")
+print("\n== T4: nb=on, only 1 paused + persist=1 → benefit << cost → block ==")
 p = CrossPoolPlanner(cfg(net_benefit_enabled=True))
 p.decide(usage_kv=0.20, usage_mamba=0.50)
-# benefit = 1 * 1000 = 1000 us
-# cost = 50000 us → 1000 << 50000*1.5=75000 → block
+# benefit = 1*1000 paused + 1*5000 persist = 6000 us
+# cost*margin = 75000 us → block
 d = p.decide(usage_kv=0.20, usage_mamba=0.92,
              num_paused_reqs=1, num_retracted_reqs=0)
 assert d.direction is None, f"should block, got {d.direction}"
-assert "1000us < cost 50000us" in d.reason, d.reason
+assert "6000us < cost 50000us" in d.reason, d.reason
 print(f"  blocked: {d.reason}")
 print("  → PASS")
 
@@ -124,4 +125,43 @@ assert d.direction is None or "no admission pressure" in d.reason, \
 print(f"  reverse trigger gated: {d.reason}")
 print("  → PASS")
 
-print("\n== ALL PASS: net-benefit gate ready (栓3) ==")
+print("\n== T9: B_persist — sustained ABOVE_HIGH triggers fire even with no paused/retracted ==")
+# v9-auto v2 failure mode: stock cache hides cost behind 0 paused/0 retracted,
+# but mamba_usage stays 1.0. With nb_persist_eval_period=10 and persist_tick_us=5000,
+# at consec=15 → B_persist=15*5000=75000us = cost*margin (50000*1.5). Should fire.
+p = CrossPoolPlanner(cfg(net_benefit_enabled=True, nb_persist_eval_period=10))
+p.decide(usage_kv=0.20, usage_mamba=0.50)  # establish IN_BAND
+# First tick at ABOVE_HIGH = edge transition; B_persist=1*5000=5000 → block
+d = p.decide(usage_kv=0.20, usage_mamba=0.92, num_paused_reqs=0, num_retracted_reqs=0)
+assert d.direction is None, f"first tick should still block, got {d.direction}"
+# Next 8 ticks: stable above_high, no re-eval (consec < 10).
+for i in range(8):
+    d = p.decide(usage_kv=0.20, usage_mamba=0.92, num_paused_reqs=0, num_retracted_reqs=0)
+    assert d.direction is None, f"tick {i+2}: should be stable, got {d.direction}"
+# Tick 10: stable, consec=10, period eval, B_persist=10*5000=50000 < 75000 → still block
+d = p.decide(usage_kv=0.20, usage_mamba=0.92, num_paused_reqs=0, num_retracted_reqs=0)
+assert d.direction is None, f"consec=10 still < margin, got {d.direction}"
+# Continue another 10 ticks; at consec=20, B_persist = 20*5000 = 100000 ≥ 75000 → fire
+fired = False
+for i in range(11, 25):
+    d = p.decide(usage_kv=0.20, usage_mamba=0.92, num_paused_reqs=0, num_retracted_reqs=0)
+    if d.direction == "kv_to_mamba":
+        fired = True
+        print(f"  fired at tick consec ~{i+1}: {d.reason}")
+        break
+assert fired, "should fire by consec=20"
+print("  → PASS (persist re-eval kicks in once B_persist clears margin)")
+
+print("\n== T10: B_persist disabled (nb_persist_eval_period=0) → never fires under no pressure ==")
+p = CrossPoolPlanner(cfg(net_benefit_enabled=True, nb_persist_eval_period=0))
+p.decide(usage_kv=0.20, usage_mamba=0.50)
+fired = 0
+for i in range(50):
+    d = p.decide(usage_kv=0.20, usage_mamba=0.92, num_paused_reqs=0, num_retracted_reqs=0)
+    if d.direction is not None:
+        fired += 1
+assert fired == 0, f"with persist_eval_period=0, no fires expected, got {fired}"
+print(f"  50 ticks at sustained ABOVE_HIGH, no admission pressure, persist disabled → fires={fired}")
+print("  → PASS")
+
+print("\n== ALL PASS: net-benefit gate ready (栓3 + B_persist) ==")

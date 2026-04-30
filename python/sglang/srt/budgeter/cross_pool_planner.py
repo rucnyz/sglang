@@ -76,6 +76,19 @@ class CrossPoolPolicyConfig:
     nb_pause_penalty_us: float = 1000.0  # cost of one paused-req tick
     nb_chunk_cost_us: float = 50000.0  # cuMemUnmap+cuMemMap per chunk (~50ms)
     nb_margin: float = 1.5             # benefit must exceed cost * margin
+    # Persistent-saturation lower bound on benefit (Setting 1 v9-auto v2
+    # follow-up). The original B_lb (paused, retracted) is zero on workloads
+    # where stock MambaRadixCache evicts aggressively enough that no request
+    # reaches paused/retracted state — but the underlying "mamba sustained
+    # at 1.0 for 100+ ticks" *is* a real cost (every miss = a re-prefill).
+    # Each tick of sustained ABOVE_HIGH on a pool contributes
+    # `nb_persist_tick_us` microseconds of avoided-future-cost to B_lb.
+    # Also enables periodic re-evaluation in the stable branch of the
+    # edge-triggered planner so the gate gets a chance to fire under
+    # sustained pressure (otherwise edge-trigger never re-checks once
+    # the state is stable).
+    nb_persist_tick_us: float = 5000.0  # per-tick value of sustained ABOVE_HIGH
+    nb_persist_eval_period: int = 10    # re-eval every N stable ticks (0=off)
 
 
 def _policy_from_env() -> CrossPoolPolicyConfig:
@@ -94,6 +107,8 @@ def _policy_from_env() -> CrossPoolPolicyConfig:
         nb_pause_penalty_us=float(os.environ.get("SGLANG_XPOOL_NB_PAUSE_PENALTY_US", "1000")),
         nb_chunk_cost_us=float(os.environ.get("SGLANG_XPOOL_NB_CHUNK_COST_US", "50000")),
         nb_margin=float(os.environ.get("SGLANG_XPOOL_NB_MARGIN", "1.5")),
+        nb_persist_tick_us=float(os.environ.get("SGLANG_XPOOL_NB_PERSIST_TICK_US", "5000")),
+        nb_persist_eval_period=int(os.environ.get("SGLANG_XPOOL_NB_PERSIST_EVAL_PERIOD", "10")),
     )
 
 
@@ -131,6 +146,12 @@ class CrossPoolPlanner:
         # forcing a transfer at startup.
         self._kv_state: str = self.IN_BAND
         self._mamba_state: str = self.IN_BAND
+        # Persist counters: number of consecutive ticks each pool has been
+        # in ABOVE_HIGH. Used by net-benefit gate's B_persist term to score
+        # sustained pool saturation as a real (if soft) cost, even when the
+        # scheduler doesn't formally retract or pause requests.
+        self._kv_above_high_consec: int = 0
+        self._mamba_above_high_consec: int = 0
         logger.info(
             "CrossPoolPlanner: kv_high=%.2f kv_low=%.2f mamba_high=%.2f "
             "mamba_low=%.2f cooldown=%d unit=%d edge_trigger=%s",
@@ -149,34 +170,46 @@ class CrossPoolPlanner:
         return self.IN_BAND
 
     def _net_benefit_ok(
-        self, num_paused: int, num_retracted: int
+        self,
+        num_paused: int,
+        num_retracted: int,
+        kv_above_consec: int = 0,
+        mamba_above_consec: int = 0,
     ) -> tuple[bool, str]:
         """Return (allow_fire, why) per the cost/benefit estimator.
 
-        Disabled (returns True) unless `net_benefit_enabled`. When enabled,
-        treats `num_retracted` as full re-prefill avoided and `num_paused`
-        as one tick of waiting avoided. Refuses to fire when benefit < cost
-        × margin — the case where actuator overhead would exceed the
-        admission-pressure cost the transfer is meant to relieve.
+        Disabled (returns True) unless `net_benefit_enabled`. Three
+        contributions to the admission-pressure lower bound:
+          (1) num_retracted * avg_input * 1e6 / prefill_tps    [retracts]
+          (2) num_paused    * pause_penalty_us                 [pauses]
+          (3) (kv_consec + mamba_consec) * persist_tick_us     [B_persist]
+        The persist term captures sustained ABOVE_HIGH saturation that
+        the scheduler absorbs silently via aggressive cache eviction —
+        each such tick has a real but soft cost that retracts/paused
+        miss. Refuses to fire when benefit < cost × margin.
         """
         c = self.config
         if not c.net_benefit_enabled:
             return True, "nb=off"
-        if num_paused == 0 and num_retracted == 0:
-            return False, "nb: no admission pressure (paused=0 retracted=0)"
+        if (num_paused == 0 and num_retracted == 0
+                and kv_above_consec == 0 and mamba_above_consec == 0):
+            return False, "nb: no pressure (paused=0 retracted=0 persist=0)"
         benefit_us = (
             num_retracted * c.nb_avg_prefill_tokens * 1e6 / c.nb_prefill_tps
             + num_paused * c.nb_pause_penalty_us
+            + (kv_above_consec + mamba_above_consec) * c.nb_persist_tick_us
         )
         cost_us = c.dst_chunks_per_action * c.nb_chunk_cost_us
+        annot = (f"paused={num_paused} retracted={num_retracted} "
+                 f"persist=({kv_above_consec},{mamba_above_consec})")
         if benefit_us < cost_us * c.nb_margin:
             return False, (
                 f"nb: benefit {benefit_us:.0f}us < cost {cost_us:.0f}us × "
-                f"margin {c.nb_margin} (paused={num_paused} retracted={num_retracted})"
+                f"margin {c.nb_margin} ({annot})"
             )
         return True, (
             f"nb: benefit {benefit_us:.0f}us >= cost {cost_us:.0f}us × "
-            f"margin {c.nb_margin} (paused={num_paused} retracted={num_retracted})"
+            f"margin {c.nb_margin} ({annot})"
         )
 
     def decide(
@@ -211,11 +244,66 @@ class CrossPoolPlanner:
             old_kv, old_mamba = self._kv_state, self._mamba_state
             # Update state BEFORE returning so next tick sees the new state.
             self._kv_state, self._mamba_state = new_kv, new_mamba
+            # Update consec counters for B_persist accumulation.
+            self._kv_above_high_consec = (
+                self._kv_above_high_consec + 1 if new_kv == self.ABOVE_HIGH else 0
+            )
+            self._mamba_above_high_consec = (
+                self._mamba_above_high_consec + 1 if new_mamba == self.ABOVE_HIGH else 0
+            )
+            kv_consec = self._kv_above_high_consec
+            mamba_consec = self._mamba_above_high_consec
             if not (kv_changed or mamba_changed):
+                # Stable. Persist re-evaluation: even without a fresh edge,
+                # if a pool has been ABOVE_HIGH long enough that B_persist
+                # has built up, give the gate another chance to fire. This
+                # closes the v9-auto v2 failure mode where stock cache hides
+                # the true cost of sustained mamba=1.0 saturation behind
+                # zero paused/retracted counters.
+                period = c.nb_persist_eval_period
+                if c.net_benefit_enabled and period > 0:
+                    # Re-eval at every period-th tick of sustained ABOVE_HIGH.
+                    if (mamba_consec >= period and (mamba_consec % period) == 0
+                            and new_mamba == self.ABOVE_HIGH
+                            and new_kv != self.ABOVE_HIGH):
+                        ok, why = self._net_benefit_ok(
+                            num_paused_reqs, num_retracted_reqs,
+                            kv_consec, mamba_consec,
+                        )
+                        if ok:
+                            self._cooldown_remaining = c.cooldown_ticks
+                            return PlanDecision(
+                                direction="kv_to_mamba",
+                                reason=f"persist: mamba ABOVE_HIGH×{mamba_consec} "
+                                       f"({usage_mamba:.2f}) kv={new_kv} "
+                                       f"({usage_kv:.2f}) [{why}]",
+                                usage_kv=usage_kv,
+                                usage_mamba=usage_mamba,
+                                queue_depth=queue_depth,
+                            )
+                    if (kv_consec >= period and (kv_consec % period) == 0
+                            and new_kv == self.ABOVE_HIGH
+                            and new_mamba != self.ABOVE_HIGH):
+                        ok, why = self._net_benefit_ok(
+                            num_paused_reqs, num_retracted_reqs,
+                            kv_consec, mamba_consec,
+                        )
+                        if ok:
+                            self._cooldown_remaining = c.cooldown_ticks
+                            return PlanDecision(
+                                direction="mamba_to_kv",
+                                reason=f"persist: kv ABOVE_HIGH×{kv_consec} "
+                                       f"({usage_kv:.2f}) mamba={new_mamba} "
+                                       f"({usage_mamba:.2f}) [{why}]",
+                                usage_kv=usage_kv,
+                                usage_mamba=usage_mamba,
+                                queue_depth=queue_depth,
+                            )
                 return PlanDecision(
                     direction=None,
                     reason=f"edge: stable kv={new_kv} mamba={new_mamba} "
-                           f"(kv={usage_kv:.2f} mamba={usage_mamba:.2f})",
+                           f"(kv={usage_kv:.2f} mamba={usage_mamba:.2f}) "
+                           f"persist=({kv_consec},{mamba_consec})",
                     usage_kv=usage_kv,
                     usage_mamba=usage_mamba,
                     queue_depth=queue_depth,
@@ -224,7 +312,10 @@ class CrossPoolPlanner:
             # net-benefit gate says actuator overhead would exceed the
             # admission-pressure cost we'd relieve.
             def _try_fire(direction: str, edge_reason: str) -> PlanDecision:
-                ok, why = self._net_benefit_ok(num_paused_reqs, num_retracted_reqs)
+                ok, why = self._net_benefit_ok(
+                    num_paused_reqs, num_retracted_reqs,
+                    kv_consec, mamba_consec,
+                )
                 if not ok:
                     return PlanDecision(
                         direction=None,
