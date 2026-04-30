@@ -480,14 +480,23 @@ class MambaPool:
             # path bumps the cap when soft chunks get mapped.
             arena = getattr(self, "_mamba_temporal_arena", None)
             if arena is not None:
-                static_min_slots = (
+                # Arena maps positions [0, static_min_tokens). Slot 0 is the
+                # padding slot, so usable allocator slot ids are [1,
+                # static_min_tokens - 1] inclusive — `n_slots` to
+                # set_capacity_slots is the inclusive upper bound, so it must
+                # be static_min_tokens - 1, NOT static_min_tokens (off-by-one
+                # caught in B3 v6: passing 128 yielded free_slots [1, 128] and
+                # the alloc of slot 128 wrote to the first byte of the
+                # unmapped soft tail → cudaErrorIllegalAddress).
+                static_min_tokens = (
                     arena.static_min_chunks_per_pool * arena.tokens_per_chunk
                 )
+                static_min_slots = static_min_tokens - 1
                 if static_min_slots < self.size:
                     self.set_capacity_slots(static_min_slots)
                     logger.info(
                         "MambaPool engine-allocator cap: %d/%d slots "
-                        "(static_min) — soft tail reserved for actuator",
+                        "(static_min - 1) — soft tail reserved for actuator",
                         static_min_slots, self.size,
                     )
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
