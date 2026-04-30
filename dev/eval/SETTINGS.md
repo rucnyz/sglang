@@ -290,8 +290,8 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | 2.1 | KV↔DN sweep | **DONE PASS** — paper Table 1 updated | — |
 | 2.2 | KV↔LoRA sweep | **DONE PASS** — paper Table 2 updated, 192× swing | — |
 | 2.3 | Prefix sweep | **DONE PASS** — paper Table 3 updated, V_prefix flat | — |
-| 3.A | V_prefix' faithful | not started | unblocked by Phase 3.d fix; needs orchestration |
-| 3.B | V_prefix' stability | not started | unblocked by Phase 3.d fix; needs cold-burst driver |
+| 3.A | V_prefix' faithful | not started | UNBLOCKED — Phase 3.d K_BIG fix landed; needs orchestration |
+| 3.B | V_prefix' stability | not started | UNBLOCKED — needs cold-burst driver |
 | 3.C | Composed L1+L2 | not started | depends on 1 + 3.A |
 | 3.D | HPB-vs-recency on GSP | **DONE PASS** — paper tab:hpb-gsp added, -19.77% TTFT | — |
 | 4 | Estimator accuracy | not started | depends on 1 + 2 |

@@ -211,6 +211,10 @@ Phase B is also essentially flat (P99 TTFT spread 82–93ms, all within 12%). **
 
 **Verdict:** L2 is the dominant contributor for the multi-turn long-context phase (-16% P95). L1 (K_BIG) is dormant in v4 because the 50-conversation × 6-turn workload doesn't grow past 8192 tokens (each turn is short; total context per conv stays < 4K). Need a longer-context Phase C variant to engage K_BIG.
 
+### Setting 1 v8 update (2026-04-30 12:48): K_BIG fix lands, no regression
+
+After the Phase 3.d K_BIG match-prefix invariant fix (BLOCKERS.md FIXED entry, commits b37bbc82e + 325f25334), Setting 1 ran end-to-end with full Layer 1 (HPB LRU + K_BIG=8192) on all 4 cells. Numbers (Phase A: 4051-4053 TPS, ~45ms TTFT; Phase B: 6059-6063 TPS, 80-93ms P99; Phase C: 334-339ms mean E2E, 348-350ms P95) match v6 (K_BIG disabled) within 4% on every metric. **K_BIG implementation is now correct AND doesn't help on this trace AND doesn't regress.** The trace is the limiting factor, not the implementation. Headline conclusions in §6.2 stand: control test passes, real contributions in §6.2 sweeps and §6.3 Q3.D.
+
 **Recommendation for paper §6.2:** the headline finding is *Phase C tail latency*, not Phase B. Suggest expanding Phase B to use longer-context prompts (multi-document rerank with 4K-context items) so K_BIG activates on Phase B too.
 
 Raw data: `/tmp/phase_shift_v4_1777548919/`.

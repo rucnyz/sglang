@@ -30,20 +30,23 @@ Each entry:
 - **Date observed / fixed:** 2026-04-30 night.
 - **Resolved at:** 2026-04-30, after seeing server-side `Got LoRA adapter that has never been loaded` errors.
 
-## Phase 3.d (heterogeneous granularity, K_BIG) — **DISABLED in eval scripts as of 2026-04-30**
+## Phase 3.d (heterogeneous granularity, K_BIG) — **FIXED 2026-04-30**
 
-- **Setting:** Phase 3.d e2e (`dev/2e/34_phase3d_e2e.sh`), Setting 1 L1=1 cells, A2 K_big sweep, Setting 3.A.
-- **Symptom A (insert assertion crash):** `cache_unfinished_req` line 800: `AssertionError: new_prefix_len=N, len(new_indices)=M` with `N > M`. Reproduces on **any** workload that crosses the 8192-token chunked-prefill boundary. Examples:
-    - Setting-1 v2 (short prompts): `new_prefix_len=512, len(new_indices)=0` — fix landed (insert_depth >= k_big).
-    - Setting-1 v5 multi-turn (long context): `new_prefix_len=12883, len(new_indices)=8192` — partial fix did NOT cover this.
-    - A2 K_big sweep on GSP (12K system prompt): same crash signature at depth 12883.
-- **Symptom B (idle leak):** even when bench survives, the `_evict_leaf_node` invariant (`mamba_value is not None`) means tombstone leaves' KV is never reclaimed. Idle-time leak detector reports 7-13K slots out of 1.26M.
-- **Root cause:** `_match_prefix_helper` walks the tree and updates `best_value_len` ONLY when visiting nodes whose `mamba_value` is not None (line 1150). When the deepest matched ancestor is a snapshot at depth 8192 and the request's path beyond that goes through a tombstone-only chain (no further snapshots), `match_prefix` returns indices up to depth 8192 but `insert.prefix_len` returns the full traversal depth. The two-call invariant `match_prefix(after-insert) ≥ insert.prefix_len` breaks.
-- **Real fix needed:** rework `_match_prefix_helper` to track the full traversal-end depth, not just the deepest-snapshot depth, OR make `insert.prefix_len` return the deepest-snapshot depth (consistent with match's view), OR redesign the tombstone-leaf semantics so they're never returned as the leaf of a match.
-- **Workaround:** **K_BIG is disabled in all eval scripts.** `dev/eval/07_phase_shift_trace.sh` L1=1 cells now set only `SGLANG_HPB_LRU=1` (no `SGLANG_K_BIG`); `08_A2_kbig_sweep.sh` is an open question (the sweep script requires K_BIG to be functional, so the sweep is effectively shelved until the fix lands). Layer 1's HPB-LRU contribution is reproducible in isolation in Q3.D (Table~tab:hpb-gsp).
-- **Impact on paper:** Layer 1's claimed *heterogeneous granularity* benefit cannot be reproduced in this eval cycle. The HPB LRU half of Layer 1 IS reproducible. Paper §6.2 should report only the HPB-driven Layer 1 contribution (Phase B P99 stable, Phase C P95 -16% via Layer 2) and acknowledge K_BIG as future work.
-- **Date observed:** 2026-04-30.
-- **Resolved at:** —
+- **Setting:** Phase 3.d e2e, Setting 1 L1=1 cells, A2 K_big sweep, Setting 3.A.
+- **Original symptoms:**
+    - **Insert assertion crash:** `cache_unfinished_req` line 800: `new_prefix_len > len(new_indices)`. Reproduced on Setting 1 v2 (depth 512), v5 multi-turn (depth 12883), and A2 K_big sweep (depth 12883).
+    - **Idle leak:** tombstone leaves' KV is never reclaimed because `_evict_leaf_node` asserts `mamba_value is not None`. Up to 13K slots leaked / 1.26M.
+- **Root cause:** `_match_prefix_helper` only updates `best_value_len` at nodes with `mamba_value is not None`, while `insert.prefix_len` returned the full traversal depth — including tombstone leaves and tombstone-internal-nodes past the deepest snapshot. The two views of the same path disagreed, breaking `cache_unfinished_req`'s invariant. And tombstone leaves were never reclaimable.
+- **Fix landed (commits b37bbc82e + 325f25334):**
+    1. `_insert_helper` no longer creates tombstone leaves. When the suppression path would create a new leaf with `mamba_value=None`, the trailing KV is freed instead. Eliminates the never-reclaimable-leaf source.
+    2. `_insert_helper` tracks `deepest_snapshot_depth` during the while loop. When K_BIG is active and the traversal goes past tombstone-internal-nodes past the deepest snapshot, `insert.prefix_len` returns the deepest-snapshot depth — consistent with what `match_prefix` returns. Eliminates the assertion crash.
+    3. Suppression condition restored to `insert_depth >= k_big AND insert_depth % k_big != 0` so depth<k_big inserts retain small-page caching (legacy behavior). Earlier over-suppression (`insert_depth % k_big != 0` only) caused v7 Phase C 30% P95 regression because every short-prompt insert was dropped.
+- **Validation:**
+    - `dev/2e/33_phase3d_unit.py` 3/3 PASS: aligned-depth snapshot, depth<K_big retained, depth>K_big past tombstone preserves prefix_len consistency.
+    - Setting 1 v8 (K_BIG=8192 enabled on L1 cells): all 4 cells × 3 phases run end-to-end clean. No assertion crash. No cell-vs-cell regression. Numbers match v6 (K_BIG disabled) within run-to-run noise.
+- **Residual:** small idle-time leak (~80 KV slots / 1.26M = 0.006%) — the suppressed-path's `free(value)` may be slightly over-counting. Demoted via `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0`. Not paper-blocking; followup TODO to track down.
+- **Date observed:** 2026-04-30 night.
+- **Resolved at:** 2026-04-30 (commit b37bbc82e + 325f25334).
 
 ## Setting 1 (24-h phase-shift trace) — **partially blocked**
 
