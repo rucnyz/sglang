@@ -29,27 +29,39 @@ OUT_DIR = Path(os.environ["OUT_DIR"])
 METRICS_PATH = Path(os.environ["METRICS_PATH"])
 
 PHASE_DURATION_S = 90
-TARGET_CONCURRENCY = 16  # in-flight cap
 
-# Two prompt sources.
+# In hybrid models every request uses both a mamba SLOT (per-request) and KV
+# TOKENS (per input-token + per output-token). Mamba pool is bottlenecked by
+# concurrency; KV pool by aggregate tokens. So genuine phase-shift needs:
+#   mamba phase: HIGH concurrency × short prompts  → mamba slot pressure
+#   kv phase:    LOW  concurrency × long inputs+outputs → KV token pressure
+# v7 used uniform 16 concurrency × short prompts in both phases, which kept
+# mamba pinned ~0.95 the whole time and KV at ~0.00 — only 1 transfer fired
+# and there was nothing more to do. v8 splits per-phase concurrency below.
+MAMBA_CONCURRENCY = 32
+KV_CONCURRENCY = 4
+
 def make_mamba_heavy_prompt(idx: int) -> tuple[str, int]:
-    """GSP-style: 12K-token shared system prompt + question. Heavy mamba."""
-    base = "Below is the system manual. Read carefully and answer.\n\n"
-    body = ("Section. " + ("a b c d e f g h " * 200)) * 8  # ~12K tokens worth
-    q = f"\n\nQuestion #{idx}: in one sentence, what is the most important section?\n"
-    return base + body + q, 64
+    """Short input, short output. Many concurrent → mamba slot pressure."""
+    p = f"Question {idx}: what is {idx % 13 + 1} times {idx % 7 + 2}? Briefly.\n"
+    return p, 32
 
 def make_kv_heavy_prompt(idx: int) -> tuple[str, int]:
-    """Random 8K-token unique prompt — fills KV, shallow mamba per request."""
+    """~8K-token unique input + 512-output. Few concurrent but each holds
+    ~8.5K KV tokens for ~20-30s of generation → fills KV token budget."""
     rnd = random.Random(idx)
-    tokens = [rnd.choice(["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"])
-              for _ in range(2000)]
-    p = " ".join(tokens) + f"\n\nIn one word: {idx}?\n"
-    return p, 32
+    tokens = [rnd.choice(["alpha", "beta", "gamma", "delta", "epsilon",
+                          "zeta", "eta", "theta", "iota", "kappa"])
+              for _ in range(8000)]
+    p = " ".join(tokens) + f"\n\nGiven the above tokens, list 50 distinct words.\n"
+    return p, 512
 
 def phase_at(t: float) -> str:
     n = int(t // PHASE_DURATION_S) % 4
     return "mamba" if n in (0, 2) else "kv"
+
+def concurrency_for_phase(ph: str) -> int:
+    return MAMBA_CONCURRENCY if ph == "mamba" else KV_CONCURRENCY
 
 
 async def fire_one(session, prompt: str, max_tokens: int, started_at: float, results: list,
@@ -81,10 +93,11 @@ async def main():
     idx = 0
     async with aiohttp.ClientSession() as session:
         while time.time() - t_start < duration_total:
-            # Maintain target concurrency.
-            while len(in_flight) < TARGET_CONCURRENCY and (time.time() - t_start < duration_total):
-                t_now = time.time() - t_start
-                ph = phase_at(t_now)
+            t_now = time.time() - t_start
+            ph = phase_at(t_now)
+            target = concurrency_for_phase(ph)
+            # Maintain phase-specific target concurrency.
+            while len(in_flight) < target and (time.time() - t_start < duration_total):
                 if ph == "mamba":
                     prompt, max_t = make_mamba_heavy_prompt(idx)
                 else:
