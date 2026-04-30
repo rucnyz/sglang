@@ -583,7 +583,14 @@ class MambaRadixCache(BasePrefixCache):
         suppressed_mamba = False
         if k_big > 0 and mamba_value is not None:
             insert_depth = prev_prefix_len + len(key)
-            if insert_depth % k_big != 0:
+            # Only suppress when (a) the insert is past the first big-page
+            # boundary (so there IS a depth-k_big ancestor that match_prefix
+            # can fall back to) AND (b) the insert depth is not itself
+            # aligned. Otherwise we'd create a tombstone leaf with no
+            # snapshot ancestor, which match_prefix returns as 0-len match
+            # — the unfinished_req path then asserts because new_prefix_len
+            # > len(new_indices).
+            if insert_depth >= k_big and insert_depth % k_big != 0:
                 # Insert KV without the snapshot. We still need _insert_helper
                 # to walk the tree; pass mamba_value=None and a flag.
                 suppressed_mamba = True

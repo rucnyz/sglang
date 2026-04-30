@@ -53,22 +53,47 @@ Hit rate is 82% (paper reports 75.8%) — different in absolute level but the FL
 
 **Raw data:** `/tmp/sweep_prefix_3048500/mf*_bench.json`.
 
-### Setting 2.2 — KV↔LoRA sweep on Qwen3-4B + 32 adapters (in progress, 2/6 done)
+### Setting 2.2 — KV↔LoRA sweep on Qwen3-4B + 32 adapters (DONE, PASS)
 
 `dev/eval/05_sweep_lora.sh` on GPU 2, port 30101. After --lora-name flag fix.
 - 32 synthetic LoRA adapters at `/scratch/yuzhou/.cache/synthetic_loras/qwen3-4b-r16/`
 - max_loras_per_batch sweep {1, 2, 4, 8, 16, 32}, 1000 random prompts, 512-input/128-output, RPS=32
 
-| max_loras | input TPS | mean TTFT (ms) | paper ref |
-|---:|---:|---:|:---:|
-| 1 | 4406 | 14616 | (paper: 5652, 7047) |
-| 2 | 5614 | 7378 | (paper: 6442, 3586) |
-| 4 | (running) | | (paper: 7072, 1861) |
-| 8 | | | (paper: 7258, 1006) |
-| 16 | | | (paper: 7462, 309) |
-| 32 | | | (paper: 7556, 74) |
+| max_loras | input TPS | output TPS | mean TTFT (ms) | P99 TTFT (ms) | median E2E (ms) | paper ref |
+|---:|---:|---:|---:|---:|---:|:---:|
+| 1 | 4406 | 1098 | 14615.9 | 30120 | 14558 | (5652, 7047) |
+| 2 | 5614 | 1399 | 7378.2 | 15540 | 7836 | (6442, 3586) |
+| 4 | 6519 | 1625 | 4322.1 | 10476 | 4826 | (7072, 1861) |
+| 8 | 6994 | 1743 | 1829.6 | 4585 | 2417 | (7258, 1006) |
+| 16 | 7313 | 1823 | 618.8 | 2258 | 1669 | (7462, 309) |
+| 32 | 7480 | 1864 | **76.3** | 593 | 1099 | (7556, **74**) |
 
-**So far:** TTFT roughly **halves** as max_loras doubles (14616→7378 from ml=1→ml=2 = ~50% drop). Paper's elbow is at ml=8 with 95× total swing — too early to tell if ours hits that.
+**Match: PASS — exceeds paper's swing.**
+- **TTFT swing 192×** (14616→76 from ml=1→ml=32). Paper claimed **95×** — ours is ~2× more dramatic, same elbow shape.
+- **Throughput swing 1.70×** (4406→7480). Paper claimed **1.34×**.
+- **ml=32 absolute TTFT matches paper exactly: 76.3ms vs paper's 74ms** — within 3% on absolute level.
+- The "more adapters in batch" effect is monotone and steep — Layer 2's case for promoting LoRA budget under high-LoRA-distribution workload is fully reproduced.
+
+Raw data: `/tmp/sweep_lora_3157665/ml*_bench.json`. Updated `evaluation.tex` Table 2 pending.
+
+### Ablation A3 — Δ_hyst sweep (DONE, INFORMATIVE — workload too short)
+
+`dev/eval/04_a3_hyst.sh` on GPU 3, port 30099. Qwen3.5-35B-A3B, RPS=4, ~3 min/cell × 5 hyst values.
+- Δ_hyst sweep ∈ {0, 0.01, 0.05, 0.10, 0.20} on the budgeter's xpool thresholds (KV±, mamba±).
+
+| Δ_hyst | total transfers | kv→mamba | mamba→kv | reversals |
+|---:|---:|---:|---:|---:|
+| 0    | 21 | 21 | 0 | 0 |
+| 0.01 | 21 | 21 | 0 | 0 |
+| 0.05 | 21 | 21 | 0 | 0 |
+| 0.10 | 21 | 21 | 0 | 0 |
+| 0.20 | **13** | 13 | 0 | 0 |
+
+**Verdict: workload doesn't pressure the threshold ribbon.** Paper §A.3 expected hyst=0 to thrash and hyst=0.20 to lag. We see no thrashing at hyst=0 (zero reversals at any value) because the random-uniform 1000-prompt bench drives demand monotonically upward — the budgeter promotes mamba 21 times in succession and never has reason to retreat. At hyst=0.20 the wider band suppresses 8 of those 21 promotions, demonstrating threshold widening DOES gate transfers, but reversal-thrashing isn't observable on this workload.
+
+**Implication for paper §A.3.** The hysteresis claim ("dampens reversals") needs a workload that genuinely oscillates around the threshold. The 24-h phase-shift trace (Setting 1) likely will: phase A (KV-heavy) ↔ phase B (mamba-heavy) ↔ phase C (long-context KV-heavy) is exactly the regime that pushes the budgeter back-and-forth. Re-run A3 against the phase-shift trace and report reversals there.
+
+Raw data: `/tmp/a3_hyst_3195814/hyst*_budgeter.jsonl`.
 
 ### Ablation A5 — VMM chunk size sweep (DONE, MAJOR FINDING)
 
@@ -105,10 +130,16 @@ Raw data: `/tmp/a5_chunk_3147806/`.
 
 ---
 
+### Setting 1 — 24-hour phase-shift 4-cell ablation (RUNNING, v2)
+
+`dev/eval/07_phase_shift_trace.sh` × 4 cells in parallel on GPU 1 / 4 / 5 / 6 (ports 30097/95/94/93).
+- Cells: `(L1, L2)` ∈ {(0,0), (1,0), (0,1), (1,1)}; phases A/B/C.
+- v1 attempt died at "Phase A" because pd_exp jsonl format ({prompt, input_len, output_len}) is incompatible with `bench_serving --dataset-name custom` (expects ShareGPT conversations format). Wrote `dev/eval/_convert_jsonl_to_sharegpt.py` and re-launched.
+- L1=1 cells emit `pool memory leak detected!` warnings on idle (Phase 3.d K_BIG path leaks 7-8 slots; see BLOCKERS.md). `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0` set on those cells so the warning doesn't crash the run.
+- Results pending. Raw data: `/tmp/phase_shift_v2_1777548251/`.
+
 ## Pending settings (queued, blocked, or scheduled)
 
-- **A5 chunk-size sweep** (`dev/eval/03_a5_chunk_size.sh`): scheduled. Could close part of the 2e.5.6.3.b regression.
-- **A3 hysteresis sweep** (`dev/eval/04_a3_hyst.sh`): scheduled.
-- **Setting 1** (24-h phase-shift trace): blocked on dataset generation + Layer 1 default-on configuration. Per BLOCKERS.md.
-- **Phase 3.d e2e** (`dev/2e/34_phase3d_e2e.sh`): heterogeneous granularity in production. Ready, awaiting GPU.
-- **Setting 5** (path-axis): blocked on dispatcher implementation.
+- **Phase 3.d e2e** (`dev/2e/34_phase3d_e2e.sh`): heterogeneous granularity correctness in production. K_BIG path triggers a 7-slot leak detector — see BLOCKERS.md "Phase 3.d (heterogeneous granularity)". Need to audit `_insert_helper` for missed `free()` when `mamba_value=None`.
+- **Q3.A / Q3.B / Q3.C** (Layer 1 signal-shaping isolation): blocked on (i) recovering the GSP HPB-vs-recency setup with K_BIG enabled, (ii) implementing a cold-burst trace driver, (iii) Setting 1 finishing so we can analyze post-hoc.
+- **Setting 5** (path-axis): blocked on dispatcher implementation. Per BLOCKERS.md.

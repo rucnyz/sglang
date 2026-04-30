@@ -30,6 +30,17 @@ Each entry:
 - **Date observed / fixed:** 2026-04-30 night.
 - **Resolved at:** 2026-04-30, after seeing server-side `Got LoRA adapter that has never been loaded` errors.
 
+## Phase 3.d (heterogeneous granularity, K_BIG=8192) — **partially fixed 2026-04-30**
+
+- **Setting:** Phase 3.d e2e and any Setting-1 cell with L1=1 (which sets SGLANG_K_BIG=8192).
+- **Symptom 1 (crash):** Setting-1 v2 attempt: `cache_unfinished_req` asserts `new_prefix_len=512, len(new_indices)=0`. The K_BIG suppression created tombstone leaves at depth 512 (NOT past the 8192 chunked-prefill boundary) and `_match_prefix_helper` returns 0 indices for tombstone-only chains.
+- **Symptom 2 (warning):** strict mem leak detector reports 7 slots / 1.26M (0.0006%) leaked at idle. tombstone-leaf nodes' KV cannot be evicted because `_evict_leaf_node` asserts `mamba_value is not None` — full LRU never reclaims them.
+- **Root cause:** `MambaRadixCache.insert` set `mamba_value=None` on every non-aligned depth, including those *below* the first big-page boundary. With no depth-K_big ancestor in the chain, match_prefix returns 0; with the new node being a tombstone leaf, evict_full skips it.
+- **Fix landed:** `mamba_radix_cache.py` line ~582 — only suppress when `insert_depth >= k_big AND insert_depth % k_big != 0`. Inserts shorter than K_big always carry their snapshot (no tombstone leaf created). Setting-1 v3 launched with the fix.
+- **Outstanding:** even with the fix, deep tombstone leaves can still arise when an insert at depth 9000 (with k_big=8192) is the FIRST request to land beyond depth 8192 on this branch. Need to audit `_evict_leaf_node` to handle tombstone-leaf eviction OR audit `_iteratively_delete_tombstone_leaf` to walk down to handle tombstone-leaves with no children. Workaround: keep `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0` for now.
+- **Date observed:** 2026-04-30 night.
+- **Resolved at:** partial fix landed 2026-04-30.
+
 ## Setting 1 (24-h phase-shift trace) — **partially blocked**
 
 - **Setting:** 1 (`dev/eval/01_phase_shift_trace.sh` not written)
