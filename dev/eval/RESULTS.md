@@ -29,7 +29,7 @@ Each entry: setting / date / what ran / result / location of raw data.
 | 1 24-h phase-shift | NULL | Smooth control test (no regression). Compressed trace doesn't bind on different pools across phases → paper §6.2 honest reframe |
 | 5.A/5.B/A6 path-axis | BLOCKED | Path-axis dispatcher not implemented → BLOCKERS.md |
 | 3.C composed | TODO | Depends on Setting 1 + 3.A; Layer 2 fires once on Setting 1 trace |
-| 4 estimator | **DONE QUANTITATIVE** | Proxy V≈usage is **saturation-blind**: flat 0.66 across Sweep 1's 5 points while true V_mamba' swings 5.8× (1670→9745). Works in unsaturated regime (3.C: usage 0.006-0.427 + 21 correct transfers). Real limitation, paper §6.4 tab:sweep4 added |
+| 4 estimator | **DONE QUANTITATIVE** | Proxy V≈usage saturation-blind (flat 0.66 vs 5.8× true swing). Mitigation: SGLANG_XPOOL_QDEPTH_TRIGGER fallback rule (5/5 unit tests PASS, gated, legacy preserved). E2e on Phase 1+2+3: both arms 21 transfers (workload doesn't reach dual-saturation). Deeper fix (per-pool admission signal) marked follow-up. Paper §6.4 + tab:sweep4 |
 
 **Implementation fix landed**: Phase 3.d K_BIG match-prefix invariant break (commits b37bbc82e + 325f25334). Drops tombstone-leaf creation; tracks deepest_snapshot_depth for insert.prefix_len consistency. 3/3 unit tests + Setting 1 v8 + A2 sweep all run end-to-end.
 

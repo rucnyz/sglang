@@ -294,7 +294,7 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | 3.B | V_prefix' stability | **DONE PASS** — HPB recovery -18% TTFT vs recency, paper tab:q3b | — |
 | 3.C | Composed L1+L2 | **DONE** — Layer 2 invariant to L1 on stress trace (21 transfers all cells); shows clean separation of concerns | feedback-loop workload follow-up |
 | 3.D | HPB-vs-recency on GSP | **DONE PASS** — paper tab:hpb-gsp added, -19.77% TTFT | — |
-| 4 | Estimator accuracy | **DONE QUANTITATIVE** — proxy is saturation-blind: flat 0.66 across Sweep 1 while true V swings 5.8× (paper tab:sweep4); works unsaturated | follow-up: admission-pressure signal |
+| 4 | Estimator accuracy | **DONE QUANTITATIVE** — proxy saturation-blind; SGLANG_XPOOL_QDEPTH_TRIGGER fallback rule landed (unit tests PASS, gated). E2e on Phase 1+2+3: workload doesn't dual-saturate so new rule never activates; deeper per-pool admission signal marked follow-up. | broader workload needed to exercise new rule |
 | 5.A | Path-axis dense | not started | **path-axis dispatcher implementation** |
 | 5.B | Path-axis hybrid | not started | depends on 5.A |
 | A1 | L1 sub-features | **DONE PASS** — cross-workload table, HPB dominant on smooth, full Layer 1 wins on cold-burst → paper tab:a1 | — |
