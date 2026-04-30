@@ -286,21 +286,22 @@ Whenever a setting reports four numbers, this is the cell ordering.
 
 | Setting | Description | Status | Blocker |
 |---|---|---|---|
-| 1 | 24-h phase-shift trace | not started | needs phase-A/B/C datasets generated; needs Layer 1 enabled by default |
-| 2.1 | KV↔DN sweep | not started | none — can run today |
-| 2.2 | KV↔LoRA sweep | not started | needs 32 rank-16 LoRA adapters checked in |
-| 2.3 | Prefix sweep | not started | needs WildChat 64×6 export |
-| 3.A | V_prefix' faithful | not started | **Phase 3.d (heterogeneous granularity)** |
-| 3.B | V_prefix' stability | not started | **Phase 3.d** |
+| 1 | 24-h phase-shift trace | **DONE v4** + v5 longer-context running | Phase C truncation needs longer multi-turn |
+| 2.1 | KV↔DN sweep | **DONE PASS** — paper Table 1 updated | — |
+| 2.2 | KV↔LoRA sweep | **DONE PASS** — paper Table 2 updated, 192× swing | — |
+| 2.3 | Prefix sweep | **DONE PASS** — paper Table 3 updated, V_prefix flat | — |
+| 3.A | V_prefix' faithful | not started | unblocked by Phase 3.d fix; needs orchestration |
+| 3.B | V_prefix' stability | not started | unblocked by Phase 3.d fix; needs cold-burst driver |
 | 3.C | Composed L1+L2 | not started | depends on 1 + 3.A |
+| 3.D | HPB-vs-recency on GSP | **DONE PASS** — paper tab:hpb-gsp added, -19.77% TTFT | — |
 | 4 | Estimator accuracy | not started | depends on 1 + 2 |
 | 5.A | Path-axis dense | not started | **path-axis dispatcher implementation** |
 | 5.B | Path-axis hybrid | not started | depends on 5.A |
 | A1 | L1 sub-features | not started | depends on 3.A and 3.B |
-| A2 | K_big sweep | not started | **Phase 3.d** |
-| A3 | Hysteresis sweep | not started | depends on 1 |
+| A2 | K_big sweep | **RUNNING** GPU 3 (5 arms × 5 min) | unblocked by Phase 3.d fix |
+| A3 | Hysteresis sweep | **DONE INFORMATIVE** — workload too monotone for thrash | depends on 1's actual phase-shift trace |
 | A4 | Tau sweep | not started | depends on 1 |
-| A5 | VMM chunk-size sweep | not started | none — can run today, may close 2e.5.6.3.b |
+| A5 | VMM chunk-size sweep | **DONE MAJOR** — 1GB chunks fix TTFT, paper §6.7 updated | — |
 | A6 | K=1 vs K=2 | not started | depends on 5.A |
 | Q1–Q4 | Quality preservation | partial | 16/17 cover Layer 2; Layer 1 token-identical TBD |
 
