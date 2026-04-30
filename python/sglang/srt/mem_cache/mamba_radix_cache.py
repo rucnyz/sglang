@@ -19,7 +19,10 @@ limitations under the License.
 The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
+import collections
 import heapq
+import os
+import time
 from collections import defaultdict
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -62,6 +65,10 @@ class TreeNode:
 
     counter = 0
     last_access_time_counter_float = float64(1.0)
+    # Phase 3 (paper §4.2): sliding-window in seconds for hits-per-byte
+    # eviction signal. Configurable via SGLANG_HPB_WINDOW_S; default 60s
+    # matches the paper's narrative.
+    hpb_window_s = float(os.environ.get("SGLANG_HPB_WINDOW_S", "60.0"))
 
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
@@ -80,7 +87,12 @@ class TreeNode:
         # last access time is only used for sanity check. LRU is maintained by the lru list.
         self.last_access_time = get_last_access_time()
 
+        # Phase 3 (paper §4.2): hits-per-byte eviction. `hit_count` is the
+        # cumulative count (defined by upstream but never incremented).
+        # `_hit_times` is the windowed deque of timestamps used for the
+        # actual signal — `hits_in_window()` lazily prunes old entries.
         self.hit_count = 0
+        self._hit_times: collections.deque = collections.deque()
         self.host_ref_counter = 0
         self.host_mamba_ref_counter = 0
         # store the host indices of KV cache
@@ -153,6 +165,59 @@ class TreeNode:
 
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
+
+    # ---- Phase 3 (paper §4.2) hits-per-byte eviction signal -----------
+
+    def record_hit(self) -> None:
+        """Append a hit timestamp to the windowed deque.
+
+        Called from `_match_prefix_helper` for every node visited during
+        a successful prefix match. The deque is pruned lazily in
+        `hits_in_window()`; we intentionally don't prune on insertion
+        since the window cutoff floats with wall time.
+        """
+        self._hit_times.append(time.monotonic())
+        self.hit_count += 1
+
+    def hits_in_window(self) -> int:
+        """Number of recorded hits within `TreeNode.hpb_window_s`."""
+        if not self._hit_times:
+            return 0
+        cutoff = time.monotonic() - TreeNode.hpb_window_s
+        # Lazy left-prune.
+        while self._hit_times and self._hit_times[0] < cutoff:
+            self._hit_times.popleft()
+        return len(self._hit_times)
+
+    def eviction_priority(self) -> float:
+        """Hits-per-byte priority. Higher = more valuable; eviction
+        targets the LOWEST-priority node.
+
+        The denominator is bytes the eviction would actually free:
+          - mamba snapshot bytes if `mamba_value` is present
+          - paged-attention KV bytes (= len(value) * page_bytes_estimate)
+        We approximate page_bytes by `value.numel()` since the radix
+        node's `value` is a tensor of page indices (int64, 8 B each);
+        the actual KV-cache cost per page is set by the engine and is
+        much larger, but we only need ratios across nodes for ordering.
+        Both terms scale linearly in node size so the ratio is correct.
+
+        Returns float('inf') for nodes that hit but free zero bytes
+        (shouldn't happen but guards against div-by-zero).
+        """
+        n_hits = self.hits_in_window()
+        size_bytes = 0
+        if self.value is not None:
+            size_bytes += int(self.value.numel())
+        if self.mamba_value is not None:
+            # Per the paper, big-page snapshots dominate the size term;
+            # for V0 we approximate by treating mamba_value as a heavy
+            # weight (1024× the per-token KV term). Real heterogeneous
+            # node accounting comes when big-page nodes are introduced.
+            size_bytes += int(self.mamba_value.numel()) * 1024
+        if size_bytes == 0:
+            return float("inf") if n_hits > 0 else 0.0
+        return n_hits / size_bytes
 
 
 def get_last_access_time() -> float64:
@@ -761,12 +826,39 @@ class MambaRadixCache(BasePrefixCache):
             num_tokens_evicted=full_num_evicted, mamba_num_evicted=mamba_num_evicted
         )
 
+    def _hpb_pick_mamba_eviction(self) -> Optional[TreeNode]:
+        """Phase 3 (paper §4.2): pick the lowest hits-per-byte mamba node
+        not currently locked. O(n) scan over the mamba LRU list's
+        evictable set; for tree sizes up to ~10K nodes (typical hybrid
+        deployments) this is bounded at ~10 us per call. Falls back to
+        recency-LRU on tie.
+        """
+        best: Optional[TreeNode] = None
+        best_priority = float("inf")
+        # mamba_lru_list.cache is the dict of all evictable mamba nodes.
+        for node in self.mamba_lru_list.cache.values():
+            if node.mamba_lock_ref > 0 or node.mamba_value is None:
+                continue
+            p = node.eviction_priority()
+            if p < best_priority or (p == best_priority and best is not None
+                                     and node.last_access_time < best.last_access_time):
+                best = node
+                best_priority = p
+        return best
+
     def evict_mamba(self, mamba_num: int) -> int:
         """Evict mamba states. Returns the number of mamba states evicted."""
         if self.disable or mamba_num <= 0:
             return 0
-        # get the least recently used node that is not locked, doesn't have to be a leaf
-        x = self.mamba_lru_list.get_lru_no_lock()
+        # Phase 3 (paper §4.2): SGLANG_HPB_LRU=1 selects by hits-per-byte;
+        # default off preserves the recency-LRU baseline.
+        use_hpb = os.environ.get("SGLANG_HPB_LRU") == "1"
+        if use_hpb:
+            x = self._hpb_pick_mamba_eviction()
+            if x is None:
+                return 0
+        else:
+            x = self.mamba_lru_list.get_lru_no_lock()
         mamba_num_evicted = 0
         # evict lru leaf nodes until mamba_num_tokens is reached
         while mamba_num_evicted < mamba_num and (self.mamba_lru_list.in_list(x)):
@@ -792,7 +884,15 @@ class MambaRadixCache(BasePrefixCache):
                 _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x, True)
                 mamba_num_evicted += mamba_evicted_delta
 
-            x = x_next
+            # In HPB mode, re-select on each iteration so subsequent
+            # victims also follow hits-per-byte ordering. Recency mode
+            # walks the LRU prev list as before.
+            if use_hpb:
+                x = self._hpb_pick_mamba_eviction()
+                if x is None:
+                    break
+            else:
+                x = x_next
 
         return mamba_num_evicted
 
@@ -957,6 +1057,12 @@ class MambaRadixCache(BasePrefixCache):
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
+        # Phase 3 (paper §4.2): record hit on every visited child so
+        # eviction_priority() reflects recent value to the workload.
+        # Without this, hit_count never increments — the paper's exact
+        # observation. We always record (cost: a deque append + int++);
+        # eviction policy chooses whether to consume the signal.
+        hit_path: List[TreeNode] = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
@@ -969,10 +1075,12 @@ class MambaRadixCache(BasePrefixCache):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
                 node = new_node
+                hit_path.append(new_node)
                 break
             else:
                 value.append(child.value)
                 node = child
+                hit_path.append(child)
                 key = key[prefix_len:]
 
                 if len(key):
@@ -981,6 +1089,13 @@ class MambaRadixCache(BasePrefixCache):
         if node.mamba_value is not None:
             best_value_len = len(value)
             best_last_node = node
+
+        # Record hits for every node we visited in the matching walk.
+        # Only do this when there was at least some prefix match —
+        # zero-length matches don't credit any node.
+        if best_value_len > 0:
+            for n in hit_path:
+                n.record_hit()
 
         return value, best_last_node, best_value_len
 

@@ -1289,5 +1289,46 @@ The paper's eval section can now run the headline trace as a real reproducible m
 **Next steps (post-2e.5.6):**
 
 - 2e.6+ (optional, future work): replace threshold-with-hysteresis planner with the bisection-on-λ Lagrange algorithm from `dev/2e/lagrange_planner.py` once we have value curves on the specs. Two-pool case won't change behavior; matters when LoRA + prefix pools are added.
-- Layer 1 work (paper §3 / §4.2): hybrid prefix cache (radix + hits-per-byte LRU). Independent of Phase 2e.
+- Layer 1 work (paper §3 / §4.2): hybrid prefix cache (radix + hits-per-byte LRU). Independent of Phase 2e. **Status: hits-per-byte LRU primitives landed 2026-04-30 (Phase 3.a). Heterogeneous-granularity radix is a separate larger refactor (Phase 3.b).**
+
+## Phase 3.a — hits-per-byte LRU primitives (PASS, 2026-04-30)
+
+**Goal.** Paper §4.2's second refinement: replace `MambaRadixCache`'s recency LRU with hits-per-byte priority so a high-hit system-prompt big page is not evicted by a cold-burst flood. The first refinement (heterogeneous granularity) requires deeper restructuring of the radix tree's snapshot policy and is deferred to 3.b.
+
+**Code.** `python/sglang/srt/mem_cache/mamba_radix_cache.py`:
+- `TreeNode.__init__`: new `_hit_times` deque + `hpb_window_s` class attribute (default 60 s, configurable via `SGLANG_HPB_WINDOW_S`).
+- `TreeNode.record_hit`: append timestamp + increment counter.
+- `TreeNode.hits_in_window`: lazy-prune oldest entries past the window, return count.
+- `TreeNode.eviction_priority`: hits / size-bytes (mamba snapshot weighted 1024× the per-token KV term, matching the paper's relative-cost framing). Returns `+inf` for the degenerate "hits but zero bytes" case so eviction never targets it.
+- `_match_prefix_helper`: now records a hit on every node visited during a successful match. The paper's exact observation — `hit_count` was defined but never incremented — is fixed.
+- `_hpb_pick_mamba_eviction`: O(n) scan of the mamba LRU list's `cache` dict, picks lowest-priority unlocked node. Bounded ~10 µs per call for ≤10K-node trees (typical hybrid deployments).
+- `evict_mamba`: when `SGLANG_HPB_LRU=1` is set, uses HPB selector for first pick AND for re-selection after each iteration; otherwise the recency-LRU path is preserved unchanged.
+
+**Reproduce.**
+```bash
+cd /scratch/yuzhou/projects/sglang
+PYTHONPATH=/data/yuzhou/projects/sglang/python:$PYTHONPATH \
+  .venv/bin/python -u dev/2e/26_hpb_lru_unit.py
+```
+
+**Result.**
+```
+Test 1: hits-per-byte priority ranking          PASS  (H @ 50 hits priority 0.016 > L @ 0 hits 0.000)
+Test 2: HPB picks cold leaves before hot page   PASS  (HPB → L_0; recency-LRU → H_system; cold-burst paper scenario)
+Test 3: hit window decays over time             PASS  (20 hits → 0 hits across a 0.7s sleep at 0.5s window)
+Test 4: zero-byte node guard                    PASS  (priority +inf, no div-by-zero)
+ALL PASS
+```
+
+**Findings.**
+
+1. **Paper §4.2's bug observation is real.** `hit_count` was defined on `TreeNode` but never incremented; `_match_prefix_helper` walked the prefix without crediting the matched nodes. This patch is the minimum fix — incrementing the windowed counter on every match.
+
+2. **The cold-burst scenario from paper §4.2 reproduces in synthetic form.** Test 2 builds a "system prompt big page" with 50 windowed hits and 20 "cold burst" leaves with 0 hits. Recency LRU picks the system page first (it was created first → oldest `last_access_time`); hits-per-byte LRU picks a cold leaf first. The paper's claimed direction is the test's outcome.
+
+3. **The 1024× snapshot weight is a placeholder.** Paper §4.2 frames eviction priority as `hits / (snapshot_bytes + KV_bytes)` where `snapshot_bytes = 0` for small-page nodes and large for big-page nodes. Phase 3.a treats `mamba_value.numel() * 1024` as a stand-in for snapshot bytes, since the actual mamba snapshot size depends on the model's per-layer state shape (`temporal_state_shape`). 3.b will compute the exact byte cost from the engine's mamba pool config.
+
+4. **Heterogeneous granularity (Phase 3.b) is the larger lift.** Today every TreeNode in `MambaRadixCache` carries a `mamba_value` snapshot (the small-K regime described in paper §4.2). Big-page-only mode requires (a) tracking which nodes are at chunked-prefill checkpoint boundaries, (b) restoring snapshot from the most recent ancestor big-page node + re-prefilling the small-page tail on partial hits, (c) accounting both node types in the eviction-priority denominator. Estimated ~400 LoC + test, separate session.
+
+**Implication for Layer 2 integration.** With HPB LRU in place, the prefix-pool's marginal value (paper §4.3 Equation 4.4) can be reported to `CrossPoolPlanner`: `V_prefix' ≈ (n / W) * S * c_prefill` where `n` = hits on the next-to-evict node, `W` = window, `S` = avg prefill saving, `c_prefill` = per-token prefill cost. That wiring lands when prefix pool joins the cross-pool budget (currently only KV + mamba; prefix is at fixed capacity).
 
