@@ -23,9 +23,16 @@ def setup_planner(edge: bool, **kwargs):
     os.environ["SGLANG_XPOOL_MAMBA_HIGH"] = str(kwargs.get("mb_high", 0.80))
     os.environ["SGLANG_XPOOL_MAMBA_LOW"] = str(kwargs.get("mb_low", 0.40))
     os.environ["SGLANG_XPOOL_COOLDOWN"] = str(kwargs.get("cooldown", 0))
+    # These tests focus on edge-trigger semantics independent of the
+    # net-benefit gate; disable nb here so fires happen whenever
+    # edge-trigger logic says so. Net-benefit is tested separately in
+    # 38_planner_netbenefit_unit.py.
+    os.environ["SGLANG_XPOOL_NET_BENEFIT"] = "0"
     os.environ.pop("SGLANG_XPOOL_QDEPTH_TRIGGER", None)
     from importlib import reload
     import sglang.srt.budgeter.cross_pool_planner as cpp
+    import sglang.srt.budgeter.pressure_adapter as pa
+    reload(pa)
     reload(cpp)
     return cpp.CrossPoolPlanner()
 

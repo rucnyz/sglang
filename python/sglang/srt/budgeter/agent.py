@@ -404,9 +404,12 @@ class BudgetAgent:
         snapshot["xpool_plan_usage_kv_inst"] = usage_kv_inst
         snapshot["xpool_plan_usage_mamba_inst"] = usage_mamba_inst
 
-        # Setting 4 follow-up: pass queue_depth so the planner has an
-        # admission-pressure signal at saturation (V≈usage proxy alone
-        # is saturation-blind).
+        # Engine-agnostic gate: snapshot is passed through to the
+        # planner, which delegates pressure-signal extraction to its
+        # `EnginePressureAdapter` (default `SGLangPressureAdapter`).
+        # Adapter reads num_evicted_tokens_recent / num_retracted_reqs /
+        # num_paused_reqs / num_queue_reqs from the snapshot and returns
+        # PressureSignals; planner sums and compares to chunk_cost_us.
         def _scalar_or_total(v) -> int:
             t = getattr(v, "total", None)
             if isinstance(t, (int, float)):
@@ -414,17 +417,11 @@ class BudgetAgent:
             return int(v) if isinstance(v, (int, float)) else 0
 
         qdepth = _scalar_or_total(snapshot.get("num_queue_reqs", 0))
-        # Net-benefit gate (Setting 1 v9-auto follow-up): expose paused/
-        # retracted counts so the planner can refuse to fire when L1's
-        # snapshot retention has already absorbed the binding shift.
-        n_paused = _scalar_or_total(snapshot.get("num_paused_reqs", 0))
-        n_retracted = _scalar_or_total(snapshot.get("num_retracted_reqs", 0))
 
         decision = self._xpool_planner.decide(
             usage_kv, usage_mamba,
             queue_depth=qdepth,
-            num_paused_reqs=n_paused,
-            num_retracted_reqs=n_retracted,
+            snapshot=snapshot,
         )
         snapshot["xpool_plan_direction"] = decision.direction or "none"
         snapshot["xpool_plan_reason"] = decision.reason
@@ -561,6 +558,25 @@ class BudgetAgent:
             and self._tree_cache.__class__.__name__ == "UnifiedRadixCache"
         )
         snap["lora_present"] = self._lora_manager is not None
+
+        # Paper §design-l2 SGLang adapter: tree-cache eviction is the
+        # primary admission-pressure relief mechanism. The cumulative
+        # counter is maintained by `check_decode_mem` in
+        # schedule_batch.py; we emit the per-tick delta as
+        # `num_evicted_tokens_recent` for the SGLangPressureAdapter to
+        # convert into benefit-microseconds via prefill_save_us_per_token.
+        if self._tree_cache is not None:
+            cum_evict = getattr(
+                self._tree_cache, "_l2_cumulative_evicted_tokens", 0
+            )
+            last = getattr(self, "_last_evicted_cumulative", 0)
+            recent = max(0, cum_evict - last)
+            self._last_evicted_cumulative = cum_evict
+            snap["num_evicted_tokens_recent"] = recent
+            snap["num_evicted_tokens_cumulative"] = cum_evict
+        else:
+            snap["num_evicted_tokens_recent"] = 0
+            snap["num_evicted_tokens_cumulative"] = 0
 
         # Phase 3.b (paper §4.2 Eq 4.4): V_prefix' marginal-value report.
         # Available on MambaRadixCache (and Hi*); other tree caches don't

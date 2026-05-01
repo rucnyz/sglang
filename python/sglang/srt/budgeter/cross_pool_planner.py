@@ -63,44 +63,28 @@ class CrossPoolPolicyConfig:
     # IN_BAND ↔ ABOVE_HIGH). Steady state above high → 0 transfers
     # after the first crossing → 0 actuator overhead.
     edge_trigger: bool = True      # paper §design-l2 default; SGLANG_XPOOL_EDGE_TRIGGER=0 to disable
-    # Net-benefit gate (Setting 1 v9-auto follow-up). v9-auto's L1+L2 cell
-    # showed L2 firing 15 transfers under L1's mamba_usage signal even when
-    # L1's HPB-LRU snapshot retention had already absorbed the binding shift,
-    # making the cuMemUnmap+cuMemMap cycle pure overhead and turning L1+L2
-    # into a +42% Phase C P99 regression vs L1-only. The gate computes
-    #   expected_benefit_us = retracted * avg_input * 1e6 / prefill_tps
-    #                       + paused * pause_penalty_us
-    #   expected_cost_us    = n_chunks * chunk_cost_us
-    # and refuses to fire unless benefit >= cost * margin. With no retracts
-    # and no paused reqs, benefit is 0 and the gate always blocks — which
-    # is exactly the v9-auto failure mode we need to suppress.
+    # Net-benefit gate (paper §design-l2). Engine-agnostic abstract:
+    #   B (benefit) ≥ C (cost) × margin
+    # B is the sum of admission-pressure signals translated through the
+    # `EnginePressureAdapter` (see budgeter/pressure_adapter.py).
+    # Different engines provide different adapters that map their native
+    # pool-pressure mechanisms into a uniform "us of GPU time saved"
+    # space. SGLang's adapter dominates the eviction term (its primary
+    # pressure-relief mechanism), vLLM's would dominate swap/preempt,
+    # etc. C is the empirically measured per-fire wall time
+    # (`nb_chunk_cost_us`).
     net_benefit_enabled: bool = True   # paper §design-l2 default; SGLANG_XPOOL_NET_BENEFIT=0 to disable
-    nb_avg_prefill_tokens: int = 4096  # avg input length used for benefit est
-    nb_prefill_tps: float = 50000.0    # prefill throughput est (H200 default)
-    nb_pause_penalty_us: float = 1000.0  # cost of one paused-req tick
-    # Actuator moves chunks in lcm-balanced units across all sub-pools — for
-    # Qwen3.5-35B-A3B (KV 20 sub-pools × mamba 30 = lcm 60), one logical "unit"
-    # actually moves 60 chunks at ~50 ms cuMemUnmap+cuMemMap each = ~3 s of GPU
-    # time per fire. The default is set to that worst-case so the gate doesn't
-    # under-cost transfers and trigger a death spiral (B3 v2 cell_01: one fire
-    # shifted 15 GB from KV to mamba, KV dropped from 1.26M to 524K tokens, β
-    # phase's 96K-input requests overflowed → 40k errors). Operators with a
-    # different model topology should override SGLANG_XPOOL_NB_CHUNK_COST_US.
-    nb_chunk_cost_us: float = 3000000.0  # ≈ lcm(20,30) × 50 ms for Qwen3.5-A3B
-    nb_margin: float = 1.5             # benefit must exceed cost * margin
-    # Persistent-saturation lower bound on benefit (Setting 1 v9-auto v2
-    # follow-up). The original B_lb (paused, retracted) is zero on workloads
-    # where stock MambaRadixCache evicts aggressively enough that no request
-    # reaches paused/retracted state — but the underlying "mamba sustained
-    # at 1.0 for 100+ ticks" *is* a real cost (every miss = a re-prefill).
-    # Each tick of sustained ABOVE_HIGH on a pool contributes
-    # `nb_persist_tick_us` microseconds of avoided-future-cost to B_lb.
-    # Also enables periodic re-evaluation in the stable branch of the
-    # edge-triggered planner so the gate gets a chance to fire under
-    # sustained pressure (otherwise edge-trigger never re-checks once
-    # the state is stable).
-    nb_persist_tick_us: float = 5000.0  # per-tick value of sustained ABOVE_HIGH
-    nb_persist_eval_period: int = 10    # re-eval every N stable ticks (0=off)
+    # nb_chunk_cost_us: empirically measured per-fire cuMemUnmap+cuMemMap
+    # wall time. ~5,000 us on H200 with 256 MB chunks per the Stage 1
+    # calibration in sglang `87360b2c7`. Adapter-specific signal
+    # coefficients live in the adapter; the planner only needs the cost.
+    nb_chunk_cost_us: float = 5000.0
+    nb_margin: float = 1.5
+    # Period (in stable ticks) at which the planner re-evaluates the
+    # net-benefit gate while a pool is sustainedly ABOVE_HIGH. Without
+    # this, edge-trigger mode would only check at state transitions and
+    # miss steady-state pressure that built up after the initial cross.
+    nb_persist_eval_period: int = 10
 
 
 def _policy_from_env() -> CrossPoolPolicyConfig:
@@ -114,20 +98,14 @@ def _policy_from_env() -> CrossPoolPolicyConfig:
         qdepth_trigger=int(os.environ.get("SGLANG_XPOOL_QDEPTH_TRIGGER", "0")),
         edge_trigger=bool(int(os.environ.get("SGLANG_XPOOL_EDGE_TRIGGER", "1"))),
         net_benefit_enabled=bool(int(os.environ.get("SGLANG_XPOOL_NET_BENEFIT", "1"))),
-        nb_avg_prefill_tokens=int(os.environ.get("SGLANG_XPOOL_NB_AVG_PREFILL_TOKENS", "4096")),
-        nb_prefill_tps=float(os.environ.get("SGLANG_XPOOL_NB_PREFILL_TPS", "50000")),
-        nb_pause_penalty_us=float(os.environ.get("SGLANG_XPOOL_NB_PAUSE_PENALTY_US", "1000")),
-        # Empirically measured on Qwen3.5-35B-A3B / H200 / 256 MB chunks
-        # (sglang `23bc28761` instrumentation, calibration run
-        # `dev/eval/runs/l2-mobile-soft-focused-20260501-221921`). Mean
-        # per-fire wall time across 2 fires moving 120 chunks total =
-        # 9.5 ms = ~80 us/chunk (cuMemUnmap + cuMemMap pair on H200).
-        # Per-fire average = 4.7 ms. Round up to 5_000 us as a
-        # conservative default; the prior 3_000_000 default came from
-        # an early micro-bench that overestimated cost by 600×.
+        # Per-fire cuMemUnmap+cuMemMap wall time, empirically measured on
+        # Qwen3.5-35B-A3B / H200 / 256 MB chunks (sglang `87360b2c7` Stage 1
+        # calibration: 2 fires, 120 chunks, 9.5 ms total = ~80 us/chunk,
+        # ~4.7 ms/fire). 5,000 us is a conservative round-up; operators
+        # should re-measure on their hardware via the actuator's
+        # `xpool_fire_total_us` log field.
         nb_chunk_cost_us=float(os.environ.get("SGLANG_XPOOL_NB_CHUNK_COST_US", "5000")),
         nb_margin=float(os.environ.get("SGLANG_XPOOL_NB_MARGIN", "1.5")),
-        nb_persist_tick_us=float(os.environ.get("SGLANG_XPOOL_NB_PERSIST_TICK_US", "5000")),
         nb_persist_eval_period=int(os.environ.get("SGLANG_XPOOL_NB_PERSIST_EVAL_PERIOD", "10")),
     )
 
@@ -157,8 +135,13 @@ class CrossPoolPlanner:
     def __init__(
         self,
         config: Optional[CrossPoolPolicyConfig] = None,
+        adapter=None,
     ) -> None:
         self.config = config if config is not None else _policy_from_env()
+        if adapter is None:
+            from sglang.srt.budgeter.pressure_adapter import get_default_adapter
+            adapter = get_default_adapter()
+        self._adapter = adapter
         self._cooldown_remaining: int = 0
         self._tick_count: int = 0
         # Edge-triggered state per pool. Initialized to IN_BAND so the
@@ -191,45 +174,48 @@ class CrossPoolPlanner:
 
     def _net_benefit_ok(
         self,
-        num_paused: int,
-        num_retracted: int,
+        snapshot: dict | None,
         kv_above_consec: int = 0,
         mamba_above_consec: int = 0,
     ) -> tuple[bool, str]:
-        """Return (allow_fire, why) per the cost/benefit estimator.
+        """Return (allow_fire, why) per the engine-agnostic cost/benefit
+        estimator.
 
-        Disabled (returns True) unless `net_benefit_enabled`. Three
-        contributions to the admission-pressure lower bound:
-          (1) num_retracted * avg_input * 1e6 / prefill_tps    [retracts]
-          (2) num_paused    * pause_penalty_us                 [pauses]
-          (3) (kv_consec + mamba_consec) * persist_tick_us     [B_persist]
-        The persist term captures sustained ABOVE_HIGH saturation that
-        the scheduler absorbs silently via aggressive cache eviction —
-        each such tick has a real but soft cost that retracts/paused
-        miss. Refuses to fire when benefit < cost × margin.
+        Paper §design-l2: `B (benefit) ≥ C (cost) × margin`. Benefit is
+        the sum of admission-pressure signals translated through the
+        engine-specific `EnginePressureAdapter` (sglang
+        `pressure_adapter.py`). Cost is `nb_chunk_cost_us` (empirically
+        measured wall time per fire, e.g., ~5 ms on H200 with 256 MB
+        chunks per the Stage 1 calibration in `87360b2c7`).
+
+        For SGLang the dominant signal is tree-cache eviction (the
+        engine's primary pressure-relief mechanism); paused/retracted
+        rarely surface because eviction satisfies pressure first.
+        Persist provides a saturation prior. The adapter normalizes
+        all of these to "us of GPU time" so the inequality is unit-clean.
+
+        Disabled (returns True unconditionally) when `net_benefit_enabled`
+        is False — useful as a kill switch but not the paper-faithful
+        default.
         """
         c = self.config
         if not c.net_benefit_enabled:
             return True, "nb=off"
-        if (num_paused == 0 and num_retracted == 0
-                and kv_above_consec == 0 and mamba_above_consec == 0):
-            return False, "nb: no pressure (paused=0 retracted=0 persist=0)"
-        benefit_us = (
-            num_retracted * c.nb_avg_prefill_tokens * 1e6 / c.nb_prefill_tps
-            + num_paused * c.nb_pause_penalty_us
-            + (kv_above_consec + mamba_above_consec) * c.nb_persist_tick_us
+        signals = self._adapter.signals_from_snapshot(
+            snapshot or {}, kv_above_consec, mamba_above_consec,
         )
+        benefit_us = signals.total_benefit_us
         cost_us = c.dst_chunks_per_action * c.nb_chunk_cost_us
-        annot = (f"paused={num_paused} retracted={num_retracted} "
-                 f"persist=({kv_above_consec},{mamba_above_consec})")
+        if benefit_us <= 0:
+            return False, f"nb: no pressure ({signals.reason_str()})"
         if benefit_us < cost_us * c.nb_margin:
             return False, (
-                f"nb: benefit {benefit_us:.0f}us < cost {cost_us:.0f}us × "
-                f"margin {c.nb_margin} ({annot})"
+                f"nb: B={benefit_us:.0f}us < C={cost_us:.0f}us × "
+                f"margin={c.nb_margin} ({signals.reason_str()})"
             )
         return True, (
-            f"nb: benefit {benefit_us:.0f}us >= cost {cost_us:.0f}us × "
-            f"margin {c.nb_margin} ({annot})"
+            f"nb: B={benefit_us:.0f}us >= C={cost_us:.0f}us × "
+            f"margin={c.nb_margin} ({signals.reason_str()})"
         )
 
     def decide(
@@ -237,9 +223,15 @@ class CrossPoolPlanner:
         usage_kv: float,
         usage_mamba: float,
         queue_depth: int = 0,
-        num_paused_reqs: int = 0,
-        num_retracted_reqs: int = 0,
+        snapshot: dict | None = None,
     ) -> PlanDecision:
+        """Decide whether to fire a cross-pool transfer this tick.
+
+        `snapshot` is the budgeter snapshot dict (passed through from
+        agent.py). The pressure adapter reads engine-native fields from
+        it (num_evicted_tokens_recent / num_retracted_reqs /
+        num_paused_reqs / num_queue_reqs) when net-benefit gate is on.
+        """
         self._tick_count += 1
         c = self.config
 
@@ -287,8 +279,7 @@ class CrossPoolPlanner:
                             and new_mamba == self.ABOVE_HIGH
                             and new_kv != self.ABOVE_HIGH):
                         ok, why = self._net_benefit_ok(
-                            num_paused_reqs, num_retracted_reqs,
-                            kv_consec, mamba_consec,
+                            snapshot, kv_consec, mamba_consec,
                         )
                         if ok:
                             self._cooldown_remaining = c.cooldown_ticks
@@ -305,8 +296,7 @@ class CrossPoolPlanner:
                             and new_kv == self.ABOVE_HIGH
                             and new_mamba != self.ABOVE_HIGH):
                         ok, why = self._net_benefit_ok(
-                            num_paused_reqs, num_retracted_reqs,
-                            kv_consec, mamba_consec,
+                            snapshot, kv_consec, mamba_consec,
                         )
                         if ok:
                             self._cooldown_remaining = c.cooldown_ticks
@@ -333,8 +323,7 @@ class CrossPoolPlanner:
             # admission-pressure cost we'd relieve.
             def _try_fire(direction: str, edge_reason: str) -> PlanDecision:
                 ok, why = self._net_benefit_ok(
-                    num_paused_reqs, num_retracted_reqs,
-                    kv_consec, mamba_consec,
+                    snapshot, kv_consec, mamba_consec,
                 )
                 if not ok:
                     return PlanDecision(

@@ -2118,7 +2118,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        # Paper §design-l2 SGLang pressure adapter: tree-cache eviction
+        # is the primary admission-pressure relief mechanism on SGLang.
+        # We measure the eviction delta via allocator.available_size
+        # before/after — that delta is the "deferred re-prefill cost"
+        # that L2's net-benefit gate consults to decide whether a
+        # cross-pool transfer is justified.
+        avail_before = self.token_to_kv_pool_allocator.available_size()
         evict_from_tree_cache(self.tree_cache, num_tokens)
+        avail_after = self.token_to_kv_pool_allocator.available_size()
+        evicted_delta = max(0, avail_after - avail_before)
+        if evicted_delta > 0 and hasattr(self, "tree_cache"):
+            tc = self.tree_cache
+            if not hasattr(tc, "_l2_cumulative_evicted_tokens"):
+                tc._l2_cumulative_evicted_tokens = 0
+            tc._l2_cumulative_evicted_tokens += evicted_delta
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
