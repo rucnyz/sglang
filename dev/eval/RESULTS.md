@@ -221,37 +221,69 @@ TPS spread 0.05%, mean TTFT 0.7%, P99 TTFT 3.2%. **Gap does not reproduce.**
 TPS literally identical. Mean TTFT C1-vs-C0 +3.8%, P99 TTFT +9.6% — both at noise
 floor for n=100 (P99 of 100 samples = single worst observation).
 
-**n=500 3-trial result (random 512in/128out RPS=8 saturated):**
+**n=500 5-trial final result (random 512in/128out RPS=8 saturated):**
 
 | metric | C0 (mean ± std) | C1 (mean ± std) | C1 / C0 |
 |--------|----------------:|----------------:|--------:|
-| input_tps        | 2081.6 ± 6.6 | 2088.5 ± 2.4 | +0.33% |
-| mean_ttft_ms     | 50.76 ± 0.33 | 56.54 ± 5.88 | +11.4% |
-| p99_ttft_ms      | 272.95 ± 42  | 603.03 ± 397 | +120.9% |
-| median_e2e_ms    | 649.75 ± 6.97| 662.80 ± 5.91| +2.01% |
+| input_tps        | 2085.50 ± 4.94 | 2085.48 ± 7.75 | 0.00% |
+| mean_ttft_ms     | 51.80 ± 1.70   | 55.51 ± 5.79   | **+7.15%** |
+| p99_ttft_ms      | 557.77 ± 315   | 566.42 ± 350   | +1.55% |
+| median_e2e_ms    | 649.73 ± 6.02  | 668.81 ± 9.21  | +2.94% |
+| mean_e2e_ms      | 707.37 ± 15.15 | 720.67 ± 5.15  | +1.88% |
 
-**The arena does not add a constant overhead — it adds variance.** C0 baseline
-is rock-solid (std 0.33ms on mean TTFT, 42ms on P99); C1 introduces 18× more
-mean TTFT variance and 9× more P99 variance. Median E2E and throughput are
-indistinguishable from baseline.
+**Final characterization (5 trials, much cleaner than 3-trial):**
+- **Throughput unchanged** (delta 0.00%)
+- **Mean TTFT cost +7.15%** with C1 trial-to-trial variance 3.4× larger than C0
+  (std 5.79 vs 1.70 ms). The variance asymmetry is the real arena-introduced
+  effect; the cost itself is small.
+- **P99 TTFT indistinguishable** from baseline (+1.55%, well within each cell's
+  σ ≈ 320-350 ms). Both C0 and C1 P99 range widely (C0 P99 247→896 across 5
+  trials, C1 P99 223→1029); the tail variance is in the workload itself
+  (Poisson arrivals at RPS=8, n=500, P99 = 5th-worst-of-500 sample),
+  **not the arena**. The 3-trial run that suggested "+120% P99" was a
+  sample-size artifact.
 
-**Conclusion:** the 5.86% mean / 12.34% P99 TTFT *constant overhead* cited in
-paper §sec:eval-arena-cost (sourced from `dev/2e/24_arena_from_blob_perf.sh`,
-2026-04-30 single-point measurement) is **not the right characterization**.
-The actual cost is best described as +11% ± 12% mean TTFT and +120% ± 400% P99
-TTFT variance under saturation, with no measurable steady-state TPS impact.
-The mean and tail-latency *gap exists* but the variance dominates the signal,
-indicating the arena's per-request cost is bursty rather than uniform —
-consistent with an allocator path that occasionally hits a slow branch
-(e.g., chunk-list traversal under fragmentation, TLB cold-page touch).
-Bisection: budgeter+planner ruled out (C2≈C3≈C1 within 1.5ms in n=100 round).
-Kernel datapath ruled out (dev/2e/40_arena_kernel_isolation.py: all 4 kernels
-within ±1% across cudaMalloc / VMM paths). Pool capacities identical
-(max_total_num_tokens=1263072 in both C0 and C1).
+**Correction from prior commits:**
+- The 5.86% mean / 12.34% P99 *constant overhead* cited in paper
+  §sec:eval-arena-cost (sourced from `dev/2e/24_arena_from_blob_perf.sh`,
+  2026-04-30 single-point measurement) is replaced by the 5-trial measurement
+  above. The original number was within run-to-run noise of the new mean
+  delta (5.86% vs 7.15% mean TTFT) but the P99 claim was not robust.
+- Bisection: budgeter+planner ruled out (C2≈C3≈C1 within 1.5ms in n=100
+  round). Kernel datapath ruled out (dev/2e/40_arena_kernel_isolation.py:
+  all 4 kernels within ±1% across cudaMalloc / VMM paths). Pool capacities
+  identical (max_total_num_tokens=1263072 in both C0 and C1).
+- Cost lives in the arena allocator/tensor-wrapper layer; manifests under
+  saturation (n=100 was below noise; n=500 above).
 
-**Next:** to localize the variance source, profile per-request lifecycle on
-C1 vs C0 and look for occasional slow allocator paths. Paper update
-required — current §sec:eval-arena-cost claim is misleading.
+**Why does the arena introduce trial-to-trial variance?** Working
+hypotheses, ranked:
+1. **GPU TLB pressure.** KV pool ≈25 GiB. cuMemMap forces 2 MiB-page
+   granularity → 12K+ page-table entries, while H200 GPU TLB covers
+   only ~1-2 GiB per SM. Under saturation, KV utilization is high →
+   cold-page TLB-miss rate rises → bursty stall cost. cudaMalloc
+   baseline may use Linux THP / driver-internal larger pages. The
+   kernel-isolation micro-bench (`dev/2e/40`) used a 30 MB KV which
+   fits trivially in TLB, so it could not exercise this regime.
+2. **PyTorch caching allocator interaction.** C1 has two disjoint VA
+   ranges (cudaMalloc heap for weights/activations + VMM range for
+   KV/mamba). When PyTorch's caching allocator stash misses, slow-path
+   `cudaMalloc` calls navigate around the VMM-occupied range; C0 has
+   no such fragmentation.
+3. **CUDA graph + VMM access-control overhead.** With
+   `--enforce-piecewise-cuda-graph` enabled, every replay revalidates
+   tensor address ranges; arena-backed tensors involve an extra
+   driver-side check.
+
+**Validation experiments (queued for follow-up):**
+- (a) Pre-touch all chunks (warm GPU TLB) before bench → if variance
+  drops, TLB confirmed.
+- (b) Sweep chunk_size 256 MiB → 1 GiB → 4 GiB → if variance drops
+  monotonically, TLB confirmed (single TLB entry covers more bytes).
+- (c) `nvprof --metrics tlb_miss_rate` direct counter comparison
+  C0 vs C1.
+- (d) Switch bench from Poisson RPS=8 to closed-loop concurrency=8 to
+  separate workload-arrival noise from arena noise.
 
 **Repro:**
 ```bash
