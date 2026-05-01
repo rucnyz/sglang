@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from typing import TYPE_CHECKING
+
+import torch
 
 from sglang.srt.arena.chunk_arena import cross_arena_transfer
 
@@ -306,10 +309,26 @@ class CrossPoolTransferActuator:
                     "skipped": "drain_pending",
                 }
 
+        # Stage 1 actuator-cost instrumentation: wall-time the cuMemUnmap
+        # (src.shrink) and cuMemMap (dst.grow) operations so gate config's
+        # chunk_cost_us can be calibrated against real measurements rather
+        # than the conservative paper-default 50ms/chunk × 60 = 3s.
+        # cuda.synchronize bracket so the wall time reflects GPU work, not
+        # just CPU enqueue.
         free_before = self.shared.free_count()
         unmapped_total = 0
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        shrink_t0 = time.monotonic_ns()
         for name in src_names:
             unmapped_total += src._arena.shrink(name, n_per_src_subpool)
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        shrink_t1 = time.monotonic_ns()
         free_after_shrink = self.shared.free_count()
 
         # Grow every dst sub-pool by exactly n_per_dst_subpool. Anything
@@ -317,10 +336,18 @@ class CrossPoolTransferActuator:
         # tracked in the stats; the leftover stays in the shared free
         # list for the next call.
         granted_total = 0
+        grow_t0 = time.monotonic_ns()
         for name in dst_names:
             granted_total += dst._arena.grow(name, n_per_dst_subpool)
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        grow_t1 = time.monotonic_ns()
 
         free_after_grow = self.shared.free_count()
+        shrink_us = (shrink_t1 - shrink_t0) // 1000
+        grow_us = (grow_t1 - grow_t0) // 1000
 
         if dst_act is not None:
             new_dst_cap = dst_act.live_capacity_tokens() + dst_grow_tokens
@@ -341,14 +368,18 @@ class CrossPoolTransferActuator:
             "free_after_grow": free_after_grow,
             "kv_capacity_tokens": self.kv.current_capacity_tokens(),
             "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
+            "shrink_us": shrink_us,
+            "grow_us": grow_us,
+            "fire_total_us": shrink_us + grow_us,
         }
         logger.info(
-            "CrossPoolTransferActuator.%s: shrank %d/src=%d → freed %d, "
-            "grew %d/dst=%d → consumed %d, leftover free %d → KV cap=%d tok, "
-            "mamba cap=%d tok",
+            "CrossPoolTransferActuator.%s: shrank %d/src=%d → freed %d (%.1f ms), "
+            "grew %d/dst=%d → consumed %d (%.1f ms), total %.1f ms, "
+            "leftover free %d → KV cap=%d tok, mamba cap=%d tok",
             direction_label,
-            n_per_src_subpool, n_src, unmapped_total,
-            n_per_dst_subpool, n_dst, granted_total,
+            n_per_src_subpool, n_src, unmapped_total, shrink_us / 1000.0,
+            n_per_dst_subpool, n_dst, granted_total, grow_us / 1000.0,
+            (shrink_us + grow_us) / 1000.0,
             free_after_grow,
             stats["kv_capacity_tokens"], stats["mamba_capacity_tokens"],
         )

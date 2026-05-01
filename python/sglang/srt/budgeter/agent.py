@@ -462,6 +462,13 @@ class BudgetAgent:
         snapshot["xpool_kv_capacity_tokens"] = stats["kv_capacity_tokens"]
         snapshot["xpool_mamba_capacity_tokens"] = stats["mamba_capacity_tokens"]
         snapshot["xpool_free_handles"] = stats["free_after_grow"]
+        # Stage 1 calibration: real cuMemUnmap/cuMemMap wall time
+        if "shrink_us" in stats:
+            snapshot["xpool_shrink_us"] = stats["shrink_us"]
+            snapshot["xpool_grow_us"] = stats["grow_us"]
+            snapshot["xpool_fire_total_us"] = stats["fire_total_us"]
+        if "skipped" in stats:
+            snapshot["xpool_skipped"] = stats["skipped"]
 
     def _maybe_evict(self, snapshot: dict) -> None:
         """Phase 2b actuation: ask the policy what to evict; call tree_cache.evict."""
