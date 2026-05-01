@@ -76,6 +76,66 @@ This session's commits:
 
 ---
 
+## TL;DR — 2026-05-01 afternoon: L2-positive search closed, architectural blocker confirmed
+
+User priority: "find a workload where L2 actually works, everything else doesn't matter."
+Outcome: not workload-tunable on this engine. Architectural finding committed and pushed.
+
+Search log (4 iterations on Qwen3.5-35B-A3B / H200 / TP=1, GPU 2):
+
+| run | workload | retract | L2_fires | result |
+|---|---|---:|---:|---|
+| `l2-positive-20260501-134900` | mamba_full_memory_ratio=0.5 + v9 trace | n/a | 0 | L2 cells OOM in `chunk_gated_delta_rule_fwd` (arena+budgeter overhead consumes GDN headroom at mem_frac=0.7) |
+| `admission-pressured-20260501-140507` | GSP 64 groups × 30 prompts × RPS=32 | 0 | n/a | workload too gentle (prefill-throughput-bound, not KV-bound) |
+| `l2-kv-overflow-20260501-143041` | random 16K × 600 × RPS=24 | 0 | n/a | engine queues 472 reqs at admission cap; KV pool never overcommits (mean_ttft=55s, p99=115s, max_concurrent=592 vs cap=120) |
+| `l2-force-kv-20260501-143828` | random 24K × 240 × RPS=48 + `--max-running-requests 240` | **0** | **0** | even forcing 5.76M-vs-1.26M (4.6× overcommit), retract=0 in ALL 4 cells |
+
+**Architectural finding (BLOCKERS.md L181, sglang `9519aa89b`).** SGLang's
+scheduler `update_running_batch` calls `check_decode_mem`, which invokes
+`evict_from_tree_cache` BEFORE the retraction path. Combined with chunked
+prefill (8K chunks, max_prefill_tokens=16384), prefill never overcommits
+the pool — KV grows incrementally per chunk, and the radix-cache evictor
+frees as fast as decode consumes. Retract only fires when a forward step
+physically cannot allocate one decode step's worth of KV — a corner case
+that does not occur under any normal admission pressure.
+
+**Mismatch with L2 design.** L2's mamba→kv reclaim physically resizes the
+KV pool via `MHATokenToKVPool.set_capacity_tokens` → arena VMM remap. But
+the scheduler's `max_running_requests = floor(max_total_num_tokens /
+avg_seq_len)` is computed **once at boot** from initial pool size. Even
+when L2 grows KV capacity dynamically, the admission cap remains static,
+so L2's extra bytes are never consumed by additional concurrent requests.
+This is exactly follow-up (b) in the L2-actuator audit (BLOCKERS.md L38,
+"the actuator updates the allocator's internal cap but the pool's
+self.size is static").
+
+L2's 0-fire outcome on the v2 forced-overflow run is the planner doing
+its job correctly: with `mamba_persist`, paused, and retracted signals
+all clean, the net-benefit gate refuses to fire. There is no regime
+where this workload exhibits L2-positive value.
+
+**What would unblock paper-grade L2-positive demo:** implement follow-up
+(b) — propagate dynamic `pool.size` (or `live_capacity_tokens()`) to the
+scheduler AND make `max_running_requests` re-derive on capacity change.
+~150-300 LoC across `scheduler.py`, `memory_pool.py`, and the budgeter
+actuator. Estimated half-day implementation + integration test.
+Substantial integration risk; deferred for user discussion (analogous to
+path-axis dispatcher in BLOCKERS.md).
+
+**Paper update (`prelude-paper@c985f6f`).** Strengthened the Q3.B 4-cell
+WIP paragraph with the concrete v2 evidence (4.6× overcommit → 0
+retracts) and the architectural cause (radix-cache eviction shields the
+retraction path). Body framing already aligned; abstract still flagged
+for user-level rewrite (BLOCKERS.md L173).
+
+This session's commits:
+  paper: c985f6f
+  sglang: 728efc5ae, 9519aa89b, 37877dbc8
+
+Raw data: `dev/eval/runs/{l2-positive-20260501-134900, admission-pressured-20260501-140507, l2-kv-overflow-20260501-143041, l2-force-kv-20260501-143828}/`
+
+---
+
 ## TL;DR — 2026-04-30 night session final summary
 
 **13 PASS, 4 INFORMATIVE/QUANTITATIVE-FINDING, 1 NULL (composed), 3 BLOCKED, +3 implementation fixes landed.**
