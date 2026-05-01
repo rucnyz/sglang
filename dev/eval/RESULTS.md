@@ -381,6 +381,51 @@ default in `dev/eval/regression_suite/jobs.py` PRELUDE_ENV. The
 2.3× σ cut is free (TPS unchanged, mean delta unchanged), and the
 P99 robustness improvement is real even if mean isn't fully fixed.
 
+### Direct micro-bench evidence — cold first-launch transient (`dev/2e/41_tlb_repro.py`)
+
+A standalone repro removes the inference engine from the loop:
+allocate 8 GiB via `cuMemAddressReserve`+`cuMemCreate`+`cuMemMap`
+(32 chunks × 256 MiB, 4096 page-table entries against H200's per-SM
+TLB coverage), wrap as `torch.float32` tensor via `from_blob`, run
+8 streaming `tensor.sum()` reductions, time each launch with
+`cuda.Event`. Cold mode skips warmup; warm mode does 3 prefatory
+`sum()` passes.
+
+| mode | launch [0] (ms) | launches [1..7] (ms) |
+|------|----------------:|--------------------:|
+| cold | **25.76**       | 1.96 (mean) |
+| warm | **1.99**        | 1.96 (mean) |
+
+**Cold first launch is 13× slower than steady-state.** The 23.8 ms
+delta (cold launch [0] − warm launch [0]) is the real cost of
+walking ~4096 fresh page-table entries across the SMs that run the
+kernel. After launch [0] populates per-SM L1 TLBs, every subsequent
+launch hits warm — including launch [0] in warm mode. This is the
+**direct latency-based confirmation** of the TLB hypothesis: a
+single observable, no statistics needed.
+
+**ncu counter-level attempt (not useful here).** We tried
+`sudo ncu` with proxy metrics (`dram__bytes_read.sum`,
+`lts__t_sector_hit_rate.pct`, etc.) since direct TLB counters
+aren't exposed in the public PerfWorks catalog (verified via
+`ncu --query-metrics --chip GH100 | grep -iE "tlb|page"` → 0 hits).
+Result: ncu's kernel-replay mechanism (collects each metric set by
+re-running the kernel ~10-20× per metric group) averages cold and
+warm executions of launch [0], collapsing the cold-TLB transient
+into noise. `dram__bytes_read.sum`, L2 hit rate, and cycles for
+launch [0] in cold-mode-ncu match warm-mode-ncu within ±1% on
+every metric. NVIDIA's profiler model on Hopper is structurally
+incompatible with single-shot cold-TLB measurement; latency timing
+is the right tool for this regime.
+
+**Production fix implication.** Whatever pre-touches the KV pages on
+the same SMs the inference will use, in the same access pattern,
+erases this transient. The bench-side pre-warm experiment (200-prompt
+4096-token inputs) does this; `t.zero_()` in arena init only does it
+partially because fill kernels and attention kernels have different
+SM grids. Right fix is an attention-shaped warmup batch in SGLang's
+startup phase (~50 LoC, not yet implemented).
+
 **Falsified hypotheses:**
 - ~~PyTorch caching allocator stash interaction~~: would show the
   same variance with pre-warm, doesn't.
