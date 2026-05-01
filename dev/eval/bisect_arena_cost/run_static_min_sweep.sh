@@ -13,12 +13,16 @@
 # 100% → 50% → 25% → 12.5%. The pool's engine-visible size scales down
 # with static_min, so the workload must fit in the smallest mapped region.
 #
-# For Qwen3.5-A3B with chunk_bytes=256MiB:
-#   tokens_per_chunk ≈ 262144, max_chunks = 9 → KV max = 2.36M tokens
-#   N=0:  static_min = 2.36M, mapped 100%
-#   N=4:  static_min = 1.31M, mapped ~56%   (≈ default tot_aligned, safe)
-#   N=6:  static_min = 786K,  mapped ~33%
-#   N=7:  static_min = 524K,  mapped ~22%   (still fits 100×640-token req)
+# For Qwen3.5-A3B with chunk_bytes=256MiB at MEM_FRACTION=0.8:
+#   tokens_per_chunk ≈ 262144, init_chunks=5 (NOT 9 — engine reserves
+#   some capacity for activations etc.). Empirically validated by the
+#   first sweep crashing with "exceeds init_chunks=5" for N=6,7.
+# Valid range: N ∈ [0, 4]. Sweep:
+#   N=0: 5 chunks mapped, ~1.31M tokens, 100% of init
+#   N=1: 4 chunks mapped, ~1.05M, 80%
+#   N=2: 3 chunks mapped, ~786K,  60%
+#   N=3: 2 chunks mapped, ~524K,  40%
+#   N=4: 1 chunk mapped,  ~262K,  20%   (still fits 100×640-token req @ ~64K)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -65,7 +69,7 @@ run_cell() {
 
 idx=0
 for trial in $(seq 1 $N_TRIALS); do
-  for mobile_n in 0 4 6 7; do
+  for mobile_n in 0 1 2 3 4; do
     cell_name="trial${trial}_mobile${mobile_n}"
     run_cell "$cell_name" "$mobile_n" $idx
     idx=$((idx + 1))
@@ -81,7 +85,7 @@ import json, os, statistics
 root = "$RUN_ROOT"
 n_trials = $N_TRIALS
 
-groups = {0: [], 4: [], 6: [], 7: []}
+groups = {0: [], 1: [], 2: [], 3: [], 4: []}
 for trial in range(1, n_trials + 1):
     for n in groups:
         p = os.path.join(root, f"trial{trial}_mobile{n}", "metrics.json")
@@ -99,7 +103,7 @@ print("-" * 70)
 for n in sorted(groups):
     arr = groups[n]
     if not arr: continue
-    frac = (9 - n) / 9 * 100   # for max_chunks=9
+    frac = (5 - n) / 5 * 100   # init_chunks=5 for Qwen3.5-A3B/MEM_FRACTION=0.8
     m_mean, m_std = stat(arr, "mean_ttft_ms")
     p_mean, p_std = stat(arr, "p99_ttft_ms")
     print(f"N={n:<11}{frac:>5.1f}%      "

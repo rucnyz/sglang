@@ -290,14 +290,32 @@ accessed, which under Poisson RPS=8 happens haphazardly.
 The kernel-isolation micro-bench (`dev/2e/40_arena_kernel_isolation.py`)
 did not exercise this regime: 30 MB KV fits trivially in TLB.
 
-**Follow-up experiments running:**
-- (e) `run_static_min_sweep.sh` (in-flight, bg) — sweep
-  `SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS ∈ {0, 4, 6, 7}` to map less of
-  the pool at boot. If TLB pressure scales with mapped bytes, variance
-  should drop monotonically as N increases.
-- (d) `run_concurrency.sh` (queued) — switch to `--max-concurrency 8`
-  closed-loop to separate Poisson arrival noise from any residual
-  arena-introduced burstiness in P99.
+**Follow-up: static_min sweep (n=2, INCONCLUSIVE).** Sweep
+`SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS ∈ {0..4}` mapped at 100→20%, n=2
+trials each:
+
+| mobile | mapped | mean_ttft (ms)  | p99_ttft (ms)  |
+|--------|-------:|----------------:|---------------:|
+| 0      | 100%   | 49.81 ± 2.51    | 312 ± 91       |
+| 1      | 80%    | 51.19 ± 0.56    | 385 ± 50       |
+| 2      | 60%    | 52.17 ± 3.89    | 642 ± 382      |
+| 3      | 40%    | 51.54 ± 1.36    | 343 ± 141      |
+| 4      | 20%    | 53.58 ± 5.29    | 498 ± 384      |
+
+No clean monotonic trend at n=2 (one outlier at trial2_mobile4 dominates
+the high end). **Hypothesis-revising insight:** TLB pressure scales
+with *working set* (active KV pages at any moment), not *mapped set*.
+The bench has ≈64K active tokens (100 in-flight × ~640 tokens) which
+fits in even the smallest setting (mobile=4, 262K tokens mapped =
+4× headroom). So static_min size does not directly modulate TLB
+pressure for this workload — the pre-warm test is the cleaner TLB
+discriminator because it deliberately touches a wider range of pages
+with 4096-token inputs.
+
+**Follow-up: closed-loop concurrency (queued).** `run_concurrency.sh`
+switches bench from Poisson `--request-rate 8` to closed-loop
+`--max-concurrency 8` to remove arrival burstiness from residual P99
+variance.
 
 **Falsified hypotheses:**
 - ~~PyTorch caching allocator stash interaction~~: would show the
