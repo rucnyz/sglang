@@ -117,7 +117,15 @@ def _policy_from_env() -> CrossPoolPolicyConfig:
         nb_avg_prefill_tokens=int(os.environ.get("SGLANG_XPOOL_NB_AVG_PREFILL_TOKENS", "4096")),
         nb_prefill_tps=float(os.environ.get("SGLANG_XPOOL_NB_PREFILL_TPS", "50000")),
         nb_pause_penalty_us=float(os.environ.get("SGLANG_XPOOL_NB_PAUSE_PENALTY_US", "1000")),
-        nb_chunk_cost_us=float(os.environ.get("SGLANG_XPOOL_NB_CHUNK_COST_US", "3000000")),
+        # Empirically measured on Qwen3.5-35B-A3B / H200 / 256 MB chunks
+        # (sglang `23bc28761` instrumentation, calibration run
+        # `dev/eval/runs/l2-mobile-soft-focused-20260501-221921`). Mean
+        # per-fire wall time across 2 fires moving 120 chunks total =
+        # 9.5 ms = ~80 us/chunk (cuMemUnmap + cuMemMap pair on H200).
+        # Per-fire average = 4.7 ms. Round up to 5_000 us as a
+        # conservative default; the prior 3_000_000 default came from
+        # an early micro-bench that overestimated cost by 600×.
+        nb_chunk_cost_us=float(os.environ.get("SGLANG_XPOOL_NB_CHUNK_COST_US", "5000")),
         nb_margin=float(os.environ.get("SGLANG_XPOOL_NB_MARGIN", "1.5")),
         nb_persist_tick_us=float(os.environ.get("SGLANG_XPOOL_NB_PERSIST_TICK_US", "5000")),
         nb_persist_eval_period=int(os.environ.get("SGLANG_XPOOL_NB_PERSIST_EVAL_PERIOD", "10")),
