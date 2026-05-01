@@ -250,9 +250,9 @@ Whenever a setting reports four numbers, this is the cell ordering.
 
 - Sweep VMM `chunk_size ∈ {64MB, 256MB, 1GB}`.
 - Default: 256MB. We currently use 64MB.
-- **Metric:** wasted bytes on shrink/grow + bitmap overhead. Need to verify 256MB is actually the right operating point given our HBM3 channel-interleaving observation (Phase 2e.5.6.3.b found ~6% steady-state TTFT regression that may shrink at coarser chunks).
+- **Metric:** wasted bytes on shrink/grow + bitmap overhead. Need to verify 256MB is actually the right operating point. Original 2e.5.6.3.b ~6% steady-state TTFT claim has been superseded by the 5-trial bisection (RESULTS.md "Arena structural cost" block, paper §sec:eval-arena-cost): +7.15% mean TTFT with 3.4× higher trial-to-trial variance than baseline. Open question: does coarser chunk size (1 GiB / 4 GiB) reduce that variance? Hypothesis (queued for variance-source session) is that GPU TLB pressure on the 25 GiB cuMemMap range with 2 MiB pages is the source, in which case bigger chunks → fewer TLB entries → lower variance.
 
-**Implementation:** `dev/eval/A5_chunk_size.sh` (TODO). **Particularly important:** this could close the §2e.5.6.3.b regression.
+**Implementation:** `dev/eval/A5_chunk_size.sh` (TODO).
 
 ### A6 — Path-axis dispatcher: $K=1$ vs $K=2$
 

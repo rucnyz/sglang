@@ -110,9 +110,10 @@ turn TTFT — only E2E latency per session.)
 Workload didn't pressure either pool: mamba peak 0.54, KV peak 0.27 across
 the entire trace. L1 had nothing to evict (cache pressure too low) → cell_10
 ≈ baseline. L2 didn't fire (no admission pressure → gate refused → 0
-transfers). The +2.4% on cell_11 is purely arena structural cost
-(matches §sec:eval-arena-cost claim of ~6% MoE TTFT cost on Qwen3.5-A3B,
-manifested here at 2.4% on a less-MoE-bound workload).
+transfers). The +2.4% on cell_11 is the arena's structural-overhead
+component as updated in the 5-trial bisection below (paper §sec:eval-arena-cost,
++7.15% mean TTFT on saturating workloads, smaller on cache-friendly ones
+like this one).
 
 **This is a no-regression measurement, not a contribution case.** Not adding
 to paper as a separate 4-cell table; covered by the existing arena-cost
