@@ -221,20 +221,37 @@ TPS spread 0.05%, mean TTFT 0.7%, P99 TTFT 3.2%. **Gap does not reproduce.**
 TPS literally identical. Mean TTFT C1-vs-C0 +3.8%, P99 TTFT +9.6% — both at noise
 floor for n=100 (P99 of 100 samples = single worst observation).
 
-**Conclusion:** the 5.86% mean / 12.34% P99 TTFT cost cited in paper
-§sec:eval-arena-cost (sourced from `dev/2e/24_arena_from_blob_perf.sh`,
-2026-04-30) **does not reproduce on current code**. Either intervening fixes
-closed it (static_min/soft split, set_capacity off-by-one, etc.) or the original
-single-point measurement had cross-cell contention noise (no variance bands).
-The current measurement budget shows arena structural cost ≤ 4% mean TTFT
-at the noise floor; budgeter and planner add nothing measurable on top of
-the arena. Pool capacities are identical across C0 and C1
-(`max_total_num_tokens=1263072, max_running_requests=120`); only
-`available_gpu_mem` differs (25.65 GB → 23.47 GB, arena reserves 2.2 GB).
+**n=500 3-trial result (random 512in/128out RPS=8 saturated):**
 
-**Next:** higher-n (n=500) C0-vs-C1 single-pass to nail the magnitude with
-stable percentiles, then update paper §sec:eval-arena-cost (likely drop
-the 5.86%/12.34% claim or replace with the new tighter measurement).
+| metric | C0 (mean ± std) | C1 (mean ± std) | C1 / C0 |
+|--------|----------------:|----------------:|--------:|
+| input_tps        | 2081.6 ± 6.6 | 2088.5 ± 2.4 | +0.33% |
+| mean_ttft_ms     | 50.76 ± 0.33 | 56.54 ± 5.88 | +11.4% |
+| p99_ttft_ms      | 272.95 ± 42  | 603.03 ± 397 | +120.9% |
+| median_e2e_ms    | 649.75 ± 6.97| 662.80 ± 5.91| +2.01% |
+
+**The arena does not add a constant overhead — it adds variance.** C0 baseline
+is rock-solid (std 0.33ms on mean TTFT, 42ms on P99); C1 introduces 18× more
+mean TTFT variance and 9× more P99 variance. Median E2E and throughput are
+indistinguishable from baseline.
+
+**Conclusion:** the 5.86% mean / 12.34% P99 TTFT *constant overhead* cited in
+paper §sec:eval-arena-cost (sourced from `dev/2e/24_arena_from_blob_perf.sh`,
+2026-04-30 single-point measurement) is **not the right characterization**.
+The actual cost is best described as +11% ± 12% mean TTFT and +120% ± 400% P99
+TTFT variance under saturation, with no measurable steady-state TPS impact.
+The mean and tail-latency *gap exists* but the variance dominates the signal,
+indicating the arena's per-request cost is bursty rather than uniform —
+consistent with an allocator path that occasionally hits a slow branch
+(e.g., chunk-list traversal under fragmentation, TLB cold-page touch).
+Bisection: budgeter+planner ruled out (C2≈C3≈C1 within 1.5ms in n=100 round).
+Kernel datapath ruled out (dev/2e/40_arena_kernel_isolation.py: all 4 kernels
+within ±1% across cudaMalloc / VMM paths). Pool capacities identical
+(max_total_num_tokens=1263072 in both C0 and C1).
+
+**Next:** to localize the variance source, profile per-request lifecycle on
+C1 vs C0 and look for occasional slow allocator paths. Paper update
+required — current §sec:eval-arena-cost claim is misleading.
 
 **Repro:**
 ```bash
