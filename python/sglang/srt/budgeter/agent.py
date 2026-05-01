@@ -432,29 +432,12 @@ class BudgetAgent:
         if decision.direction is None:
             return
 
-        # Paper §design-l2 drain protocol is implemented in the
-        # actuator (`_drain_complete` check before unmap), but the
-        # check has a known race with SGLang's batched free path
-        # (free_group buffer): pages above the new cap can be in the
-        # batched-free buffer pending flush, which makes _drain_complete
-        # return True prematurely → unmap → in-flight decode hits
-        # unmapped chunk → CUDA illegal access. Until that's fixed
-        # cleanly, fall back to the strict engine-busy gate which
-        # trivially guarantees drain (n_running=0 → no in-flight refs).
-        # Limits L2 firing to idle windows but is correctness-safe.
-        def _to_int(v):
-            t = getattr(v, "total", None)
-            if isinstance(t, (int, float)):
-                return int(t)
-            try:
-                return int(v) if v is not None else 0
-            except (TypeError, ValueError):
-                return 0
-        n_running = _to_int(snapshot.get("num_running_reqs", 0))
-        n_queued = _to_int(snapshot.get("num_queue_reqs", 0))
-        if n_running > 0 or n_queued > 0:
-            snapshot["xpool_plan_skipped"] = "engine_busy"
-            return
+        # Paper §design-l2 drain protocol: actuator's `_drain_complete`
+        # check now accounts for `_capped_pages` + `release_pages` +
+        # `free_pages` + `free_group` pending flush, so it correctly
+        # detects "no in-flight req holds a slot above new_cap". When
+        # not drained, actuator returns `skipped="drain_pending"` and
+        # the gate retries after cooldown.
 
         unit = self._xpool_planner.config.dst_chunks_per_action
         # Paper §design-l2: planner-driven fires use the direct single-

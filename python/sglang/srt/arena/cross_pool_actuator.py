@@ -127,36 +127,103 @@ class CrossPoolTransferActuator:
     def _drain_complete(self, src_act, new_cap_tokens: int) -> bool:
         """Drain protocol check (paper §design-l2-actuator L184).
 
-        Returns True if all pages/slots above `new_cap_tokens` have been
-        freed by their owning requests and are now held in the
-        allocator's `_capped_pages` / `_capped_slots` tail buffer (= no
-        in-flight req still references the soon-to-be-unmapped tail).
+        Returns True iff no in-flight request still references a slot
+        with id > new_cap. The check is computed by accounting:
 
-        The cap-aware free path on KV's allocator + MambaPool already
-        routes freed-above-cap entries into `_capped`. Here we just
-        check whether the count matches the expected drained target
-        `(allocator_size - new_cap)`.
+          in_use_above = (size - new_cap)
+                       - capped_above
+                       - release_pages_above
+                       - free_group_above
+                       - free_pages_above
+
+        At drain completion, in_use_above == 0, equivalently the right-
+        hand side accumulators >= (size - new_cap). The previous version
+        checked only `capped_above` — but SGLang's allocator can hold
+        pages > new_cap in three other places that aren't in_use:
+
+        1. `_capped_pages` — explicit tail buffer (cap-aware free routes
+           freed-above-cap entries here)
+        2. `release_pages` — reqs that freed via `is_not_in_free_group=True`
+           with `need_sort=True` go through release_pages first, then
+           merge into free_pages later. After cap, release entries can
+           still hold ids > new_cap.
+        3. `free_group` (a Python list) — batched frees pending flush via
+           `free_group_end`. Same situation.
+        4. `free_pages` — after cap, set_capacity_pages drops above-cap
+           ids out of free, but if some were in release at cap time and
+           later flush back, they re-enter free_pages.
+
+        Counting all four covers the cases where pages > new_cap have
+        been fully released by their owning requests but haven't yet
+        landed in `_capped_pages`. If any slot id > new_cap is genuinely
+        in_use (held by a still-running req), the right-hand side falls
+        short and drain is not complete.
         """
         if src_act is None:
             return True  # No allocator coord — no drain needed.
-        # KV: src_act.allocator (BaseTokenToKVPoolAllocator) with .size and ._capped_pages
-        # Mamba: src_act.pool (MambaPool) with .size and ._capped_slots
+        # KV: src_act.allocator with .size, ._capped_pages, .release_pages, .free_group, .free_pages
+        # Mamba: src_act.pool with .size, ._capped_slots, .free_slots
+        import torch  # local import to avoid module-level dep cycles
         alloc = getattr(src_act, "allocator", None)
         if alloc is not None:
             page_size = max(1, src_act.pool.page_size)
             new_cap_pages = new_cap_tokens // page_size
             new_cap_pages = min(new_cap_pages, alloc.size)
-            expected_capped = alloc.size - new_cap_pages
-            capped = getattr(alloc, "_capped_pages", None)
-            current_capped = capped.numel() if capped is not None else 0
-            return current_capped >= expected_capped
+            expected = alloc.size - new_cap_pages
+            if expected <= 0:
+                return True
+
+            def _count_above(t, threshold):
+                if t is None or t.numel() == 0:
+                    return 0
+                return int((t > threshold).sum().item())
+
+            capped_above = _count_above(
+                getattr(alloc, "_capped_pages", None), new_cap_pages
+            )
+            release_above = _count_above(
+                getattr(alloc, "release_pages", None), new_cap_pages
+            )
+            # free_pages should have NO ids > new_cap after cap_allocator_only,
+            # but a subsequent merge_and_sort_free can reintroduce them from
+            # release_pages. Re-count to be safe.
+            free_above = _count_above(
+                getattr(alloc, "free_pages", None), new_cap_pages
+            )
+            # free_group is a list[Tensor]; iterate and count.
+            free_group_above = 0
+            free_group = getattr(alloc, "free_group", None)
+            if free_group:
+                for t in free_group:
+                    free_group_above += _count_above(t, new_cap_pages)
+            total_above_freed = (
+                capped_above + release_above + free_above + free_group_above
+            )
+            return total_above_freed >= expected
+
         pool = getattr(src_act, "pool", None)
         if pool is not None:
             new_cap_slots = min(new_cap_tokens, pool.size)
-            expected_capped = pool.size - new_cap_slots
+            expected = pool.size - new_cap_slots
+            if expected <= 0:
+                return True
             capped = getattr(pool, "_capped_slots", None)
-            current_capped = capped.numel() if capped is not None else 0
-            return current_capped >= expected_capped
+            free_slots = getattr(pool, "free_slots", None)
+
+            def _count_above(t, threshold):
+                if t is None:
+                    return 0
+                # MambaPool free_slots can be torch.Tensor; _capped_slots same.
+                if hasattr(t, "numel"):
+                    if t.numel() == 0:
+                        return 0
+                    return int((t > threshold).sum().item())
+                # Fallback for list/other.
+                return sum(1 for v in t if v > threshold)
+
+            capped_above = _count_above(capped, new_cap_slots)
+            free_above = _count_above(free_slots, new_cap_slots)
+            return (capped_above + free_above) >= expected
         # Unknown actuator shape; conservative: not drained.
         return False
 
