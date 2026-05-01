@@ -286,12 +286,12 @@ Whenever a setting reports four numbers, this is the cell ordering.
 
 | Setting | Description | Status | Blocker |
 |---|---|---|---|
-| 1 | 24-h phase-shift trace | **DONE v6 NULL + v9 PASS** — v9 pool-binding-shift trace shows full system Phase B -37% TTFT, Phase C -38% E2E, fires 28 transfers; Phase A regresses (K_BIG hurts mamba-bound shared-prefix) → paper tab:headline-v9 | adaptive K_BIG follow-up |
+| 1 | 24-h phase-shift trace | **DONE v9 + 3-trial variance bands (2026-05-01)** — adaptive K_BIG fixed Phase A regression. (1,1) cell beats baseline -29% mean TTFT / -62% P99 on Phase C. With variance bands joint cell ≈ L1-only (Δ < combined σ); L2 = no-regression mechanism, doesn't add measurable value over L1-alone on this trace. Honest paper framing landed. → paper Fig 7 + tab:headline-v9 + tab:variance-bands + tab:contribution-attribution. | demonstrating L2-positive workload is paper's flagged work-in-progress |
 | 2.1 | KV↔DN sweep | **DONE PASS** — paper Table 1 updated | — |
 | 2.2 | KV↔LoRA sweep | **DONE PASS** — paper Table 2 updated, 192× swing | — |
 | 2.3 | Prefix sweep | **DONE PASS** — paper Table 3 updated, V_prefix flat | — |
 | 3.A | V_prefix' faithful | **DONE PARTIAL (3-arm)** — default best on TTFT, all configs in 80-83% hit band | host-tier-on arm + pressured-pool workload future work |
-| 3.B | V_prefix' stability | **DONE PASS** — HPB recovery -18% TTFT vs recency, paper tab:q3b | — |
+| 3.B | V_prefix' stability | **DONE PASS + 3-trial variance bands (2026-05-01)** — HPB recovery -18% TTFT vs recency (paper tab:q3b). 4-cell ablation tab:q3b-4cell variance run shows joint cell L11 209.0±6 ms ≈ L10 207.4±4.4 ms (Δ < combined σ); same pattern as v9-auto. L1 carries -26% recovery TTFT win; L2 marginal value below noise floor. | same |
 | 3.C | Composed L1+L2 | **DONE** — Layer 2 invariant to L1 on stress trace (21 transfers all cells); shows clean separation of concerns | feedback-loop workload follow-up |
 | 3.D | HPB-vs-recency on GSP | **DONE PASS** — paper tab:hpb-gsp added, -19.77% TTFT | — |
 | 4 | Estimator accuracy | **DONE QUANTITATIVE** — proxy saturation-blind; SGLANG_XPOOL_QDEPTH_TRIGGER fallback rule landed (unit tests PASS, gated). E2e on Phase 1+2+3: workload doesn't dual-saturate so new rule never activates; deeper per-pool admission signal marked follow-up. | broader workload needed to exercise new rule |
@@ -308,16 +308,30 @@ Whenever a setting reports four numbers, this is the cell ordering.
 | Q3 | Quality preservation (classification accuracy) | **DONE PASS** — 49/50 = 98% on both arms, 50/50 byte-identical | — |
 | Q4 | Quality preservation (ROUGE-L vs wildchat ref) | **DONE PASS** — mean ROUGE 0.124 vs 0.148, KS p=0.306, t-test p=0.055 | XSum substitute |
 
-## Order of execution (proposed)
+## Order of execution (proposed) — STATUS as of 2026-05-01
 
-If we have ~24 GPU-hours of bench budget, the priority order to maximize paper readiness:
+The original priorities (Setting 2.1, A5, 2.3, Setting 1) are all DONE. The
+2026-05-01 NeurIPS-strengthening session added:
 
-1. **Setting 2.1 (KV↔DN sweep)** — this directly populates Table \ref{tab:sweep1}, which is already partially in the paper. Quickest win, no implementation blockers. **~1.5 h.**
-2. **Ablation A5 (VMM chunk size)** — could materially reduce 2e.5.6.3.b regression. Engineering-relevant, paper claims chunk_size doesn't matter much; confirming or refuting matters. **~3 h (3 boots × 1 h).**
-3. **Setting 2.3 (prefix sweep on Qwen3-8B)** — populates Table 3 of the paper (referenced but not yet generated). **~1 h.**
-4. **Setting 1 (phase-shift trace)** — *blocked on Layer 1 default-on configuration*. After we wire the default cleanly, run this. **~5.5 h.**
-5. **Setting 5.A (path-axis dispatcher)** — *blocked on dispatcher implementation*. Standalone secondary contribution. **~2 h after implementation.**
-6. Everything else as time allows.
+1. **Tier 1 (figures, paper `76b753e`):** 6 figures tied to paper narrative.
+2. **Tier 2 (paper `ef09782` → `198a9a5`):** L1×L2 contribution attribution +
+   tab:contribution-attribution; vLLM cross-engine baseline tab:vllm-vs-sglang;
+   static-best partition baseline tab:static-best (single ratio=0.9 beats
+   dynamic on v9 Phase A by 1.9× — honest finding); 3-trial variance bands on
+   Setting 1 v9-auto headline + Fig 7 + tab:variance-bands.
+3. **Tier 3 (paper `0376ec4`):** gate-retune negative results — MAMBA_HIGH
+   sweep + NET_BENEFIT enable + COOLDOWN sweep; all configs fire 15 transfers
+   on v9 Phase A regardless. Reframed as "v9-auto = L1 headline + L2
+   no-regression test"; Q3.B is L2's actual win trace.
+4. **Tier 4 (paper `aaa837c`):** Q3.B 4-cell variance bands — joint cell
+   209.0±6 ms ≈ L1-only 207.4±4.4 ms; L2's marginal value below trial-to-trial
+   variance on Q3.B too. Final paper claim: L1 carries the measurable
+   end-to-end win on every workload tested; L2 = no-regression mechanism whose
+   marginal value over L1 is below variance at our measurement budget.
+   Demonstrating L2-only positive delta requires admission-pressured workload
+   (no paused/retracted reqs in current traces because stock cache evicts
+   aggressively) — flagged as work-in-progress.
+5. **Path-axis dispatcher (Settings 5.A, 5.B, A6):** still BLOCKED.
 
 ## Open implementation work (blocking eval)
 
@@ -352,3 +366,4 @@ For all settings, we keep one regenerated copy in `dev/eval/datasets/` and reuse
 ## Append-only changelog
 
 - **2026-04-30** — Initial draft. Settings 1–5 + 6 ablations + quality preservation. Drawn from `prelude-paper/evaluation.tex` Q1–Q5 section + §Ablations. Marked Phase 3.d and path-axis dispatcher as critical blockers.
+- **2026-05-01** — NeurIPS strengthening session: 6 figures (Fig 1-7), L1×L2 contribution attribution, vLLM baseline, static-best partition baseline, 3-trial variance bands on v9-auto and Q3.B, gate-retune sweeps (negative). Final honest framing: L1 carries lift; L2 = no-regression mechanism; demonstrating L2-positive workload is paper-flagged work-in-progress. Phase 3.d FIXED earlier today (commits b37bbc82e + 325f25334).
