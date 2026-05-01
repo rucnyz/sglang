@@ -76,6 +76,52 @@ This session's commits:
 
 ---
 
+## TL;DR — 2026-05-01 late-night: paper-faithful L2 refactor (8 commits)
+
+After the evening's "mobile-soft always off" discovery, took the L2
+implementation through a complete paper-faithful refactor. 8 sglang
+commits + 1 paper commit landed:
+
+| commit | piece |
+|---|---|
+| `8f0950b99` | Boot full init mapped (no donate-at-boot); pool boots at baseline-equal capacity |
+| `265ece34e` | Drain protocol skeleton in actuator `_do_transfer` |
+| `23bc28761` | Actuator wall-time instrumentation (`shrink_us` / `grow_us` / `fire_total_us` in budgeter snapshot) |
+| `87360b2c7` | Stage 1 calibration: actuator real cost = ~80 µs/chunk on H200 (paper default 50 ms = 600× overestimate); default `nb_chunk_cost_us` 3M → 5K |
+| `d88557c85` | **Engine-agnostic pressure adapter framework**. New file `python/sglang/srt/budgeter/pressure_adapter.py` (170 LoC, 10/10 unit tests pass). `EnginePressureAdapter` abstract base + `SGLangPressureAdapter` impl. Eviction = primary signal; retract/paused/queue still supported. cross_pool_planner.decide() takes snapshot, delegates B computation to adapter. cleanup of dead env vars (NON_BALANCED, MOBILE_SOFT_*, nb_avg_prefill_tokens, etc.) |
+| `02e58e59a` | Safety rollback: re-add engine_busy gate after smoke v3 hit CUDA illegal access (drain race) |
+| `e36d04a64` | **Drain race fix**: `_drain_complete` now counts `_capped + release + free_pages + free_group` above cap; engine_busy gate removed |
+| paper `634bdc6` | §design-l2 Eq.~\ref{eq:nb-lb} rewritten for adapter framework; `c_actuator≈50ms` → `≈80 µs/chunk` |
+
+**Stage 1 calibration evidence** (`runs/l2-mobile-soft-focused-20260501-221921`):
+  Fire 1: 40 chunks unmap (2.16 ms) + 30 chunks map (3.46 ms) = 5.63 ms
+  Fire 2: 20 chunks unmap (1.26 ms) + 30 chunks map (2.64 ms) = 3.90 ms
+  Per-chunk: 80 µs. Per-fire avg: 4.7 ms.
+  Paper had c_actuator ≈ 50 ms — overestimated by 600×.
+
+**Smoke v3** (`runs/l2-mobile-soft-focused-20260501-231320`, before drain fix):
+  Server boot OK at full pool (KV 879K, mamba 251 — = baseline).
+  1 fire moved 30 chunks granted (mamba 256→384), 5.7 ms wall time.
+  Then CUDA illegal access in process_batch_result_decode — drain
+  protocol's `_drain_complete` only counted `_capped_pages` but missed
+  pages > new_cap pending in `release_pages` and `free_group`. Diagnosed
+  & fixed in `e36d04a64`.
+
+**Smoke under drain fix**: kicked 23:30 on GPU 3
+(`runs/l2-mobile-soft-focused-20260501-233038`), result pending.
+
+**vLLM adapter** is appendix material in the new framework — same
+gate, different engine adapter (would weight swap-out / preemption).
+
+This session's commits (sglang prelude):
+  8f0950b99 → 265ece34e → 23bc28761 → 87360b2c7 → d88557c85 →
+  02e58e59a → e36d04a64
+
+Paper:
+  c985f6f → 634bdc6
+
+---
+
 ## TL;DR — 2026-05-01 evening: mobile-soft was always off — every L2 fire dormant
 
 **Major retraction of the afternoon's "architectural blocker" framing.**

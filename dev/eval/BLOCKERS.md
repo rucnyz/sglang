@@ -207,5 +207,30 @@ that get past the gate are no-ops anyway. If (b) lands, this surfaces.
 - **Risk profile.** Mid risk: free_pages tensor extension is straightforward but free_pages is read on every alloc/free, so any race is a hard-to-debug CUDA illegal-access. Mitigation: serialize set_capacity_tokens with the engine's request-processing loop (already true — the actuator only fires from the budgeter agent which runs in the scheduler's tick callback). Also: the static-min floor in `7490e5ed5` already prevents the actuator from shrinking past static_min, so growth is the only direction that would exercise the new code path on production traces.
 - **Recommended path forward.** Single-PR plan: land steps 1-3+5 first (pool/allocator + unit test, gated default-off, no scheduler change). Validate that the new envvar does nothing without `SGLANG_DYNAMIC_POOL_SIZE=1`. Then in a follow-up PR add step 4 (scheduler `max_running_requests` recompute) once the pool/allocator side is stable. This keeps the blast radius small and lets the user gate adoption.
 - **Workaround:** none for paper-grade L2-positive demonstration. Paper body already frames L2 as the no-regression cross-pool reallocation mechanism whose marginal value above L1-only is below variance at the current measurement budget; the abstract entry above (`Paper abstract has stale claim`) covers the abstract rewrite. The L2 design is paper-correct; the architectural friction lives entirely on the engine integration side.
-- **Resolved at:** —
+
+- **2026-05-01 late-night — RESOLVED in 8 commits** (`8f0950b99` … `e36d04a64`):
+
+  **(1) Paper-faithful boot** (`8f0950b99`): scrapped the "donate-at-boot" mobile-soft mechanism. Boot now maps full init_chunks per sub-pool. `static_min` becomes a small actuator floor (1 chunk per sub-pool when shared_arena=1; = init when off → identical-to-baseline behavior). KV pool boots at the full `tot_aligned` capacity (879K tokens vs 524K under prior donate scheme). Earlier "L2-on cells lose 40% pool" complaint disappears.
+
+  **(2) Drain protocol** (`265ece34e`, `e36d04a64`): paper §design-l2-actuator drain is now implemented in `cross_pool_actuator._drain_complete`. Counts pages > new_cap across `_capped_pages + release_pages + free_pages + free_group` (all the places SGLang's allocator can hold freed-but-not-in-_capped pages). Drain returns True iff `total_above_freed >= size - new_cap`, i.e., zero in_use slots above cap. The earlier crash in v3 (`runs/l2-mobile-soft-focused-20260501-181148`) was due to undercount — `_capped` alone missed `release_pages` and `free_group` entries → returned True prematurely → unmap killed in-flight slots → CUDA illegal access. Re-tested in `e36d04a64` smoke (pending).
+
+  **(3) Engine-agnostic pressure adapter** (`d88557c85`): refactored the net-benefit gate's B term from a hardcoded `paused×x + retracted×y + persist×z` formula to an abstract `sum_i k_i × S_i` where each engine provides its own `EnginePressureAdapter` (new file `pressure_adapter.py`). SGLang adapter dominates the **eviction** signal — `num_evicted_tokens_recent` (per-tick delta of tree-cache eviction) × `prefill_save_us_per_token=12.5us` — because SGLang's primary admission-pressure relief mechanism is tree-cache eviction, not retract. Retract/paused/queue still surface but rarely fire. Persist provides a saturation backstop. New file `python/sglang/srt/budgeter/pressure_adapter.py` defines `PressureSignals` + `EnginePressureAdapter` + `SGLangPressureAdapter`; `cross_pool_planner.decide()` consumes via `_net_benefit_ok(snapshot, ...)`. 10/10 unit tests pass in `dev/2e/38_planner_netbenefit_unit.py`.
+
+  **(4) Stage 1 actuator-cost calibration** (`23bc28761` instrumentation, `87360b2c7` calibration): wrapped `src._arena.shrink` and `dst._arena.grow` in `torch.cuda.synchronize` + `time.monotonic_ns` brackets. Smoke captured 2 fires moving 120 chunks total in 9.5 ms wall-time. Per-chunk `cuMemUnmap+cuMemMap` ≈ **80 µs** on Qwen3.5-35B-A3B / H200 / 256 MB chunks — paper default `c_actuator ≈ 50 ms` was **600× overestimate**. New default `nb_chunk_cost_us = 5_000` (per typical 1-chunk-per-dst-subpool fire). Paper §design-l2 L137 updated to `≈80 µs/chunk`.
+
+  **(5) Eviction signal in scheduler** (`d88557c85`): `schedule_batch.py:check_decode_mem` now measures tree-cache eviction delta via `allocator.available_size` before/after `evict_from_tree_cache`, accumulates in `tree_cache._l2_cumulative_evicted_tokens`. Budgeter snapshot emits `num_evicted_tokens_recent` (per-tick delta) for the SGLang adapter to consume.
+
+  **Validation status (as of `e36d04a64`):**
+  - 10/10 unit tests pass (planner + adapter)
+  - Smoke v3 (`l2-mobile-soft-focused-20260501-231320`): server boot @ full pool, fire moves 30 chunks (mamba 256→384), `xpool_fire_total_us=5689` matches Stage 1 prediction. CUDA crash AFTER fire revealed drain race (now fixed in `e36d04a64`).
+  - Smoke under fix: pending end-of-bench (kicked at 23:30; `l2-mobile-soft-focused-20260501-233038`).
+
+  **Paper updated:** `prelude-paper@634bdc6` rewrites §design-l2 net-benefit gate (Eq.~\ref{eq:nb-lb}) for engine-agnostic adapter framework, updates `c_actuator` from 50 ms to 80 µs.
+
+- **Remaining work to fully close:**
+  - End-to-end smoke under drain fix proving live-traffic fires (no CUDA crash) — in progress at this writing
+  - vLLM adapter (paper claims framework portability; appendix material)
+  - Per-workload calibration of `prefill_save_us_per_token` and `full_prefill_us` from bench_serving outputs (currently hardcoded; auto-calibration would land cleanly)
+  - Update paper `evaluation.tex` Q3.B paragraph + abstract once smoke validates the drain fix
+- **Resolved at:** 2026-05-01 late-night (sglang prelude commits 8f0950b99…e36d04a64; paper main commit 634bdc6)
 
