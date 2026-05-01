@@ -451,10 +451,26 @@ class BudgetAgent:
             return
 
         unit = self._xpool_planner.config.dst_chunks_per_action
+        # SGLANG_XPOOL_NON_BALANCED=1 uses the non-balanced single-direction
+        # transfer (`kv_to_mamba_chunks(unit)` etc.) instead of the balanced
+        # round-trip wrapper. Balanced multiplies by lcm(n_kv,n_mamba)/n_dst
+        # which can demand more chunks than the shared free queue holds when
+        # only one pool has mobile-soft donations (e.g., on Qwen3.5-A3B with
+        # KV mobile-soft enabled but mamba mobile-soft disabled to avoid the
+        # CUDA-graph + slot-cap interaction). Non-balanced grows dst by
+        # `unit` chunks per dst-subpool, which fits in shared without
+        # requiring src to shrink past static_min. Default 0 = unchanged.
+        non_balanced = bool(int(os.environ.get("SGLANG_XPOOL_NON_BALANCED", "0")))
         if decision.direction == "mamba_to_kv":
-            stats = self._xpool_actuator.balanced_mamba_to_kv(unit)
+            if non_balanced:
+                stats = self._xpool_actuator.mamba_to_kv_chunks(unit)
+            else:
+                stats = self._xpool_actuator.balanced_mamba_to_kv(unit)
         else:  # kv_to_mamba
-            stats = self._xpool_actuator.balanced_kv_to_mamba(unit)
+            if non_balanced:
+                stats = self._xpool_actuator.kv_to_mamba_chunks(unit)
+            else:
+                stats = self._xpool_actuator.balanced_kv_to_mamba(unit)
         snapshot["xpool_plan_executed"] = True
         snapshot["xpool_direction"] = stats["direction"]
         snapshot["xpool_unmapped_total"] = stats["unmapped_total"]
