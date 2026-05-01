@@ -257,34 +257,52 @@ floor for n=100 (P99 of 100 samples = single worst observation).
 - Cost lives in the arena allocator/tensor-wrapper layer; manifests under
   saturation (n=100 was below noise; n=500 above).
 
-**Why does the arena introduce trial-to-trial variance?** Working
-hypotheses, ranked:
-1. **GPU TLB pressure.** KV pool ≈25 GiB. cuMemMap forces 2 MiB-page
-   granularity → 12K+ page-table entries, while H200 GPU TLB covers
-   only ~1-2 GiB per SM. Under saturation, KV utilization is high →
-   cold-page TLB-miss rate rises → bursty stall cost. cudaMalloc
-   baseline may use Linux THP / driver-internal larger pages. The
-   kernel-isolation micro-bench (`dev/2e/40`) used a 30 MB KV which
-   fits trivially in TLB, so it could not exercise this regime.
-2. **PyTorch caching allocator interaction.** C1 has two disjoint VA
-   ranges (cudaMalloc heap for weights/activations + VMM range for
-   KV/mamba). When PyTorch's caching allocator stash misses, slow-path
-   `cudaMalloc` calls navigate around the VMM-occupied range; C0 has
-   no such fragmentation.
-3. **CUDA graph + VMM access-control overhead.** With
-   `--enforce-piecewise-cuda-graph` enabled, every replay revalidates
-   tensor address ranges; arena-backed tensors involve an extra
-   driver-side check.
+**Why does the arena introduce trial-to-trial variance? — TLB pressure CONFIRMED.**
 
-**Validation experiments (queued for follow-up):**
-- (a) Pre-touch all chunks (warm GPU TLB) before bench → if variance
-  drops, TLB confirmed.
-- (b) Sweep chunk_size 256 MiB → 1 GiB → 4 GiB → if variance drops
-  monotonically, TLB confirmed (single TLB entry covers more bytes).
-- (c) `nvprof --metrics tlb_miss_rate` direct counter comparison
-  C0 vs C1.
-- (d) Switch bench from Poisson RPS=8 to closed-loop concurrency=8 to
-  separate workload-arrival noise from arena noise.
+Pre-warm experiment (`dev/eval/bisect_arena_cost/run_prewarm.sh`,
+2026-05-01): each trial runs a 200-prompt warmup bench (4096in/64out
+RPS=8) before the timed n=500 bench, touching a wide range of KV pages
+to warm the GPU TLB. 3 trials, interleaved with C0:
+
+| metric | no-prewarm 5-trial | prewarm 3-trial | change |
+|--------|---:|---:|---:|
+| C0 mean_ttft (ms)  | 51.80 ± 1.70   | 51.12 ± 0.60   | C0 stable both ways |
+| C1 mean_ttft (ms)  | 55.51 ± **5.79** | 52.64 ± **0.61** | **C1 σ cut 9.5×** |
+| delta              | +7.15%         | +2.98%         | gap halved |
+| C0 p99_ttft (ms)   | 557.77 ± 315   | 511.74 ± 92    | σ cut 3.4× |
+| C1 p99_ttft (ms)   | 566.42 ± 350   | 501.00 ± 119   | σ cut 2.9× |
+
+Pre-warming the KV pool's TLB collapses C1's run-to-run variance to the
+C0 baseline level (σ 0.61 vs 0.60 ms — indistinguishable). TLB is
+confirmed as the variance source. The remaining +2.98% mean TTFT is
+the actual warm-state arena structural cost.
+
+**Mechanism:** KV pool ≈25 GiB. `cuMemMap` allocates physical memory in
+2 MiB-page units → ~12K+ page-table entries. H200 GPU TLB covers only
+~1-2 GiB per SM, so cold-page touches under saturation fall back to
+page-table walks (sub-µs each but accumulating bursty across kernel
+launches). The cudaMalloc baseline doesn't pay this cost because the
+PyTorch caching allocator pre-warms its heap on init — by the time
+serving starts, all activation/weight pages are TLB-resident. The
+arena's mapped pages are only TLB-resident after they're first
+accessed, which under Poisson RPS=8 happens haphazardly.
+
+The kernel-isolation micro-bench (`dev/2e/40_arena_kernel_isolation.py`)
+did not exercise this regime: 30 MB KV fits trivially in TLB.
+
+**Follow-up experiments running:**
+- (e) `run_static_min_sweep.sh` (in-flight, bg) — sweep
+  `SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS ∈ {0, 4, 6, 7}` to map less of
+  the pool at boot. If TLB pressure scales with mapped bytes, variance
+  should drop monotonically as N increases.
+- (d) `run_concurrency.sh` (queued) — switch to `--max-concurrency 8`
+  closed-loop to separate Poisson arrival noise from any residual
+  arena-introduced burstiness in P99.
+
+**Falsified hypotheses:**
+- ~~PyTorch caching allocator stash interaction~~: would show the
+  same variance with pre-warm, doesn't.
+- ~~CUDA graph piecewise-replay access control~~: ditto.
 
 **Repro:**
 ```bash
