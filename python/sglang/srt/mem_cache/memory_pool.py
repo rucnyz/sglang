@@ -347,29 +347,20 @@ class MambaPool:
                         chunk_bytes=chunk_bytes,
                     )
 
-                # Static-min/soft split (paper §design-l2-actuator). Of
-                # the init_tokens worth of physical handles funded at
-                # boot, only static_min worth are cuMemMap'd into this
-                # arena; the rest stay as mobile soft chunks in the
-                # shared free queue, available to either pool's actuator.
-                # Default 0 mobile chunks → static_min == init → today's
-                # behavior. SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS=N
-                # carves N chunks per sub-pool out of init into the
-                # mobile pool. CUDA graphs only see static_min so the
-                # cross-pool actuator can map/unmap soft chunks safely.
-                mamba_mobile_chunks = (
-                    int(os.environ.get("SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS", "0"))
-                    if shared_arena else 0
-                )
+                # Static-min/soft split (paper §design-l2-actuator). All
+                # init_chunks worth of physical handles are cuMemMap'd at
+                # boot — the pool boots at full baseline capacity, no
+                # donation to a shared queue. The static_min defines the
+                # FLOOR below which the cross-pool actuator never shrinks
+                # (paper L184: "the bytes the pool needs to admit any
+                # traffic"). When shared_arena is enabled we set static_min
+                # to 1 chunk per sub-pool, leaving (init - 1) chunks per
+                # sub-pool transferable via drain protocol on fire. When
+                # shared_arena is off, static_min = init = no shrink
+                # possible (matches non-L2 baseline behavior identically).
                 init_chunks = tot_aligned // tokens_per_chunk
-                if mamba_mobile_chunks > init_chunks:
-                    raise ValueError(
-                        f"SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS={mamba_mobile_chunks} "
-                        f"exceeds init_chunks={init_chunks}"
-                    )
-                mamba_static_min_tokens = (
-                    tot_aligned - mamba_mobile_chunks * tokens_per_chunk
-                )
+                mamba_static_min_chunks = 1 if shared_arena else init_chunks
+                mamba_static_min_tokens = mamba_static_min_chunks * tokens_per_chunk
                 self._mamba_temporal_arena = MultiTensorArena(
                     device_id=torch.cuda.current_device(),
                     n_layers=num_mamba_layers,
@@ -470,35 +461,12 @@ class MambaPool:
             self.free_slots = torch.arange(
                 1, self.size + 1, dtype=torch.int64, device=self.device
             )
-            # Static-min/soft engine plumbing: when mobile_soft_chunks > 0,
-            # the arena boots with only static_min worth of physical pages
-            # mapped. The engine's allocator must NOT hand out slot ids in
-            # the soft (initially unmapped) tail or the next decode write
-            # → cudaErrorIllegalAddress (B3 v5 cell_01 crashed exactly this
-            # way after 48 reqs). Cap the allocator at static_min slots
-            # initially; the cross-pool actuator's `cap_allocator_only`
-            # path bumps the cap when soft chunks get mapped.
-            arena = getattr(self, "_mamba_temporal_arena", None)
-            if arena is not None:
-                # Arena maps positions [0, static_min_tokens). Slot 0 is the
-                # padding slot, so usable allocator slot ids are [1,
-                # static_min_tokens - 1] inclusive — `n_slots` to
-                # set_capacity_slots is the inclusive upper bound, so it must
-                # be static_min_tokens - 1, NOT static_min_tokens (off-by-one
-                # caught in B3 v6: passing 128 yielded free_slots [1, 128] and
-                # the alloc of slot 128 wrote to the first byte of the
-                # unmapped soft tail → cudaErrorIllegalAddress).
-                static_min_tokens = (
-                    arena.static_min_chunks_per_pool * arena.tokens_per_chunk
-                )
-                static_min_slots = static_min_tokens - 1
-                if static_min_slots < self.size:
-                    self.set_capacity_slots(static_min_slots)
-                    logger.info(
-                        "MambaPool engine-allocator cap: %d/%d slots "
-                        "(static_min - 1) — soft tail reserved for actuator",
-                        static_min_slots, self.size,
-                    )
+            # Paper §design-l2: at boot, pool maps init_chunks (= self.size
+            # slots usable). Allocator hands out the full range — engine
+            # behaves identically to non-L2 baseline. The actuator only
+            # shrinks via drain protocol (cap allocator → wait for in-flight
+            # tail-slot reqs to drain → cuMemUnmap), which dynamically
+            # re-caps the allocator at fire time. No boot-time cap needed.
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
@@ -1246,19 +1214,12 @@ class MHATokenToKVPool(KVCache):
                     )
 
                 # Static-min/soft split — see MambaPool note above.
-                kv_mobile_chunks = (
-                    int(os.environ.get("SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS", "0"))
-                    if shared_arena else 0
-                )
+                # Boot maps init_chunks fully; static_min is the floor for
+                # actuator shrink (1 chunk per sub-pool when shared_arena=on,
+                # else == init for non-L2 baseline behavior).
                 init_chunks = tot_aligned // tokens_per_chunk
-                if kv_mobile_chunks > init_chunks:
-                    raise ValueError(
-                        f"SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS={kv_mobile_chunks} "
-                        f"exceeds init_chunks={init_chunks}"
-                    )
-                kv_static_min_tokens = (
-                    tot_aligned - kv_mobile_chunks * tokens_per_chunk
-                )
+                kv_static_min_chunks = 1 if shared_arena else init_chunks
+                kv_static_min_tokens = kv_static_min_chunks * tokens_per_chunk
                 self._kv_arena = MultiTensorArena(
                     device_id=torch.cuda.current_device(),
                     n_layers=self.layer_num,
@@ -1271,22 +1232,9 @@ class MHATokenToKVPool(KVCache):
                     chunk_bytes=chunk_bytes,
                     external_handle_pool=shared_pool,
                 )
-                # Static-min/soft engine plumbing: cap pool's engine-visible
-                # size at static_min when mobile-soft is active. Mirrors the
-                # MambaPool fix (sglang 8ceb63de6). Without this, the engine's
-                # KV allocator (created against self.size = init_tokens) would
-                # hand out positions in the unmapped soft tail → CUDA illegal
-                # access on the next decode write.
-                if kv_mobile_chunks > 0:
-                    new_size = kv_static_min_tokens - self.page_size
-                    logger.info(
-                        "MHATokenToKVPool engine-allocator cap: size %d → %d "
-                        "(static_min - page_size); soft tail %d tokens "
-                        "reserved for actuator",
-                        self.size, new_size,
-                        kv_mobile_chunks * tokens_per_chunk,
-                    )
-                    self.size = new_size
+                # Paper §design-l2: pool boots at full init capacity. The
+                # actuator dynamically caps the allocator during drain when
+                # firing a shrink; no boot-time cap needed.
                 logger.info(
                     "MHATokenToKVPool arena: tot_tokens=%d (tot_aligned=%d), "
                     "tokens_per_chunk=%d, chunk_bytes=%d, per_token_bytes=%d, "

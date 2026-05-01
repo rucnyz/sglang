@@ -224,6 +224,31 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        # Paper §design-l2 drain protocol: a freed page whose id is above
+        # the current live cap belongs in _capped_pages, not back in
+        # free_pages. The actuator may be in the middle of draining +
+        # unmapping the tail; if we put the id back in free_pages, the
+        # next alloc would hand it out and the next decode would touch
+        # an unmapped chunk → cudaErrorIllegalAddress. Mirrors the cap-
+        # aware free path on MambaPool.
+        cap = getattr(self, "_cap", None)
+        if cap is not None and self.is_not_in_free_group:
+            mask_above = free_index > cap
+            if mask_above.any():
+                held_now = free_index[mask_above]
+                kept = free_index[~mask_above]
+                existing = getattr(self, "_capped_pages", None)
+                if existing is None or existing.numel() == 0:
+                    self._capped_pages = held_now
+                else:
+                    self._capped_pages = torch.cat([existing, held_now])
+                if kept.numel() > 0:
+                    if self.need_sort:
+                        self.release_pages = torch.cat((self.release_pages, kept))
+                    else:
+                        self.free_pages = torch.cat((self.free_pages, kept))
+                return
+
         if self.is_not_in_free_group:
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))

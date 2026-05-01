@@ -174,23 +174,23 @@ class MultiTensorArena:
             external_handle_pool=external_handle_pool,
         )
 
-        # Initial mapping: ONLY static_min_chunks_per_pool to each
-        # sub-pool. The remaining (init - static_min) chunks worth of
-        # handles stay in the shared pool's free queue as mobile soft
-        # chunks. CUDA graphs captured at warmup will see allocator
-        # capacity = static_min and never issue offsets beyond it, which
-        # is what makes the actuator's later cuMemMap/cuMemUnmap of soft
-        # chunks safe.
+        # Paper §design-l2: boot maps the full init_chunks_per_pool worth
+        # of physical handles into each sub-pool. Pool boots at baseline
+        # capacity. The actuator's drain protocol shrinks down to
+        # static_min only at fire time, never at boot. (Earlier "donate
+        # mobile-soft chunks to shared queue at boot" design was a
+        # workaround that introduced an unrelated boot-time pool-size
+        # regression; replaced by drain protocol.)
         for i in range(n_subpools):
             granted = self._arena.grow(
-                self._pool_name(i), self.static_min_chunks_per_pool)
-            if granted != self.static_min_chunks_per_pool:
+                self._pool_name(i), self.init_chunks_per_pool)
+            if granted != self.init_chunks_per_pool:
                 raise RuntimeError(
                     f"sub-pool {i} only got {granted} of "
-                    f"{self.static_min_chunks_per_pool} static-min chunks"
+                    f"{self.init_chunks_per_pool} init chunks"
                 )
 
-        # Hand each sub-pool to the C-side allocator.
+        # Hand each sub-pool to the C-side allocator at full init capacity.
         so_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _SO_NAME)
         self._lib = ctypes.CDLL(so_path)
         self._lib.multi_init.argtypes = [
@@ -200,7 +200,7 @@ class MultiTensorArena:
             base = self._arena.pool_va_base(self._pool_name(i))
             self._lib.multi_init(
                 self._c_index(i), base, chunk_bytes,
-                self.static_min_chunks_per_pool)
+                self.init_chunks_per_pool)
 
         # Tensor construction. Two paths:
         #
@@ -262,25 +262,26 @@ class MultiTensorArena:
                     t = torch.empty(
                         (max_tokens, *per_token_shape), dtype=dtype, device="cuda")
                 if os.environ.get("SGLANG_ARENA_ZERO_INIT_LIVE") == "1":
-                    live_tokens = self.static_min_chunks_per_pool * self.tokens_per_chunk
+                    live_tokens = self.init_chunks_per_pool * self.tokens_per_chunk
                     if live_tokens > 0:
                         t[:live_tokens].zero_()
                 # Restore so subsequent torch.empty inside this MemPool
-                # would respect the live (static-min) capacity.
+                # respects the boot-mapped capacity (= init_chunks).
                 self._lib.multi_set_capacity(
-                    ci, self.static_min_chunks_per_pool)
+                    ci, self.init_chunks_per_pool)
                 self._tensors.append(t)
 
         torch.cuda.synchronize()
         logger.info(
             "MultiTensorArena initialized: n_layers=%d, n_kinds=%d, "
             "n_subpools=%d, chunk_bytes=%d, max_tokens=%d, init_tokens=%d, "
-            "static_min_tokens=%d, tokens_per_chunk=%d, va_base=0x%x, "
-            "boot_mapped=%d, mobile_soft_chunks=%d (per sub-pool)",
+            "static_min_tokens=%d (actuator floor), tokens_per_chunk=%d, "
+            "va_base=0x%x, boot_mapped=%d (= init_chunks), "
+            "transferable_per_pool=%d (= init - static_min)",
             self.n_layers, self.n_kinds, n_subpools, chunk_bytes,
             max_tokens, init_tokens, static_min_tokens, self.tokens_per_chunk,
             self._arena.va_base,
-            self.static_min_chunks_per_pool,
+            self.init_chunks_per_pool,
             self.init_chunks_per_pool - self.static_min_chunks_per_pool,
         )
 

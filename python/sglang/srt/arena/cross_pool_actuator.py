@@ -184,16 +184,13 @@ class CrossPoolTransferActuator:
         src_min_mapped = min(
             src._arena.pool_mapped_chunks(name) for name in src_names
         )
-        # Static-min floor: paper §design-l2-actuator (line 133-135) requires
-        # a static-min region whose physical pages are mapped at startup and
-        # NEVER unmapped, against which CUDA graphs are captured. The arena
-        # exposes `static_min_chunks_per_pool` as that floor; the actuator
-        # refuses any shrink that would drop a sub-pool below it. With the
-        # mobile-soft split (SGLANG_ARENA_*_MOBILE_SOFT_CHUNKS), boot-time
-        # mapped chunks = static_min, and (init - static_min) chunks live in
-        # the shared free queue as transferable mobile soft. Without the
-        # split (default), static_min == init and the actuator effectively
-        # can't shrink — transfers must come from peer's free handles.
+        # Static-min floor (paper §design-l2-actuator L184): the actuator
+        # refuses any shrink that would drop a sub-pool below static_min.
+        # When shared_arena=True, memory_pool sets static_min=1 chunk per
+        # sub-pool, leaving (init - 1) chunks per sub-pool transferable
+        # via drain protocol. When shared_arena=False, static_min=init and
+        # the actuator can't shrink (engine behaves identically to non-L2
+        # baseline).
         static_min = src.static_min_chunks_per_pool
         if src_min_mapped - n_per_src_subpool < static_min:
             return {

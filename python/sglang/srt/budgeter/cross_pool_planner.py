@@ -62,7 +62,7 @@ class CrossPoolPolicyConfig:
     # Edge-triggered mode fires ONLY at state transitions (BELOW_LOW ↔
     # IN_BAND ↔ ABOVE_HIGH). Steady state above high → 0 transfers
     # after the first crossing → 0 actuator overhead.
-    edge_trigger: bool = False     # gate via SGLANG_XPOOL_EDGE_TRIGGER=1
+    edge_trigger: bool = True      # paper §design-l2 default; SGLANG_XPOOL_EDGE_TRIGGER=0 to disable
     # Net-benefit gate (Setting 1 v9-auto follow-up). v9-auto's L1+L2 cell
     # showed L2 firing 15 transfers under L1's mamba_usage signal even when
     # L1's HPB-LRU snapshot retention had already absorbed the binding shift,
@@ -74,7 +74,7 @@ class CrossPoolPolicyConfig:
     # and refuses to fire unless benefit >= cost * margin. With no retracts
     # and no paused reqs, benefit is 0 and the gate always blocks — which
     # is exactly the v9-auto failure mode we need to suppress.
-    net_benefit_enabled: bool = False  # gate via SGLANG_XPOOL_NET_BENEFIT=1
+    net_benefit_enabled: bool = True   # paper §design-l2 default; SGLANG_XPOOL_NET_BENEFIT=0 to disable
     nb_avg_prefill_tokens: int = 4096  # avg input length used for benefit est
     nb_prefill_tps: float = 50000.0    # prefill throughput est (H200 default)
     nb_pause_penalty_us: float = 1000.0  # cost of one paused-req tick
@@ -112,8 +112,8 @@ def _policy_from_env() -> CrossPoolPolicyConfig:
         cooldown_ticks=int(os.environ.get("SGLANG_XPOOL_COOLDOWN", "16")),
         dst_chunks_per_action=int(os.environ.get("SGLANG_XPOOL_UNIT", "1")),
         qdepth_trigger=int(os.environ.get("SGLANG_XPOOL_QDEPTH_TRIGGER", "0")),
-        edge_trigger=bool(int(os.environ.get("SGLANG_XPOOL_EDGE_TRIGGER", "0"))),
-        net_benefit_enabled=bool(int(os.environ.get("SGLANG_XPOOL_NET_BENEFIT", "0"))),
+        edge_trigger=bool(int(os.environ.get("SGLANG_XPOOL_EDGE_TRIGGER", "1"))),
+        net_benefit_enabled=bool(int(os.environ.get("SGLANG_XPOOL_NET_BENEFIT", "1"))),
         nb_avg_prefill_tokens=int(os.environ.get("SGLANG_XPOOL_NB_AVG_PREFILL_TOKENS", "4096")),
         nb_prefill_tps=float(os.environ.get("SGLANG_XPOOL_NB_PREFILL_TPS", "50000")),
         nb_pause_penalty_us=float(os.environ.get("SGLANG_XPOOL_NB_PAUSE_PENALTY_US", "1000")),
