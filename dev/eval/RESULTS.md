@@ -29,6 +29,26 @@ Scripts at `prelude-paper/figures/scripts/`, raw data under
   Phase A regression (3105±13 vs 1818±29 ms) is statistically significant
   at ~44σ — gate-tuning issue not measurement noise.
 
+**Tier 4: Q3.B 4-cell variance bands (paper `aaa837c` + Fig 8 `e8f6663`).**
+3-trial × 4-cell × 3-phase variance run on cold-burst trace. Recovery-phase
+headline (the load-bearing metric for paper's L2 claim per `0376ec4` framing):
+  L00 baseline:  mean 281.1 ± 2.4 ms / P99 1117 ± 12 / E2E 2884 ± 4
+  L10 L1 only:   mean 207.4 ± 4.4 ms / P99  408 ±  8 / E2E 2657 ± 15  (-26% / -63%)
+  L01 L2 only:   mean 285.1 ± 2.6 ms / P99 1118 ±  5 / E2E 2873 ± 51  (~baseline)
+  L11 full:      mean 209.0 ± 6.0 ms / P99  416 ±  4 / E2E 2684 ± 26  (-26% / -63%)
+
+L11 vs L10: Δmean 1.6 ms < combined σ 10.4 ms — joint cell **NOT
+statistically separable from L1-only**. Original single-trial (1,1)=200/412/2627
+was at low-edge of trial variance, not a robust dominance.
+
+This consolidates the paper's final framing: **L1 carries the measurable
+end-to-end win on every workload tested (v9-auto + Q3.B); L2 is no-regression
+mechanism whose marginal value over L1-alone is below trial-to-trial variance
+at our measurement budget**. Demonstrating L2-only positive delta requires
+an admission-pressured workload where stock cache evicts aggressively enough
+to produce paused/retracted requests — flagged as paper work-in-progress.
+Fig 8 visualizes Q3.B variance bands (mirrors Fig 7 v9-auto).
+
 **Tier 3: gate-retune NEGATIVE results consolidated (paper `0376ec4`).**
 - MAMBA_HIGH ∈ {0.08, 0.20, 0.50, 0.80} sweep: Phase A stays 3085-3227ms
   across all (within 2σ of variance baseline). Threshold isn't the right
