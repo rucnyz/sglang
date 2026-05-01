@@ -341,6 +341,46 @@ The mechanism gate (Eq.~\ref{eq:nb-gate}) requires α·C_act = 4.5 s of
 avoided re-prefill before firing; the worst-case 1-2 ms warm-state
 overhead is amortized by 3 orders of magnitude on any actuator fire.
 
+### Pretouch fix attempt (PARTIAL, 2026-05-01)
+
+We tested `SGLANG_ARENA_ZERO_INIT_LIVE=1` (existing knob; calls
+`t[:live_tokens].zero_()` on every sub-pool's mapped range during arena
+init) as a production fix to erase the cold-TLB transient at boot.
+5 trials Poisson RPS=8, n=500, no-warm — same harness as the
+baseline measurement:
+
+| condition | C0 mean | C1 mean | delta | σ improvement |
+|---|---:|---:|---:|---:|
+| no-pretouch (reference)    | 51.80 ± 1.70 | 55.51 ± 5.79 | +7.15% | — |
+| **pretouch ZERO_INIT_LIVE=1** | 48.88 ± 0.70 | 52.34 ± 2.53 | **+7.08%** | **2.3× σ cut** |
+
+**Result: partial fix.** σ on C1 cut from 5.79 → 2.53 ms (2.3×), but
+mean delta unchanged (+7.08% vs +7.15%). Per-trial: C1+pretouch =
+[51.77, 51.27, 54.90, 48.95, 54.81] — 3 trials normal (~50 ms), 2
+trials still showing cold-TLB outliers (~55 ms with P99 spikes 888,
+907 ms).
+
+**Why the fix is incomplete:** The bench-side pre-warm (200-prompt
+4096-token inputs before timed bench) DID erase the variance entirely
+(C1 σ 5.79 → 0.61 ms). The difference: bench-side warmup runs the
+*same* attention kernel on the *same* SMs as the timed bench, populating
+the relevant TLB entries. Boot-time `zero_()` runs a fill kernel
+(different launch grid, different SM coverage) and the elapsed time
+between boot and bench-start (~30s including health-check polling)
+gives TLB entries time to evict before measurement begins.
+
+**Real fix sketch:** modify SGLang's startup to dispatch a real
+attention forward pass during the pre-`ready` warmup phase, sized to
+touch every KV page. Not a one-line env change; ~50 LoC in
+`model_runner_kv_cache_mixin.warmup_step` to inject a sweep batch.
+Out of scope for the current paper measurement; flagging as
+follow-up.
+
+**Production decision:** flip `SGLANG_ARENA_ZERO_INIT_LIVE=1` on by
+default in `dev/eval/regression_suite/jobs.py` PRELUDE_ENV. The
+2.3× σ cut is free (TPS unchanged, mean delta unchanged), and the
+P99 robustness improvement is real even if mean isn't fully fixed.
+
 **Falsified hypotheses:**
 - ~~PyTorch caching allocator stash interaction~~: would show the
   same variance with pre-warm, doesn't.
