@@ -64,6 +64,16 @@ class CrossPoolTransferActuator:
         self.kv_actuator = kv_actuator
         self.mamba_actuator = mamba_actuator
 
+        # Drain protocol state (paper §design-l2-actuator). When a fire
+        # decides to shrink src, we cap src's allocator to new_cap so no
+        # new req can be admitted to the tail [new_cap, old_cap]. The
+        # actual cuMemUnmap+cuMemMap is deferred until in-flight reqs
+        # holding tail slots have completed naturally — drain check
+        # compares len(src_allocator._capped_pages) to (size - new_cap).
+        # While pending, no new fire is admitted; planner.decide is
+        # bypassed in agent.py.
+        self._pending: dict | None = None
+
         if kv_arena._arena._external_pool is not shared_pool:
             raise ValueError("kv_arena does not use the provided shared_pool")
         if mamba_arena._arena._external_pool is not shared_pool:
@@ -110,6 +120,42 @@ class CrossPoolTransferActuator:
 
     def _dst_actuator(self, dst: "MultiTensorArena"):
         return self.kv_actuator if dst is self.kv else self.mamba_actuator
+
+    def _drain_complete(self, src_act, new_cap_tokens: int) -> bool:
+        """Drain protocol check (paper §design-l2-actuator L184).
+
+        Returns True if all pages/slots above `new_cap_tokens` have been
+        freed by their owning requests and are now held in the
+        allocator's `_capped_pages` / `_capped_slots` tail buffer (= no
+        in-flight req still references the soon-to-be-unmapped tail).
+
+        The cap-aware free path on KV's allocator + MambaPool already
+        routes freed-above-cap entries into `_capped`. Here we just
+        check whether the count matches the expected drained target
+        `(allocator_size - new_cap)`.
+        """
+        if src_act is None:
+            return True  # No allocator coord — no drain needed.
+        # KV: src_act.allocator (BaseTokenToKVPoolAllocator) with .size and ._capped_pages
+        # Mamba: src_act.pool (MambaPool) with .size and ._capped_slots
+        alloc = getattr(src_act, "allocator", None)
+        if alloc is not None:
+            page_size = max(1, src_act.pool.page_size)
+            new_cap_pages = new_cap_tokens // page_size
+            new_cap_pages = min(new_cap_pages, alloc.size)
+            expected_capped = alloc.size - new_cap_pages
+            capped = getattr(alloc, "_capped_pages", None)
+            current_capped = capped.numel() if capped is not None else 0
+            return current_capped >= expected_capped
+        pool = getattr(src_act, "pool", None)
+        if pool is not None:
+            new_cap_slots = min(new_cap_tokens, pool.size)
+            expected_capped = pool.size - new_cap_slots
+            capped = getattr(pool, "_capped_slots", None)
+            current_capped = capped.numel() if capped is not None else 0
+            return current_capped >= expected_capped
+        # Unknown actuator shape; conservative: not drained.
+        return False
 
     def _do_transfer(
         self,
@@ -230,16 +276,35 @@ class CrossPoolTransferActuator:
         src_shrink_tokens = n_per_src_subpool * src_tokens_per_chunk
         dst_grow_tokens = n_per_dst_subpool * dst_tokens_per_chunk
 
-        if src_act is not None:
-            new_src_cap = max(1, src_act.live_capacity_tokens() - src_shrink_tokens)
-            # IMPORTANT: cap_allocator_only, NOT set_capacity_tokens. The
-            # latter calls through to MultiTensorArena.set_capacity_tokens,
-            # which would physically shrink the source arena — and our
-            # explicit `src._arena.shrink(...)` below would then shrink
-            # AGAIN, leaking handles to the shared free pool. The cross-
-            # pool actuator owns the physical chunk movement; per-pool
-            # actuators only manage allocator-side capacity.
+        # Paper §design-l2-actuator drain protocol. When src needs to
+        # shrink, in-flight reqs may currently hold slots above the new
+        # cap. We cap the allocator (no new admit to tail) and then
+        # check drain status: all pages above new_cap should be in
+        # `_capped_pages` (the cap-aware free path puts there). If
+        # drain is not yet complete, abort this fire (un-cap) and the
+        # gate retries on a future tick (after cooldown).
+        if src_act is not None and n_per_src_subpool > 0:
+            old_src_cap = src_act.live_capacity_tokens()
+            new_src_cap = max(1, old_src_cap - src_shrink_tokens)
             src_act.cap_allocator_only(new_src_cap)
+            if not self._drain_complete(src_act, new_src_cap):
+                # Restore allocator cap; gate will retry next admissible tick.
+                src_act.cap_allocator_only(old_src_cap)
+                return {
+                    "direction": direction_label,
+                    "n_per_src_subpool": 0,
+                    "n_per_dst_subpool": n_per_dst_subpool,
+                    "src_subpools": n_src,
+                    "dst_subpools": n_dst,
+                    "unmapped_total": 0,
+                    "granted_total": 0,
+                    "free_before": self.shared.free_count(),
+                    "free_after_shrink": self.shared.free_count(),
+                    "free_after_grow": self.shared.free_count(),
+                    "kv_capacity_tokens": self.kv.current_capacity_tokens(),
+                    "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
+                    "skipped": "drain_pending",
+                }
 
         free_before = self.shared.free_count()
         unmapped_total = 0
