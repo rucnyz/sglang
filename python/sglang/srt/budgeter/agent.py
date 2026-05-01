@@ -432,28 +432,34 @@ class BudgetAgent:
         if decision.direction is None:
             return
 
-        # Paper §design-l2 drain protocol: actuator's `_drain_complete`
-        # check counts `_capped + release + free_pages + free_group`
-        # above cap. Empirically (`runs/l2-mobile-soft-focused-20260501-
-        # 233038`) this still races with some path we haven't isolated:
-        # drain returns True but unmap kills slots that decode kernels
-        # still reference → CUDA illegal access. Until that's fully
-        # diagnosed, keep the strict engine_busy gate as the safety
-        # belt — drain check still runs (correctness in idle is
-        # trivially preserved) but live-traffic firing is deferred.
-        def _to_int(v):
-            t = getattr(v, "total", None)
-            if isinstance(t, (int, float)):
-                return int(t)
+        # Paper §design-l2 drain protocol: BEFORE the actuator's
+        # `_drain_complete` check, force-flush tree-cache evictable
+        # entries. SGLang's radix prefix cache holds slot ids on behalf
+        # of completed-but-cached prefix paths; from the allocator's
+        # perspective those slot ids are "in_use" (not in free/capped/
+        # release/free_group), but they're not held by any live request
+        # — they're held by the tree. If we don't flush them, an unmap
+        # of chunks above new_cap will kill slots the tree still
+        # references; a subsequent cache hit dereferences unmapped
+        # memory → cudaErrorIllegalAddress.
+        #
+        # `evict_from_tree_cache(tree, BIG)` walks the radix tree and
+        # frees every refcount-zero entry's KV via `allocator.free()`,
+        # which routes through the cap-aware path → ids above new_cap
+        # land in `_capped_pages`. After this, the only "in_use_above"
+        # pages are slot ids genuinely held by active in-flight
+        # requests; drain check correctly waits for those.
+        if self._tree_cache is not None and decision.direction == "kv_to_mamba":
             try:
-                return int(v) if v is not None else 0
-            except (TypeError, ValueError):
-                return 0
-        n_running = _to_int(snapshot.get("num_running_reqs", 0))
-        n_queued = _to_int(snapshot.get("num_queue_reqs", 0))
-        if n_running > 0 or n_queued > 0:
-            snapshot["xpool_plan_skipped"] = "engine_busy"
-            return
+                from sglang.srt.mem_cache.common import (
+                    evict_from_tree_cache,
+                )
+                evictable = self._tree_cache.evictable_size()
+                if evictable > 0:
+                    evict_from_tree_cache(self._tree_cache, evictable)
+                    snapshot["xpool_pre_fire_evicted"] = evictable
+            except Exception as e:  # noqa
+                logger.warning("Pre-fire tree_cache flush failed: %s", e)
 
         unit = self._xpool_planner.config.dst_chunks_per_action
         # Paper §design-l2: planner-driven fires use the direct single-
