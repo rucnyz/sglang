@@ -76,6 +76,71 @@ This session's commits:
 
 ---
 
+## TL;DR — 2026-05-01 evening: mobile-soft was always off — every L2 fire dormant
+
+**Major retraction of the afternoon's "architectural blocker" framing.**
+
+Spot-checked `runs/q3b-variance-20260501-094916/trial1_L11/budgeter.jsonl`:
+the actuator's first kv_to_mamba fire reports `xpool_unmapped_total=0`,
+`xpool_granted_total=0`. The fire physically moved zero bytes.
+
+Followed the trail: every eval script in `dev/eval/*.sh` that sets
+`SGLANG_BUDGETER=1` is missing `SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS` and
+`SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS`. Confirmed via repo-wide grep:
+
+```
+grep -rln "SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS=[1-9]\|...MAMBA...=[1-9]"
+  → only matches BLOCKERS.md (where the discovery is documented)
+```
+
+15 scripts affected: 03/04/07/11–17/20/22/27/29–31. With both env vars at 0
+(default), `init_chunks == static_min_chunks` per pool, the shared free
+queue is empty at boot, `src.shrink` refuses to go below `static_min`,
+and `dst.grow` has no handles to pull → **every L2 fire across every
+paper-cited run was a planner-side decision with zero physical byte
+movement**.
+
+`runs/nb-gate-20260501-081514/nb_on/L11_L21/budgeter.jsonl` shows the
+pathology cleanly: 15 fires, all `granted_nonzero=0`.
+
+**Paper-level implications:**
+- The v9-auto Phase A "L2 regression" attributed to actuator overhead
+  was in fact planner CPU + tick-callback overhead with zero compensating
+  byte transfer.
+- The Q3.B 4-cell variance band finding (joint ≈ L1-only, paper §6
+  Q3.B 4-cell paragraph + Fig 8) ran on a configuration where L2
+  physically did nothing.
+- The B2 cold_burst historical −24.5% TTFT (this file's earlier TL;DR
+  "Tier 4") was on the same misconfig — that benefit was either L1
+  (HPB LRU + K_BIG) attribution or measurement variance; it cannot have
+  been L2 fires moving bytes.
+- Paper's "L2 = no-regression mechanism" body framing is technically
+  correct for the wrong reason: the actuator NEVER ENGAGED on any
+  paper-cited workload, so of course it didn't regress.
+
+**Recovery path landed (commit `90c42c761`):**
+1. Edited `21_setting1_v9_pool_binding.sh` to set
+   `SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS=1` on L2-on cells. Mamba forced to 0
+   because at 1 GB chunk size mamba's `init_chunks=1` per sub-pool, so
+   `MAMBA_MOBILE_SOFT>0` raises ValueError at server init (verified on
+   the first smoke attempt: `runs/l2-mobile-soft-20260501-164134`).
+2. Asymmetric L2 under 1 GB chunks: only `kv_to_mamba` physically moves
+   bytes (mamba can grow by pulling KV's donated chunk; reverse path
+   needs symmetric mobile-soft, gated on smaller chunk size).
+3. Wrote `dev/eval/32_l2_mobile_soft_smoke.sh` driver. Smoke run in flight
+   on GPU 2. Pivotal data point: does L10_L21's budgeter.jsonl show
+   `xpool_granted_total > 0` during Phase A?
+4. If yes: the prior "architectural blocker" framing collapses to
+   "config blocker," paper L2 evidence is recoverable from this point
+   forward. All 15 affected scripts need the same edit and a re-run.
+5. If still 0: deeper investigation; possibly need 256 MB chunks for
+   bilateral mobile-soft, contradicting paper §6.7's chunk-size finding.
+
+This session's commits:
+  sglang: 90c42c761 (discovery + fix + smoke driver)
+
+---
+
 ## TL;DR — 2026-05-01 afternoon: L2-positive search closed, architectural blocker confirmed
 
 User priority: "find a workload where L2 actually works, everything else doesn't matter."
