@@ -50,6 +50,26 @@ if [ "$ONLY_L1" = "1" ]; then
 fi
 if [ "$ONLY_L2" = "1" ]; then
   extra_env="$extra_env SGLANG_ARENA_SHARED=1 SGLANG_ARENA_FROM_BLOB=1 SGLANG_ARENA_CHUNK_BYTES=1073741824 SGLANG_BUDGETER=1 SGLANG_BUDGETER_XPOOL_PLANNER=1 SGLANG_BUDGETER_XPOOL_COORDINATED=1 SGLANG_BUDGETER_TICK_S=2.0 SGLANG_BUDGETER_LOG=$OUT_DIR/${cell}_budgeter.jsonl SGLANG_XPOOL_KV_HIGH=0.04 SGLANG_XPOOL_KV_LOW=0.015 SGLANG_XPOOL_MAMBA_HIGH=0.08 SGLANG_XPOOL_MAMBA_LOW=0.03 SGLANG_XPOOL_COOLDOWN=2"
+  # Mobile-soft: KV and/or mamba donate N chunks to the shared queue
+  # at boot. Without this, init_chunks == static_min_chunks and the
+  # shared free queue is empty → src.shrink and dst.grow both return
+  # 0 → fires are dormant (verified on q3b-variance budgeter logs:
+  # xpool_unmapped_total=0, xpool_granted_total=0 for every fire).
+  #
+  # At 1 GB chunk size (paper §6.7's tuned default), mamba's
+  # init_chunks=1 per sub-pool because per-slot bytes are tiny (~1 MB)
+  # so 361 slots fit in <1 chunk. Setting MAMBA_MOBILE_SOFT_CHUNKS>0
+  # therefore raises ValueError at server init. KV's init_chunks=2 per
+  # sub-pool (1.26 M tokens × ~1 KB = 1.26 GB / 1 GB chunks) so KV
+  # CAN do mobile_soft=1, donating one of its two chunks to shared.
+  # This is asymmetric: mamba can grow (pulling KV's donated chunk)
+  # but mamba can't shrink past its init=static_min floor. So under
+  # 1 GB chunks the only fire direction that physically moves bytes is
+  # kv_to_mamba — appropriate for the v9 trace's mamba-bound Phase A.
+  # Override with SGLANG_L2_MOBILE_SOFT_KV_CHUNKS / _MAMBA_CHUNKS.
+  l2_mobile_kv=${SGLANG_L2_MOBILE_SOFT_KV_CHUNKS:-1}
+  l2_mobile_mamba=${SGLANG_L2_MOBILE_SOFT_MAMBA_CHUNKS:-0}
+  extra_env="$extra_env SGLANG_ARENA_KV_MOBILE_SOFT_CHUNKS=$l2_mobile_kv SGLANG_ARENA_MAMBA_MOBILE_SOFT_CHUNKS=$l2_mobile_mamba"
 fi
 log="$OUT_DIR/${cell}_server.log"
 echo "=== cell=$cell ($extra_env) ==="
