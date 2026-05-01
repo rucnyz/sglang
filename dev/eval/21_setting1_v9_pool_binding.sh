@@ -68,6 +68,7 @@ nohup env $extra_env \
     --mem-fraction-static $mem_frac --log-level info \
     --enforce-piecewise-cuda-graph \
     --reasoning-parser qwen3 \
+    ${EXTRA_FLAGS:-} \
     >"$log" 2>&1 &
 pid=$!
 echo "[$cell] pid=$pid"
