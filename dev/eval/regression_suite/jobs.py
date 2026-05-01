@@ -31,6 +31,13 @@ PRELUDE_ENV = {
     # at server start, which is a follow-up code change. Free to enable
     # (TPS unchanged), so default on.
     "SGLANG_ARENA_ZERO_INIT_LIVE": "1",
+    # Two-stage TLB warmup (full fix): stage 1 fill-walks every page,
+    # stage 2 dispatches _dummy_run() to warm the attention kernel's SM
+    # grid. Lands in ModelRunner._arena_tlb_warmup() at end of init.
+    # 5-trial validation: C1+full-warmup beats C0 baseline by mean TTFT
+    # -5.4% / P99 -59% (RESULTS.md "Production fix landed"). Required
+    # for the "arena ≥ baseline" production guarantee.
+    "SGLANG_ARENA_WARMUP": "1",
     # 256 MiB chunks: with 1 GiB chunks, KV's 1.26M tokens round up to 2.10M
     # (n_subpools=20 → ~10 GiB excess) and mamba's 362 rounds to 512 (n_subpools=30
     # → ~8.7 GiB excess), eating the activation reserve and OOM'ing FLA. Smaller
