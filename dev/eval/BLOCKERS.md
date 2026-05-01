@@ -170,3 +170,11 @@ that get past the gate are no-ops anyway. If (b) lands, this surfaces.
 - **Workaround:** start with Phase A + B only on the trace and document Phase C as "coming after WildChat export."
 - **Resolved at:** —
 
+## Paper abstract has stale "no static configuration achieves" claim — **needs user-level decision**
+
+- **Setting:** `prelude-paper/abstract.tex` last sentence: "On a 24-hour phase-shift trace over Qwen3 / Qwen3.5 / Qwen3-Next, Layer 1 + Layer 2 together sustain throughput across phase changes that no static configuration achieves; the four-cell ablation isolates each layer's contribution."
+- **Issue:** the static-best partition baseline (`prelude-paper@647da07`, paper Table~\ref{tab:static-best}) found that single static `mamba_full_memory_ratio=0.9` beats the dynamic $(1,1)$ cell on v9-auto Phase A by $1.9\times$ mean TTFT. The contribution-attribution finding (`ef09782`, Table~\ref{tab:contribution-attribution}) and 3-trial variance bands on both v9-auto (`198a9a5`, Fig 7) and Q3.B 4-cell (`aaa837c`, Fig 8) show that the joint $(1,1)$ cell does not statistically dominate the L1-only $(1,0)$ cell at our measurement budget. Abstract's "no static config achieves" + "isolates each layer's contribution" framing therefore does not match the body's honest framing of "L1 carries the lift; L2 = no-regression mechanism whose marginal value over L1 is below variance".
+- **Resolution:** rewrite the abstract's last sentence to match body. Example: "Layer 1 contributes a measurable end-to-end win on every workload tested ($-26\%$ to $-37\%$ recovery TTFT vs.\ baseline at $\sim 4$\,ms variance); Layer 2 is the no-regression cross-pool reallocation mechanism that becomes load-bearing on workloads with sustained admission pressure (work-in-progress)." Paper-framing decision; not autonomously edited.
+- **Date observed:** 2026-05-01 NeurIPS strengthening session.
+- **Status:** flagged for user review; body sections (`evaluation.tex`) already report honestly.
+
