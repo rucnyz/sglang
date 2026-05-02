@@ -451,15 +451,33 @@ class BudgetAgent:
         # requests; drain check correctly waits for those.
         if self._tree_cache is not None and decision.direction == "kv_to_mamba":
             try:
-                from sglang.srt.mem_cache.common import (
-                    evict_from_tree_cache,
+                # MambaRadixCache (the hybrid SGLang prefix cache) splits
+                # `evictable_size` into separate full-pool and mamba-pool
+                # accessors and raises NotImplementedError on the unified
+                # one. Use the full-pool size (which is what KV-side
+                # eviction acts on) and call evict_full directly.
+                tc = self._tree_cache
+                full_evictable = (
+                    tc.full_evictable_size()
+                    if hasattr(tc, "full_evictable_size")
+                    else (tc.evictable_size() if hasattr(tc, "evictable_size") else 0)
                 )
-                evictable = self._tree_cache.evictable_size()
-                if evictable > 0:
-                    evict_from_tree_cache(self._tree_cache, evictable)
-                    snapshot["xpool_pre_fire_evicted"] = evictable
+                if full_evictable > 0:
+                    if hasattr(tc, "evict_full"):
+                        tc.evict_full(full_evictable)
+                    else:
+                        from sglang.srt.mem_cache.common import (
+                            evict_from_tree_cache,
+                        )
+                        evict_from_tree_cache(tc, full_evictable)
+                    snapshot["xpool_pre_fire_evicted"] = full_evictable
             except Exception as e:  # noqa
-                logger.warning("Pre-fire tree_cache flush failed: %s", e)
+                import traceback
+                logger.warning(
+                    "Pre-fire tree_cache flush failed: %r\n%s",
+                    e, traceback.format_exc(),
+                )
+                snapshot["xpool_pre_fire_evicted_error"] = repr(e)
 
         unit = self._xpool_planner.config.dst_chunks_per_action
         # Paper §design-l2: planner-driven fires use the direct single-
