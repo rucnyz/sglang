@@ -199,7 +199,21 @@ class CrossPoolTransferActuator:
             total_above_freed = (
                 capped_above + release_above + free_above + free_group_above
             )
-            return total_above_freed >= expected
+            in_use_above = expected - total_above_freed
+            ok = total_above_freed >= expected
+            logger.info(
+                "_drain_complete: ok=%s expected=%d total_freed_above=%d "
+                "(capped=%d release=%d free=%d free_group=%d) in_use_above=%d "
+                "(alloc.size=%d new_cap_pages=%d, free_pages.numel=%d, "
+                "release.numel=%d, capped.numel=%d)",
+                ok, expected, total_above_freed,
+                capped_above, release_above, free_above, free_group_above,
+                in_use_above, alloc.size, new_cap_pages,
+                getattr(getattr(alloc, "free_pages", None), "numel", lambda: 0)(),
+                getattr(getattr(alloc, "release_pages", None), "numel", lambda: 0)(),
+                getattr(getattr(alloc, "_capped_pages", None), "numel", lambda: 0)(),
+            )
+            return ok
 
         pool = getattr(src_act, "pool", None)
         if pool is not None:
