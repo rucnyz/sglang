@@ -21,10 +21,10 @@ extra_env="$extra_env SGLANG_ARENA_SHARED=1 SGLANG_ARENA_FROM_BLOB=0 SGLANG_AREN
 extra_env="$extra_env SGLANG_BUDGETER=1 SGLANG_BUDGETER_XPOOL_PLANNER=1 SGLANG_BUDGETER_XPOOL_COORDINATED=1 SGLANG_BUDGETER_TICK_S=2.0"
 extra_env="$extra_env SGLANG_BUDGETER_LOG=$OUT_DIR/budgeter.jsonl"
 extra_env="$extra_env SGLANG_XPOOL_KV_HIGH=0.5 SGLANG_XPOOL_KV_LOW=0.05 SGLANG_XPOOL_MAMBA_HIGH=0.08 SGLANG_XPOOL_MAMBA_LOW=0.03 SGLANG_XPOOL_COOLDOWN=2"
-# CALIBRATION MODE: net_benefit=0 to force fires for actuator timing
-# measurement (Stage 1 of paper-grade gate validation). Once calibrated,
-# the gate goes back to paper-faithful default (net_benefit=1).
-extra_env="$extra_env SGLANG_XPOOL_NET_BENEFIT=0"
+# Paper-faithful gate: net_benefit=1 (default since sglang `d88557c85`).
+# SGLangPressureAdapter reads num_evicted_tokens_recent from snapshot,
+# weights it by 12.5 us/token (= 1/prefill_tps); fires when total
+# adapter benefit clears chunk_cost × margin = 5_000 × 1.5 = 7_500 us.
 
 log="$OUT_DIR/server.log"
 pkill -f "launch_server.*--port $PORT" 2>/dev/null || true

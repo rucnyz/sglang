@@ -177,6 +177,7 @@ class CrossPoolPlanner:
         snapshot: dict | None,
         kv_above_consec: int = 0,
         mamba_above_consec: int = 0,
+        edge_active: bool = False,
     ) -> tuple[bool, str]:
         """Return (allow_fire, why) per the engine-agnostic cost/benefit
         estimator.
@@ -203,6 +204,7 @@ class CrossPoolPlanner:
             return True, "nb=off"
         signals = self._adapter.signals_from_snapshot(
             snapshot or {}, kv_above_consec, mamba_above_consec,
+            edge_active=edge_active,
         )
         benefit_us = signals.total_benefit_us
         cost_us = c.dst_chunks_per_action * c.nb_chunk_cost_us
@@ -224,6 +226,7 @@ class CrossPoolPlanner:
         usage_mamba: float,
         queue_depth: int = 0,
         snapshot: dict | None = None,
+        edge_active: bool = False,
     ) -> PlanDecision:
         """Decide whether to fire a cross-pool transfer this tick.
 
@@ -266,12 +269,55 @@ class CrossPoolPlanner:
             kv_consec = self._kv_above_high_consec
             mamba_consec = self._mamba_above_high_consec
             if not (kv_changed or mamba_changed):
-                # Stable. Persist re-evaluation: even without a fresh edge,
-                # if a pool has been ABOVE_HIGH long enough that B_persist
-                # has built up, give the gate another chance to fire. This
-                # closes the v9-auto v2 failure mode where stock cache hides
-                # the true cost of sustained mamba=1.0 saturation behind
-                # zero paused/retracted counters.
+                # Stable. Two re-evaluation paths from inside a stable
+                # state, both pointing the gate at signals it would
+                # otherwise miss:
+                #   (1) Edge re-eval (paper §design-l2 S_edge): when
+                #       the agent observes |Δu| > θ_edge this tick, a
+                #       phase transition is in progress even if the
+                #       discrete state classifier hasn't crossed yet
+                #       (or just crossed and we're now in the
+                #       post-crossing stable run). The S_edge benefit
+                #       term is one-tick-bounded, so we must re-eval
+                #       the gate this tick or lose it.
+                #   (2) Persist re-eval: a pool that's been ABOVE_HIGH
+                #       long enough has accumulated B_persist; give the
+                #       gate another chance even without an edge.
+                if c.net_benefit_enabled and edge_active:
+                    if (new_mamba == self.ABOVE_HIGH
+                            and new_kv != self.ABOVE_HIGH):
+                        ok, why = self._net_benefit_ok(
+                            snapshot, kv_consec, mamba_consec,
+                            edge_active=True,
+                        )
+                        if ok:
+                            self._cooldown_remaining = c.cooldown_ticks
+                            return PlanDecision(
+                                direction="kv_to_mamba",
+                                reason=f"edge_signal: mamba ABOVE_HIGH "
+                                       f"({usage_mamba:.2f}) kv={new_kv} "
+                                       f"({usage_kv:.2f}) [{why}]",
+                                usage_kv=usage_kv,
+                                usage_mamba=usage_mamba,
+                                queue_depth=queue_depth,
+                            )
+                    if (new_kv == self.ABOVE_HIGH
+                            and new_mamba != self.ABOVE_HIGH):
+                        ok, why = self._net_benefit_ok(
+                            snapshot, kv_consec, mamba_consec,
+                            edge_active=True,
+                        )
+                        if ok:
+                            self._cooldown_remaining = c.cooldown_ticks
+                            return PlanDecision(
+                                direction="mamba_to_kv",
+                                reason=f"edge_signal: kv ABOVE_HIGH "
+                                       f"({usage_kv:.2f}) mamba={new_mamba} "
+                                       f"({usage_mamba:.2f}) [{why}]",
+                                usage_kv=usage_kv,
+                                usage_mamba=usage_mamba,
+                                queue_depth=queue_depth,
+                            )
                 period = c.nb_persist_eval_period
                 if c.net_benefit_enabled and period > 0:
                     # Re-eval at every period-th tick of sustained ABOVE_HIGH.
@@ -280,6 +326,7 @@ class CrossPoolPlanner:
                             and new_kv != self.ABOVE_HIGH):
                         ok, why = self._net_benefit_ok(
                             snapshot, kv_consec, mamba_consec,
+                            edge_active=edge_active,
                         )
                         if ok:
                             self._cooldown_remaining = c.cooldown_ticks
@@ -297,6 +344,7 @@ class CrossPoolPlanner:
                             and new_mamba != self.ABOVE_HIGH):
                         ok, why = self._net_benefit_ok(
                             snapshot, kv_consec, mamba_consec,
+                            edge_active=edge_active,
                         )
                         if ok:
                             self._cooldown_remaining = c.cooldown_ticks

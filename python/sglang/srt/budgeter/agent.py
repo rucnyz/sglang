@@ -281,19 +281,139 @@ class BudgetAgent:
                     "raw chunk-move path (idle-window-only).", e,
                 )
                 mamba_act = None
+        # Per-spec drain probes (paper §189-190). Each inspector walks the
+        # scheduler's live request set and returns the count of in-flight
+        # slot ids ≥ new_cap. This is the rigorous drain check the paper's
+        # spec drain protocol calls for; without it, _drain_complete's
+        # accounting can return True while a still-running req holds a
+        # slot id whose physical handle is about to be cuMemUnmap'd
+        # (cudaErrorIllegalAddress on the next kernel that touches it).
+        kv_probe = self._make_kv_live_slot_inspector()
+        mamba_probe = self._make_mamba_live_slot_inspector()
         self._xpool_actuator = CrossPoolTransferActuator(
             kv_arena=kv_arena,
             mamba_arena=mamba_arena,
             shared_pool=shared,
             kv_actuator=kv_act,
             mamba_actuator=mamba_act,
+            kv_live_slot_inspector=kv_probe,
+            mamba_live_slot_inspector=mamba_probe,
         )
         logger.info(
             "BudgetAgent xpool: actuator attached, oscillator unit=%d, "
-            "coordinated=%s (kv_act=%s, mamba_act=%s)",
+            "coordinated=%s (kv_act=%s, mamba_act=%s, kv_probe=%s, mamba_probe=%s)",
             self._xpool_unit, self.xpool_coordinated,
             kv_act is not None, mamba_act is not None,
+            kv_probe is not None, mamba_probe is not None,
         )
+
+    def _make_kv_live_slot_inspector(self):
+        """Returns callable(new_cap_pages: int) -> int: count of in-flight
+        KV slot ids strictly greater than new_cap_pages across all running
+        and chunked-prefilling reqs the scheduler knows about. Reads
+        `req_to_token_pool.req_to_token[req_pool_idx, :seqlen-1]` per req.
+
+        We snapshot the running batch + waiting list at call time. Reqs
+        that have NOT yet been prefilled (req_pool_idx is None) hold no
+        KV — skip them. Reqs that just finished but haven't been freed
+        yet may show up; their slots are still live until the allocator
+        free path runs, so we count them as in-flight (conservative).
+        """
+        sched = self.scheduler
+
+        def inspect(new_cap_pages: int) -> int:
+            try:
+                req_pool = getattr(sched, "req_to_token_pool", None)
+                if req_pool is None:
+                    return 0
+                rt = getattr(req_pool, "req_to_token", None)
+                if rt is None:
+                    return 0
+                # Collect in-flight reqs from running_batch and current_batch.
+                reqs = []
+                rb = getattr(sched, "running_batch", None)
+                if rb is not None:
+                    reqs.extend(getattr(rb, "reqs", None) or [])
+                cb = getattr(sched, "cur_batch", None) or getattr(
+                    sched, "last_batch", None
+                )
+                if cb is not None and cb is not rb:
+                    reqs.extend(getattr(cb, "reqs", None) or [])
+                if not reqs:
+                    return 0
+                # Per-req scan: only the populated portion [0, seqlen-1)
+                # holds real slot ids; tail is stale. Scalar comparison
+                # on a single row at a time keeps the GPU op tiny and
+                # short-circuits as soon as any req shows above-cap slots.
+                import torch
+                live_above = 0
+                for r in reqs:
+                    idx = getattr(r, "req_pool_idx", None)
+                    if idx is None:
+                        continue
+                    seqlen = int(getattr(r, "seqlen", 0) or 0)
+                    if seqlen <= 1:
+                        continue
+                    row = rt[idx, : seqlen - 1]
+                    if row.numel() == 0:
+                        continue
+                    above = int((row > new_cap_pages).sum().item())
+                    live_above += above
+                    if live_above > 0:
+                        # Early exit: any > 0 already aborts the fire.
+                        return live_above
+                return live_above
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "kv_live_slot_inspector raised %r — returning a "
+                    "non-zero sentinel so drain aborts conservatively", e,
+                )
+                return 1
+        return inspect
+
+    def _make_mamba_live_slot_inspector(self):
+        """Returns callable(new_cap_slots: int) -> int: count of in-flight
+        mamba slot ids > new_cap_slots across all running reqs. Mamba
+        slots are 1-per-req via `req.mamba_pool_idx`, so the scan is
+        O(n_running_reqs) — much cheaper than the KV side.
+        """
+        sched = self.scheduler
+
+        def inspect(new_cap_slots: int) -> int:
+            try:
+                reqs = []
+                rb = getattr(sched, "running_batch", None)
+                if rb is not None:
+                    reqs.extend(getattr(rb, "reqs", None) or [])
+                cb = getattr(sched, "cur_batch", None) or getattr(
+                    sched, "last_batch", None
+                )
+                if cb is not None and cb is not rb:
+                    reqs.extend(getattr(cb, "reqs", None) or [])
+                if not reqs:
+                    return 0
+                live_above = 0
+                for r in reqs:
+                    mi = getattr(r, "mamba_pool_idx", None)
+                    if mi is None:
+                        continue
+                    # mamba_pool_idx is a torch.Tensor of shape (1) —
+                    # unwrap to a Python scalar before comparing.
+                    if hasattr(mi, "item"):
+                        mi_v = int(mi.item())
+                    else:
+                        mi_v = int(mi)
+                    if mi_v > new_cap_slots:
+                        live_above += 1
+                        return live_above
+                return live_above
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "mamba_live_slot_inspector raised %r — returning a "
+                    "non-zero sentinel so drain aborts conservatively", e,
+                )
+                return 1
+        return inspect
 
     def _maybe_xpool_actuate(self, snapshot: dict) -> None:
         """Phase 2e.5.6.2 demo. Safe-by-design: only transfers when there are
@@ -404,6 +524,37 @@ class BudgetAgent:
         snapshot["xpool_plan_usage_kv_inst"] = usage_kv_inst
         snapshot["xpool_plan_usage_mamba_inst"] = usage_mamba_inst
 
+        # S_edge phase-transition signal (paper §design-l2-actuator).
+        # Maintain low-pass EMA of the two pools' usage and compute the
+        # absolute change since last tick. When |Δu| > θ_edge on either
+        # pool, mark this tick as edge-active so the adapter contributes
+        # its bounded one-tick edge_us benefit. The signal is bounded
+        # to one tick by construction (θ-trigger only fires when the
+        # gradient crosses, not while it stays elevated).
+        ema_alpha = float(os.environ.get("SGLANG_XPOOL_EMA_ALPHA", "0.4"))
+        theta_edge = float(os.environ.get("SGLANG_XPOOL_THETA_EDGE", "0.10"))
+        if not hasattr(self, "_xpool_ema_kv"):
+            self._xpool_ema_kv = usage_kv_inst
+            self._xpool_ema_mamba = usage_mamba_inst
+            self._xpool_prev_ema_kv = usage_kv_inst
+            self._xpool_prev_ema_mamba = usage_mamba_inst
+        prev_ema_kv = self._xpool_ema_kv
+        prev_ema_mamba = self._xpool_ema_mamba
+        self._xpool_ema_kv = (
+            ema_alpha * usage_kv_inst + (1.0 - ema_alpha) * prev_ema_kv
+        )
+        self._xpool_ema_mamba = (
+            ema_alpha * usage_mamba_inst + (1.0 - ema_alpha) * prev_ema_mamba
+        )
+        du_kv = self._xpool_ema_kv - prev_ema_kv
+        du_mamba = self._xpool_ema_mamba - prev_ema_mamba
+        edge_active = (abs(du_kv) > theta_edge) or (abs(du_mamba) > theta_edge)
+        snapshot["xpool_ema_kv"] = self._xpool_ema_kv
+        snapshot["xpool_ema_mamba"] = self._xpool_ema_mamba
+        snapshot["xpool_du_kv"] = du_kv
+        snapshot["xpool_du_mamba"] = du_mamba
+        snapshot["xpool_edge_active"] = edge_active
+
         # Engine-agnostic gate: snapshot is passed through to the
         # planner, which delegates pressure-signal extraction to its
         # `EnginePressureAdapter` (default `SGLangPressureAdapter`).
@@ -422,6 +573,7 @@ class BudgetAgent:
             usage_kv, usage_mamba,
             queue_depth=qdepth,
             snapshot=snapshot,
+            edge_active=edge_active,
         )
         snapshot["xpool_plan_direction"] = decision.direction or "none"
         snapshot["xpool_plan_reason"] = decision.reason

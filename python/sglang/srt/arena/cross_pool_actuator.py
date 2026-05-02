@@ -54,6 +54,8 @@ class CrossPoolTransferActuator:
         shared_pool: "SharedHandlePool",
         kv_actuator=None,        # Optional[KVArenaActuator]
         mamba_actuator=None,     # Optional[MambaArenaActuator]
+        kv_live_slot_inspector=None,    # Optional[Callable[[int], int]]
+        mamba_live_slot_inspector=None, # Optional[Callable[[int], int]]
     ) -> None:
         self.kv = kv_arena
         self.mamba = mamba_arena
@@ -66,6 +68,17 @@ class CrossPoolTransferActuator:
         # behavior — safe only in idle windows.
         self.kv_actuator = kv_actuator
         self.mamba_actuator = mamba_actuator
+
+        # Rigorous drain check: in-flight slot ids held by running reqs
+        # are NOT in any allocator free buffer. Without scheduler-side
+        # introspection, _drain_complete's accounting can return True
+        # while reqs still hold ids > new_cap → cuMemUnmap kills active
+        # KV → cudaErrorIllegalAddress on next kernel. Each inspector is
+        # callable(new_cap_pages: int) -> int, returning the count of
+        # in-flight slot ids ≥ new_cap_pages on its respective pool.
+        # When > 0, drain is incomplete regardless of accounting.
+        self._kv_live_slot_inspector = kv_live_slot_inspector
+        self._mamba_live_slot_inspector = mamba_live_slot_inspector
 
         # Drain protocol state (paper §design-l2-actuator). When a fire
         # decides to shrink src, we cap src's allocator to new_cap so no
@@ -164,6 +177,15 @@ class CrossPoolTransferActuator:
         # KV: src_act.allocator with .size, ._capped_pages, .release_pages, .free_group, .free_pages
         # Mamba: src_act.pool with .size, ._capped_slots, .free_slots
         import torch  # local import to avoid module-level dep cycles
+        # Pick the inspector that matches the source pool. We can't tell
+        # KV vs mamba just from src_act, so use identity on the cached
+        # actuators we were given at init.
+        if src_act is self.kv_actuator:
+            live_inspector = self._kv_live_slot_inspector
+        elif src_act is self.mamba_actuator:
+            live_inspector = self._mamba_live_slot_inspector
+        else:
+            live_inspector = None
         alloc = getattr(src_act, "allocator", None)
         if alloc is not None:
             page_size = max(1, src_act.pool.page_size)
@@ -172,6 +194,26 @@ class CrossPoolTransferActuator:
             expected = alloc.size - new_cap_pages
             if expected <= 0:
                 return True
+
+            # Rigorous live-slot check: walk in-flight reqs first. If any
+            # holds a KV slot id > new_cap_pages, drain is not complete —
+            # those slots' physical handles must not be unmapped.
+            if live_inspector is not None:
+                try:
+                    live_above = int(live_inspector(new_cap_pages))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "live_slot_inspector raised %r — treating as "
+                        "drain-not-complete (conservative)", e,
+                    )
+                    return False
+                if live_above > 0:
+                    logger.info(
+                        "_drain_complete: ok=False (live in-flight slots "
+                        "above new_cap_pages=%d count=%d)",
+                        new_cap_pages, live_above,
+                    )
+                    return False
 
             def _count_above(t, threshold):
                 if t is None or t.numel() == 0:
@@ -221,6 +263,28 @@ class CrossPoolTransferActuator:
             expected = pool.size - new_cap_slots
             if expected <= 0:
                 return True
+
+            # Same rigorous live-slot check as KV side: walk in-flight reqs
+            # holding mamba slots > new_cap. Paper §190 ("DeltaNet/SSM slot
+            # shrink: mark slots above the new cap as 'not-for-reuse';
+            # release as owning requests complete").
+            if live_inspector is not None:
+                try:
+                    live_above = int(live_inspector(new_cap_slots))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "mamba live_slot_inspector raised %r — treating as "
+                        "drain-not-complete (conservative)", e,
+                    )
+                    return False
+                if live_above > 0:
+                    logger.info(
+                        "_drain_complete (mamba): ok=False (live in-flight "
+                        "slots above new_cap_slots=%d count=%d)",
+                        new_cap_slots, live_above,
+                    )
+                    return False
+
             capped = getattr(pool, "_capped_slots", None)
             free_slots = getattr(pool, "free_slots", None)
 

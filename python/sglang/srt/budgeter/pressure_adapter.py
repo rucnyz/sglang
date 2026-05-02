@@ -51,16 +51,17 @@ class PressureSignals:
     paused_us: float = 0.0   # admission-paused reqs
     queue_us: float = 0.0    # queued reqs waiting for admission
     persist_us: float = 0.0  # pool above-high dwell time (saturation prior)
+    edge_us: float = 0.0     # phase-transition signal: |du/dt| above threshold
 
     @property
     def total_benefit_us(self) -> float:
         return (self.evict_us + self.retract_us + self.paused_us
-                + self.queue_us + self.persist_us)
+                + self.queue_us + self.persist_us + self.edge_us)
 
     def reason_str(self) -> str:
         return (f"evict={self.evict_us:.0f} retract={self.retract_us:.0f} "
                 f"paused={self.paused_us:.0f} queue={self.queue_us:.0f} "
-                f"persist={self.persist_us:.0f}")
+                f"persist={self.persist_us:.0f} edge={self.edge_us:.0f}")
 
 
 class EnginePressureAdapter(ABC):
@@ -78,6 +79,7 @@ class EnginePressureAdapter(ABC):
         snapshot: dict,
         kv_consec: int,
         mamba_consec: int,
+        edge_active: bool = False,
     ) -> PressureSignals:
         ...
 
@@ -116,6 +118,7 @@ class SGLangPressureAdapter(EnginePressureAdapter):
         pause_penalty_us: float | None = None,
         queue_wait_us: float | None = None,
         persist_tick_us: float | None = None,
+        edge_us: float | None = None,
     ):
         self.prefill_save_us_per_token = (
             prefill_save_us_per_token
@@ -147,12 +150,26 @@ class SGLangPressureAdapter(EnginePressureAdapter):
             else float(os.environ.get(
                 "SGLANG_XPOOL_PERSIST_TICK_US", "5000"))
         )
+        # S_edge: paper §design-l2-actuator. Bounded one-tick benefit
+        # added when the planner observes |du_σ/dt| > θ_edge — the
+        # gradient signature of a phase transition. Calibrated as one
+        # control interval's worth of avoided re-prefill at the engine's
+        # current prefill throughput. Default 100 ms ≈ τ × prefill_tps
+        # × prefill_save_us_per_token at τ=2 s (i.e., ~25K tokens worth
+        # of deferred re-prefill avoided by re-allocating now rather
+        # than waiting one more tick).
+        self.edge_us = (
+            edge_us
+            if edge_us is not None
+            else float(os.environ.get("SGLANG_XPOOL_EDGE_US", "100000"))
+        )
         logger.info(
             "SGLangPressureAdapter: prefill_save=%.1f us/tok "
             "full_prefill=%.0f us pause_penalty=%.0f us "
-            "queue_wait=%.0f us persist_tick=%.0f us",
+            "queue_wait=%.0f us persist_tick=%.0f us edge=%.0f us",
             self.prefill_save_us_per_token, self.full_prefill_us,
             self.pause_penalty_us, self.queue_wait_us, self.persist_tick_us,
+            self.edge_us,
         )
 
     @staticmethod
@@ -174,6 +191,7 @@ class SGLangPressureAdapter(EnginePressureAdapter):
         snapshot: dict,
         kv_consec: int,
         mamba_consec: int,
+        edge_active: bool = False,
     ) -> PressureSignals:
         evicted_tokens = self._to_int(snapshot.get("num_evicted_tokens_recent", 0))
         retracted = self._to_int(snapshot.get("num_retracted_reqs", 0))
@@ -190,6 +208,7 @@ class SGLangPressureAdapter(EnginePressureAdapter):
             paused_us=paused * self.pause_penalty_us,
             queue_us=queued * self.queue_wait_us,
             persist_us=max_consec * self.persist_tick_us,
+            edge_us=self.edge_us if edge_active else 0.0,
         )
 
 
