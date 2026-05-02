@@ -85,6 +85,21 @@ class CrossPoolPolicyConfig:
     # this, edge-trigger mode would only check at state transitions and
     # miss steady-state pressure that built up after the initial cross.
     nb_persist_eval_period: int = 10
+    # Hysteresis Δ on the both-pools-ABOVE_HIGH branch: when both are
+    # saturated, fire toward the less-saturated pool only if the
+    # |usage_kv - usage_mamba| gap exceeds this margin. Prevents
+    # oscillation when both pools sit at near-equal pressure.
+    hysteresis_delta: float = 0.05
+    # Both-above branch tight activation gate (fix#37 v2 — prevents
+    # oscillation on workloads where both pools are merely "high" but
+    # neither is truly binding). Must satisfy:
+    #   max(usage_kv, usage_mamba) >= both_above_max_threshold AND
+    #   |usage_kv - usage_mamba|       >= both_above_min_gap.
+    # Without these, fire toggles direction every persist period as the
+    # gap reverses sign post-fire (each fire shifts capacity by ~10-20%
+    # in usage units, exceeding hysteresis_delta=0.05).
+    both_above_max_threshold: float = 0.95
+    both_above_min_gap: float = 0.20
 
 
 def _policy_from_env() -> CrossPoolPolicyConfig:
@@ -107,6 +122,9 @@ def _policy_from_env() -> CrossPoolPolicyConfig:
         nb_chunk_cost_us=float(os.environ.get("SGLANG_XPOOL_NB_CHUNK_COST_US", "5000")),
         nb_margin=float(os.environ.get("SGLANG_XPOOL_NB_MARGIN", "1.5")),
         nb_persist_eval_period=int(os.environ.get("SGLANG_XPOOL_NB_PERSIST_EVAL_PERIOD", "10")),
+        hysteresis_delta=float(os.environ.get("SGLANG_XPOOL_HYSTERESIS_DELTA", "0.05")),
+        both_above_max_threshold=float(os.environ.get("SGLANG_XPOOL_BOTH_ABOVE_MAX", "0.95")),
+        both_above_min_gap=float(os.environ.get("SGLANG_XPOOL_BOTH_ABOVE_GAP", "0.20")),
     )
 
 
@@ -357,6 +375,70 @@ class CrossPoolPlanner:
                                 usage_mamba=usage_mamba,
                                 queue_depth=queue_depth,
                             )
+
+                    # Both pools ABOVE_HIGH simultaneously: the binding
+                    # pool is the one with HIGHER usage. The persist re-
+                    # eval branches above only fire when exactly one is
+                    # ABOVE_HIGH; without this both-pools branch, a
+                    # post-fire over-shrink that lifts the destination
+                    # pool above HIGH alongside an already-saturating
+                    # source pool leaves both saturated and the planner
+                    # stuck (paper §design-l2-firegate Lagrange
+                    # equalization: arbitrate toward the larger marginal
+                    # value).
+                    #
+                    # Tight activation gate: only fire when one pool is
+                    # actually saturated (max usage ≥ both_above_max_threshold,
+                    # default 0.95) AND the gap exceeds both_above_min_gap
+                    # (default 0.20). The proxy V'_σ ≈ usage_σ saturates
+                    # at high usage; firing on small post-fire gap with
+                    # both pools merely "high" (e.g., 0.6/0.8) leads to
+                    # ping-pong because each fire shifts capacity by
+                    # ~10-20% which immediately reverses the gap. Tight
+                    # gate restricts this branch to the "one pool truly
+                    # binding" regime where Lagrange equalization is
+                    # well-defined under the proxy.
+                    both_above = (new_kv == self.ABOVE_HIGH
+                                  and new_mamba == self.ABOVE_HIGH)
+                    long_persist = (kv_consec >= period
+                                    and (kv_consec % period) == 0
+                                    and mamba_consec >= period)
+                    max_u = max(usage_kv, usage_mamba)
+                    truly_binding = max_u >= c.both_above_max_threshold
+                    if both_above and long_persist and truly_binding:
+                        gap = usage_kv - usage_mamba
+                        if abs(gap) >= c.both_above_min_gap:
+                            ok, why = self._net_benefit_ok(
+                                snapshot, kv_consec, mamba_consec,
+                                edge_active=edge_active,
+                            )
+                            if ok:
+                                self._cooldown_remaining = c.cooldown_ticks
+                                if gap > 0:
+                                    direction = "mamba_to_kv"
+                                    reason_head = (
+                                        f"persist (both above): kv "
+                                        f"({usage_kv:.2f}) > mamba "
+                                        f"({usage_mamba:.2f}) by "
+                                        f"{gap:+.2f} > Δ="
+                                        f"{c.hysteresis_delta}; relieve KV"
+                                    )
+                                else:
+                                    direction = "kv_to_mamba"
+                                    reason_head = (
+                                        f"persist (both above): mamba "
+                                        f"({usage_mamba:.2f}) > kv "
+                                        f"({usage_kv:.2f}) by "
+                                        f"{-gap:+.2f} > Δ="
+                                        f"{c.hysteresis_delta}; relieve mamba"
+                                    )
+                                return PlanDecision(
+                                    direction=direction,
+                                    reason=f"{reason_head} [{why}]",
+                                    usage_kv=usage_kv,
+                                    usage_mamba=usage_mamba,
+                                    queue_depth=queue_depth,
+                                )
                 return PlanDecision(
                     direction=None,
                     reason=f"edge: stable kv={new_kv} mamba={new_mamba} "

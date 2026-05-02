@@ -601,6 +601,14 @@ class BudgetAgent:
         # land in `_capped_pages`. After this, the only "in_use_above"
         # pages are slot ids genuinely held by active in-flight
         # requests; drain check correctly waits for those.
+        # Pre-fire: flush tree_cache entries on the SHRINKING pool's
+        # side. Without this, drain inspector sees in-flight reqs as
+        # the only "above-cap" holders, but tree_cache snapshot nodes
+        # quietly hold pool slots above new_cap and the actuator's
+        # cuMemUnmap kills bytes the cache still references on the next
+        # cache-hit. Symmetric handling for both directions: kv_to_mamba
+        # evicts the FULL (paged-attention KV) side; mamba_to_kv evicts
+        # the MAMBA (recurrent state snapshot) side.
         if self._tree_cache is not None and decision.direction == "kv_to_mamba":
             try:
                 # MambaRadixCache (the hybrid SGLang prefix cache) splits
@@ -627,6 +635,24 @@ class BudgetAgent:
                 import traceback
                 logger.warning(
                     "Pre-fire tree_cache flush failed: %r\n%s",
+                    e, traceback.format_exc(),
+                )
+                snapshot["xpool_pre_fire_evicted_error"] = repr(e)
+        elif self._tree_cache is not None and decision.direction == "mamba_to_kv":
+            try:
+                tc = self._tree_cache
+                mamba_evictable = (
+                    tc.mamba_evictable_size()
+                    if hasattr(tc, "mamba_evictable_size")
+                    else 0
+                )
+                if mamba_evictable > 0 and hasattr(tc, "evict_mamba"):
+                    tc.evict_mamba(mamba_evictable)
+                    snapshot["xpool_pre_fire_evicted_mamba"] = mamba_evictable
+            except Exception as e:  # noqa
+                import traceback
+                logger.warning(
+                    "Pre-fire mamba tree_cache flush failed: %r\n%s",
                     e, traceback.format_exc(),
                 )
                 snapshot["xpool_pre_fire_evicted_error"] = repr(e)

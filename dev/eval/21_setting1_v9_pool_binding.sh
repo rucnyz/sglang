@@ -49,7 +49,22 @@ if [ "$ONLY_L1" = "1" ]; then
   fi
 fi
 if [ "$ONLY_L2" = "1" ]; then
-  extra_env="$extra_env SGLANG_ARENA_SHARED=1 SGLANG_ARENA_FROM_BLOB=1 SGLANG_ARENA_CHUNK_BYTES=1073741824 SGLANG_BUDGETER=1 SGLANG_BUDGETER_XPOOL_PLANNER=1 SGLANG_BUDGETER_XPOOL_COORDINATED=1 SGLANG_BUDGETER_TICK_S=2.0 SGLANG_BUDGETER_LOG=$OUT_DIR/${cell}_budgeter.jsonl SGLANG_XPOOL_KV_HIGH=0.04 SGLANG_XPOOL_KV_LOW=0.015 SGLANG_XPOOL_MAMBA_HIGH=0.08 SGLANG_XPOOL_MAMBA_LOW=0.03 SGLANG_XPOOL_COOLDOWN=2"
+  # Chunk size: 256 MiB default. 1 GiB was too coarse — at the
+  # paper's per-pool budget per sub-pool (~780 MB on Qwen3.5-35B-A3B
+  # KV at mem-fraction-static=0.7), 1 GiB chunks make init_chunks=
+  # static_min=1 per sub-pool and the actuator has no shrink headroom
+  # (every fire skipped src_at_static_min). 256 MiB gives each KV
+  # sub-pool ~3 init chunks, enough for the budgeter to actually
+  # shrink under the drain-protocol invariants.
+  chunk_bytes=${SGLANG_ARENA_CHUNK_BYTES:-$((256*1024*1024))}
+  # Threshold defaults match the original v9 binding-shift trace; can be
+  # overridden from the wrapper's environment (e.g., to test the
+  # paper-faithful symmetric KV_HIGH=MAMBA_HIGH=0.5 regime).
+  kv_hi=${SGLANG_XPOOL_KV_HIGH:-0.04}
+  kv_lo=${SGLANG_XPOOL_KV_LOW:-0.015}
+  m_hi=${SGLANG_XPOOL_MAMBA_HIGH:-0.08}
+  m_lo=${SGLANG_XPOOL_MAMBA_LOW:-0.03}
+  extra_env="$extra_env SGLANG_ARENA_SHARED=1 SGLANG_ARENA_FROM_BLOB=1 SGLANG_ARENA_CHUNK_BYTES=$chunk_bytes SGLANG_BUDGETER=1 SGLANG_BUDGETER_XPOOL_PLANNER=1 SGLANG_BUDGETER_XPOOL_COORDINATED=1 SGLANG_BUDGETER_TICK_S=2.0 SGLANG_BUDGETER_LOG=$OUT_DIR/${cell}_budgeter.jsonl SGLANG_XPOOL_KV_HIGH=$kv_hi SGLANG_XPOOL_KV_LOW=$kv_lo SGLANG_XPOOL_MAMBA_HIGH=$m_hi SGLANG_XPOOL_MAMBA_LOW=$m_lo SGLANG_XPOOL_COOLDOWN=2"
   # Paper §design-l2: when SGLANG_ARENA_SHARED=1, the engine boots
   # both pools at full init capacity and sets static_min=1 chunk per
   # sub-pool (the actuator floor below which drain protocol won't
@@ -63,10 +78,12 @@ echo "=== cell=$cell ($extra_env) ==="
 pkill -f "launch_server.*--port $PORT" 2>/dev/null || true
 sleep 6
 
-# L2-on cells need extra GPU headroom for arena/budgeter mappings;
-# drop mem-fraction-static to 0.7 when L2 is enabled.
-mem_frac="0.8"
-if [ "$ONLY_L2" = "1" ]; then mem_frac="0.7"; fi
+# Apples-to-apples: keep mem-fraction-static identical across cells
+# so the L1-only / L1+L2 comparison isn't confounded by a 14 GB
+# difference in KV pool budget. Under the new opportunistic-drain
+# path the arena reserves VA only (no extra HBM), so L2 cells run
+# fine at 0.8 too. Override with MEM_FRAC if needed.
+mem_frac="${MEM_FRAC:-0.8}"
 
 nohup env $extra_env \
   .venv/bin/python -m sglang.launch_server \

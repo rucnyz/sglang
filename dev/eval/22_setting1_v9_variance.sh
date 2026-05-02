@@ -31,7 +31,8 @@ for trial in $(seq 1 $N_TRIALS); do
     echo "=========================================================="
     ONLY_L1=$L1 ONLY_L2=$L2 \
       CUDA_VISIBLE_DEVICES=$GPU PORT=$port OUT_DIR="$out_dir" \
-      SGLANG_K_BIG_AUTO_THRESHOLD=0.5 \
+      SGLANG_K_BIG_AUTO_THRESHOLD=${SGLANG_K_BIG_AUTO_THRESHOLD:-0.85} \
+      MEM_FRAC=${MEM_FRAC:-0.8} \
       bash dev/eval/21_setting1_v9_pool_binding.sh \
       2>&1 | tee "$out_dir/runner.log" || echo "[v9-variance] $cell trial$trial FAILED"
   done
