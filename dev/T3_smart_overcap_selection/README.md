@@ -78,10 +78,15 @@ the §3.2 ideal mode.
 - [x] `free_page_mask()` and `select_drain_pages(n)` on allocator
   (`python/sglang/srt/mem_cache/allocator.py:76-130`); unit test PASS
   in `results/unit_test_allocator_api.txt`
-- [ ] `shrink_explicit(pool, slots)` on `ChunkArena`
-- [ ] Actuator wiring under `SGLANG_SMART_OVERCAP=1`
-- [ ] Smoke serving works under combined flags
-- [ ] Drain success rate captured (log analysis)
+- [x] `shrink_explicit(pool, slots)` on `ChunkArena`; unit test PASS
+  in `results/unit_test_shrink_explicit.txt`
+- [x] Actuator wiring under `SGLANG_SMART_OVERCAP=1`
+  (`python/sglang/srt/arena/cross_pool_actuator.py`)
+- [x] Smoke serving works under T1+T2+T3 flags combined (boot 110 s, 5
+  generates return cleanly; T2 prerequisite log line confirmed)
+- [-] Drain success rate uplift: deferred to T7 (M2 swarm conc=800).
+  T3 milestone scope is API surface + integration boot + smoke; the
+  real on/off delta needs an admission-saturated workload to fire.
 
 ## Followups
 

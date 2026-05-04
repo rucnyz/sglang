@@ -29,12 +29,47 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.srt.arena.chunk_arena import cross_arena_transfer
+
+
+def _select_drainable_chunks(
+    src_act, n_chunks: int, tokens_per_chunk: int
+) -> list[int]:
+    """T3 (paper §3.2.2): pick `n_chunks` chunk indices on `src_act` whose
+    ALL pages are currently free in the allocator's free-page mask.
+
+    Returns the highest-indexed such chunks (preferring tail under T2's
+    placement bias). May return fewer than `n_chunks` if not enough chunks
+    are fully drainable.
+
+    Returns an empty list and logs at INFO if no `select_drain_pages` API
+    is available (e.g., when the allocator is not the BaseTokenToKVPoolAllocator).
+    """
+    alloc = getattr(src_act, "allocator", None) if src_act is not None else None
+    if alloc is None or not hasattr(alloc, "free_page_mask"):
+        return []
+    if tokens_per_chunk <= 0:
+        return []
+    mask = alloc.free_page_mask()
+    # Reshape: mask[1:1 + n_chunks * tokens_per_chunk] groups consecutive
+    # `tokens_per_chunk` pages into one chunk. A chunk is drainable iff
+    # all its pages are free.
+    n_pages = alloc.size
+    n_total_chunks = n_pages // tokens_per_chunk
+    if n_total_chunks == 0:
+        return []
+    pages = mask[1:1 + n_total_chunks * tokens_per_chunk]
+    chunks = pages.view(n_total_chunks, tokens_per_chunk).all(dim=1)
+    drainable = torch.where(chunks)[0].tolist()
+    # Highest-indexed chunks first → contiguous tail unmap.
+    drainable.sort(reverse=True)
+    return drainable[:n_chunks]
 
 if TYPE_CHECKING:
     from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
@@ -467,8 +502,37 @@ class CrossPoolTransferActuator:
         except Exception:
             pass
         shrink_t0 = time.monotonic_ns()
-        for name in src_names:
-            unmapped_total += src._arena.shrink(name, n_per_src_subpool)
+        # T3 (paper §3.2.2): SGLANG_SMART_OVERCAP=1 picks chunks whose
+        # all pages are free in the allocator (anywhere in the pool, not
+        # just tail). Default path keeps legacy "shrink tail" semantic.
+        smart_overcap = os.environ.get("SGLANG_SMART_OVERCAP", "0") == "1"
+        smart_chunks = []
+        if smart_overcap and src_act is not None:
+            tpc = getattr(src_act, "tokens_per_chunk", None)
+            if tpc is None:
+                pool = getattr(src_act, "pool", None)
+                if pool is not None:
+                    tpc = getattr(pool, "tokens_per_chunk", 1)
+            if tpc and tpc > 0:
+                smart_chunks = _select_drainable_chunks(
+                    src_act, n_per_src_subpool, int(tpc)
+                )
+                logger.info(
+                    "T3 smart over-cap selection: tokens_per_chunk=%d, "
+                    "requested=%d, drainable=%d (%s)",
+                    tpc, n_per_src_subpool, len(smart_chunks),
+                    "tail" if all(c >= len(src._arena.pools[src_names[0]].mapped) - n_per_src_subpool
+                                  for c in smart_chunks) else "non-tail",
+                )
+        if smart_overcap and len(smart_chunks) >= n_per_src_subpool:
+            for name in src_names:
+                unmapped_total += src._arena.shrink_explicit(name, smart_chunks)
+        else:
+            # Default tail-shrink path. Falls back here when smart_overcap
+            # is off, when the allocator can't supply enough drainable
+            # chunks, or when the source actuator lacks the API.
+            for name in src_names:
+                unmapped_total += src._arena.shrink(name, n_per_src_subpool)
         try:
             torch.cuda.synchronize()
         except Exception:

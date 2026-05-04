@@ -394,6 +394,37 @@ class ChunkArena:
             unmapped += 1
         return unmapped
 
+    def shrink_explicit(self, pool_name: str, slot_indices) -> int:
+        """T3 (paper §3.2.2): unmap a caller-specified list of slot indices.
+
+        Replaces the implicit "tail" assumption of `shrink()`. The caller
+        (typically the actuator, which has consulted the spec's
+        allocator via `select_drain_pages`) supplies which slots to
+        unmap, freeing the chunk_arena from any per-pool drainability
+        knowledge.
+
+        Returns: number actually unmapped. Slots that aren't currently
+        mapped (None in pool.mapped) are skipped silently.
+
+        slot_indices: any iterable of int (e.g., list, torch.Tensor).
+        """
+        pool = self.pools[pool_name]
+        # Accept torch.Tensor by converting to a Python list of ints.
+        if hasattr(slot_indices, "tolist"):
+            slots = [int(s) for s in slot_indices.tolist()]
+        else:
+            slots = [int(s) for s in slot_indices]
+        unmapped = 0
+        for slot in slots:
+            if slot < 0 or slot >= pool.n_slots:
+                continue
+            if pool.mapped[slot] is None:
+                continue
+            handle_idx = self._unmap_slot(pool, slot)
+            self._free_handles.append(handle_idx)
+            unmapped += 1
+        return unmapped
+
     def transfer_chunks(self, from_pool: str, to_pool: str, n: int) -> int:
         """Move n physical handles from `from_pool` to `to_pool`.
 
