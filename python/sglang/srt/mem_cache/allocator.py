@@ -79,6 +79,64 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         cap = getattr(self, "_cap", None)
         return cap if cap is not None else self.size
 
+    def free_page_mask(self) -> torch.Tensor:
+        """T3 (paper §3.2.2): return a boolean tensor of length `self.size + 1`
+        with True at indices currently free (in `free_pages`, not held by
+        any in-flight request, not in `release_pages`). Index 0 is the
+        reserved-sentinel slot and is always False.
+
+        Used by the actuator to pick which slots to unmap when shrinking
+        the pool — replaces the assumption that the highest-VA slots are
+        free with an explicit query of allocator state.
+
+        Note: page indices in this allocator run 1..size (slot 0 is a
+        dummy sentinel for padded-output writes); the mask matches that
+        convention.
+        """
+        mask = torch.zeros(self.size + 1, dtype=torch.bool, device=self.device)
+        if self.free_pages is not None and self.free_pages.numel() > 0:
+            mask[self.free_pages] = True
+        # release_pages also count as free for drain purposes — they
+        # are released-but-not-yet-merged, no live req holds them.
+        if self.release_pages is not None and self.release_pages.numel() > 0:
+            mask[self.release_pages] = True
+        return mask
+
+    def select_drain_pages(self, n: int, prefer: str = "high") -> torch.Tensor:
+        """T3 (paper §3.2.2): return up to `n` page indices that are
+        currently free, suitable for cuMemUnmap.
+
+        `prefer="high"`: pick the highest-indexed free pages — under T2's
+        placement bias (live blocks at low indices), the high tail is
+        most likely contiguously free, letting the actuator batch the
+        unmap into a single VA range.
+
+        `prefer="low"`: opposite preference; useful only for tests.
+
+        Returns a 1-D int64 tensor with length min(n, available_free).
+        Caller is responsible for verifying drain readiness for each
+        returned index (via in-flight slot inspector); this function
+        only checks allocator-side state.
+        """
+        if n <= 0:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        candidates = []
+        if self.free_pages is not None and self.free_pages.numel() > 0:
+            candidates.append(self.free_pages)
+        if self.release_pages is not None and self.release_pages.numel() > 0:
+            candidates.append(self.release_pages)
+        if not candidates:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        all_free = torch.cat(candidates)
+        sorted_free, _ = torch.sort(all_free)
+        if prefer == "high":
+            return sorted_free[-n:].to(torch.int64) if sorted_free.numel() > n \
+                else sorted_free.to(torch.int64)
+        elif prefer == "low":
+            return sorted_free[:n].to(torch.int64)
+        else:
+            raise ValueError(f"unknown prefer={prefer!r}")
+
     def set_capacity_pages(self, n_pages: int) -> None:
         """Restrict the allocator to only hand out pages with id <= n_pages.
 
