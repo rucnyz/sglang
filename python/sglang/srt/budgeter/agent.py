@@ -126,6 +126,14 @@ class BudgetAgent:
         self.xpool_planner_enabled = _env_flag("SGLANG_BUDGETER_XPOOL_PLANNER", False)
         self._xpool_planner = None  # lazy-built on first tick
 
+        # T6 (paper §3.2.4): admission-time fire enable.
+        self.admission_time_fire_enabled = _env_flag(
+            "SGLANG_ADMISSION_TIME_FIRE", False
+        )
+        # Single in-flight emergency fire at a time — avoids the same
+        # admission event triggering N parallel actuator calls.
+        self._emergency_fire_in_progress = False
+
         if self.enabled:
             try:
                 self._log_fp = open(self.log_path, "a", buffering=1)
@@ -136,6 +144,15 @@ class BudgetAgent:
                 "BudgetAgent enabled (actuate=%s, tick=%.1fs, log=%s, pid=%d)",
                 self.actuate_enabled, self.tick_interval_s, self.log_path, os.getpid(),
             )
+            # Register process-singleton so admission-time hooks can
+            # find the agent without restructuring tree_cache.
+            from sglang.srt.budgeter import _set_budget_agent_singleton
+            _set_budget_agent_singleton(self)
+            if self.admission_time_fire_enabled:
+                logger.info(
+                    "T6 admission-time fire enabled — admission gate may "
+                    "trigger cross-pool transfers on demand"
+                )
 
     # ---- Public API used from scheduler.event_loop_* ----
 
@@ -307,6 +324,38 @@ class BudgetAgent:
             kv_probe is not None, mamba_probe is not None,
         )
 
+    def _estimate_post_fire_mamba_cap(self) -> int:
+        """Predict the mamba-pool slot cap immediately after a
+        successful mamba_to_kv fire of the configured unit size.
+        Used by the pre-fire flush to compute the slot threshold for
+        slot-id-targeted eviction. Returns 0 if the actuator has no
+        mamba state (in which case targeted flush degrades to no-op).
+        """
+        try:
+            actuator = self._xpool_actuator
+            if actuator is None:
+                return 0
+            mamba_act = actuator.mamba_actuator
+            if mamba_act is None or not hasattr(mamba_act, "pool"):
+                return 0
+            current_cap = mamba_act.live_capacity_tokens()
+            unit = self._xpool_planner.config.dst_chunks_per_action
+            n_mamba = actuator.n_mamba_subpools
+            n_kv = actuator.n_kv_subpools
+            # mamba_to_kv shrinks src (mamba) by the dst-anchored amount
+            # divided by the src/dst sub-pool ratio. Per actuator code:
+            # n_per_src_subpool = ceil(unit * n_kv / n_mamba)
+            n_per_src = max(1, (unit * n_kv + n_mamba - 1) // n_mamba)
+            mamba_pool = mamba_act.pool
+            tokens_per_chunk = max(
+                1, getattr(mamba_pool, "size", 384) // max(1,
+                    getattr(actuator, "_init_chunks_per_pool", 3))
+            )
+            shrink_tokens = n_per_src * tokens_per_chunk
+            return max(1, current_cap - shrink_tokens)
+        except Exception:
+            return 0
+
     def _make_kv_live_slot_inspector(self):
         """Returns callable(new_cap_pages: int) -> int: count of in-flight
         KV slot ids strictly greater than new_cap_pages across all running
@@ -463,6 +512,63 @@ class BudgetAgent:
         snapshot["xpool_mamba_capacity_tokens"] = stats["mamba_capacity_tokens"]
         snapshot["xpool_free_handles"] = stats["free_after_grow"]
 
+    def try_admission_time_fire(
+        self,
+        direction: str = "rec_to_kv",
+        n_chunks: int = 1,
+    ) -> bool:
+        """T6 (paper §3.2.4): on-demand cross-pool fire from the admission
+        gate. Skips the 30 s cooldown and hysteresis (the request-side
+        wait penalty has already exceeded those by construction — paper
+        Eq.~\\ref{eq:nb-direction-gate}).
+
+        Returns True iff a fire was actually committed (bytes moved).
+        Safe to call from the scheduler hot path; no-op when:
+          - SGLANG_ADMISSION_TIME_FIRE=0 (default)
+          - actuator not wired (xpool_planner_enabled=False)
+          - another emergency fire is already in flight on this thread
+          - cross-pool slack is insufficient (planner declines)
+
+        `direction` is "kv_to_rec" or "rec_to_kv". `n_chunks` is the
+        size of the requested transfer in chunks.
+        """
+        if not self.admission_time_fire_enabled:
+            return False
+        if not self.xpool_planner_enabled:
+            return False
+        if self._emergency_fire_in_progress:
+            return False  # Reentrancy guard
+        self._emergency_fire_in_progress = True
+        try:
+            self._ensure_xpool_actuator()
+            if self._xpool_actuator is None:
+                return False
+            if direction == "kv_to_rec":
+                stats = self._xpool_actuator.kv_to_mamba_chunks(n_chunks)
+            elif direction == "rec_to_kv":
+                stats = self._xpool_actuator.mamba_to_kv_chunks(n_chunks)
+            else:
+                logger.warning(
+                    "try_admission_time_fire: unknown direction %r", direction
+                )
+                return False
+            unmapped = stats.get("unmapped_total", 0) if stats else 0
+            granted = stats.get("granted_total", 0) if stats else 0
+            committed = unmapped > 0 and granted > 0
+            logger.info(
+                "T6 admission-time fire: dir=%s n=%d committed=%s "
+                "unmapped=%d granted=%d",
+                direction, n_chunks, committed, unmapped, granted,
+            )
+            return committed
+        except Exception as e:
+            logger.warning(
+                "try_admission_time_fire failed: %r", e, exc_info=True
+            )
+            return False
+        finally:
+            self._emergency_fire_in_progress = False
+
     def _maybe_xpool_planner(self, snapshot: dict) -> None:
         """Phase 2e.5.6.3.c: planner-driven cross-pool transfers.
 
@@ -498,6 +604,7 @@ class BudgetAgent:
 
         usage_kv_inst = 0.0
         usage_mamba_inst = 0.0
+        usage_mamba_active_inst = 0.0
         if alloc is not None:
             live = getattr(alloc, "live_size", alloc.size)
             avail = alloc.available_size()
@@ -508,6 +615,31 @@ class BudgetAgent:
             ms_avail = mamba_pool.available_size()
             if ms_live > 0:
                 usage_mamba_inst = max(0.0, min(1.0, (ms_live - ms_avail) / ms_live))
+            # Active-slot count: 1 per running req via req.mamba_pool_idx.
+            # The MambaPool's available_size() doesn't distinguish active
+            # slots from snapshot slots (radix-tree-cached states); both
+            # consume `free_slots`. For the saturation guard we want the
+            # admission-gating signal (active slots), not the cache-fill
+            # signal (snapshots), because shrinking the cache-snapshot
+            # side is cheap (eats c_m × P_loss in NB) while shrinking
+            # active slots forces queueing breakdown.
+            try:
+                active_count = 0
+                rb = getattr(sched, "running_batch", None)
+                if rb is not None:
+                    for r in (getattr(rb, "reqs", None) or []):
+                        mi = getattr(r, "mamba_pool_idx", None)
+                        if mi is None:
+                            continue
+                        active_count += 1
+                if ms_live > 0:
+                    usage_mamba_active_inst = max(
+                        0.0, min(1.0, active_count / float(ms_live))
+                    )
+            except Exception:
+                # Conservative fallback: assume same as total usage so the
+                # guard's behavior is never worse than the pre-split path.
+                usage_mamba_active_inst = usage_mamba_inst
 
         # Exponential decay for peak tracking. Per-tick decay; with
         # 0.5s tick and decay=0.6, half-life ~1 tick (0.5s) — fast enough
@@ -523,6 +655,14 @@ class BudgetAgent:
         usage_mamba = self._xpool_peak_mamba
         snapshot["xpool_plan_usage_kv_inst"] = usage_kv_inst
         snapshot["xpool_plan_usage_mamba_inst"] = usage_mamba_inst
+        # Mamba active-slot usage: admission-gate signal, distinct from
+        # total mamba pool fill (which includes radix-tree snapshots).
+        # Used by NB direction-aware gate's saturation guard so that
+        # m2k fires aren't blocked by a snapshot-saturated mamba pool
+        # whose active-slot count is well below high-water (snapshots
+        # can be evicted cheaply by the radix tree's own LRU).
+        snapshot["xpool_plan_usage_mamba_active_inst"] = usage_mamba_active_inst
+        snapshot["usage_mamba_active"] = usage_mamba_active_inst
 
         # S_edge phase-transition signal (paper §design-l2-actuator).
         # Maintain low-pass EMA of the two pools' usage and compute the
@@ -646,9 +786,41 @@ class BudgetAgent:
                     if hasattr(tc, "mamba_evictable_size")
                     else 0
                 )
-                if mamba_evictable > 0 and hasattr(tc, "evict_mamba"):
-                    tc.evict_mamba(mamba_evictable)
-                    snapshot["xpool_pre_fire_evicted_mamba"] = mamba_evictable
+                # Mamba-side pre-fire flush. Goal: clear refcount-0
+                # snapshot nodes whose slot id falls in the over-cap
+                # range so the actuator's drain inspector can commit
+                # the cuMemUnmap. Two regressions to avoid:
+                #   (1) Greedy generic eviction (mamba_evictable_size
+                #       across the whole pool) wipes the multi-turn
+                #       prefix cache and regresses steady-state TTFT
+                #       (v5 measurement: -16% TPS).
+                #   (2) Capped generic eviction (small N, LRU/HPB
+                #       order) preserves cache but only stochastically
+                #       hits the over-cap range; drain rarely passes
+                #       (v6 measurement: 1 fire_w_mv per cell, neutral).
+                # Right answer: targeted eviction — evict only nodes
+                # whose mamba slot id exceeds the new cap. Falls back
+                # to capped generic eviction on engines/tree-caches
+                # that don't expose the targeted API.
+                if mamba_evictable > 0:
+                    # Compute new mamba cap (in slots) from current
+                    # actuator state; fire will shrink to this.
+                    new_cap_slots = self._estimate_post_fire_mamba_cap()
+                    flush_cap = int(os.environ.get(
+                        "SGLANG_XPOOL_MAMBA_FLUSH_CAP", "256"
+                    ))
+                    if hasattr(tc, "evict_mamba_above_slot"):
+                        evicted = tc.evict_mamba_above_slot(
+                            new_cap_slots, max_to_evict=flush_cap,
+                        )
+                        snapshot["xpool_pre_fire_evicted_mamba"] = evicted
+                        snapshot["xpool_pre_fire_mamba_evictable_total"] = mamba_evictable
+                        snapshot["xpool_pre_fire_mamba_threshold"] = new_cap_slots
+                    elif hasattr(tc, "evict_mamba"):
+                        to_evict = min(mamba_evictable, flush_cap)
+                        tc.evict_mamba(to_evict)
+                        snapshot["xpool_pre_fire_evicted_mamba"] = to_evict
+                        snapshot["xpool_pre_fire_mamba_evictable_total"] = mamba_evictable
             except Exception as e:  # noqa
                 import traceback
                 logger.warning(
@@ -680,6 +852,21 @@ class BudgetAgent:
             snapshot["xpool_shrink_us"] = stats["shrink_us"]
             snapshot["xpool_grow_us"] = stats["grow_us"]
             snapshot["xpool_fire_total_us"] = stats["fire_total_us"]
+            # Runtime self-calibration (paper §sec:design-l2-firegate):
+            # feed the observed wall-time into the process-wide EWMA so
+            # the next gate evaluation sees the live-traffic actuator
+            # cost instead of the conservative cold-start initial.
+            n_chunks = max(1, int(stats.get("granted_total", 0)) or
+                              int(stats.get("unmapped_total", 0)) or
+                              int(unit))
+            try:
+                from sglang.srt.budgeter.cost_model import get_runtime_actuator_cost
+                get_runtime_actuator_cost().update(
+                    total_us=float(stats["fire_total_us"]),
+                    n_chunks=n_chunks,
+                )
+            except Exception:
+                pass
         if "skipped" in stats:
             snapshot["xpool_skipped"] = stats["skipped"]
 
@@ -793,6 +980,65 @@ class BudgetAgent:
         else:
             snap["num_evicted_tokens_recent"] = 0
             snap["num_evicted_tokens_cumulative"] = 0
+
+        # Pool-fill metrics (paper §motivation, Figure
+        # bubble_two_workloads): (pool.size - pool.available_size()) /
+        # pool.size INCLUDES radix-tree-cached prefix/snapshots, unlike
+        # the scheduler's `full_token_usage` / `mamba_usage` which
+        # subtract evictable size for the admission-pressure framing.
+        # Snapshot-fill is the right "real bubble" measure for the
+        # motivation figure. Computed unconditionally — does NOT depend
+        # on whether the cross-pool actuator is initialized.
+        try:
+            alloc_for_usage = getattr(sched, "token_to_kv_pool_allocator", None)
+            if alloc_for_usage is not None:
+                kv_total = getattr(alloc_for_usage, "size", 0)
+                kv_avail = alloc_for_usage.available_size()
+                if kv_total > 0:
+                    snap["pool_fill_kv"] = max(
+                        0.0, min(1.0, (kv_total - kv_avail) / kv_total)
+                    )
+            kv_pool = (
+                alloc_for_usage.get_kvcache()
+                if alloc_for_usage and hasattr(alloc_for_usage, "get_kvcache")
+                else None
+            )
+            mamba_pool = (
+                getattr(kv_pool, "mamba_pool", None) if kv_pool else None
+            )
+            if mamba_pool is not None:
+                m_total = getattr(mamba_pool, "size", 0)
+                m_avail = mamba_pool.available_size()
+                if m_total > 0:
+                    snap["pool_fill_mamba"] = max(
+                        0.0, min(1.0, (m_total - m_avail) / m_total)
+                    )
+        except Exception:
+            pass
+
+        # Stage-0 calibration consumer (paper §sec:design-l2-firegate):
+        # plumb observed mean recovery length so the SGLangPressureAdapter
+        # can evaluate c_σ(L) at the live operating point instead of using
+        # the constructor scalar. L_recover ≈ running-batch mean seq length:
+        # what a retracted-then-resumed request has to re-prefill, and
+        # within an order of magnitude what a tree-cache eviction-driven
+        # re-prefill pays per evicted prefix entry.
+        # Read DIRECTLY from running_batch.seq_lens_cpu — the stats-attribute
+        # path is unreliable on multi-turn workloads (decode_sum_seq_lens
+        # only populates on certain scheduler iterations). When the batch
+        # is empty, fall back to SGLANG_XPOOL_DEFAULT_L (4096) so the gate
+        # still has a reasonable c_σ evaluation point.
+        try:
+            running = getattr(sched, "running_batch", None)
+            seq_lens_cpu = getattr(running, "seq_lens_cpu", None) if running else None
+            if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
+                mean_L = float(seq_lens_cpu.float().mean().item())
+            else:
+                mean_L = float(os.environ.get("SGLANG_XPOOL_DEFAULT_L", "4096"))
+            snap["mean_recovery_len_kv"] = mean_L
+            snap["mean_recovery_len_retract"] = mean_L
+        except Exception:
+            pass
 
         # Phase 3.b (paper §4.2 Eq 4.4): V_prefix' marginal-value report.
         # Available on MambaRadixCache (and Hi*); other tree caches don't

@@ -281,6 +281,21 @@ def alloc_token_slots(
     backup_state: bool = False,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
+    # T6 (paper §3.2.4): admission-time cost evaluation. If the
+    # allocator's currently-mapped capacity is short of `num_tokens`
+    # AND cross-pool transfer can supply, fire the actuator NOW
+    # rather than waiting for the 30 s control tick. The hook is
+    # gated on SGLANG_ADMISSION_TIME_FIRE=1 inside the budgeter.
+    try:
+        from sglang.srt.budgeter import get_budget_agent
+        ba = get_budget_agent()
+        if ba is not None and getattr(ba, "admission_time_fire_enabled", False):
+            avail = allocator.available_size()
+            if avail < num_tokens:
+                ba.try_admission_time_fire(direction="rec_to_kv", n_chunks=1)
+    except Exception:
+        # Hot path: never break alloc on a hook failure.
+        pass
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
