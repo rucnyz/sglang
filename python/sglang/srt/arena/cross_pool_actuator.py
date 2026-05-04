@@ -125,11 +125,30 @@ def _select_drainable_chunks(
     Returns an empty list and logs at INFO if no `select_drain_pages` API
     is available (e.g., when the allocator is not the BaseTokenToKVPoolAllocator).
     """
-    alloc = getattr(src_act, "allocator", None) if src_act is not None else None
-    if alloc is None or not hasattr(alloc, "free_page_mask"):
-        return []
+    if src_act is None:
+        return []  # No actuator → no fire is a legitimate state.
+    alloc = getattr(src_act, "allocator", None)
+    if alloc is None:
+        return []  # Pool without a separate allocator (e.g., raw mamba) — caller falls back.
+    if not hasattr(alloc, "free_page_mask"):
+        # T7 cleanup: this used to silently return [] here. That hides
+        # a wiring bug — every BaseTokenToKVPoolAllocator gets the API
+        # via T3 part 1. If we land here, somebody has a non-standard
+        # allocator and the smart-overcap path can't act on it.
+        raise RuntimeError(
+            "_select_drainable_chunks: allocator lacks free_page_mask. "
+            "T3 (paper §3.2.2) added this method on "
+            "BaseTokenToKVPoolAllocator; this code path implies a "
+            "non-standard allocator. Investigate rather than silently "
+            "fall through to legacy tail-shrink."
+        )
     if tokens_per_chunk <= 0:
-        return []
+        raise ValueError(
+            f"_select_drainable_chunks: tokens_per_chunk must be > 0, "
+            f"got {tokens_per_chunk}. Caller should resolve via the "
+            f"actuator's `tokens_per_chunk` property which raises on "
+            f"missing arena."
+        )
     mask = alloc.free_page_mask()
     # Reshape: mask[1:1 + n_chunks * tokens_per_chunk] groups consecutive
     # `tokens_per_chunk` pages into one chunk. A chunk is drainable iff
@@ -591,22 +610,23 @@ class CrossPoolTransferActuator:
         smart_overcap = os.environ.get("SGLANG_SMART_OVERCAP", "0") == "1"
         smart_chunks = []
         if smart_overcap and src_act is not None:
-            tpc = getattr(src_act, "tokens_per_chunk", None)
-            if tpc is None:
-                pool = getattr(src_act, "pool", None)
-                if pool is not None:
-                    tpc = getattr(pool, "tokens_per_chunk", 1)
-            if tpc and tpc > 0:
-                smart_chunks = _select_drainable_chunks(
-                    src_act, n_per_src_subpool, int(tpc)
-                )
-                logger.info(
-                    "T3 smart over-cap selection: tokens_per_chunk=%d, "
-                    "requested=%d, drainable=%d (%s)",
-                    tpc, n_per_src_subpool, len(smart_chunks),
-                    "tail" if all(c >= len(src._arena.pools[src_names[0]].mapped) - n_per_src_subpool
-                                  for c in smart_chunks) else "non-tail",
-                )
+            # T7 cleanup: read tpc from the actuator's property only.
+            # Earlier code fell back to pool.tokens_per_chunk (which
+            # doesn't exist on KV/mamba pool objects) → silent default 1
+            # → wrong chunk indices → silent no-op fire. The actuator
+            # property now raises if the underlying arena is missing,
+            # so misconfig is loud.
+            tpc = src_act.tokens_per_chunk
+            smart_chunks = _select_drainable_chunks(
+                src_act, n_per_src_subpool, int(tpc)
+            )
+            logger.info(
+                "T3 smart over-cap selection: tokens_per_chunk=%d, "
+                "requested=%d, drainable=%d (%s)",
+                tpc, n_per_src_subpool, len(smart_chunks),
+                "tail" if all(c >= len(src._arena.pools[src_names[0]].mapped) - n_per_src_subpool
+                              for c in smart_chunks) else "non-tail",
+            )
                 # T4 (paper §3.2.3): if smart selection came up short,
                 # try to expand the drain set by atomically migrating
                 # live slots out of partial-free chunks. mamba-only at

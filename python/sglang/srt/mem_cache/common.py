@@ -286,16 +286,23 @@ def alloc_token_slots(
     # AND cross-pool transfer can supply, fire the actuator NOW
     # rather than waiting for the 30 s control tick. The hook is
     # gated on SGLANG_ADMISSION_TIME_FIRE=1 inside the budgeter.
+    #
+    # Imports stay local-to-call so SGLang installs without the
+    # budgeter package still work (defensive against env that doesn't
+    # ship sglang.srt.budgeter at all). The narrow except below catches
+    # ImportError ONLY — actual hook bugs (e.g., the agent crashes
+    # mid-fire) propagate out so we can see them, instead of silently
+    # masking exactly the kind of issue T7 caught.
     try:
         from sglang.srt.budgeter import get_budget_agent
+    except ImportError:
+        get_budget_agent = None
+    if get_budget_agent is not None:
         ba = get_budget_agent()
         if ba is not None and getattr(ba, "admission_time_fire_enabled", False):
             avail = allocator.available_size()
             if avail < num_tokens:
                 ba.try_admission_time_fire(direction="rec_to_kv", n_chunks=1)
-    except Exception:
-        # Hot path: never break alloc on a hook failure.
-        pass
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None

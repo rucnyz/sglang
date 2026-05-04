@@ -67,6 +67,30 @@ class MambaArenaActuator:
     def live_capacity_tokens(self) -> int:
         return self.live_slots
 
+    @property
+    def tokens_per_chunk(self) -> int:
+        """T7 fix (paper §3.2.2): expose tokens_per_chunk for the
+        cross_pool_actuator helper. For mamba pool one slot = one chunk
+        at page-grain VMM (T1), so this is typically 1. Raises rather
+        than silently defaulting — a missing arena means construction
+        is broken and silent fallback masks bugs.
+        """
+        arena = getattr(self.pool, "_mamba_temporal_arena", None)
+        if arena is None:
+            raise RuntimeError(
+                "MambaArenaActuator.tokens_per_chunk: pool has no "
+                "_mamba_temporal_arena. SGLANG_ARENA_SHARED must have failed "
+                "during pool construction. Don't fall back silently — fix "
+                "the wiring."
+            )
+        tpc = getattr(arena, "tokens_per_chunk", None)
+        if tpc is None:
+            raise RuntimeError(
+                "MambaArenaActuator.tokens_per_chunk: _mamba_temporal_arena "
+                "exists but lacks tokens_per_chunk."
+            )
+        return int(tpc)
+
     def cap_allocator_only(self, n_tokens: int) -> int:
         """Phase 2e.5.6.3: same contract as KVArenaActuator.cap_allocator_only.
         For MambaPool this is identical to set_capacity_tokens because
