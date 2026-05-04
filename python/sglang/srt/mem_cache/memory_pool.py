@@ -334,10 +334,33 @@ class MambaPool:
                 # The headroom is VA-only — no physical handles are
                 # allocated for [init, max), they only get mapped at
                 # transfer time. So this does NOT cost any KV/mamba budget.
-                mamba_growth_chunks = (
-                    int(os.environ.get("SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS", "4"))
-                    if shared_arena else 0
+                #
+                # T5 (paper §3.2.1): SGLANG_ARENA_MAMBA_HEADROOM_BYTES, if
+                # set, takes precedence over SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS.
+                # Default 80 GiB ensures the actuator can actually pull a
+                # peer-released ~25 GiB recurrent budget into a peer pool
+                # whose chunks are 2 MiB (T1).
+                mamba_headroom_bytes_env = os.environ.get(
+                    "SGLANG_ARENA_MAMBA_HEADROOM_BYTES",
                 )
+                if shared_arena and mamba_headroom_bytes_env is not None:
+                    mamba_growth_chunks = (
+                        int(mamba_headroom_bytes_env) // chunk_bytes
+                    )
+                elif shared_arena:
+                    # Default to 80 GiB headroom; legacy CHUNKS env still
+                    # honored for explicit overrides like "=4".
+                    legacy_chunks_env = os.environ.get(
+                        "SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS"
+                    )
+                    if legacy_chunks_env is not None:
+                        mamba_growth_chunks = int(legacy_chunks_env)
+                    else:
+                        mamba_growth_chunks = (
+                            (80 * 1024 * 1024 * 1024) // chunk_bytes
+                        )
+                else:
+                    mamba_growth_chunks = 0
                 mamba_max_tokens = (
                     tot_aligned + mamba_growth_chunks * tokens_per_chunk
                 )
@@ -570,6 +593,17 @@ class MambaPool:
         else:
             t = self.mamba_cache.temporal
             t[:, dst, ...].copy_(t[:, src, ...])
+        # Speculative-decoding: SpeculativeState adds intermediate_ssm
+        # (Tensor) + intermediate_conv_window (List[Tensor]). Without
+        # this branch, migration silently strips speculative state and
+        # the next decode reads stale data — caught by audit, not by
+        # unit test (the unit test only constructs a non-speculative
+        # State).
+        if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+            t = self.mamba_cache.intermediate_ssm
+            t[:, dst, ...].copy_(t[:, src, ...])
+            for t in self.mamba_cache.intermediate_conv_window:
+                t[:, dst, ...].copy_(t[:, src, ...])
 
         # Allocator-side state: dst removed from free_slots; src into
         # _capped_slots (NOT free_slots — its chunk is about to be
@@ -1254,10 +1288,29 @@ class MHATokenToKVPool(KVCache):
 
                 shared_pool = None
                 # See MambaPool note above: VA-only headroom for the actuator.
-                kv_growth_chunks = (
-                    int(os.environ.get("SGLANG_ARENA_KV_HEADROOM_CHUNKS", "4"))
-                    if shared_arena else 0
+                # T5 (paper §3.2.1): SGLANG_ARENA_KV_HEADROOM_BYTES takes
+                # precedence over the legacy SGLANG_ARENA_KV_HEADROOM_CHUNKS.
+                # Default 80 GiB ensures the KV pool can grow into a
+                # peer-released ~80 GiB budget at 2 MiB grain (T1).
+                kv_headroom_bytes_env = os.environ.get(
+                    "SGLANG_ARENA_KV_HEADROOM_BYTES"
                 )
+                if shared_arena and kv_headroom_bytes_env is not None:
+                    kv_growth_chunks = (
+                        int(kv_headroom_bytes_env) // chunk_bytes
+                    )
+                elif shared_arena:
+                    legacy_chunks_env = os.environ.get(
+                        "SGLANG_ARENA_KV_HEADROOM_CHUNKS"
+                    )
+                    if legacy_chunks_env is not None:
+                        kv_growth_chunks = int(legacy_chunks_env)
+                    else:
+                        kv_growth_chunks = (
+                            (80 * 1024 * 1024 * 1024) // chunk_bytes
+                        )
+                else:
+                    kv_growth_chunks = 0
                 kv_max_tokens = tot_aligned + kv_growth_chunks * tokens_per_chunk
                 if shared_arena:
                     from sglang.srt.arena.shared_pool import (

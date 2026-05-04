@@ -25,6 +25,27 @@ class _FakeMambaCache:
         )
 
 
+class _FakeSpeculativeMambaCache:
+    """Speculative-decoding stand-in: adds intermediate_ssm and
+    intermediate_conv_window. Real SpeculativeState dataclass — match
+    the field shapes the migrate_slot copies.
+    """
+    def __init__(self, n_layers, size, device):
+        self.conv = [
+            torch.zeros(n_layers, size + 1, 16, 4, dtype=torch.bfloat16, device=device)
+        ]
+        self.temporal = torch.zeros(
+            n_layers, size + 1, 8, 32, dtype=torch.bfloat16, device=device
+        )
+        # Speculative-only fields; shapes are arbitrary stand-ins.
+        self.intermediate_ssm = torch.zeros(
+            n_layers, size + 1, 4, 16, dtype=torch.bfloat16, device=device
+        )
+        self.intermediate_conv_window = [
+            torch.zeros(n_layers, size + 1, 8, 8, dtype=torch.bfloat16, device=device)
+        ]
+
+
 class _FakeMambaPool:
     """Simulates just enough MambaPool surface for migrate_slot.
 
@@ -90,6 +111,47 @@ def main():
     ok4 = pool.migrate_slot(8, 8)
     assert not ok4, f"src == dst should return False, got {ok4}"
     print("[edge: src == dst] migrate_slot returned False as expected")
+
+    # SpeculativeState path: ensure intermediate_ssm and
+    # intermediate_conv_window also get copied. Audit-found gap:
+    # earlier migrate_slot only copied conv + temporal, silently
+    # dropping speculative state.
+    spec_pool = _FakeMambaPool(size=10, device=device)
+    spec_pool.mamba_cache = _FakeSpeculativeMambaCache(4, 10, device)
+    # isinstance(self.mamba_cache, self.SpeculativeState) needs the
+    # FakeSpeculativeMambaCache to BE a SpeculativeState. Simplest: add
+    # to the real SpeculativeState class hierarchy.
+    from sglang.srt.mem_cache.memory_pool import MambaPool
+    # Patch isinstance check by setting __class__ to SpeculativeState
+    # OR by passing a real SpeculativeState. Simpler: subclass it.
+    SpecState = MambaPool.SpeculativeState
+    # Build a real SpeculativeState instance with our tensors.
+    spec_pool.mamba_cache = SpecState(
+        conv=[torch.zeros(4, 11, 16, 4, dtype=torch.bfloat16, device=device)],
+        temporal=torch.zeros(4, 11, 8, 32, dtype=torch.bfloat16, device=device),
+        intermediate_ssm=torch.zeros(4, 11, 4, 16, dtype=torch.bfloat16, device=device),
+        intermediate_conv_window=[
+            torch.zeros(4, 11, 8, 8, dtype=torch.bfloat16, device=device)
+        ],
+    )
+    # Mark slot 5 live, populate ALL state fields with known values.
+    spec_pool.free_slots = spec_pool.free_slots[spec_pool.free_slots != 5]
+    spec_pool.mamba_cache.conv[0][:, 5, :, :] = 1.5
+    spec_pool.mamba_cache.temporal[:, 5, :, :] = -2.25
+    spec_pool.mamba_cache.intermediate_ssm[:, 5, :, :] = 7.0
+    spec_pool.mamba_cache.intermediate_conv_window[0][:, 5, :, :] = -3.5
+
+    ok_spec = spec_pool.migrate_slot(5, 7)
+    assert ok_spec
+    # Verify all four fields migrated.
+    assert (spec_pool.mamba_cache.conv[0][:, 7, :, :] == 1.5).all()
+    assert (spec_pool.mamba_cache.temporal[:, 7, :, :] == -2.25).all()
+    assert (spec_pool.mamba_cache.intermediate_ssm[:, 7, :, :] == 7.0).all(), \
+        "intermediate_ssm not migrated! Speculative state corruption."
+    assert (spec_pool.mamba_cache.intermediate_conv_window[0][:, 7, :, :] == -3.5).all(), \
+        "intermediate_conv_window not migrated! Speculative state corruption."
+    print("[spec state] all 4 fields (conv, temporal, intermediate_ssm, "
+          "intermediate_conv_window) migrated correctly")
 
     print("\nT4 migrate_slot unit test PASS")
     return 0

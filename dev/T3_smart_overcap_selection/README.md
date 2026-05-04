@@ -91,6 +91,10 @@ the §3.2 ideal mode.
   under a real fire).
 - [x] **`_select_drainable_chunks` helper**: 5-case unit test covers
   all-free / partial-free / sparse-free / nothing-free / no-allocator.
+- [x] **Actuator chain end-to-end** (`test_actuator_chain.py`): drives
+  the full T3+T4 pipeline with mocked components; verifies
+  `_select_drainable_chunks → mark_pages_capped` removes the right pages
+  from the alloc free-list.
 - [-] Drain success rate uplift: deferred to T7 (M2 swarm conc=800).
   T3 milestone scope is API surface + integration boot + smoke + every
   reachable correctness invariant; the real on/off delta needs an

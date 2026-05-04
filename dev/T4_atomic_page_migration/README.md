@@ -126,6 +126,10 @@ load** is T7's job.
   - `test_migrate_slot.py` (PASS) — byte-copy + alloc state + edge cases
   - `test_expand_via_migration.py` (PASS) — 5 edge cases
 - [x] Smoke under T1+T2+T3+T4 flags (PASS, boot 110 s)
+- [x] **Actuator chain end-to-end** (`test_actuator_chain.py`,
+  shared with T3): drives `_expand_via_migration` against a fake
+  pool / migrator; verifies migration call sequence, partial-failure
+  handling, no-migrator no-op.
 - [-] Budgeter-level migrator-callback plumbing: deferred. T7's M2
   swarm validation will plumb the callback to walk
   `scheduler.running_batch` for the owning request and update

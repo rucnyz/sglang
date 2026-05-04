@@ -78,8 +78,11 @@ invariants).
 - [x] Smoke serving works under `SGLANG_ALLOCATOR_PLACEMENT_BIAS=1`
 - [x] A/B vs placement-bias-off: 20.70 s vs 20.73 s (Δ = 0.15%, noise);
   32/32 success either arm; log line confirms env override path.
-- [-] Allocation distribution histogram: deferred to T3, requires
-  per-page free-mask query that T3 will expose.
+- [x] **Direct placement-bias mechanism**: `test_placement_bias_direct.py`
+  proves bias-on alloc returns indices in sorted ascending order
+  (lowest free first); bias-off returns FIFO order (freed-back indices
+  go to tail and are handed out 50× later). Mechanism verified at
+  invariant level, not statistical workload.
 
 ## Followups
 
