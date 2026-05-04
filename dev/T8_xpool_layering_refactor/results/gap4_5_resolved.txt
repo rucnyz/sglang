@@ -1,0 +1,63 @@
+T8 gaps (4) and (5) — resolved
+=================================
+
+Gap (5) — CUDA graph invalidation around T8 fires
+--------------------------------------------------
+Re-analyzed; turned out to be addressed BY THE PROTOCOL, not requiring
+a separate hook. Reasoning:
+
+  - Captured piecewise CUDA graphs read kv_indices via runtime indexing
+    (k_buffer[kv_indices[i]]), not baked-in page-id constants.
+  - The migrate path rewrites kv_indices entries BEFORE arena.shrink_explicit
+    runs (step 3 of execute(plan), drain runs at step 2, migrate at step 3).
+  - After migrate, no active req references the about-to-be-unmapped pages.
+  - The captured graph's next replay reads kv_indices[i] → resolves to
+    fresh, head-region page-ids → reads still-mapped physical memory.
+  - mamba slots: same story via req.mamba_pool_idx (in-place updated).
+
+So no graph-invalidate hook is required. Conclusion documented; no code
+change needed for gap (5).
+
+Gap (4) — mamba migration symmetry
+-----------------------------------
+Wired:
+  - python/sglang/srt/arena/mamba_migrator.py     (~80 lines)
+      MambaPageMigrator: walks running_batch + waiting_queue to find
+      the req owning each src slot; calls MambaPool.migrate_slot;
+      updates req.mamba_pool_idx in-place. Fails loudly when:
+        * no req owns src_slot (OwnerMap walker disagrees with sched)
+        * MambaPool.migrate_slot returns False (dst not free / src==dst)
+  - python/sglang/srt/budgeter/scheduler_owner_provider.py
+      build_mamba_owner_map: real implementation. Walks
+      MambaPool.free_slots / _capped_slots / running-req
+      mamba_pool_idx. Returns OwnerMap with pool_name="mamba". If a
+      mamba radix cache holds residual slots, coverage assert trips
+      and planner refuses (safer than inventing ownership).
+  - python/sglang/srt/budgeter/agent.py
+      _ensure_t8_state now also constructs MambaPageMigrator when
+      mamba_actuator + pool are present.
+      _maybe_t8_fire dispatches direction → KV migrator or mamba
+      migrator. mamba_to_kv falls back to legacy if mamba_migrator
+      missing (e.g. pure-attention model).
+
+Tests:
+  cd /scratch/yuzhou/projects/sglang && .venv/bin/python \
+     dev/T8_xpool_layering_refactor/test/test_mamba_symmetry.py
+
+  [gap4] mamba owner map: free=6 active=2
+  [gap4] mamba owner map with capped: capped=4
+  [gap4] mamba migrate: ops=2 migrated=[(5, 1), (6, 2)]
+  [gap4] mamba migrate unknown-src correctly raised
+  [gap4] mamba migrate-failure correctly raised, req unchanged
+  T8 gap4 (mamba symmetry) test PASS
+
+Re-ran all 8 T8 test files. All PASS.
+
+Files added/modified:
+  python/sglang/srt/arena/mamba_migrator.py                NEW
+  python/sglang/srt/budgeter/scheduler_owner_provider.py   build_mamba_owner_map
+  python/sglang/srt/budgeter/agent.py                      mamba migrator wired
+  dev/T8_xpool_layering_refactor/test/test_mamba_symmetry.py
+
+Default behavior unchanged.
+Ready for step 7 (delete legacy code).

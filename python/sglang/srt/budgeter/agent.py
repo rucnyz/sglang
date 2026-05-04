@@ -298,31 +298,197 @@ class BudgetAgent:
                     "raw chunk-move path (idle-window-only).", e,
                 )
                 mamba_act = None
-        # Per-spec drain probes (paper §189-190). Each inspector walks the
-        # scheduler's live request set and returns the count of in-flight
-        # slot ids ≥ new_cap. This is the rigorous drain check the paper's
-        # spec drain protocol calls for; without it, _drain_complete's
-        # accounting can return True while a still-running req holds a
-        # slot id whose physical handle is about to be cuMemUnmap'd
-        # (cudaErrorIllegalAddress on the next kernel that touches it).
-        kv_probe = self._make_kv_live_slot_inspector()
-        mamba_probe = self._make_mamba_live_slot_inspector()
+        # T8: drain/migrate ground-truth replaces legacy spec drain probes;
+        # SchedulerOwnerProvider walks running batch + tree directly, no
+        # inspector callback needed.
         self._xpool_actuator = CrossPoolTransferActuator(
             kv_arena=kv_arena,
             mamba_arena=mamba_arena,
             shared_pool=shared,
             kv_actuator=kv_act,
             mamba_actuator=mamba_act,
-            kv_live_slot_inspector=kv_probe,
-            mamba_live_slot_inspector=mamba_probe,
         )
         logger.info(
-            "BudgetAgent xpool: actuator attached, oscillator unit=%d, "
-            "coordinated=%s (kv_act=%s, mamba_act=%s, kv_probe=%s, mamba_probe=%s)",
+            "BudgetAgent xpool: actuator attached, unit=%d, "
+            "coordinated=%s (kv_act=%s, mamba_act=%s)",
             self._xpool_unit, self.xpool_coordinated,
             kv_act is not None, mamba_act is not None,
-            kv_probe is not None, mamba_probe is not None,
         )
+
+    def _ensure_t8_state(self) -> bool:
+        """Lazily build the T8 plan-based-fire state: FirePlanner,
+        SchedulerOwnerProvider, KVPageMigrator, and a drain callback
+        that delegates to the radix tree's per-page evict.
+
+        Returns True iff state is fully wired and the T8 path can fire.
+        Returns False (and logs once) if any prerequisite is missing.
+        """
+        if getattr(self, "_t8_state", None) is not None:
+            return self._t8_state is not False
+        # Use False as a sentinel for "tried, gave up" so we don't retry.
+        self._t8_state = False
+        if self._xpool_actuator is None:
+            return False
+        if self._xpool_actuator.kv_actuator is None:
+            logger.info("T8: no kv_actuator wired — staying on legacy path")
+            return False
+        sched = self.scheduler
+        if sched is None:
+            logger.info("T8: no scheduler ref — staying on legacy path")
+            return False
+        try:
+            from sglang.srt.arena.kv_migrator import KVPageMigrator
+            from sglang.srt.arena.mamba_migrator import MambaPageMigrator
+            from sglang.srt.budgeter.fire_planner import XPoolFirePlanner
+            from sglang.srt.budgeter.scheduler_owner_provider import (
+                SchedulerOwnerProvider,
+            )
+        except ImportError as e:
+            logger.warning("T8: import failed: %r", e)
+            return False
+        provider = SchedulerOwnerProvider(sched)
+        planner = XPoolFirePlanner(
+            kv_actuator=self._xpool_actuator.kv_actuator,
+            mamba_actuator=self._xpool_actuator.mamba_actuator,
+            owner_provider=provider,
+        )
+        kv_pool = self._xpool_actuator.kv_actuator.pool
+        kv_migrator = KVPageMigrator(
+            kv_pool=kv_pool,
+            req_to_token_pool=sched.req_to_token_pool,
+            allocator=self._xpool_actuator.kv_actuator.allocator,
+        )
+        mamba_migrator = None
+        mamba_act = self._xpool_actuator.mamba_actuator
+        if mamba_act is not None:
+            mamba_pool = getattr(mamba_act, "pool", None)
+            if mamba_pool is not None:
+                mamba_migrator = MambaPageMigrator(
+                    mamba_pool=mamba_pool, scheduler=sched,
+                )
+
+        # Drain callback: evict tree nodes that own the given pages.
+        # The radix tree's evict API is keyed on the EvictParams + LRU
+        # walker; we don't have a "evict-these-specific-pages" API. The
+        # cleanest fit is to call the existing tree_cache.evict with a
+        # page-count target — sglang evicts in LRU order, which matches
+        # the planner's drain set as long as the planner picks the tail
+        # (which it does under T2 placement bias). For pages outside
+        # that LRU prefix, a follow-up version will need a per-page
+        # evict; for now we verify post-drain that all pages_to_drain
+        # actually left tree state, falling back to abort-fire if not.
+        tree_cache = sched.tree_cache
+
+        def drain_callback(pages):
+            if not pages or tree_cache is None:
+                return 0
+            try:
+                # tree_cache.evict signature differs across cache classes;
+                # all of them accept a target token count and an
+                # EvictParams-like object. We hit the lowest-common path:
+                # evict(num_tokens=len(pages)). LRU-evicting that many
+                # tokens covers the planner's drain set under T2 bias.
+                from sglang.srt.mem_cache.base_prefix_cache import (
+                    EvictParams,
+                )
+                params = EvictParams(num_tokens=len(pages))
+                tree_cache.evict(params)
+            except (ImportError, AttributeError, TypeError):
+                # Fallback for cache implementations with a simpler
+                # `evict(num_tokens)` signature.
+                try:
+                    tree_cache.evict(len(pages))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("T8 drain_callback: evict failed: %r", e)
+                    return 0
+            return len(pages)
+
+        self._t8_state = {
+            "planner": planner,
+            "provider": provider,
+            "kv_migrator": kv_migrator,
+            "mamba_migrator": mamba_migrator,
+            "drain_callback": drain_callback,
+        }
+        logger.info("T8: state wired — fires will route through execute(plan)")
+        return True
+
+    def _maybe_t8_fire(self, direction: str, unit: int, snapshot: dict):
+        """Run a fire through the T8 plan-based path. Returns a stats
+        dict in the legacy shape (so the caller's snapshot logging code
+        works unchanged), or None if the T8 path could not produce a
+        plan (caller falls back to the legacy `*_chunks(unit)` path).
+        """
+        if not self._ensure_t8_state():
+            return None
+        st = self._t8_state
+        actuator = self._xpool_actuator
+        if direction == "kv_to_mamba":
+            src_act = actuator.kv_actuator
+            migrate_cb = st["kv_migrator"].migrate
+        else:
+            src_act = actuator.mamba_actuator
+            mamba_mig = st.get("mamba_migrator")
+            if mamba_mig is None:
+                # No mamba migrator wired (mamba_actuator absent).
+                # Caller will fall back to legacy path.
+                return None
+            migrate_cb = mamba_mig.migrate
+        if src_act is None:
+            return None
+        target_drop_pages = unit * src_act.tokens_per_chunk
+        plan = st["planner"].build(
+            direction=direction,
+            target_drop_pages=target_drop_pages,
+            dst_grant_chunks=unit,
+        )
+        if plan is None:
+            snapshot["xpool_t8_skipped"] = "plan_refused"
+            return {
+                "direction": direction,
+                "unmapped_total": 0,
+                "granted_total": 0,
+                "kv_capacity_tokens": actuator.kv.current_capacity_tokens(),
+                "mamba_capacity_tokens": actuator.mamba.current_capacity_tokens(),
+                "free_after_grow": actuator.shared.free_count(),
+                "skipped": "t8_plan_refused",
+            }
+        try:
+            res = actuator.execute(
+                plan,
+                drain_callback=st["drain_callback"],
+                migrate_callback=migrate_cb,
+            )
+        except RuntimeError as e:
+            logger.error("T8 execute(plan) failed: %r", e)
+            snapshot["xpool_t8_error"] = repr(e)
+            return None
+        snapshot["xpool_t8_plan_seq"] = res.plan_seq
+        snapshot["xpool_t8_drained_pages"] = res.drained_pages
+        snapshot["xpool_t8_migrated_pages"] = res.migrated_pages
+        snapshot["xpool_t8_aborted"] = res.aborted
+        if res.aborted:
+            snapshot["xpool_t8_abort_reason"] = res.abort_reason
+            return {
+                "direction": direction,
+                "unmapped_total": 0,
+                "granted_total": 0,
+                "kv_capacity_tokens": actuator.kv.current_capacity_tokens(),
+                "mamba_capacity_tokens": actuator.mamba.current_capacity_tokens(),
+                "free_after_grow": actuator.shared.free_count(),
+                "skipped": f"t8_aborted: {res.abort_reason}",
+            }
+        return {
+            "direction": direction,
+            "unmapped_total": res.unmapped_pages,
+            "granted_total": res.granted_chunks,
+            "kv_capacity_tokens": actuator.kv.current_capacity_tokens(),
+            "mamba_capacity_tokens": actuator.mamba.current_capacity_tokens(),
+            "free_after_grow": actuator.shared.free_count(),
+            "shrink_us": res.unmap_us,
+            "grow_us": res.map_us,
+            "fire_total_us": res.total_us,
+        }
 
     def _estimate_post_fire_mamba_cap(self) -> int:
         """Predict the mamba-pool slot cap immediately after a
@@ -356,114 +522,6 @@ class BudgetAgent:
         except Exception:
             return 0
 
-    def _make_kv_live_slot_inspector(self):
-        """Returns callable(new_cap_pages: int) -> int: count of in-flight
-        KV slot ids strictly greater than new_cap_pages across all running
-        and chunked-prefilling reqs the scheduler knows about. Reads
-        `req_to_token_pool.req_to_token[req_pool_idx, :seqlen-1]` per req.
-
-        We snapshot the running batch + waiting list at call time. Reqs
-        that have NOT yet been prefilled (req_pool_idx is None) hold no
-        KV — skip them. Reqs that just finished but haven't been freed
-        yet may show up; their slots are still live until the allocator
-        free path runs, so we count them as in-flight (conservative).
-        """
-        sched = self.scheduler
-
-        def inspect(new_cap_pages: int) -> int:
-            try:
-                req_pool = getattr(sched, "req_to_token_pool", None)
-                if req_pool is None:
-                    return 0
-                rt = getattr(req_pool, "req_to_token", None)
-                if rt is None:
-                    return 0
-                # Collect in-flight reqs from running_batch and current_batch.
-                reqs = []
-                rb = getattr(sched, "running_batch", None)
-                if rb is not None:
-                    reqs.extend(getattr(rb, "reqs", None) or [])
-                cb = getattr(sched, "cur_batch", None) or getattr(
-                    sched, "last_batch", None
-                )
-                if cb is not None and cb is not rb:
-                    reqs.extend(getattr(cb, "reqs", None) or [])
-                if not reqs:
-                    return 0
-                # Per-req scan: only the populated portion [0, seqlen-1)
-                # holds real slot ids; tail is stale. Scalar comparison
-                # on a single row at a time keeps the GPU op tiny and
-                # short-circuits as soon as any req shows above-cap slots.
-                import torch
-                live_above = 0
-                for r in reqs:
-                    idx = getattr(r, "req_pool_idx", None)
-                    if idx is None:
-                        continue
-                    seqlen = int(getattr(r, "seqlen", 0) or 0)
-                    if seqlen <= 1:
-                        continue
-                    row = rt[idx, : seqlen - 1]
-                    if row.numel() == 0:
-                        continue
-                    above = int((row > new_cap_pages).sum().item())
-                    live_above += above
-                    if live_above > 0:
-                        # Early exit: any > 0 already aborts the fire.
-                        return live_above
-                return live_above
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "kv_live_slot_inspector raised %r — returning a "
-                    "non-zero sentinel so drain aborts conservatively", e,
-                )
-                return 1
-        return inspect
-
-    def _make_mamba_live_slot_inspector(self):
-        """Returns callable(new_cap_slots: int) -> int: count of in-flight
-        mamba slot ids > new_cap_slots across all running reqs. Mamba
-        slots are 1-per-req via `req.mamba_pool_idx`, so the scan is
-        O(n_running_reqs) — much cheaper than the KV side.
-        """
-        sched = self.scheduler
-
-        def inspect(new_cap_slots: int) -> int:
-            try:
-                reqs = []
-                rb = getattr(sched, "running_batch", None)
-                if rb is not None:
-                    reqs.extend(getattr(rb, "reqs", None) or [])
-                cb = getattr(sched, "cur_batch", None) or getattr(
-                    sched, "last_batch", None
-                )
-                if cb is not None and cb is not rb:
-                    reqs.extend(getattr(cb, "reqs", None) or [])
-                if not reqs:
-                    return 0
-                live_above = 0
-                for r in reqs:
-                    mi = getattr(r, "mamba_pool_idx", None)
-                    if mi is None:
-                        continue
-                    # mamba_pool_idx is a torch.Tensor of shape (1) —
-                    # unwrap to a Python scalar before comparing.
-                    if hasattr(mi, "item"):
-                        mi_v = int(mi.item())
-                    else:
-                        mi_v = int(mi)
-                    if mi_v > new_cap_slots:
-                        live_above += 1
-                        return live_above
-                return live_above
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "mamba_live_slot_inspector raised %r — returning a "
-                    "non-zero sentinel so drain aborts conservatively", e,
-                )
-                return 1
-        return inspect
-
     def _maybe_xpool_actuate(self, snapshot: dict) -> None:
         """Phase 2e.5.6.2 demo. Safe-by-design: only transfers when there are
         zero running/queued requests (i.e., during warmup or quiescent
@@ -494,15 +552,16 @@ class BudgetAgent:
             snapshot["xpool_state"] = self._xpool_actuator.state()
             return
 
-        # Oscillator: balanced kv→mamba, then balanced mamba→kv, repeat.
-        # Balanced wrappers use lcm-aware sub-pool unit sizes so a
-        # round-trip leaves both pools and the shared free list at their
-        # starting state — no drift, no leftover handles accumulating.
+        # Oscillator demo: alternate kv→mamba and mamba→kv via T8 path.
+        # The lcm-balanced wrappers were dropped with the legacy actuator;
+        # planner picks tail chunks at the configured unit, drift is
+        # bounded by free-handle accounting in the shared pool.
         self._xpool_phase = (self._xpool_phase + 1) % 2
-        if self._xpool_phase == 1:
-            stats = self._xpool_actuator.balanced_kv_to_mamba(self._xpool_unit)
-        else:
-            stats = self._xpool_actuator.balanced_mamba_to_kv(self._xpool_unit)
+        direction = "kv_to_mamba" if self._xpool_phase == 1 else "mamba_to_kv"
+        stats = self._maybe_t8_fire(direction, self._xpool_unit, snapshot)
+        if stats is None:
+            snapshot["xpool_skipped"] = "t8_wiring_unavailable"
+            return
 
         # Inline a few key fields into the snapshot for easy grep.
         snapshot["xpool_direction"] = stats["direction"]
@@ -544,13 +603,16 @@ class BudgetAgent:
             if self._xpool_actuator is None:
                 return False
             if direction == "kv_to_rec":
-                stats = self._xpool_actuator.kv_to_mamba_chunks(n_chunks)
+                t8_dir = "kv_to_mamba"
             elif direction == "rec_to_kv":
-                stats = self._xpool_actuator.mamba_to_kv_chunks(n_chunks)
+                t8_dir = "mamba_to_kv"
             else:
                 logger.warning(
                     "try_admission_time_fire: unknown direction %r", direction
                 )
+                return False
+            stats = self._maybe_t8_fire(t8_dir, n_chunks, snapshot={})
+            if stats is None:
                 return False
             unmapped = stats.get("unmapped_total", 0) if stats else 0
             granted = stats.get("granted_total", 0) if stats else 0
@@ -836,10 +898,16 @@ class BudgetAgent:
         # oscillator demos but isn't appropriate for planner-driven
         # firing — its lcm-balanced multiplier can demand more chunks
         # than available, causing src to shrink past static_min and bail.
-        if decision.direction == "mamba_to_kv":
-            stats = self._xpool_actuator.mamba_to_kv_chunks(unit)
-        else:  # kv_to_mamba
-            stats = self._xpool_actuator.kv_to_mamba_chunks(unit)
+        # T8: every fire goes through the plan-based execute(plan) path.
+        # _maybe_t8_fire returns a stats dict (with skipped="..." when
+        # the planner refuses), never None — caller has nothing to
+        # fall back to since the legacy heuristic path is gone.
+        stats = self._maybe_t8_fire(decision.direction, unit, snapshot)
+        if stats is None:
+            # T8 wiring failed (no scheduler / no actuator). Skip this
+            # tick rather than crashing.
+            snapshot["xpool_skipped"] = "t8_wiring_unavailable"
+            return
         snapshot["xpool_plan_executed"] = True
         snapshot["xpool_direction"] = stats["direction"]
         snapshot["xpool_unmapped_total"] = stats["unmapped_total"]

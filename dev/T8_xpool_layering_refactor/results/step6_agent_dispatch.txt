@@ -1,0 +1,45 @@
+T8 step 6 — BudgetAgent dispatch wiring
+=========================================
+
+Run: cd /scratch/yuzhou/projects/sglang && .venv/bin/python \
+     dev/T8_xpool_layering_refactor/test/test_agent_dispatch.py
+
+Output:
+[step6] flag-off: dispatch site bypasses T8 path
+[step6] flag-on no-scheduler: returns None
+[step6] flag-on full wiring: unmap=8 grant=1 plan_seq=1
+
+T8 step6 agent dispatch test PASS
+
+Cases covered:
+  - SGLANG_T8_PLANNER + SGLANG_T8_EXECUTE both off → caller falls
+    through to legacy `*_chunks(unit)` path (no T8 attempt)
+  - flags on, no scheduler ref         → _maybe_t8_fire returns None
+                                          (caller falls back; no crash)
+  - flags on, full wiring              → planner+executor+migrator wired,
+                                          fire returns legacy-shape stats
+                                          dict, snap gets t8_plan_seq +
+                                          drained_pages + migrated_pages
+
+Test scaffolding gotcha (kept as a comment in the test):
+  Earlier draft used `actuator = MagicMock()` for the
+  CrossPoolTransferActuator. That auto-mocks `_all_subpool_names`, so
+  `for name in self._all_subpool_names(src)` silently iterates an empty
+  default mock and never calls `shrink_explicit`. Test now uses
+  `CrossPoolTransferActuator.__new__(...)` so real instance methods
+  resolve correctly — same pattern as test_integration_no_cuda.py.
+  Comment placed in the test fixture so this lesson doesn't get lost.
+
+Files added/modified:
+  python/sglang/srt/budgeter/agent.py
+    +~150 lines: _ensure_t8_state, _maybe_t8_fire, dispatch hook in
+    _maybe_xpool_planner that routes through the new path when
+    SGLANG_T8_PLANNER=1 and SGLANG_T8_EXECUTE=1 are both set
+  python/sglang/srt/budgeter/fire_planner.py
+    +is_executor_enabled() helper
+  dev/T8_xpool_layering_refactor/test/test_agent_dispatch.py
+
+Re-ran all 7 T8 tests (steps 1-6): all PASS.
+
+Default behavior unchanged (flags default off). Real engine smoke
+deferred to step 7+8 (delete legacy + run M2 swarm conc=800).

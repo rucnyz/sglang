@@ -1,168 +1,31 @@
 """
-Phase 2e.5.6 — CrossPoolTransferActuator: KV ↔ mamba physical-handle migration.
+T8 — CrossPoolTransferActuator: pure mechanical executor.
 
-Sits on top of two MultiTensorArena instances that share one
-SharedHandlePool (Phase 2e.5.6.1). Exposes:
+Wraps two MultiTensorArena instances (KV + mamba) sharing one
+SharedHandlePool. Exposes a single decision-free entrypoint:
 
-  - kv_to_mamba_chunks(n_per_kv_subpool):
-        Shrinks each KV sub-pool by `n` chunks (frees `n * n_kv_subpools`
-        handles into the shared pool), then grows each mamba sub-pool
-        by `floor(n_freed / n_mamba_subpools)` chunks. Any remainder
-        stays in the shared pool's free list and is available for the
-        next call (or the reverse direction).
+  execute(plan: FirePlan, drain_callback, migrate_callback) -> FirePlanResult
 
-  - mamba_to_kv_chunks(n_per_mamba_subpool):
-        Symmetric.
+The plan is built upstream by `sglang.srt.budgeter.fire_planner` against
+ground-truth ownership state from `sglang.srt.budgeter.scheduler_owner_provider`.
+The executor does cap-barrier → drain → migrate → verify → unmap+map →
+uncap-dst with no fallbacks — every page in the unmap range has been
+classified as free / drainable / migratable by the planner.
 
-The asymmetry — KV has `n_kv_layers * 2` sub-pools (k, v per layer),
-mamba has `n_mamba_layers * 1` (temporal per layer) — is handled by
-keeping per-call grow rounding to the floor. Engineering rationale:
-the planner's "budget" is in tokens-of-capacity per pool, which maps
-to "live capacity = min mapped chunks * tokens_per_chunk" inside each
-MultiTensorArena. The min-across-subpools requirement is what forces
-us to grow (or shrink) all sub-pools by the same amount.
-
-The planner is policy-side; this actuator only handles the mechanical
-"move these many chunks from arena A to arena B" operation.
+See `dev/T8_xpool_layering_refactor/README.md` for the full design and
+the legacy `_do_transfer` / `kv_to_mamba_chunks` family that this
+replaces.
 """
 from __future__ import annotations
 
 import logging
-import math
-import os
 import time
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.arena.chunk_arena import cross_arena_transfer
+from sglang.srt.arena.fire_plan import FirePlan, FirePlanResult, MigrateOp
 
-
-def _expand_via_migration(
-    src_act,
-    drainable_chunks: list[int],
-    n_target: int,
-    tokens_per_chunk: int,
-    migrator=None,  # Callable[[int_src_slot, int_dst_slot], bool]
-) -> list[int]:
-    """T4 (paper §3.2.3): when smart-overcap returned fewer chunks than
-    requested, expand the drain set by migrating live slots out of
-    partially-free chunks.
-
-    Currently implemented for tokens_per_chunk==1 only (mamba pool at
-    page-grain — every slot is its own chunk). For tokens_per_chunk > 1
-    (KV) the migration would need per-token block copy + req_to_token
-    update, which is out of T4 scope.
-
-    Returns an extended chunk list (>= n_target if migration succeeded
-    on enough slots, else the longest list it could assemble).
-
-    `migrator(src_slot, dst_slot) -> bool` is the caller-provided
-    migration function: copies state src→dst, updates owner pointers,
-    marks alloc-side. Returns True on success, False if migration
-    impossible (dst not free, src not live, etc.).
-    """
-    if tokens_per_chunk != 1:
-        return drainable_chunks  # KV migration out of scope
-    if migrator is None:
-        return drainable_chunks
-    n_more = n_target - len(drainable_chunks)
-    if n_more <= 0:
-        return drainable_chunks
-
-    alloc = getattr(src_act, "allocator", None)
-    pool = getattr(src_act, "pool", None)
-    target_pool = pool if pool is not None and hasattr(pool, "free_slots") else alloc
-    if target_pool is None:
-        return drainable_chunks
-
-    # Free slots available for migration *destinations*. We must pick
-    # destinations from low indices (head of pool) to keep the head dense
-    # and not overlap with the chosen drainable_chunks (tail). Skip any
-    # slot id whose chunk is in the drain set.
-    drain_set = set(drainable_chunks)
-    free = target_pool.free_slots if hasattr(target_pool, "free_slots") else target_pool.free_pages
-    free_low = sorted(int(s) for s in free.tolist() if (int(s) - 1) not in drain_set)
-
-    # Pick the next n_more "live" tail-ish slots to expand the drain set
-    # by — for tpc=1, each chunk c corresponds to slot c+1.
-    pool_size = target_pool.size
-    free_set = set(int(s) for s in free.tolist())
-    extra = []
-    # Walk from the highest non-drainable slot downward.
-    i = pool_size
-    while len(extra) < n_more and i >= 1:
-        chunk = i - 1
-        if chunk not in drain_set and i not in free_set:
-            extra.append((chunk, i))  # (chunk_idx, src_slot_id)
-        i -= 1
-
-    # For each, find a free dst from free_low (popping from front).
-    expanded = list(drainable_chunks)
-    free_low_iter = iter(free_low)
-    for chunk_idx, src_slot in extra:
-        try:
-            dst_slot = next(free_low_iter)
-        except StopIteration:
-            break
-        if migrator(src_slot, dst_slot):
-            expanded.append(chunk_idx)
-        # else: migration failed; skip this chunk
-    expanded.sort(reverse=True)
-    return expanded
-
-
-def _select_drainable_chunks(
-    src_act, n_chunks: int, tokens_per_chunk: int
-) -> list[int]:
-    """T3 (paper §3.2.2): pick `n_chunks` chunk indices on `src_act` whose
-    ALL pages are currently free in the allocator's free-page mask.
-
-    Returns the highest-indexed such chunks (preferring tail under T2's
-    placement bias). May return fewer than `n_chunks` if not enough chunks
-    are fully drainable.
-
-    Returns an empty list and logs at INFO if no `select_drain_pages` API
-    is available (e.g., when the allocator is not the BaseTokenToKVPoolAllocator).
-    """
-    if src_act is None:
-        return []  # No actuator → no fire is a legitimate state.
-    alloc = getattr(src_act, "allocator", None)
-    if alloc is None:
-        return []  # Pool without a separate allocator (e.g., raw mamba) — caller falls back.
-    if not hasattr(alloc, "free_page_mask"):
-        # T7 cleanup: this used to silently return [] here. That hides
-        # a wiring bug — every BaseTokenToKVPoolAllocator gets the API
-        # via T3 part 1. If we land here, somebody has a non-standard
-        # allocator and the smart-overcap path can't act on it.
-        raise RuntimeError(
-            "_select_drainable_chunks: allocator lacks free_page_mask. "
-            "T3 (paper §3.2.2) added this method on "
-            "BaseTokenToKVPoolAllocator; this code path implies a "
-            "non-standard allocator. Investigate rather than silently "
-            "fall through to legacy tail-shrink."
-        )
-    if tokens_per_chunk <= 0:
-        raise ValueError(
-            f"_select_drainable_chunks: tokens_per_chunk must be > 0, "
-            f"got {tokens_per_chunk}. Caller should resolve via the "
-            f"actuator's `tokens_per_chunk` property which raises on "
-            f"missing arena."
-        )
-    mask = alloc.free_page_mask()
-    # Reshape: mask[1:1 + n_chunks * tokens_per_chunk] groups consecutive
-    # `tokens_per_chunk` pages into one chunk. A chunk is drainable iff
-    # all its pages are free.
-    n_pages = alloc.size
-    n_total_chunks = n_pages // tokens_per_chunk
-    if n_total_chunks == 0:
-        return []
-    pages = mask[1:1 + n_total_chunks * tokens_per_chunk]
-    chunks = pages.view(n_total_chunks, tokens_per_chunk).all(dim=1)
-    drainable = torch.where(chunks)[0].tolist()
-    # Highest-indexed chunks first → contiguous tail unmap.
-    drainable.sort(reverse=True)
-    return drainable[:n_chunks]
 
 if TYPE_CHECKING:
     from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
@@ -180,52 +43,17 @@ class CrossPoolTransferActuator:
         kv_arena: "MultiTensorArena",
         mamba_arena: "MultiTensorArena",
         shared_pool: "SharedHandlePool",
-        kv_actuator=None,        # Optional[KVArenaActuator]
-        mamba_actuator=None,     # Optional[MambaArenaActuator]
-        kv_live_slot_inspector=None,    # Optional[Callable[[int], int]]
-        mamba_live_slot_inspector=None, # Optional[Callable[[int], int]]
-        mamba_slot_migrator=None,       # T4: Callable[[int_src, int_dst], bool]
+        kv_actuator=None,
+        mamba_actuator=None,
     ) -> None:
-        # T4 atomic migration (paper §3.2.3). When provided, the
-        # actuator will call this with (src_slot, dst_slot) for each
-        # live slot it needs to migrate out of a to-be-unmapped chunk.
-        # The callback's responsibility:
-        #   1. pool.migrate_slot(src, dst) — copy bytes + update alloc
-        #   2. update any in-flight req's mamba_pool_idx from src to dst
-        # Returns True if migration succeeded, False otherwise.
-        self._mamba_slot_migrator = mamba_slot_migrator
         self.kv = kv_arena
         self.mamba = mamba_arena
         self.shared = shared_pool
-        # Phase 2e.5.6.3: when both per-pool actuators are provided, the
-        # cross-pool actuator coordinates capacity changes with the
-        # allocators so the engine respects the new capacities (live-
-        # traffic safe, modulo the busy-engine gate at the budgeter level).
-        # When omitted, falls back to the 2e.5.6.2 "raw chunk move only"
-        # behavior — safe only in idle windows.
+        # Per-pool actuators are required for plan-based execute(); this
+        # was optional in the legacy "raw chunk move only" path. T8 made
+        # them mandatory because cap-barrier+migrate need allocator access.
         self.kv_actuator = kv_actuator
         self.mamba_actuator = mamba_actuator
-
-        # Rigorous drain check: in-flight slot ids held by running reqs
-        # are NOT in any allocator free buffer. Without scheduler-side
-        # introspection, _drain_complete's accounting can return True
-        # while reqs still hold ids > new_cap → cuMemUnmap kills active
-        # KV → cudaErrorIllegalAddress on next kernel. Each inspector is
-        # callable(new_cap_pages: int) -> int, returning the count of
-        # in-flight slot ids ≥ new_cap_pages on its respective pool.
-        # When > 0, drain is incomplete regardless of accounting.
-        self._kv_live_slot_inspector = kv_live_slot_inspector
-        self._mamba_live_slot_inspector = mamba_live_slot_inspector
-
-        # Drain protocol state (paper §design-l2-actuator). When a fire
-        # decides to shrink src, we cap src's allocator to new_cap so no
-        # new req can be admitted to the tail [new_cap, old_cap]. The
-        # actual cuMemUnmap+cuMemMap is deferred until in-flight reqs
-        # holding tail slots have completed naturally — drain check
-        # compares len(src_allocator._capped_pages) to (size - new_cap).
-        # While pending, no new fire is admitted; planner.decide is
-        # bypassed in agent.py.
-        self._pending: dict | None = None
 
         if kv_arena._arena._external_pool is not shared_pool:
             raise ValueError("kv_arena does not use the provided shared_pool")
@@ -235,31 +63,11 @@ class CrossPoolTransferActuator:
         self.n_kv_subpools = kv_arena.n_layers * kv_arena.n_kinds
         self.n_mamba_subpools = mamba_arena.n_layers * mamba_arena.n_kinds
 
-        # Balanced unit (lcm-aware): the smallest dst_per_subpool that
-        # makes the transfer leftover-free (= no handles accumulate in
-        # the shared pool after a round-trip). For dst with n_dst sub-pools
-        # and src with n_src, we need n_per_dst * n_dst == n_per_src * n_src
-        # to balance. The smallest n_per_dst integer satisfying this is
-        # n_src // gcd(n_src, n_dst); the corresponding n_per_src is
-        # n_dst // gcd(n_src, n_dst).
-        g = math.gcd(self.n_kv_subpools, self.n_mamba_subpools)
-        # kv → mamba: dst=mamba (count=n_mamba), src=kv (count=n_kv).
-        self.balanced_unit_kv_to_mamba_dst = self.n_kv_subpools // g
-        self.balanced_unit_kv_to_mamba_src = self.n_mamba_subpools // g
-        # mamba → kv: dst=kv, src=mamba.
-        self.balanced_unit_mamba_to_kv_dst = self.n_mamba_subpools // g
-        self.balanced_unit_mamba_to_kv_src = self.n_kv_subpools // g
-
         logger.info(
             "CrossPoolTransferActuator: kv_subpools=%d, mamba_subpools=%d, "
-            "shared_handles=%d, free=%d, balanced_unit_kv2m=(dst=%d,src=%d), "
-            "balanced_unit_m2kv=(dst=%d,src=%d)",
+            "shared_handles=%d, free=%d",
             self.n_kv_subpools, self.n_mamba_subpools,
             self.shared.total_count(), self.shared.free_count(),
-            self.balanced_unit_kv_to_mamba_dst,
-            self.balanced_unit_kv_to_mamba_src,
-            self.balanced_unit_mamba_to_kv_dst,
-            self.balanced_unit_mamba_to_kv_src,
         )
 
     # ------------------------------------------------------------------
@@ -274,515 +82,208 @@ class CrossPoolTransferActuator:
     def _dst_actuator(self, dst: "MultiTensorArena"):
         return self.kv_actuator if dst is self.kv else self.mamba_actuator
 
-    def _drain_complete(self, src_act, new_cap_tokens: int) -> bool:
-        """Drain protocol check (paper §design-l2-actuator L184).
-
-        Returns True iff no in-flight request still references a slot
-        with id > new_cap. The check is computed by accounting:
-
-          in_use_above = (size - new_cap)
-                       - capped_above
-                       - release_pages_above
-                       - free_group_above
-                       - free_pages_above
-
-        At drain completion, in_use_above == 0, equivalently the right-
-        hand side accumulators >= (size - new_cap). The previous version
-        checked only `capped_above` — but SGLang's allocator can hold
-        pages > new_cap in three other places that aren't in_use:
-
-        1. `_capped_pages` — explicit tail buffer (cap-aware free routes
-           freed-above-cap entries here)
-        2. `release_pages` — reqs that freed via `is_not_in_free_group=True`
-           with `need_sort=True` go through release_pages first, then
-           merge into free_pages later. After cap, release entries can
-           still hold ids > new_cap.
-        3. `free_group` (a Python list) — batched frees pending flush via
-           `free_group_end`. Same situation.
-        4. `free_pages` — after cap, set_capacity_pages drops above-cap
-           ids out of free, but if some were in release at cap time and
-           later flush back, they re-enter free_pages.
-
-        Counting all four covers the cases where pages > new_cap have
-        been fully released by their owning requests but haven't yet
-        landed in `_capped_pages`. If any slot id > new_cap is genuinely
-        in_use (held by a still-running req), the right-hand side falls
-        short and drain is not complete.
-        """
-        if src_act is None:
-            return True  # No allocator coord — no drain needed.
-        # KV: src_act.allocator with .size, ._capped_pages, .release_pages, .free_group, .free_pages
-        # Mamba: src_act.pool with .size, ._capped_slots, .free_slots
-        import torch  # local import to avoid module-level dep cycles
-        # Pick the inspector that matches the source pool. We can't tell
-        # KV vs mamba just from src_act, so use identity on the cached
-        # actuators we were given at init.
-        if src_act is self.kv_actuator:
-            live_inspector = self._kv_live_slot_inspector
-        elif src_act is self.mamba_actuator:
-            live_inspector = self._mamba_live_slot_inspector
-        else:
-            live_inspector = None
-        alloc = getattr(src_act, "allocator", None)
-        if alloc is not None:
-            page_size = max(1, src_act.pool.page_size)
-            new_cap_pages = new_cap_tokens // page_size
-            new_cap_pages = min(new_cap_pages, alloc.size)
-            expected = alloc.size - new_cap_pages
-            if expected <= 0:
-                return True
-
-            # Rigorous live-slot check: walk in-flight reqs first. If any
-            # holds a KV slot id > new_cap_pages, drain is not complete —
-            # those slots' physical handles must not be unmapped.
-            if live_inspector is not None:
-                try:
-                    live_above = int(live_inspector(new_cap_pages))
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "live_slot_inspector raised %r — treating as "
-                        "drain-not-complete (conservative)", e,
-                    )
-                    return False
-                if live_above > 0:
-                    logger.info(
-                        "_drain_complete: ok=False (live in-flight slots "
-                        "above new_cap_pages=%d count=%d)",
-                        new_cap_pages, live_above,
-                    )
-                    return False
-
-            def _count_above(t, threshold):
-                if t is None or t.numel() == 0:
-                    return 0
-                return int((t > threshold).sum().item())
-
-            capped_above = _count_above(
-                getattr(alloc, "_capped_pages", None), new_cap_pages
-            )
-            release_above = _count_above(
-                getattr(alloc, "release_pages", None), new_cap_pages
-            )
-            # free_pages should have NO ids > new_cap after cap_allocator_only,
-            # but a subsequent merge_and_sort_free can reintroduce them from
-            # release_pages. Re-count to be safe.
-            free_above = _count_above(
-                getattr(alloc, "free_pages", None), new_cap_pages
-            )
-            # free_group is a list[Tensor]; iterate and count.
-            free_group_above = 0
-            free_group = getattr(alloc, "free_group", None)
-            if free_group:
-                for t in free_group:
-                    free_group_above += _count_above(t, new_cap_pages)
-            total_above_freed = (
-                capped_above + release_above + free_above + free_group_above
-            )
-            in_use_above = expected - total_above_freed
-            ok = total_above_freed >= expected
-            logger.info(
-                "_drain_complete: ok=%s expected=%d total_freed_above=%d "
-                "(capped=%d release=%d free=%d free_group=%d) in_use_above=%d "
-                "(alloc.size=%d new_cap_pages=%d, free_pages.numel=%d, "
-                "release.numel=%d, capped.numel=%d)",
-                ok, expected, total_above_freed,
-                capped_above, release_above, free_above, free_group_above,
-                in_use_above, alloc.size, new_cap_pages,
-                getattr(getattr(alloc, "free_pages", None), "numel", lambda: 0)(),
-                getattr(getattr(alloc, "release_pages", None), "numel", lambda: 0)(),
-                getattr(getattr(alloc, "_capped_pages", None), "numel", lambda: 0)(),
-            )
-            return ok
-
-        pool = getattr(src_act, "pool", None)
-        if pool is not None:
-            new_cap_slots = min(new_cap_tokens, pool.size)
-            expected = pool.size - new_cap_slots
-            if expected <= 0:
-                return True
-
-            # Same rigorous live-slot check as KV side: walk in-flight reqs
-            # holding mamba slots > new_cap. Paper §190 ("DeltaNet/SSM slot
-            # shrink: mark slots above the new cap as 'not-for-reuse';
-            # release as owning requests complete").
-            if live_inspector is not None:
-                try:
-                    live_above = int(live_inspector(new_cap_slots))
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "mamba live_slot_inspector raised %r — treating as "
-                        "drain-not-complete (conservative)", e,
-                    )
-                    return False
-                if live_above > 0:
-                    logger.info(
-                        "_drain_complete (mamba): ok=False (live in-flight "
-                        "slots above new_cap_slots=%d count=%d)",
-                        new_cap_slots, live_above,
-                    )
-                    return False
-
-            capped = getattr(pool, "_capped_slots", None)
-            free_slots = getattr(pool, "free_slots", None)
-
-            def _count_above(t, threshold):
-                if t is None:
-                    return 0
-                # MambaPool free_slots can be torch.Tensor; _capped_slots same.
-                if hasattr(t, "numel"):
-                    if t.numel() == 0:
-                        return 0
-                    return int((t > threshold).sum().item())
-                # Fallback for list/other.
-                return sum(1 for v in t if v > threshold)
-
-            capped_above = _count_above(capped, new_cap_slots)
-            free_above = _count_above(free_slots, new_cap_slots)
-            return (capped_above + free_above) >= expected
-        # Unknown actuator shape; conservative: not drained.
-        return False
-
-    def _do_transfer(
-        self,
-        src: "MultiTensorArena",
-        dst: "MultiTensorArena",
-        n_per_dst_subpool: int,
-        direction_label: str,
-    ) -> dict:
-        """Grow every dst sub-pool by `n_per_dst_subpool` chunks; this
-        requires shrinking each src sub-pool by
-        `ceil(n_per_dst_subpool * n_dst_subpools / n_src_subpools)`. Any
-        leftover unmapped handles stay in the shared pool's free list and
-        are available for the next call.
-
-        Why dst-anchored (not src-anchored):
-          live capacity of an MTA is min mapped chunks across its
-          sub-pools. If we shrank src by 1 chunk per src-subpool but
-          src has more sub-pools than dst, dst would only grow by
-          floor(n_src/n_dst) per dst-subpool, which is 0 when n_src <
-          n_dst (e.g., KV's 20 sub-pools < mamba's 30). Making the
-          caller specify dst-side guarantees the transfer always
-          actually grows dst.
-
-        Returns: stats dict.
-        """
-        if n_per_dst_subpool <= 0:
-            raise ValueError(
-                f"n_per_dst_subpool={n_per_dst_subpool} must be > 0"
-            )
-
-        src_names = self._all_subpool_names(src)
-        dst_names = self._all_subpool_names(dst)
-        n_src = len(src_names)
-        n_dst = len(dst_names)
-
-        # Phase 2e.5.6.3.c bug fix: bail when dst is already at max OR
-        # src is already at min. Without this, we'd shrink src for nothing
-        # (dst can't grow, all the freed handles get stranded in the
-        # shared free pool, src capacity collapses toward 0).
-        dst_min_mapped = min(
-            dst._arena.pool_mapped_chunks(name) for name in dst_names
-        )
-        if dst_min_mapped + n_per_dst_subpool > dst.max_chunks_per_pool:
-            return {
-                "direction": direction_label,
-                "n_per_src_subpool": 0,
-                "n_per_dst_subpool": n_per_dst_subpool,
-                "src_subpools": n_src,
-                "dst_subpools": n_dst,
-                "unmapped_total": 0,
-                "granted_total": 0,
-                "free_before": self.shared.free_count(),
-                "free_after_shrink": self.shared.free_count(),
-                "free_after_grow": self.shared.free_count(),
-                "kv_capacity_tokens": self.kv.current_capacity_tokens(),
-                "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
-                "skipped": "dst_at_max",
-            }
-
-        # How many chunks must each src sub-pool shed to free enough
-        # handles for the dst grow? Subtract whatever's already free in
-        # the shared pool first — under the mobile-soft split, that's
-        # where (init − static_min) chunks per arena live initially, so
-        # in many cases dst can grow purely from mobile soft without
-        # touching src. Whatever remains is divided equally across src
-        # sub-pools (ceil so dst grows fully).
-        needed = n_per_dst_subpool * n_dst
-        shared_free = self.shared.free_count()
-        needed_from_src = max(0, needed - shared_free)
-        n_per_src_subpool = (needed_from_src + n_src - 1) // n_src if n_src > 0 else 0
-
-        src_min_mapped = min(
-            src._arena.pool_mapped_chunks(name) for name in src_names
-        )
-        # Static-min floor (paper §design-l2-actuator L184): the actuator
-        # refuses any shrink that would drop a sub-pool below static_min.
-        # When shared_arena=True, memory_pool sets static_min=1 chunk per
-        # sub-pool, leaving (init - 1) chunks per sub-pool transferable
-        # via drain protocol. When shared_arena=False, static_min=init and
-        # the actuator can't shrink (engine behaves identically to non-L2
-        # baseline).
-        static_min = src.static_min_chunks_per_pool
-        if src_min_mapped - n_per_src_subpool < static_min:
-            return {
-                "direction": direction_label,
-                "n_per_src_subpool": 0,
-                "n_per_dst_subpool": n_per_dst_subpool,
-                "src_subpools": n_src,
-                "dst_subpools": n_dst,
-                "unmapped_total": 0,
-                "granted_total": 0,
-                "free_before": self.shared.free_count(),
-                "free_after_shrink": self.shared.free_count(),
-                "free_after_grow": self.shared.free_count(),
-                "kv_capacity_tokens": self.kv.current_capacity_tokens(),
-                "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
-                "skipped": f"src_at_static_min (would drop {src_min_mapped} → {src_min_mapped - n_per_src_subpool} below static_min={static_min})",
-            }
-
-        # Phase 2e.5.6.3: if per-pool actuators are wired, coordinate
-        # with the allocators. The contract:
-        #   1. BEFORE shrinking the src arena physically, cap the src
-        #      pool's allocator to its new capacity (= live - shrink
-        #      tokens). New requests are immediately refused tail slots;
-        #      already-allocated slots in the soon-to-be-unmapped tail
-        #      MUST have been drained by the busy-engine gate at the
-        #      budgeter level (or, for the demo, we just refuse to fire
-        #      while engine is busy).
-        #   2. Do the chunk move (src.shrink + dst.grow).
-        #   3. AFTER the dst arena has new physical chunks, raise the
-        #      dst pool's allocator cap so the new slots become
-        #      allocatable.
-        src_act = self._src_actuator(src)
-        dst_act = self._dst_actuator(dst)
-        # Translate chunk counts to token counts for the actuator API.
-        src_tokens_per_chunk = src.tokens_per_chunk
-        dst_tokens_per_chunk = dst.tokens_per_chunk
-        src_shrink_tokens = n_per_src_subpool * src_tokens_per_chunk
-        dst_grow_tokens = n_per_dst_subpool * dst_tokens_per_chunk
-
-        # Paper §design-l2-actuator drain protocol. When src needs to
-        # shrink, in-flight reqs may currently hold slots above the new
-        # cap. We cap the allocator (no new admit to tail) and then
-        # check drain status: all pages above new_cap should be in
-        # `_capped_pages` (the cap-aware free path puts there). If
-        # drain is not yet complete, abort this fire (un-cap) and the
-        # gate retries on a future tick (after cooldown).
-        if src_act is not None and n_per_src_subpool > 0:
-            old_src_cap = src_act.live_capacity_tokens()
-            new_src_cap = max(1, old_src_cap - src_shrink_tokens)
-            src_act.cap_allocator_only(new_src_cap)
-            if not self._drain_complete(src_act, new_src_cap):
-                # Restore allocator cap; gate will retry next admissible tick.
-                src_act.cap_allocator_only(old_src_cap)
-                return {
-                    "direction": direction_label,
-                    "n_per_src_subpool": 0,
-                    "n_per_dst_subpool": n_per_dst_subpool,
-                    "src_subpools": n_src,
-                    "dst_subpools": n_dst,
-                    "unmapped_total": 0,
-                    "granted_total": 0,
-                    "free_before": self.shared.free_count(),
-                    "free_after_shrink": self.shared.free_count(),
-                    "free_after_grow": self.shared.free_count(),
-                    "kv_capacity_tokens": self.kv.current_capacity_tokens(),
-                    "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
-                    "skipped": "drain_pending",
-                }
-
-        # Stage 1 actuator-cost instrumentation: wall-time the cuMemUnmap
-        # (src.shrink) and cuMemMap (dst.grow) operations so gate config's
-        # chunk_cost_us can be calibrated against real measurements rather
-        # than the conservative paper-default 50ms/chunk × 60 = 3s.
-        # cuda.synchronize bracket so the wall time reflects GPU work, not
-        # just CPU enqueue.
-        free_before = self.shared.free_count()
-        unmapped_total = 0
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            pass
-        shrink_t0 = time.monotonic_ns()
-        # T3 (paper §3.2.2): SGLANG_SMART_OVERCAP=1 picks chunks whose
-        # all pages are free in the allocator (anywhere in the pool, not
-        # just tail). Default path keeps legacy "shrink tail" semantic.
-        smart_overcap = os.environ.get("SGLANG_SMART_OVERCAP", "0") == "1"
-        smart_chunks = []
-        if smart_overcap and src_act is not None:
-            # T7 cleanup: read tpc from the actuator's property only.
-            # Earlier code fell back to pool.tokens_per_chunk (which
-            # doesn't exist on KV/mamba pool objects) → silent default 1
-            # → wrong chunk indices → silent no-op fire. The actuator
-            # property now raises if the underlying arena is missing,
-            # so misconfig is loud.
-            tpc = src_act.tokens_per_chunk
-            smart_chunks = _select_drainable_chunks(
-                src_act, n_per_src_subpool, int(tpc)
-            )
-            logger.info(
-                "T3 smart over-cap selection: tokens_per_chunk=%d, "
-                "requested=%d, drainable=%d (%s)",
-                tpc, n_per_src_subpool, len(smart_chunks),
-                "tail" if all(c >= len(src._arena.pools[src_names[0]].mapped) - n_per_src_subpool
-                              for c in smart_chunks) else "non-tail",
-            )
-                # T4 (paper §3.2.3): if smart selection came up short,
-                # try to expand the drain set by atomically migrating
-                # live slots out of partial-free chunks. mamba-only at
-                # tpc=1; KV (tpc>1) falls through to legacy tail path.
-                atomic_migration = (
-                    os.environ.get("SGLANG_ATOMIC_MIGRATION", "0") == "1"
-                )
-                if (atomic_migration and len(smart_chunks) < n_per_src_subpool
-                    and int(tpc) == 1):
-                    migrator = getattr(self, "_mamba_slot_migrator", None)
-                    if migrator is not None and src_act is self.mamba_actuator:
-                        before = len(smart_chunks)
-                        smart_chunks = _expand_via_migration(
-                            src_act, smart_chunks, n_per_src_subpool,
-                            int(tpc), migrator,
-                        )
-                        logger.info(
-                            "T4 atomic migration: expanded %d -> %d chunks",
-                            before, len(smart_chunks),
-                        )
-        if smart_overcap and len(smart_chunks) >= n_per_src_subpool:
-            for name in src_names:
-                unmapped_total += src._arena.shrink_explicit(name, smart_chunks)
-            # T3 correctness: tell the allocator those chunks' pages are no
-            # longer mappable, so subsequent alloc can't hand them out.
-            # Without this, free_pages still contains page ids whose VA was
-            # just cuMemUnmapped → next alloc + cuMemMap from another pool
-            # would race with the still-cached free_pages entries → crash.
-            alloc = getattr(src_act, "allocator", None)
-            tpc_local = locals().get("tpc", 1) or 1
-            if alloc is not None and hasattr(alloc, "mark_pages_capped") and tpc_local > 0:
-                # Pages are 1-indexed (slot 0 sentinel). For chunk c, the
-                # pages are [c*tpc + 1, (c+1)*tpc + 1).
-                drained_pages = []
-                for c in smart_chunks:
-                    drained_pages.extend(range(c * tpc_local + 1, (c + 1) * tpc_local + 1))
-                if drained_pages:
-                    pages_t = torch.tensor(drained_pages, dtype=torch.int64,
-                                           device=alloc.device)
-                    moved = alloc.mark_pages_capped(pages_t)
-                    logger.info(
-                        "T3 mark_pages_capped: chunks=%d, pages=%d, moved=%d",
-                        len(smart_chunks), len(drained_pages), moved,
-                    )
-        else:
-            # Default tail-shrink path. Falls back here when smart_overcap
-            # is off, when the allocator can't supply enough drainable
-            # chunks, or when the source actuator lacks the API.
-            for name in src_names:
-                unmapped_total += src._arena.shrink(name, n_per_src_subpool)
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            pass
-        shrink_t1 = time.monotonic_ns()
-        free_after_shrink = self.shared.free_count()
-
-        # Grow every dst sub-pool by exactly n_per_dst_subpool. Anything
-        # we couldn't grant (because src didn't free enough handles) is
-        # tracked in the stats; the leftover stays in the shared free
-        # list for the next call.
-        granted_total = 0
-        grow_t0 = time.monotonic_ns()
-        for name in dst_names:
-            granted_total += dst._arena.grow(name, n_per_dst_subpool)
-        try:
-            torch.cuda.synchronize()
-        except Exception:
-            pass
-        grow_t1 = time.monotonic_ns()
-
-        free_after_grow = self.shared.free_count()
-        shrink_us = (shrink_t1 - shrink_t0) // 1000
-        grow_us = (grow_t1 - grow_t0) // 1000
-
-        if dst_act is not None:
-            new_dst_cap = dst_act.live_capacity_tokens() + dst_grow_tokens
-            # Same reasoning as above — only un-cap the allocator side;
-            # the dst arena was already grown above by `dst._arena.grow`.
-            dst_act.cap_allocator_only(new_dst_cap)
-
-        stats = {
-            "direction": direction_label,
-            "n_per_src_subpool": n_per_src_subpool,
-            "n_per_dst_subpool": n_per_dst_subpool,
-            "src_subpools": n_src,
-            "dst_subpools": n_dst,
-            "unmapped_total": unmapped_total,
-            "granted_total": granted_total,
-            "free_before": free_before,
-            "free_after_shrink": free_after_shrink,
-            "free_after_grow": free_after_grow,
-            "kv_capacity_tokens": self.kv.current_capacity_tokens(),
-            "mamba_capacity_tokens": self.mamba.current_capacity_tokens(),
-            "shrink_us": shrink_us,
-            "grow_us": grow_us,
-            "fire_total_us": shrink_us + grow_us,
-        }
-        logger.info(
-            "CrossPoolTransferActuator.%s: shrank %d/src=%d → freed %d (%.1f ms), "
-            "grew %d/dst=%d → consumed %d (%.1f ms), total %.1f ms, "
-            "leftover free %d → KV cap=%d tok, mamba cap=%d tok",
-            direction_label,
-            n_per_src_subpool, n_src, unmapped_total, shrink_us / 1000.0,
-            n_per_dst_subpool, n_dst, granted_total, grow_us / 1000.0,
-            (shrink_us + grow_us) / 1000.0,
-            free_after_grow,
-            stats["kv_capacity_tokens"], stats["mamba_capacity_tokens"],
-        )
-        return stats
-
-    # ------------------------------------------------------------------
-
-    def kv_to_mamba_chunks(self, n_per_mamba_subpool: int) -> dict:
-        """Grow mamba by `n` chunks per mamba sub-pool, sourcing handles
-        from KV via the shared pool. KV sheds
-        `ceil(n * n_mamba_subpools / n_kv_subpools)` chunks per KV
-        sub-pool (rounded up so dst grows fully). Any leftover handles
-        stay in the shared free list.
-        """
-        return self._do_transfer(
-            src=self.kv, dst=self.mamba,
-            n_per_dst_subpool=n_per_mamba_subpool,
-            direction_label="kv_to_mamba",
-        )
-
-    def mamba_to_kv_chunks(self, n_per_kv_subpool: int) -> dict:
-        """Symmetric: grow KV by `n` chunks per KV sub-pool, sourcing from
-        mamba. See `kv_to_mamba_chunks`.
-        """
-        return self._do_transfer(
-            src=self.mamba, dst=self.kv,
-            n_per_dst_subpool=n_per_kv_subpool,
-            direction_label="mamba_to_kv",
-        )
-
     # ---- Balanced (leftover-free) wrappers ---------------------------
 
-    def balanced_kv_to_mamba(self, multiplier: int = 1) -> dict:
-        """`kv_to_mamba_chunks` at the balanced unit, scaled by `multiplier`.
+    # ---- T8 plan-based execution -------------------------------------
 
-        Balanced means the source-shrink and destination-grow consume
-        exactly the same number of handles, so the shared pool's free
-        count doesn't drift. Use this in oscillator-style demos where
-        every kv_to_mamba is matched by a balanced_mamba_to_kv: round-trip
-        leaves both pools and the free pool at their starting state.
+    def execute(
+        self,
+        plan: "FirePlan",
+        drain_callback=None,
+        migrate_callback=None,
+    ) -> "FirePlanResult":
+        """T8 step 3: execute a planner-produced FirePlan.
+
+        The plan already encodes which chunks to unmap, which tree refs
+        to drain, which active-req pages to migrate. The executor runs
+        a fixed 6-step protocol with no decisions:
+
+          1. cap-barrier   — pull every page in capped_page_range out of
+                             allocator.free_pages (no new alloc lands there)
+          2. drain         — call `drain_callback(pages_to_drain)` so the
+                             scheduler evicts referencing tree nodes; the
+                             pages return through allocator.free into the
+                             capped set (allocator handles this transition).
+          3. migrate       — call `migrate_callback(pages_to_migrate)` so
+                             the scheduler D2D-copies KV slices to dst_page
+                             and atomically updates req.kv_indices[slot].
+          4. verify        — assert every page in capped_page_range is now
+                             in capped state (free_pages disjoint from
+                             [low,high)). Aborts the fire if not.
+          5. unmap+map     — physically shrink_explicit on src, grow on dst.
+          6. uncap dst     — raise dst allocator's capacity to expose the
+                             newly-mapped chunks to alloc.
+
+        Callbacks are required when their corresponding lists are
+        non-empty. We refuse to silently no-op a non-empty list — that
+        was exactly the T7 v3 failure mode.
+
+        Returns a `FirePlanResult` capturing per-step timings + counts.
         """
-        return self.kv_to_mamba_chunks(
-            self.balanced_unit_kv_to_mamba_dst * multiplier
+        if plan.pages_to_drain and drain_callback is None:
+            raise RuntimeError(
+                f"FirePlan seq={plan.plan_seq} has {len(plan.pages_to_drain)} "
+                f"pages_to_drain but no drain_callback provided. Refusing "
+                f"to execute — silent skip would unmap pages still owned "
+                f"by tree nodes."
+            )
+        if plan.pages_to_migrate and migrate_callback is None:
+            raise RuntimeError(
+                f"FirePlan seq={plan.plan_seq} has {len(plan.pages_to_migrate)} "
+                f"pages_to_migrate but no migrate_callback provided. Refusing "
+                f"to execute — silent skip would unmap pages still owned "
+                f"by active reqs."
+            )
+
+        if plan.direction == "kv_to_mamba":
+            src, dst = self.kv, self.mamba
+            src_act, dst_act = self.kv_actuator, self.mamba_actuator
+        elif plan.direction == "mamba_to_kv":
+            src, dst = self.mamba, self.kv
+            src_act, dst_act = self.mamba_actuator, self.kv_actuator
+        else:
+            raise ValueError(f"unknown plan.direction: {plan.direction!r}")
+
+        if src_act is None or dst_act is None:
+            raise RuntimeError(
+                "execute(plan) requires both per-pool actuators wired "
+                "(via __init__ kv_actuator + mamba_actuator). The plan-based "
+                "path does not have an idle-window-only fallback — the "
+                "scheduler-side wiring is mandatory."
+            )
+
+        result = FirePlanResult(
+            plan_seq=plan.plan_seq,
+            direction=plan.direction,
+            unmapped_pages=0,
+            granted_chunks=0,
+            drained_pages=0,
+            migrated_pages=0,
+            cap_barrier_us=0,
+            drain_us=0,
+            migrate_us=0,
+            unmap_us=0,
+            map_us=0,
+            total_us=0,
+        )
+        t_start = time.monotonic_ns()
+
+        # --- Step 1: cap-barrier --------------------------------------
+        cap_t0 = time.monotonic_ns()
+        cap_low, cap_high = plan.capped_page_range
+        alloc = getattr(src_act, "allocator", None)
+        if alloc is None or not hasattr(alloc, "mark_pages_capped"):
+            raise RuntimeError(
+                "execute(plan): src allocator missing mark_pages_capped — "
+                "the plan-based path requires T3 cap-barrier API."
+            )
+        cap_pages = list(range(cap_low, cap_high))
+        cap_t = torch.tensor(cap_pages, dtype=torch.int64, device=alloc.device)
+        moved_to_capped = alloc.mark_pages_capped(cap_t)
+        result.cap_barrier_us = (time.monotonic_ns() - cap_t0) // 1000
+        logger.info(
+            "execute[seq=%d] cap-barrier: range=[%d,%d) marked=%d "
+            "(free→capped) in %d us",
+            plan.plan_seq, cap_low, cap_high, moved_to_capped,
+            result.cap_barrier_us,
         )
 
-    def balanced_mamba_to_kv(self, multiplier: int = 1) -> dict:
-        """Symmetric balanced wrapper. See `balanced_kv_to_mamba`."""
-        return self.mamba_to_kv_chunks(
-            self.balanced_unit_mamba_to_kv_dst * multiplier
+        # --- Step 2: drain --------------------------------------------
+        drain_t0 = time.monotonic_ns()
+        if plan.pages_to_drain:
+            result.drained_pages = drain_callback(plan.pages_to_drain)
+        result.drain_us = (time.monotonic_ns() - drain_t0) // 1000
+
+        # --- Step 3: migrate ------------------------------------------
+        mig_t0 = time.monotonic_ns()
+        if plan.pages_to_migrate:
+            result.migrated_pages = migrate_callback(plan.pages_to_migrate)
+        result.migrate_us = (time.monotonic_ns() - mig_t0) // 1000
+
+        # --- Step 4: verify -------------------------------------------
+        # Every page in [cap_low, cap_high) must NOT be in free_pages
+        # anymore (cap-barrier moved free → capped; drain/migrate moved
+        # tree/active → capped via allocator.free path). If anything is
+        # still in free_pages, drain/migrate didn't complete and unmap
+        # would corrupt active state.
+        free_pages_t = getattr(alloc, "free_pages", None)
+        if free_pages_t is not None and free_pages_t.numel() > 0:
+            in_range = (free_pages_t >= cap_low) & (free_pages_t < cap_high)
+            n_violations = int(in_range.sum().item())
+            if n_violations > 0:
+                # Restore the cap state so a retry next tick is clean.
+                alloc.unmark_pages_capped(cap_t)
+                result.aborted = True
+                result.abort_reason = (
+                    f"verify failed: {n_violations} pages still in free_pages "
+                    f"after drain+migrate (range=[{cap_low},{cap_high}))"
+                )
+                result.total_us = (time.monotonic_ns() - t_start) // 1000
+                logger.error(
+                    "execute[seq=%d] ABORT after verify: %s",
+                    plan.plan_seq, result.abort_reason,
+                )
+                return result
+
+        # --- Step 5: unmap + map --------------------------------------
+        src_names = self._all_subpool_names(src)
+        dst_names = self._all_subpool_names(dst)
+
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            pass
+        unmap_t0 = time.monotonic_ns()
+        unmapped_total = 0
+        for name in src_names:
+            unmapped_total += src._arena.shrink_explicit(name, plan.chunks_to_unmap_src)
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            pass
+        result.unmap_us = (time.monotonic_ns() - unmap_t0) // 1000
+        result.unmapped_pages = unmapped_total
+
+        # Sanity: did we actually unmap what we expected?
+        # Per-subpool count of unmapped pages should equal
+        # len(chunks_to_unmap_src) * tpc; total is summed across subpools.
+        expected_total = plan.expected_unmap_pages * len(src_names)
+        if unmapped_total != expected_total:
+            logger.warning(
+                "execute[seq=%d] unmap count mismatch: got=%d expected=%d "
+                "(per-subpool %d * %d subpools). chunks may have been "
+                "skipped by shrink_explicit's bounds check.",
+                plan.plan_seq, unmapped_total, expected_total,
+                plan.expected_unmap_pages, len(src_names),
+            )
+
+        map_t0 = time.monotonic_ns()
+        granted_total = 0
+        for name in dst_names:
+            granted_total += dst._arena.grow(name, plan.chunks_to_map_dst)
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError:
+            pass
+        result.map_us = (time.monotonic_ns() - map_t0) // 1000
+        result.granted_chunks = granted_total
+
+        # --- Step 6: uncap dst ----------------------------------------
+        dst_grow_tokens = plan.chunks_to_map_dst * dst.tokens_per_chunk
+        new_dst_cap = dst_act.live_capacity_tokens() + dst_grow_tokens
+        dst_act.cap_allocator_only(new_dst_cap)
+
+        result.total_us = (time.monotonic_ns() - t_start) // 1000
+        logger.info(
+            "execute[seq=%d] DONE dir=%s unmapped=%d granted=%d "
+            "drained=%d migrated=%d cap=%dus drain=%dus migrate=%dus "
+            "unmap=%dus map=%dus total=%dus",
+            plan.plan_seq, plan.direction, result.unmapped_pages,
+            result.granted_chunks, result.drained_pages, result.migrated_pages,
+            result.cap_barrier_us, result.drain_us, result.migrate_us,
+            result.unmap_us, result.map_us, result.total_us,
         )
+        return result
 
     # ------------------------------------------------------------------
 

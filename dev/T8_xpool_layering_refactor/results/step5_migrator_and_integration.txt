@@ -1,0 +1,46 @@
+T8 step 5 — KVPageMigrator + end-to-end integration
+======================================================
+
+Migrator unit tests:
+  cd /scratch/yuzhou/projects/sglang && .venv/bin/python \
+     dev/T8_xpool_layering_refactor/test/test_migrator.py
+
+  [step5] migrate: 3 ops, 18 D2D copies, req_to_token + free_pages updated
+  [step5] dst-not-in-free correctly raised
+  [step5] empty ops no-op OK
+  [step5] release_pages claimed correctly
+  T8 step5 migrator test PASS
+
+Integration test (planner → executor → migrator):
+  cd /scratch/yuzhou/projects/sglang && .venv/bin/python \
+     dev/T8_xpool_layering_refactor/test/test_integration_no_cuda.py
+
+  [integ] OwnerMap: free=12 tree=2 active=2 capped=0
+  [integ] FirePlan: cap=[9,17) drain=[11, 12] migrate=[13->1,14->2]
+  [integ] execute: aborted=False drained=2 migrated=2
+  T8 step5 integration test PASS
+
+What this proves end-to-end:
+  - SchedulerOwnerProvider correctly classifies a synthetic engine
+    (running req on pages 13/14, tree node on 11/12, rest free).
+  - XPoolFirePlanner emits a FirePlan with cap_range=[9,17),
+    chunks_to_unmap=[1], drain=[11,12], migrate=[(13→1),(14→2)],
+    selecting dst pages strictly below cap_low.
+  - Executor runs cap-barrier (free → capped), invokes drain callback
+    with [11,12], invokes migrator with the two MigrateOps, verifies
+    no capped-range pages remain in free_pages, fires shrink+grow.
+  - KVPageMigrator does D2D copy of K/V data (verified via patterned
+    fill: dst page now holds src page's pattern), updates
+    req_to_token in-place, claims dst pages from free_pages.
+  - Post-fire state: req_to_token[5, :2] points to dst pages (1, 2);
+    free_pages no longer contains 1, 2, or any of [9..16];
+    Original req's KV is preserved exactly (lossless migration).
+
+Files added:
+  python/sglang/srt/arena/kv_migrator.py   (~140 lines)
+  dev/T8_xpool_layering_refactor/test/test_migrator.py
+  dev/T8_xpool_layering_refactor/test/test_integration_no_cuda.py
+
+Default behavior unchanged. Provider, planner, executor, migrator
+fully wired but not yet called from BudgetAgent.
+Ready for step 6 (BudgetAgent dispatch + flag flip).

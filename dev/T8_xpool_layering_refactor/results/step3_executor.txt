@@ -1,0 +1,44 @@
+T8 step 3 — CrossPoolTransferActuator.execute(plan)
+====================================================
+
+Run: cd /scratch/yuzhou/projects/sglang && .venv/bin/python \
+     dev/T8_xpool_layering_refactor/test/test_executor.py
+
+Output:
+[step3] happy path: unmapped=16 granted=1
+[step3] drain-without-callback correctly raised
+[step3] migrate-without-callback correctly raised
+[step3] callbacks invoked: drain=2 migrate=2
+[step3] verify abort: verify failed: 1 pages still in free_pages after drain+migrate (range=[57,65))
+
+T8 step3 executor test PASS
+
+Cases covered:
+  - Happy path (drain=[], migrate=[]):
+      cap-barrier mark_pages_capped(57..64), shrink_explicit per src
+      subpool, grow per dst subpool, dst uncap. Tracking unmapped=16
+      (8 pages × 2 src subpools), granted=1.
+  - Non-empty drain without drain_callback        → RuntimeError raised
+                                                     ("Refusing to execute
+                                                     — silent skip would
+                                                     unmap pages still
+                                                     owned by tree nodes")
+  - Non-empty migrate without migrate_callback    → RuntimeError raised
+  - Callbacks called with the exact lists from the plan, return values
+    flow into result.drained_pages / result.migrated_pages.
+  - Verify step: if free_pages still contains a capped-range page after
+    drain/migrate, executor calls unmark_pages_capped (restoring state)
+    and returns FirePlanResult(aborted=True, abort_reason="...") with
+    no shrink_explicit / grow calls. unmap MUST NOT happen.
+
+Files added/modified:
+  python/sglang/srt/arena/cross_pool_actuator.py
+    +180 lines: execute() method, FirePlan/FirePlanResult/MigrateOp imports
+    bug fix: 4-space indentation error on lines 631-650 (T4 atomic_migration
+            block was syntactically broken — unreachable in any prior run.
+            Restored to its intended sibling-of-logger.info indent level.
+            Block scheduled for removal in step 7.)
+  dev/T8_xpool_layering_refactor/test/test_executor.py
+
+No call sites in BudgetAgent / scheduler yet. Default behavior unchanged.
+Ready for step 4 (scheduler-side OwnerProvider).
