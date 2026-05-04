@@ -571,7 +571,19 @@ class ModelRunnerKVCacheMixin:
                     )
 
         # Initialize token_to_kv_pool_allocator
-        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
+        # T2 (paper §3.2.2): SGLANG_ALLOCATOR_PLACEMENT_BIAS=1 forces
+        # need_sort=True so allocator picks the smallest free indices first
+        # (lowest-address placement). Live blocks cluster at pool head, free
+        # accumulates at tail — required for T3's smart over-cap selection.
+        need_sort = (
+            self.server_args.disaggregation_mode in ("decode", "prefill")
+            or os.environ.get("SGLANG_ALLOCATOR_PLACEMENT_BIAS", "0") == "1"
+        )
+        if need_sort:
+            logger.info(
+                "T2 placement bias active (need_sort=True): allocator picks "
+                "smallest free indices first; live blocks cluster at pool head."
+            )
         if self.token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
