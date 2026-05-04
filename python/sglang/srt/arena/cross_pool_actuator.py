@@ -527,6 +527,27 @@ class CrossPoolTransferActuator:
         if smart_overcap and len(smart_chunks) >= n_per_src_subpool:
             for name in src_names:
                 unmapped_total += src._arena.shrink_explicit(name, smart_chunks)
+            # T3 correctness: tell the allocator those chunks' pages are no
+            # longer mappable, so subsequent alloc can't hand them out.
+            # Without this, free_pages still contains page ids whose VA was
+            # just cuMemUnmapped → next alloc + cuMemMap from another pool
+            # would race with the still-cached free_pages entries → crash.
+            alloc = getattr(src_act, "allocator", None)
+            tpc_local = locals().get("tpc", 1) or 1
+            if alloc is not None and hasattr(alloc, "mark_pages_capped") and tpc_local > 0:
+                # Pages are 1-indexed (slot 0 sentinel). For chunk c, the
+                # pages are [c*tpc + 1, (c+1)*tpc + 1).
+                drained_pages = []
+                for c in smart_chunks:
+                    drained_pages.extend(range(c * tpc_local + 1, (c + 1) * tpc_local + 1))
+                if drained_pages:
+                    pages_t = torch.tensor(drained_pages, dtype=torch.int64,
+                                           device=alloc.device)
+                    moved = alloc.mark_pages_capped(pages_t)
+                    logger.info(
+                        "T3 mark_pages_capped: chunks=%d, pages=%d, moved=%d",
+                        len(smart_chunks), len(drained_pages), moved,
+                    )
         else:
             # Default tail-shrink path. Falls back here when smart_overcap
             # is off, when the allocator can't supply enough drainable

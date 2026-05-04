@@ -102,6 +102,76 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             mask[self.release_pages] = True
         return mask
 
+    def mark_pages_capped(self, page_indices: torch.Tensor) -> int:
+        """T3 (paper §3.2.2): hold the given page indices out of the
+        free-list. Used after `shrink_explicit` unmaps non-tail chunks
+        so the allocator stops handing those pages out.
+
+        Removes `page_indices` from `free_pages` and `release_pages`
+        (whichever list each occupies), and appends them to
+        `_capped_pages`. Returns the number of pages actually moved
+        (may be < len(page_indices) if some indices weren't currently
+        in either free list).
+
+        Pages re-enter the free list via the symmetric `unmark_pages_capped`
+        when the actuator grows the pool back.
+        """
+        if page_indices is None or page_indices.numel() == 0:
+            return 0
+        # Build sets for fast membership.
+        target = page_indices.to(self.device).to(torch.int64)
+        # Drop matching ids out of free_pages.
+        moved = 0
+        if self.free_pages is not None and self.free_pages.numel() > 0:
+            mask = torch.isin(self.free_pages, target)
+            held = self.free_pages[mask]
+            self.free_pages = self.free_pages[~mask]
+            moved += int(held.numel())
+            existing = getattr(self, "_capped_pages", None)
+            if existing is None or existing.numel() == 0:
+                self._capped_pages = held
+            else:
+                self._capped_pages = torch.cat([existing, held])
+        # Drop matching ids out of release_pages.
+        if self.release_pages is not None and self.release_pages.numel() > 0:
+            mask = torch.isin(self.release_pages, target)
+            held = self.release_pages[mask]
+            self.release_pages = self.release_pages[~mask]
+            moved += int(held.numel())
+            existing = getattr(self, "_capped_pages", None)
+            if existing is None or existing.numel() == 0:
+                self._capped_pages = held
+            else:
+                self._capped_pages = torch.cat([existing, held])
+        return moved
+
+    def unmark_pages_capped(self, page_indices: torch.Tensor) -> int:
+        """Reverse of `mark_pages_capped`: move given page ids from
+        `_capped_pages` back to `free_pages` (or `release_pages` under
+        need_sort=True so a subsequent merge sorts them).
+        """
+        if page_indices is None or page_indices.numel() == 0:
+            return 0
+        existing = getattr(self, "_capped_pages", None)
+        if existing is None or existing.numel() == 0:
+            return 0
+        target = page_indices.to(self.device).to(torch.int64)
+        mask = torch.isin(existing, target)
+        held = existing[mask]
+        self._capped_pages = existing[~mask]
+        if held.numel() > 0:
+            if self.need_sort:
+                if self.release_pages is None or self.release_pages.numel() == 0:
+                    self.release_pages = held
+                else:
+                    self.release_pages = torch.cat([self.release_pages, held])
+            else:
+                if self.free_pages is None or self.free_pages.numel() == 0:
+                    self.free_pages = held
+                else:
+                    self.free_pages = torch.cat([self.free_pages, held])
+        return int(held.numel())
+
     def select_drain_pages(self, n: int, prefer: str = "high") -> torch.Tensor:
         """T3 (paper §3.2.2): return up to `n` page indices that are
         currently free, suitable for cuMemUnmap.

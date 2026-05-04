@@ -4,46 +4,69 @@
 
 | Part | File | Change |
 |---|---|---|
-| 1 | `python/sglang/srt/mem_cache/allocator.py` | Added `free_page_mask()` and `select_drain_pages(n, prefer)` to `BaseTokenToKVPoolAllocator` |
-| 2 | `python/sglang/srt/arena/chunk_arena.py` | Added `ChunkArena.shrink_explicit(pool, slot_indices)` |
-| 3 | `python/sglang/srt/arena/cross_pool_actuator.py` | Added `_select_drainable_chunks()` helper + env-gated branch in shrink loop |
+| 1 | `python/sglang/srt/mem_cache/allocator.py` | `free_page_mask()`, `select_drain_pages(n, prefer)`, `mark_pages_capped(ids)`, `unmark_pages_capped(ids)` on `BaseTokenToKVPoolAllocator` |
+| 2 | `python/sglang/srt/arena/chunk_arena.py` | `ChunkArena.shrink_explicit(pool, slot_indices)` |
+| 3 | `python/sglang/srt/arena/cross_pool_actuator.py` | `_select_drainable_chunks()` helper + env-gated `SGLANG_SMART_OVERCAP=1` branch in `shrink_then_grow` that picks chunks via the helper, calls `shrink_explicit`, then `mark_pages_capped` to prevent the allocator from handing out pages whose VA was just unmapped |
 
 ## Verification
 
-| Test | Verifies | Result |
-|---|---|---|
-| `test/test_allocator_api.py` | Part 1 API correctness in isolation: mask shape, sentinel slot 0, alloc/free updates, prefer="high"/"low" semantics, capped n | PASS |
-| `test/test_shrink_explicit.py` | Part 2 unmap mechanics: unmaps specified slots, skips already-unmapped / OOB silently, accepts list or tensor | PASS |
-| `test/test_smoke.sh` | T1+T2+T3 flags compose: boot succeeds, T2 prerequisite log appears, 5 generates return | PASS (boot 110 s) |
+| Test | Path | Verifies | Result |
+|---|---|---|---|
+| `test_allocator_api.py` | CPU/CUDA | Part 1 free_page_mask + select_drain_pages: shape, sentinel slot 0, alloc-then-prefer="high"/"low" semantics, capped-on-overrequest | PASS |
+| `test_shrink_explicit.py` | small CUDA arena | Part 2: unmap given slots, return count, skip OOB / already-unmapped, accept list and tensor | PASS |
+| `test_select_drainable_chunks.py` | pure Python with fake allocator | Helper picks all-free chunks, prefers high index, handles edge cases (nothing free / sparse free / no allocator) | PASS |
+| `test_mark_pages_capped.py` | small CUDA | **Correctness invariant**: alloc never returns a page that was passed to mark_pages_capped, even when mask shows "free". Round-trip via unmark restores original state. | PASS |
+| `test_smoke.sh` | full engine boot | T1+T2+T3 flags compose, server boots, 5 generates return, T2 prerequisite log line appears | PASS (boot 110 s) |
 
-## What this verifies
+## Hidden bug found and fixed
 
-1. The allocator can answer "which pages are free" without going through HTTP / Python introspection.
-2. The chunk arena can unmap an arbitrary explicit slot list (not just tail).
-3. The actuator's env-gated branch picks chunks via the new helper without crashing the engine on boot or simple serving.
+The first version of T3 part 3 wired `shrink_explicit` directly without
+also telling the allocator that the unmapped pages were no longer
+mappable. This would have allowed the next `alloc()` to hand out a page
+id whose underlying VA had just been `cuMemUnmap`'d → next kernel touch
+would `cudaErrorIllegalAddress`. Caught by reasoning through the
+allocator-state path, not by the smoke (smoke doesn't exercise fire +
+re-alloc against the same pool).
 
-## What this does NOT verify
+Fix: added `mark_pages_capped(page_indices)` + `unmark_pages_capped()`
+on `BaseTokenToKVPoolAllocator` and wired the cap-page call right after
+`shrink_explicit` in cross_pool_actuator.py. The new
+`test_mark_pages_capped.py` unit test asserts the invariant explicitly
+(alloc(60) after marking 91..100 capped never returns 91..100).
 
-The smoke does not exercise the **fire path** — i.e., the cross-pool actuator deciding to shrink one pool and grow the other. That requires a workload that pushes a pool toward the admission ceiling (M2 swarm conc=800, or M3 phase-shift). Until T7 runs that workload with `SGLANG_SMART_OVERCAP=1`, the commit-success-rate uplift over T1+T2 alone is unobserved.
+## What remains unverified
 
-Specifically untested:
-- Whether `_select_drainable_chunks` returns the **right** chunks under
-  contention (tested only that the shape / count is sensible).
-- Whether `shrink_explicit` plus the env-gated branch **commits** more
-  fires than the `shrink("tail")` path on a real workload.
-- Whether the page→chunk grouping (a `mask.view(n_chunks, tokens_per_chunk).all(dim=1)`) handles the case where `size` isn't a multiple of `tokens_per_chunk` (currently rounded down via `n_pages // tokens_per_chunk`; a few trailing pages may be hidden from the smart-selection scan but they're equally hidden from the tail-scan, so no asymmetric regression).
+The smoke does not exercise the **fire path** — i.e., budgeter actually
+deciding to call `kv_to_mamba_chunks` or `mamba_to_kv_chunks`. The
+five-generate workload doesn't approach admission ceiling, so the
+budgeter never fires. Verifying that:
 
-## Followup items
+1. The `T3 smart over-cap selection` log line actually appears under load
+2. The `T3 mark_pages_capped` log line appears with non-zero `moved`
+3. Subsequent allocations after fire don't crash on unmapped pages
 
-T4 (atomic page migration) will use the same `free_page_mask` API
-plus a new "migrate live block out of these pages" primitive.
+requires a workload that triggers cross-pool transfer. T7 (M2 swarm
+conc=800) is that workload; it will run with `SGLANG_SMART_OVERCAP=1`
+and can grep server log for both lines + count successful fires.
 
-T7 (M2 swarm conc=800 validation) is where commit-success-rate is
-actually measured — at that point the budgeter log's
-`xpool_unmapped_total` per fire under all three flags vs T1+T2 only
-gives the on/off delta this milestone delivers.
+The conservative path (smart_overcap=0, env unset) is unchanged from
+T2, so any regression on the fire path can be A/B'd by toggling the
+flag.
 
 ## Status
 
-T3 done. Code change spans 3 files (~110 lines net). Two unit tests +
-one smoke test all pass. Real-workload uplift deferred to T7.
+T3 done.
+
+Code changes (4 files):
+- python/sglang/srt/mem_cache/allocator.py        (~110 lines added)
+- python/sglang/srt/arena/chunk_arena.py          (~30 lines added)
+- python/sglang/srt/arena/cross_pool_actuator.py  (~50 lines added)
+
+Tests (4 unit + 1 smoke), all PASS:
+- dev/T3_smart_overcap_selection/test/test_allocator_api.py
+- dev/T3_smart_overcap_selection/test/test_shrink_explicit.py
+- dev/T3_smart_overcap_selection/test/test_select_drainable_chunks.py
+- dev/T3_smart_overcap_selection/test/test_mark_pages_capped.py
+- dev/T3_smart_overcap_selection/test/test_smoke.sh
+
+Real-workload verification: T7.

@@ -84,9 +84,17 @@ the §3.2 ideal mode.
   (`python/sglang/srt/arena/cross_pool_actuator.py`)
 - [x] Smoke serving works under T1+T2+T3 flags combined (boot 110 s, 5
   generates return cleanly; T2 prerequisite log line confirmed)
+- [x] **Allocator capping invariant after smart unmap**: bug fix added
+  `mark_pages_capped` / `unmark_pages_capped` on the allocator;
+  `test_mark_pages_capped.py` PASS proves alloc never returns a
+  page that was capped (would have caused cudaErrorIllegalAddress
+  under a real fire).
+- [x] **`_select_drainable_chunks` helper**: 5-case unit test covers
+  all-free / partial-free / sparse-free / nothing-free / no-allocator.
 - [-] Drain success rate uplift: deferred to T7 (M2 swarm conc=800).
-  T3 milestone scope is API surface + integration boot + smoke; the
-  real on/off delta needs an admission-saturated workload to fire.
+  T3 milestone scope is API surface + integration boot + smoke + every
+  reachable correctness invariant; the real on/off delta needs an
+  admission-saturated workload to fire.
 
 ## Followups
 
