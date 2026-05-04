@@ -307,8 +307,11 @@ class MambaPool:
                 from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
                 # Compute chunk-aligned slot count.
                 # Phase A5: ablation honors SGLANG_ARENA_CHUNK_BYTES.
+                # T1 (paper §3.2.1): default to CUDA VMM's native 2 MiB page
+                # granularity on H200. Chunk-grain (e.g., 64 MiB) is selectable
+                # via SGLANG_ARENA_CHUNK_BYTES for legacy A/B comparison.
                 chunk_bytes = int(os.environ.get(
-                    "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
+                    "SGLANG_ARENA_CHUNK_BYTES", str(2 * 1024 * 1024)
                 ))
                 per_token_bytes = (
                     int(np.prod(temporal_state_shape))
@@ -1184,8 +1187,11 @@ class MHATokenToKVPool(KVCache):
                 # resize once the budgeter is wired in 2e.4.d.
                 tot = self.size + self.page_size
                 # Phase A5: ablation honors SGLANG_ARENA_CHUNK_BYTES.
+                # T1 (paper §3.2.1): default to CUDA VMM's native 2 MiB page
+                # granularity on H200. Chunk-grain (e.g., 64 MiB) is selectable
+                # via SGLANG_ARENA_CHUNK_BYTES for legacy A/B comparison.
                 chunk_bytes = int(os.environ.get(
-                    "SGLANG_ARENA_CHUNK_BYTES", str(64 * 1024 * 1024)
+                    "SGLANG_ARENA_CHUNK_BYTES", str(2 * 1024 * 1024)
                 ))
                 per_token_bytes = (
                     self.head_num * self.head_dim
