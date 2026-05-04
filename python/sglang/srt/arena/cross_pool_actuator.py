@@ -38,6 +38,80 @@ import torch
 from sglang.srt.arena.chunk_arena import cross_arena_transfer
 
 
+def _expand_via_migration(
+    src_act,
+    drainable_chunks: list[int],
+    n_target: int,
+    tokens_per_chunk: int,
+    migrator=None,  # Callable[[int_src_slot, int_dst_slot], bool]
+) -> list[int]:
+    """T4 (paper §3.2.3): when smart-overcap returned fewer chunks than
+    requested, expand the drain set by migrating live slots out of
+    partially-free chunks.
+
+    Currently implemented for tokens_per_chunk==1 only (mamba pool at
+    page-grain — every slot is its own chunk). For tokens_per_chunk > 1
+    (KV) the migration would need per-token block copy + req_to_token
+    update, which is out of T4 scope.
+
+    Returns an extended chunk list (>= n_target if migration succeeded
+    on enough slots, else the longest list it could assemble).
+
+    `migrator(src_slot, dst_slot) -> bool` is the caller-provided
+    migration function: copies state src→dst, updates owner pointers,
+    marks alloc-side. Returns True on success, False if migration
+    impossible (dst not free, src not live, etc.).
+    """
+    if tokens_per_chunk != 1:
+        return drainable_chunks  # KV migration out of scope
+    if migrator is None:
+        return drainable_chunks
+    n_more = n_target - len(drainable_chunks)
+    if n_more <= 0:
+        return drainable_chunks
+
+    alloc = getattr(src_act, "allocator", None)
+    pool = getattr(src_act, "pool", None)
+    target_pool = pool if pool is not None and hasattr(pool, "free_slots") else alloc
+    if target_pool is None:
+        return drainable_chunks
+
+    # Free slots available for migration *destinations*. We must pick
+    # destinations from low indices (head of pool) to keep the head dense
+    # and not overlap with the chosen drainable_chunks (tail). Skip any
+    # slot id whose chunk is in the drain set.
+    drain_set = set(drainable_chunks)
+    free = target_pool.free_slots if hasattr(target_pool, "free_slots") else target_pool.free_pages
+    free_low = sorted(int(s) for s in free.tolist() if (int(s) - 1) not in drain_set)
+
+    # Pick the next n_more "live" tail-ish slots to expand the drain set
+    # by — for tpc=1, each chunk c corresponds to slot c+1.
+    pool_size = target_pool.size
+    free_set = set(int(s) for s in free.tolist())
+    extra = []
+    # Walk from the highest non-drainable slot downward.
+    i = pool_size
+    while len(extra) < n_more and i >= 1:
+        chunk = i - 1
+        if chunk not in drain_set and i not in free_set:
+            extra.append((chunk, i))  # (chunk_idx, src_slot_id)
+        i -= 1
+
+    # For each, find a free dst from free_low (popping from front).
+    expanded = list(drainable_chunks)
+    free_low_iter = iter(free_low)
+    for chunk_idx, src_slot in extra:
+        try:
+            dst_slot = next(free_low_iter)
+        except StopIteration:
+            break
+        if migrator(src_slot, dst_slot):
+            expanded.append(chunk_idx)
+        # else: migration failed; skip this chunk
+    expanded.sort(reverse=True)
+    return expanded
+
+
 def _select_drainable_chunks(
     src_act, n_chunks: int, tokens_per_chunk: int
 ) -> list[int]:
@@ -91,7 +165,16 @@ class CrossPoolTransferActuator:
         mamba_actuator=None,     # Optional[MambaArenaActuator]
         kv_live_slot_inspector=None,    # Optional[Callable[[int], int]]
         mamba_live_slot_inspector=None, # Optional[Callable[[int], int]]
+        mamba_slot_migrator=None,       # T4: Callable[[int_src, int_dst], bool]
     ) -> None:
+        # T4 atomic migration (paper §3.2.3). When provided, the
+        # actuator will call this with (src_slot, dst_slot) for each
+        # live slot it needs to migrate out of a to-be-unmapped chunk.
+        # The callback's responsibility:
+        #   1. pool.migrate_slot(src, dst) — copy bytes + update alloc
+        #   2. update any in-flight req's mamba_pool_idx from src to dst
+        # Returns True if migration succeeded, False otherwise.
+        self._mamba_slot_migrator = mamba_slot_migrator
         self.kv = kv_arena
         self.mamba = mamba_arena
         self.shared = shared_pool
@@ -524,6 +607,26 @@ class CrossPoolTransferActuator:
                     "tail" if all(c >= len(src._arena.pools[src_names[0]].mapped) - n_per_src_subpool
                                   for c in smart_chunks) else "non-tail",
                 )
+                # T4 (paper §3.2.3): if smart selection came up short,
+                # try to expand the drain set by atomically migrating
+                # live slots out of partial-free chunks. mamba-only at
+                # tpc=1; KV (tpc>1) falls through to legacy tail path.
+                atomic_migration = (
+                    os.environ.get("SGLANG_ATOMIC_MIGRATION", "0") == "1"
+                )
+                if (atomic_migration and len(smart_chunks) < n_per_src_subpool
+                    and int(tpc) == 1):
+                    migrator = getattr(self, "_mamba_slot_migrator", None)
+                    if migrator is not None and src_act is self.mamba_actuator:
+                        before = len(smart_chunks)
+                        smart_chunks = _expand_via_migration(
+                            src_act, smart_chunks, n_per_src_subpool,
+                            int(tpc), migrator,
+                        )
+                        logger.info(
+                            "T4 atomic migration: expanded %d -> %d chunks",
+                            before, len(smart_chunks),
+                        )
         if smart_overcap and len(smart_chunks) >= n_per_src_subpool:
             for name in src_names:
                 unmapped_total += src._arena.shrink_explicit(name, smart_chunks)

@@ -534,6 +534,55 @@ class MambaPool:
                 return
         self.free_slots = torch.cat((self.free_slots, free_index))
 
+    def migrate_slot(self, src: int, dst: int) -> bool:
+        """T4 (paper §3.2.3): atomic per-slot migration. Copies the
+        recurrent-state contents of slot `src` to slot `dst`, then
+        updates allocator side state: `src` joins _capped_slots
+        (held out, about to be unmapped), `dst` removed from free_slots
+        (now live with src's data).
+
+        Caller's responsibility: update any in-flight request whose
+        `mamba_pool_idx == src` to `dst`. The slot's tensor bytes are
+        moved here; the *owning-request pointer* is the caller's job
+        (it has the scheduler reference; this pool does not).
+
+        Caller must also wrap the call with `torch.cuda.synchronize`
+        before (so all in-flight kernels using src finish reading) and
+        after (so the copy is visible before the next kernel launch).
+        Strictly between scheduler steps this is automatic.
+
+        Returns True if migration succeeded; False if `dst` is not
+        currently free or `src` and `dst` are equal.
+        """
+        if src == dst:
+            return False
+        # Verify dst is free.
+        is_dst_free = bool((self.free_slots == dst).any().item())
+        if not is_dst_free:
+            return False
+
+        # Copy state across all conv tensors and the temporal tensor(s).
+        for t in self.mamba_cache.conv:
+            t[:, dst, ...].copy_(t[:, src, ...])
+        if isinstance(self.mamba_cache.temporal, list):
+            for t in self.mamba_cache.temporal:
+                t[dst, ...].copy_(t[src, ...])
+        else:
+            t = self.mamba_cache.temporal
+            t[:, dst, ...].copy_(t[:, src, ...])
+
+        # Allocator-side state: dst removed from free_slots; src into
+        # _capped_slots (NOT free_slots — its chunk is about to be
+        # unmapped by the actuator).
+        self.free_slots = self.free_slots[self.free_slots != dst]
+        existing = getattr(self, "_capped_slots", None)
+        src_t = torch.tensor([src], dtype=self.free_slots.dtype, device=self.device)
+        if existing is None or existing.numel() == 0:
+            self._capped_slots = src_t
+        else:
+            self._capped_slots = torch.cat([existing, src_t])
+        return True
+
     def clear(self):
         # Phase 2e.5.6.3.c: respect the budgeter's capacity cap, mirroring
         # BaseTokenToKVPoolAllocator.clear's fix. Without this, flush_cache
