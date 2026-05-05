@@ -634,6 +634,60 @@ class RadixCache(BasePrefixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
+    def evict_pages_in_range(self, low: int, high: int) -> int:
+        """T9: pinpoint cross-pool drain. Evict every evictable tree node whose
+        `value` (page-id tensor) overlaps the half-open page-id range
+        ``[low, high)``. Used by the cross-pool actuator's drain step
+        (\\S3.2.5) so that planner-selected tail pages actually leave the
+        tree, instead of relying on LRU semantics which can pick pages
+        outside the cap range.
+
+        Returns the number of pages freed. Pages on locked nodes
+        (`lock_ref > 0`) are skipped; in normal operation the cross-pool
+        planner classifies those as `live` rather than `cached`, so they do
+        not appear in any pages_to_drain set.
+
+        Note on partial overlap: a tree node whose value spans the cap
+        boundary (some page-ids inside, some outside) is evicted as a
+        whole. This frees a few pages outside the cap range as collateral
+        cache loss; under T2 placement bias such cross-boundary nodes
+        cluster at the cap edge and the loss is bounded.
+        """
+        if self.disable:
+            return 0
+        if high <= low:
+            return 0
+
+        start_time = time.perf_counter()
+        num_evicted = 0
+        # Iterate until no evictable leaf overlaps the range. We drain leaves
+        # bottom-up: deleting a leaf may promote its parent to evictable, and
+        # that parent may itself overlap the range.
+        progress = True
+        while progress:
+            progress = False
+            # Snapshot to avoid mutating-while-iterating.
+            leaves = list(self.evictable_leaves)
+            for node in leaves:
+                if node.lock_ref > 0:
+                    continue
+                v = getattr(node, "value", None)
+                if v is None or v.numel() == 0:
+                    continue
+                # Cheap path: check if any page-id in node.value falls in
+                # [low, high). torch ops are µs-level for typical node sizes.
+                in_range = ((v >= low) & (v < high)).any().item()
+                if not in_range:
+                    continue
+                self.token_to_kv_pool_allocator.free(v)
+                num_evicted += int(v.numel())
+                self._delete_leaf(node)
+                self._record_remove_event(node)
+                progress = True
+
+        self.update_eviction_metrics(num_evicted, start_time)
+        return num_evicted
+
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)

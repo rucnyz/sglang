@@ -19,6 +19,8 @@ import os
 import time
 from typing import Any, Optional
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 
@@ -367,41 +369,55 @@ class BudgetAgent:
                     mamba_pool=mamba_pool, scheduler=sched,
                 )
 
-        # Drain callback: evict tree nodes that own the given pages.
-        # The radix tree's evict API is keyed on the EvictParams + LRU
-        # walker; we don't have a "evict-these-specific-pages" API. The
-        # cleanest fit is to call the existing tree_cache.evict with a
-        # page-count target — sglang evicts in LRU order, which matches
-        # the planner's drain set as long as the planner picks the tail
-        # (which it does under T2 placement bias). For pages outside
-        # that LRU prefix, a follow-up version will need a per-page
-        # evict; for now we verify post-drain that all pages_to_drain
-        # actually left tree state, falling back to abort-fire if not.
+        # T9 drain callback: pinpoint-evict tree nodes whose value pages
+        # overlap the cap range, then sweep the freed pages back into
+        # `_capped_pages` (the tree's `evict` path frees pages through
+        # `allocator.free`, which lands them in `free_pages`; verify would
+        # then trip on cap-range pages reappearing in free).
+        # Falls back to LRU-evict-by-count if the tree cache lacks
+        # `evict_pages_in_range` (older RadixCache classes); in that mode
+        # the verify step still catches stragglers.
         tree_cache = sched.tree_cache
+        kv_alloc = self._xpool_actuator.kv_actuator.allocator
 
         def drain_callback(pages):
             if not pages or tree_cache is None:
                 return 0
-            try:
-                # tree_cache.evict signature differs across cache classes;
-                # all of them accept a target token count and an
-                # EvictParams-like object. We hit the lowest-common path:
-                # evict(num_tokens=len(pages)). LRU-evicting that many
-                # tokens covers the planner's drain set under T2 bias.
-                from sglang.srt.mem_cache.base_prefix_cache import (
-                    EvictParams,
-                )
-                params = EvictParams(num_tokens=len(pages))
-                tree_cache.evict(params)
-            except (ImportError, AttributeError, TypeError):
-                # Fallback for cache implementations with a simpler
-                # `evict(num_tokens)` signature.
+            low = min(pages)
+            high = max(pages) + 1
+            n_freed = 0
+            evict_pinpoint = getattr(tree_cache, "evict_pages_in_range", None)
+            if evict_pinpoint is not None:
                 try:
-                    tree_cache.evict(len(pages))
+                    n_freed = int(evict_pinpoint(low, high))
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("T8 drain_callback: evict failed: %r", e)
+                    logger.warning(
+                        "T9 drain_callback: evict_pages_in_range failed: %r", e
+                    )
                     return 0
-            return len(pages)
+            else:
+                # Fallback for tree caches without pinpoint API.
+                try:
+                    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                    tree_cache.evict(EvictParams(num_tokens=len(pages)))
+                except (ImportError, AttributeError, TypeError):
+                    try:
+                        tree_cache.evict(len(pages))
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("T9 drain_callback: evict failed: %r", e)
+                        return 0
+                n_freed = len(pages)
+
+            # Cap-barrier sweep: evict freed pages through allocator.free,
+            # which routes them to `free_pages`. Re-mark the cap range as
+            # capped so verify sees them in the right bucket.
+            cap_t = torch.tensor(
+                list(range(low, high)),
+                dtype=torch.int64,
+                device=kv_alloc.device,
+            )
+            kv_alloc.mark_pages_capped(cap_t)
+            return n_freed
 
         self._t8_state = {
             "planner": planner,
