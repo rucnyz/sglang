@@ -797,7 +797,7 @@ class BudgetAgent:
         # cache-hit. Symmetric handling for both directions: kv_to_mamba
         # evicts the FULL (paged-attention KV) side; mamba_to_kv evicts
         # the MAMBA (recurrent state snapshot) side.
-        if self._tree_cache is not None and decision.direction == "kv_to_mamba":
+        if decision.direction == "kv_to_mamba":
             try:
                 # MambaRadixCache (the hybrid SGLang prefix cache) splits
                 # `evictable_size` into separate full-pool and mamba-pool
@@ -826,7 +826,7 @@ class BudgetAgent:
                     e, traceback.format_exc(),
                 )
                 snapshot["xpool_pre_fire_evicted_error"] = repr(e)
-        elif self._tree_cache is not None and decision.direction == "mamba_to_kv":
+        elif decision.direction == "mamba_to_kv":
             try:
                 tc = self._tree_cache
                 mamba_evictable = (
@@ -926,8 +926,6 @@ class BudgetAgent:
 
     def _maybe_evict(self, snapshot: dict) -> None:
         """Phase 2b actuation: ask the policy what to evict; call tree_cache.evict."""
-        if self._tree_cache is None:
-            return
         target = self._policy.decide(snapshot, self._tick_count)
         # Annotate the snapshot with the decision so the JSONL records what we did.
         snapshot["budgeter_decision"] = target.reason
@@ -991,18 +989,14 @@ class BudgetAgent:
         # schedule_batch.py; we emit the per-tick delta as
         # `num_evicted_tokens_recent` for the SGLangPressureAdapter to
         # convert into benefit-microseconds via prefill_save_us_per_token.
-        if self._tree_cache is not None:
-            cum_evict = getattr(
-                self._tree_cache, "_l2_cumulative_evicted_tokens", 0
-            )
-            last = getattr(self, "_last_evicted_cumulative", 0)
-            recent = max(0, cum_evict - last)
-            self._last_evicted_cumulative = cum_evict
-            snap["num_evicted_tokens_recent"] = recent
-            snap["num_evicted_tokens_cumulative"] = cum_evict
-        else:
-            snap["num_evicted_tokens_recent"] = 0
-            snap["num_evicted_tokens_cumulative"] = 0
+        cum_evict = getattr(
+            self._tree_cache, "_l2_cumulative_evicted_tokens", 0
+        )
+        last = getattr(self, "_last_evicted_cumulative", 0)
+        recent = max(0, cum_evict - last)
+        self._last_evicted_cumulative = cum_evict
+        snap["num_evicted_tokens_recent"] = recent
+        snap["num_evicted_tokens_cumulative"] = cum_evict
 
         # Pool-fill metrics (paper §motivation, Figure
         # bubble_two_workloads): (pool.size - pool.available_size()) /
@@ -1066,10 +1060,7 @@ class BudgetAgent:
         # Phase 3.b (paper §4.2 Eq 4.4): V_prefix' marginal-value report.
         # Available on MambaRadixCache (and Hi*); other tree caches don't
         # expose this signal yet.
-        if (
-            self._tree_cache is not None
-            and hasattr(self._tree_cache, "estimate_v_prefix_marginal")
-        ):
+        if hasattr(self._tree_cache, "estimate_v_prefix_marginal"):
             try:
                 snap["v_prefix_marginal"] = self._tree_cache.estimate_v_prefix_marginal()
             except Exception as e:  # never break the snapshot path
