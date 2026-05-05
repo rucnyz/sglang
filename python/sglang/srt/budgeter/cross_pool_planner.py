@@ -64,8 +64,8 @@ class CrossPoolPolicyConfig:
     # Edge-triggered mode fires ONLY at state transitions (BELOW_LOW ↔
     # IN_BAND ↔ ABOVE_HIGH). Steady state above high → 0 transfers
     # after the first crossing → 0 actuator overhead.
-    edge_trigger: bool = True      # paper §design-l2 default; SGLANG_XPOOL_EDGE_TRIGGER=0 to disable
-    # Net-benefit gate (paper §design-l2). Engine-agnostic abstract:
+    edge_trigger: bool = True      # paper §sec:design-l2 default; SGLANG_XPOOL_EDGE_TRIGGER=0 to disable
+    # Net-benefit gate (paper §sec:design-l2). Engine-agnostic abstract:
     #   B (benefit) ≥ C (cost) × margin
     # B is the sum of admission-pressure signals translated through the
     # `EnginePressureAdapter` (see budgeter/pressure_adapter.py).
@@ -75,7 +75,7 @@ class CrossPoolPolicyConfig:
     # pressure-relief mechanism), vLLM's would dominate swap/preempt,
     # etc. C is the empirically measured per-fire wall time
     # (`nb_chunk_cost_us`).
-    net_benefit_enabled: bool = True   # paper §design-l2 default; SGLANG_XPOOL_NET_BENEFIT=0 to disable
+    net_benefit_enabled: bool = True   # paper §sec:design-l2 default; SGLANG_XPOOL_NET_BENEFIT=0 to disable
     # nb_chunk_cost_us: empirically measured per-fire cuMemUnmap+cuMemMap
     # wall time. ~5,000 us on H200 with 256 MB chunks per the Stage 1
     # calibration in sglang `87360b2c7`. Adapter-specific signal
@@ -364,7 +364,7 @@ class CrossPoolPlanner:
         """Return (allow_fire, why) per the engine-agnostic cost/benefit
         estimator.
 
-        Paper §design-l2: `B (benefit) ≥ C (cost) × margin`. Benefit is
+        Paper §sec:design-l2: `B (benefit) ≥ C (cost) × margin`. Benefit is
         the sum of admission-pressure signals translated through the
         engine-specific `EnginePressureAdapter` (sglang
         `pressure_adapter.py`). Cost is `nb_chunk_cost_us` (empirically
@@ -632,7 +632,7 @@ class CrossPoolPlanner:
                 # Stable. Two re-evaluation paths from inside a stable
                 # state, both pointing the gate at signals it would
                 # otherwise miss:
-                #   (1) Edge re-eval (paper §design-l2 S_edge): when
+                #   (1) Edge re-eval (paper §sec:design-l2 S_edge): when
                 #       the agent observes |Δu| > θ_edge this tick, a
                 #       phase transition is in progress even if the
                 #       discrete state classifier hasn't crossed yet
@@ -725,7 +725,7 @@ class CrossPoolPlanner:
                     # post-fire over-shrink that lifts the destination
                     # pool above HIGH alongside an already-saturating
                     # source pool leaves both saturated and the planner
-                    # stuck (paper §design-l2-firegate Lagrange
+                    # stuck (paper §sec:design-l2-firegate Lagrange
                     # equalization: arbitrate toward the larger marginal
                     # value).
                     #

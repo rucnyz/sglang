@@ -373,7 +373,7 @@ class MambaPool:
                         chunk_bytes=chunk_bytes,
                     )
 
-                # Static-min/soft split (paper §design-l2-actuator). All
+                # Static-min/soft split (paper §sec:design-l2-actuator). All
                 # init_chunks worth of physical handles are cuMemMap'd at
                 # boot — the pool boots at full baseline capacity, no
                 # donation to a shared queue. The static_min defines the
@@ -487,7 +487,7 @@ class MambaPool:
             self.free_slots = torch.arange(
                 1, self.size + 1, dtype=torch.int64, device=self.device
             )
-            # Paper §design-l2: at boot, pool maps init_chunks (= self.size
+            # Paper §sec:design-l2: at boot, pool maps init_chunks (= self.size
             # slots usable). Allocator hands out the full range — engine
             # behaves identically to non-L2 baseline. The actuator only
             # shrinks via drain protocol (cap allocator → wait for in-flight
@@ -1340,7 +1340,7 @@ class MHATokenToKVPool(KVCache):
                     chunk_bytes=chunk_bytes,
                     external_handle_pool=shared_pool,
                 )
-                # Paper §design-l2: pool boots at full init capacity. The
+                # Paper §sec:design-l2: pool boots at full init capacity. The
                 # actuator dynamically caps the allocator during drain when
                 # firing a shrink; no boot-time cap needed.
                 logger.info(

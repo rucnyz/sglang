@@ -352,7 +352,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
-        # Paper §design-l2 drain protocol: a freed page whose id is above
+        # Paper §sec:design-l2 drain protocol: a freed page whose id is above
         # the current live cap belongs in _capped_pages, not back in
         # free_pages. The actuator may be in the middle of draining +
         # unmapping the tail; if we put the id back in free_pages, the

@@ -1,6 +1,6 @@
 """Engine-native pressure adapter for L2's net-benefit gate.
 
-Paper §design-l2 states the gate as `B (benefit) ≥ C (cost) × margin`.
+Paper §sec:design-l2 states the gate as `B (benefit) ≥ C (cost) × margin`.
 The benefit term `B` is the sum of admission-pressure signals translated
 to a uniform "us of GPU time saved" space. Different engines surface
 admission pressure through different mechanisms:
@@ -176,7 +176,7 @@ class SGLangPressureAdapter(EnginePressureAdapter):
             else float(os.environ.get(
                 "SGLANG_XPOOL_PERSIST_TICK_US", "5000"))
         )
-        # S_edge: paper §design-l2-actuator. Bounded one-tick benefit
+        # S_edge: paper §sec:design-l2-actuator. Bounded one-tick benefit
         # added when the planner observes |du_σ/dt| > θ_edge — the
         # gradient signature of a phase transition. Calibrated as one
         # control interval's worth of avoided re-prefill at the engine's

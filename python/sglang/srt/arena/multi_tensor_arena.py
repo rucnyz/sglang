@@ -73,7 +73,7 @@ class MultiTensorArena:
         chunk_bytes: int = 32 * 1024 * 1024,
         external_handle_pool: Optional[SharedHandlePool] = None,
         subpool_offset: Optional[int] = None,
-        # Paper §design-l2-actuator (line 133-135) static-min/soft split:
+        # Paper §sec:design-l2-actuator (line 133-135) static-min/soft split:
         # at boot, only `static_min_tokens` worth of physical pages are
         # cuMemMap'd into each sub-pool; CUDA graphs are captured against
         # this range and the engine's allocator initially caps at
@@ -174,7 +174,7 @@ class MultiTensorArena:
             external_handle_pool=external_handle_pool,
         )
 
-        # Paper §design-l2: boot maps the full init_chunks_per_pool worth
+        # Paper §sec:design-l2: boot maps the full init_chunks_per_pool worth
         # of physical handles into each sub-pool. Pool boots at baseline
         # capacity. The actuator's drain protocol shrinks down to
         # static_min only at fire time, never at boot. (Earlier "donate

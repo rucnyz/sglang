@@ -205,6 +205,12 @@ class BudgetAgent:
                 ", ".join(missing),
             )
             return False
+        # Pre-init the L2 eviction counter on tree_cache. schedule_batch.py
+        # lazy-creates it on the first non-zero evict; pre-creating here
+        # lets the snapshot path read the attribute directly without a
+        # getattr-default fallback.
+        if not hasattr(tree_cache, "_l2_cumulative_evicted_tokens"):
+            tree_cache._l2_cumulative_evicted_tokens = 0
         self._tree_cache = tree_cache
         return True
 
@@ -712,7 +718,7 @@ class BudgetAgent:
         snapshot["xpool_plan_usage_mamba_active_inst"] = usage_mamba_active_inst
         snapshot["usage_mamba_active"] = usage_mamba_active_inst
 
-        # S_edge phase-transition signal (paper §design-l2-actuator).
+        # S_edge phase-transition signal (paper §sec:design-l2-actuator).
         # Maintain low-pass EMA of the two pools' usage and compute the
         # absolute change since last tick. When |Δu| > θ_edge on either
         # pool, mark this tick as edge-active so the adapter contributes
@@ -772,7 +778,7 @@ class BudgetAgent:
         if decision.direction is None:
             return
 
-        # Paper §design-l2 drain protocol: BEFORE the actuator's
+        # Paper §sec:design-l2 drain protocol: BEFORE the actuator's
         # `_drain_complete` check, force-flush tree-cache evictable
         # entries. SGLang's radix prefix cache holds slot ids on behalf
         # of completed-but-cached prefix paths; from the allocator's
@@ -878,7 +884,7 @@ class BudgetAgent:
                 snapshot["xpool_pre_fire_evicted_error"] = repr(e)
 
         unit = self._xpool_planner.config.dst_chunks_per_action
-        # Paper §design-l2: planner-driven fires use the direct single-
+        # Paper §sec:design-l2: planner-driven fires use the direct single-
         # direction `*_chunks(unit)` path (grow dst by `unit` chunks per
         # dst-subpool). The balanced wrapper exists for round-trip
         # oscillator demos but isn't appropriate for planner-driven
@@ -983,15 +989,13 @@ class BudgetAgent:
             ),
         }
 
-        # Paper §design-l2 SGLang adapter: tree-cache eviction is the
+        # Paper §sec:design-l2 SGLang adapter: tree-cache eviction is the
         # primary admission-pressure relief mechanism. The cumulative
         # counter is maintained by `check_decode_mem` in
         # schedule_batch.py; we emit the per-tick delta as
         # `num_evicted_tokens_recent` for the SGLangPressureAdapter to
         # convert into benefit-microseconds via prefill_save_us_per_token.
-        cum_evict = getattr(
-            self._tree_cache, "_l2_cumulative_evicted_tokens", 0
-        )
+        cum_evict = self._tree_cache._l2_cumulative_evicted_tokens
         last = getattr(self, "_last_evicted_cumulative", 0)
         recent = max(0, cum_evict - last)
         self._last_evicted_cumulative = cum_evict

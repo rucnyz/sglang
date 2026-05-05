@@ -2118,7 +2118,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
-        # Paper §design-l2 SGLang pressure adapter: tree-cache eviction
+        # Paper §sec:design-l2 SGLang pressure adapter: tree-cache eviction
         # is the primary admission-pressure relief mechanism on SGLang.
         # We measure the eviction delta via allocator.available_size
         # before/after — that delta is the "deferred re-prefill cost"
