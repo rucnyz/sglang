@@ -1043,11 +1043,11 @@ class MambaRadixCache(BasePrefixCache):
         self,
         c_prefill: float = 1.0,
     ) -> float:
-        """Phase 3.b (paper §4.2 Eq. 4.4): V_prefix'(m) reporter.
+        """\\hat v_{prefix}(m) reporter (paper §sec:design-l1, Eq:vprefix-est).
 
         Estimate the marginal value of holding one more byte of prefix
         cache. The paper's formula:
-            V_prefix'(m) ≈ (n / W) * S * c_prefill
+            \\hat v_{prefix}(m) ≈ (n_bdry / (W · B_bdry)) · S · c_prefill
         where:
             n          = hits-in-window on the NEXT-TO-EVICT node
             W          = hpb_window_s (matches the windowed counter)

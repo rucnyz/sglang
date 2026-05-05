@@ -325,20 +325,21 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
-# Recovery-length EWMA: paper §sec:design-formalism-offline evaluates c_i
-# at the EWMA mean recovery length \bar L_i per pool. KV side is fed by
-# the length of each leaf evicted from the prefix cache; retract side is
-# fed by each retracted req's seq_len. Budgeter snapshot reads the two
-# fields directly. Cold-start (no events yet): EWMA stays at 0, snapshot
-# falls back to SGLANG_XPOOL_DEFAULT_L.
+# Slow-timescale recovery-length signal (paper §sec:design-formalism-offline,
+# the \bar L_i input to (P)'s slow-timescale water-filling). EWMA written
+# event-by-event from the actual evict / retract sites; consumed at
+# budgeter-tick granularity by the cross-pool planner. KV side is fed by
+# leaf evictions; rec side by mamba snapshot evictions; retract side by
+# req kicks. Cold-start (no events yet): EWMA stays at 0; snapshot falls
+# back to SGLANG_XPOOL_DEFAULT_L.
 _RECOVERY_LEN_EWMA_ALPHA = 0.05  # ~14-event half-life
 
 
 def record_recovery_len_kv(tree_cache, L: int) -> None:
     if tree_cache is None or L <= 0:
         return
-    prev = getattr(tree_cache, "_recovery_len_kv_ewma", 0.0)
-    tree_cache._recovery_len_kv_ewma = (
+    prev = getattr(tree_cache, "_slow_recovery_len_kv_ewma", 0.0)
+    tree_cache._slow_recovery_len_kv_ewma = (
         float(L)
         if prev <= 0
         else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev
@@ -350,8 +351,8 @@ def record_recovery_len_rec(tree_cache, L: int) -> None:
     a mamba snapshot when it gets evicted from the prefix tree."""
     if tree_cache is None or L <= 0:
         return
-    prev = getattr(tree_cache, "_recovery_len_rec_ewma", 0.0)
-    tree_cache._recovery_len_rec_ewma = (
+    prev = getattr(tree_cache, "_slow_recovery_len_rec_ewma", 0.0)
+    tree_cache._slow_recovery_len_rec_ewma = (
         float(L)
         if prev <= 0
         else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev
@@ -364,8 +365,8 @@ def record_recovery_len_retract(tree_cache, L: int) -> None:
     feeds the SGLang adapter's `retract_us` admission-pressure term."""
     if tree_cache is None or L <= 0:
         return
-    prev = getattr(tree_cache, "_recovery_len_retract_ewma", 0.0)
-    tree_cache._recovery_len_retract_ewma = (
+    prev = getattr(tree_cache, "_slow_recovery_len_retract_ewma", 0.0)
+    tree_cache._slow_recovery_len_retract_ewma = (
         float(L)
         if prev <= 0
         else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev

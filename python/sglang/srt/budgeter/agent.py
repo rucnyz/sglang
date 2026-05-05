@@ -203,12 +203,12 @@ class BudgetAgent:
         # the snapshot path read attributes directly without getattr.
         if not hasattr(tree_cache, "_admission_cumulative_evicted_tokens"):
             tree_cache._admission_cumulative_evicted_tokens = 0
-        if not hasattr(tree_cache, "_recovery_len_kv_ewma"):
-            tree_cache._recovery_len_kv_ewma = 0.0
-        if not hasattr(tree_cache, "_recovery_len_rec_ewma"):
-            tree_cache._recovery_len_rec_ewma = 0.0
-        if not hasattr(tree_cache, "_recovery_len_retract_ewma"):
-            tree_cache._recovery_len_retract_ewma = 0.0
+        if not hasattr(tree_cache, "_slow_recovery_len_kv_ewma"):
+            tree_cache._slow_recovery_len_kv_ewma = 0.0
+        if not hasattr(tree_cache, "_slow_recovery_len_rec_ewma"):
+            tree_cache._slow_recovery_len_rec_ewma = 0.0
+        if not hasattr(tree_cache, "_slow_recovery_len_retract_ewma"):
+            tree_cache._slow_recovery_len_retract_ewma = 0.0
         self._tree_cache = tree_cache
         return True
 
@@ -1016,16 +1016,17 @@ class BudgetAgent:
         # usable c_i evaluation point before the first event lands.
         tc = self._tree_cache
         default_L = float(os.environ.get("SGLANG_XPOOL_DEFAULT_L", "4096"))
-        kv_L = tc._recovery_len_kv_ewma if tc._recovery_len_kv_ewma > 0 else default_L
-        rec_L = tc._recovery_len_rec_ewma if tc._recovery_len_rec_ewma > 0 else kv_L
+        kv_L = tc._slow_recovery_len_kv_ewma if tc._slow_recovery_len_kv_ewma > 0 else default_L
+        rec_L = tc._slow_recovery_len_rec_ewma if tc._slow_recovery_len_rec_ewma > 0 else kv_L
         retract_L = (
-            tc._recovery_len_retract_ewma if tc._recovery_len_retract_ewma > 0 else kv_L
+            tc._slow_recovery_len_retract_ewma if tc._slow_recovery_len_retract_ewma > 0 else kv_L
         )
-        snap["mean_recovery_len_kv"] = kv_L
-        snap["mean_recovery_len_rec"] = rec_L
-        snap["mean_recovery_len_retract"] = retract_L
+        snap["slow_recovery_len_kv"] = kv_L
+        snap["slow_recovery_len_rec"] = rec_L
+        snap["slow_recovery_len_retract"] = retract_L
 
-        # Phase 3.b (paper §4.2 Eq 4.4): V_prefix' marginal-value report.
+        # \hat v_{prefix}(m) reporter (paper §sec:design-l1, Eq:vprefix-est).
+        # Diagnostic only — emitted to jsonl, not consumed by the gate.
         # Available on MambaRadixCache (and Hi*); other tree caches don't
         # expose this signal yet.
         if hasattr(self._tree_cache, "estimate_v_prefix_marginal"):

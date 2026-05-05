@@ -246,10 +246,10 @@ class SGLangPressureAdapter(EnginePressureAdapter):
         # each miss pays c_KV(\\bar L_KV). Total ≈ (N/\\bar L) · c_KV(\\bar L).
         # No-calibration path keeps the legacy per-token scalar so existing
         # deployments are bit-for-bit unchanged.
-        kv_L = self._to_float(snapshot.get("mean_recovery_len_kv", 0.0))
-        retract_L = self._to_float(snapshot.get("mean_recovery_len_retract", 0.0))
+        kv_L = self._to_float(snapshot.get("slow_recovery_len_kv", 0.0))
+        retract_L = self._to_float(snapshot.get("slow_recovery_len_retract", 0.0))
         use_curves = self.cost_curves.source != "legacy_default" or \
-                     snapshot.get("mean_recovery_len_kv") is not None
+                     snapshot.get("slow_recovery_len_kv") is not None
         if use_curves and evicted_tokens > 0 and kv_L > 0:
             num_misses = evicted_tokens / kv_L
             evict_us = num_misses * self.cost_curves.c_kv_us(kv_L)

@@ -258,10 +258,10 @@ class CrossPoolPlanner:
         c = self.config
         # Per-pool L̄_i (paper §sec:design-formalism-offline). Each pool's
         # EWMA is fed by its own evict events: KV evict for L_kv, mamba
-        # snapshot evict for L_m. mean_recovery_len_retract (req kicked
+        # snapshot evict for L_m. slow_recovery_len_retract (req kicked
         # out) is a separate retract-pressure signal and not used here.
-        L_kv = float((snapshot or {}).get("mean_recovery_len_kv", 0) or 0)
-        L_m = float((snapshot or {}).get("mean_recovery_len_rec", L_kv) or L_kv)
+        L_kv = float((snapshot or {}).get("slow_recovery_len_kv", 0) or 0)
+        L_m = float((snapshot or {}).get("slow_recovery_len_rec", L_kv) or L_kv)
         if L_kv <= 0 and L_m <= 0:
             # No L̄ observed yet — fall back to legacy path.
             return None, 0.0, "nb_direction: no recovery_len observed"
@@ -396,7 +396,7 @@ class CrossPoolPlanner:
         # visible in the log without re-deriving from raw fields.
         regime_str = ""
         if self._cost_curves is not None and snapshot:
-            kv_L = float(snapshot.get("mean_recovery_len_kv", 0) or 0)
+            kv_L = float(snapshot.get("slow_recovery_len_kv", 0) or 0)
             if kv_L > 0:
                 kv_ms = self._cost_curves.c_kv_ms(kv_L)
                 m_ms = self._cost_curves.c_m_ms(kv_L)
@@ -461,9 +461,9 @@ class CrossPoolPlanner:
         )
         if snapshot:
             for k in (
-                "mean_recovery_len_kv",
-                "mean_recovery_len_rec",
-                "mean_recovery_len_retract",
+                "slow_recovery_len_kv",
+                "slow_recovery_len_rec",
+                "slow_recovery_len_retract",
                 "num_evicted_tokens_recent",
                 "num_retracted_reqs",
                 "num_paused_reqs",
@@ -489,7 +489,7 @@ class CrossPoolPlanner:
             rec["benefit_breakdown"] = breakdown
             self._last_emitted_breakdown_serial = breakdown_serial
         if self._cost_curves is not None and snapshot:
-            kv_L = float(snapshot.get("mean_recovery_len_kv", 0) or 0)
+            kv_L = float(snapshot.get("slow_recovery_len_kv", 0) or 0)
             if kv_L > 0:
                 rec["c_kv_ms_at_L"] = self._cost_curves.c_kv_ms(kv_L)
                 rec["c_m_ms_at_L"] = self._cost_curves.c_m_ms(kv_L)
@@ -521,7 +521,7 @@ class CrossPoolPlanner:
             # hoc analysis can correlate fires with the asymmetry direction.
             extra = ""
             if self._cost_curves is not None and snapshot:
-                kv_L = float(snapshot.get("mean_recovery_len_kv", 0) or 0)
+                kv_L = float(snapshot.get("slow_recovery_len_kv", 0) or 0)
                 if kv_L > 0:
                     kv_ms = self._cost_curves.c_kv_ms(kv_L)
                     m_ms = self._cost_curves.c_m_ms(kv_L)
