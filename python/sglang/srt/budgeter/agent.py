@@ -103,21 +103,14 @@ class BudgetAgent:
         self.log_enabled = False
         self._log_fp = None
 
-        # KV-side arena actuator. Lazy-built on first use; serves as the
-        # KV per-pool actuator for the coordinated cross-pool fire path
-        # (xpool_coordinated=1).
+        # KV-side arena actuator (KVArenaActuator). Lazy-built on first
+        # use; serves as the KV per-pool actuator for the cross-pool
+        # fire path (propagates capacity changes back to the allocator).
         self._arena_actuator = None
 
         # Cross-pool transfer actuator. Requires SGLANG_ARENA_SHARED=1 at
         # engine boot; lazy-built on first tick.
         self._xpool_actuator = None
-        # When SGLANG_BUDGETER_XPOOL_COORDINATED=1, the
-        # cross-pool actuator is constructed with per-pool actuators
-        # (KVArenaActuator + MambaArenaActuator) so capacity changes
-        # propagate to allocators. Otherwise (legacy / 2e.5.6.2 path),
-        # only raw chunk movement happens, which is only safe in idle
-        # windows.
-        self.xpool_coordinated = _env_flag("SGLANG_BUDGETER_XPOOL_COORDINATED", False)
 
         # Cross-pool planner state (paper §sec:design-l2). Lazy-built on
         # first tick; runs every tick whenever the budgeter is enabled.
@@ -277,23 +270,18 @@ class BudgetAgent:
         from sglang.srt.arena.cross_pool_actuator import (
             CrossPoolTransferActuator,
         )
-        kv_act = None
-        mamba_act = None
-        if self.xpool_coordinated:
-            self._ensure_arena_actuator()
-            kv_act = self._arena_actuator
-            from sglang.srt.arena.mamba_actuator import MambaArenaActuator
-            try:
-                mamba_act = MambaArenaActuator(mamba_pool)
-            except RuntimeError as e:
-                logger.warning(
-                    "MambaArenaActuator build failed (%s); falling back to "
-                    "raw chunk-move path (idle-window-only).", e,
-                )
-                mamba_act = None
-        # T8: drain/migrate ground-truth replaces legacy spec drain probes;
-        # SchedulerOwnerProvider walks running batch + tree directly, no
-        # inspector callback needed.
+        from sglang.srt.arena.mamba_actuator import MambaArenaActuator
+        self._ensure_arena_actuator()
+        kv_act = self._arena_actuator
+        try:
+            mamba_act = MambaArenaActuator(mamba_pool)
+        except RuntimeError as e:
+            logger.warning(
+                "MambaArenaActuator build failed (%s); cross-pool transfer "
+                "disabled — under live traffic without per-pool capacity "
+                "propagation, allocator can hand out unmapped slots.", e,
+            )
+            return
         self._xpool_actuator = CrossPoolTransferActuator(
             kv_arena=kv_arena,
             mamba_arena=mamba_arena,
@@ -302,9 +290,7 @@ class BudgetAgent:
             mamba_actuator=mamba_act,
         )
         logger.info(
-            "BudgetAgent xpool: actuator attached, coordinated=%s "
-            "(kv_act=%s, mamba_act=%s)",
-            self.xpool_coordinated,
+            "BudgetAgent xpool: actuator attached (kv_act=%s, mamba_act=%s)",
             kv_act is not None, mamba_act is not None,
         )
 
@@ -491,13 +477,13 @@ class BudgetAgent:
             self._emergency_fire_in_progress = False
 
     def _maybe_xpool_planner(self, snapshot: dict) -> None:
-        """Planner-driven cross-pool transfers.
+        """Planner-driven cross-pool transfers (paper §sec:design-l2).
 
         Attaches the cross-pool actuator on first call, then a
         CrossPoolPlanner reads pressure signals from the snapshot and
-        decides direction. Capacity-coordinated path (the actuator
-        updates per-pool allocators) is implied by
-        SGLANG_BUDGETER_XPOOL_COORDINATED=1.
+        decides direction. Per-pool actuators always propagate capacity
+        changes back to the allocators so transfers are safe under live
+        traffic.
         """
         self._ensure_xpool_actuator()
         if self._xpool_actuator is None:
