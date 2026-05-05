@@ -497,17 +497,17 @@ class BudgetAgent:
         # the pools/allocators to get the LIVE state at tick time, then
         # peak-track across consecutive ticks (peaks decay exponentially)
         # so the planner sees the recent maximum, not the just-now zero.
-        kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+        alloc = self.scheduler.token_to_kv_pool_allocator
+        kv_pool = alloc.get_kvcache()
         mamba_pool = getattr(kv_pool, "mamba_pool", None)
 
         usage_kv_inst = 0.0
         usage_mamba_inst = 0.0
         usage_mamba_active_inst = 0.0
-        if alloc is not None:
-            live = getattr(alloc, "live_size", alloc.size)
-            avail = alloc.available_size()
-            if live > 0:
-                usage_kv_inst = max(0.0, min(1.0, (live - avail) / live))
+        live = getattr(alloc, "live_size", alloc.size)
+        avail = alloc.available_size()
+        if live > 0:
+            usage_kv_inst = max(0.0, min(1.0, (live - avail) / live))
         if mamba_pool is not None:
             ms_live = getattr(mamba_pool, "live_size", mamba_pool.size)
             ms_avail = mamba_pool.available_size()
