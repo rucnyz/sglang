@@ -76,6 +76,7 @@ class RequestMetric:
     output_tokens: int
     ttft_ms: float
     e2e_ms: float
+    submit_ts: float = 0.0  # wall-clock at request issue (for warmup discard)
     error: str = ""
 
 
@@ -158,7 +159,14 @@ async def run_user(
     metrics: list,
     rng: random.Random,
     session_label: str,
+    start_at_ts: float = 0.0,
 ) -> SessionState:
+    # Optional staggered start: each user begins at start_at_ts to
+    # spread the initial admission burst across the warmup window.
+    if start_at_ts > 0.0:
+        wait_s = max(0.0, start_at_ts - time.time())
+        if wait_s > 0.0:
+            await asyncio.sleep(wait_s)
     state = SessionState(user_id=user_id)
     timeout_s = 600.0  # tolerant of long prefills
     async with aiohttp.ClientSession() as session:
@@ -177,6 +185,7 @@ async def run_user(
                 {"role": "user", "content": user_msg}
             ]
 
+            submit_ts = time.time()
             text, ttft, e2e, out_tok, err = await chat_call(
                 session, api_base, model, messages,
                 max_output_tokens_per_turn, timeout_s,
@@ -189,6 +198,7 @@ async def run_user(
                 output_tokens=out_tok,
                 ttft_ms=ttft,
                 e2e_ms=e2e,
+                submit_ts=submit_ts,
                 error=err,
             ))
             if err:
@@ -227,6 +237,15 @@ def main():
                    help="Reset session when accumulated context exceeds this.")
     p.add_argument("--max-time-s", type=int, default=300,
                    help="Total benchmark wall-clock seconds.")
+    p.add_argument("--stagger-s", type=float, default=0.0,
+                   help="Stagger session starts by this many seconds "
+                        "between agents — avoids the all-at-once startup "
+                        "admission burst that inflates absolute TTFT in "
+                        "steady-state measurements.")
+    p.add_argument("--measure-after-s", type=float, default=0.0,
+                   help="Discard the first N seconds of per-request metrics "
+                        "from the summary (warmup discard, steady-state "
+                        "measurement). Per-request JSONL retains all rows.")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
@@ -236,6 +255,7 @@ def main():
     deadline_ts = time.time() + args.max_time_s
     base_rng = random.Random(args.seed)
 
+    bench_start_ts = time.time()
     async def driver():
         users = [
             run_user(
@@ -249,6 +269,7 @@ def main():
                 metrics=metrics,
                 rng=random.Random(base_rng.randint(0, 2**31)),
                 session_label=f"agent-{i}",
+                start_at_ts=bench_start_ts + i * args.stagger_s,
             )
             for i in range(args.num_concurrency)
         ]
@@ -267,11 +288,19 @@ def main():
         for m in metrics:
             f.write(json.dumps(asdict(m)) + "\n")
 
-    # Compute summary
-    valid = [m for m in metrics if not m.error]
+    # Compute summary — optional warmup discard (steady-state).
+    measure_cutoff_ts = bench_start_ts + args.measure_after_s
     n_total = len(metrics)
+    discarded = sum(1 for m in metrics if m.submit_ts < measure_cutoff_ts)
+    valid = [
+        m for m in metrics
+        if not m.error and m.submit_ts >= measure_cutoff_ts
+    ]
     n_valid = len(valid)
-    n_errors = n_total - n_valid
+    n_errors = sum(
+        1 for m in metrics
+        if m.error and m.submit_ts >= measure_cutoff_ts
+    )
     if valid:
         ttfts = sorted(m.ttft_ms for m in valid)
         e2es = sorted(m.e2e_ms for m in valid)
@@ -282,8 +311,11 @@ def main():
             "wall_s": wall,
             "num_concurrency": args.num_concurrency,
             "session_cap_tokens": args.session_cap_tokens,
+            "stagger_s": args.stagger_s,
+            "measure_after_s": args.measure_after_s,
             "num_requests_total": n_total,
             "num_requests_valid": n_valid,
+            "num_requests_discarded_warmup": discarded,
             "num_errors": n_errors,
             "mean_ttft_ms": sum(ttfts) / len(ttfts),
             "p50_ttft_ms": pct(ttfts, 0.50),

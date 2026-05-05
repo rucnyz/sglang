@@ -68,28 +68,43 @@ class MambaArenaActuator:
         return self.live_slots
 
     @property
-    def tokens_per_chunk(self) -> int:
-        """T7 fix (paper §3.2.2): expose tokens_per_chunk for the
-        cross_pool_actuator helper. For mamba pool one slot = one chunk
-        at page-grain VMM (T1), so this is typically 1. Raises rather
-        than silently defaulting — a missing arena means construction
-        is broken and silent fallback masks bugs.
-        """
+    def n_pages(self) -> int:
+        """Total physical page count for this pool. Mamba's recurrent
+        state is one slot per req per layer, so one page typically holds
+        one slot — but the same accessor convention matches KVArenaActuator."""
+        return int(self.pool.size) // self._tokens_per_page()
+
+    def _tokens_per_page(self) -> int:
+        """Internal: tokens-per-page for the mamba arena (== slots-per-
+        chunk; typically 1 under T1 page-grain VMM)."""
         arena = getattr(self.pool, "_mamba_temporal_arena", None)
         if arena is None:
             raise RuntimeError(
-                "MambaArenaActuator.tokens_per_chunk: pool has no "
-                "_mamba_temporal_arena. SGLANG_ARENA_SHARED must have failed "
-                "during pool construction. Don't fall back silently — fix "
-                "the wiring."
+                "MambaArenaActuator: pool has no _mamba_temporal_arena "
+                "(SGLANG_ARENA_SHARED?)."
             )
         tpc = getattr(arena, "tokens_per_chunk", None)
         if tpc is None:
             raise RuntimeError(
-                "MambaArenaActuator.tokens_per_chunk: _mamba_temporal_arena "
-                "exists but lacks tokens_per_chunk."
+                "MambaArenaActuator: _mamba_temporal_arena lacks tokens_per_chunk."
             )
         return int(tpc)
+
+    def expand_pages_to_token_slots(self, page_ids):
+        """Translate page-ids → token-slot ids for the mamba allocator.
+        See KVArenaActuator.expand_pages_to_token_slots."""
+        tps = self._tokens_per_page()
+        out = []
+        for p in page_ids:
+            out.extend(range(p * tps + 1, (p + 1) * tps + 1))
+        return out
+
+    def page_is_fully_free(self, page_id: int, free_token_set: set) -> bool:
+        tps = self._tokens_per_page()
+        for s in range(page_id * tps + 1, (page_id + 1) * tps + 1):
+            if s not in free_token_set:
+                return False
+        return True
 
     def cap_allocator_only(self, n_tokens: int) -> int:
         """Phase 2e.5.6.3: same contract as KVArenaActuator.cap_allocator_only.

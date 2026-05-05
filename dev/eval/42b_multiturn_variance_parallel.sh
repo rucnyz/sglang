@@ -48,6 +48,8 @@ launch_wave() {
       TURN_INPUT=${TURN_INPUT:-4096} TURN_OUTPUT=${TURN_OUTPUT:-4096} \
       SESSION_CAP=${SESSION_CAP:-60000} \
       MAX_TIME_S=${MAX_TIME_S:-300} \
+      STAGGER_S=${STAGGER_S:-0.0} \
+      MEASURE_AFTER_S=${MEASURE_AFTER_S:-0.0} \
       MEM_FRAC=${MEM_FRAC:-0.8} \
       SGLANG_XPOOL_UNIT=${SGLANG_XPOOL_UNIT:-1} \
       bash dev/eval/42_multiturn_per_cell.sh \

@@ -913,6 +913,66 @@ class MambaRadixCache(BasePrefixCache):
                 best_priority = p
         return best
 
+    def evict_mamba_above_slot(
+        self, slot_threshold: int, max_to_evict: int = 0
+    ) -> int:
+        """Selectively evict mamba snapshot nodes whose pool slot id is
+        strictly greater than `slot_threshold`. Used by Layer~2's
+        cross-pool actuator to clear the over-cap range before a
+        mamba_to_kv shrink without disturbing low-slot cache entries
+        that the next request stream is likely to hit.
+
+        Without this, a generic `evict_mamba(N)` walks the LRU/HPB
+        list in eviction-priority order and evicts whichever nodes
+        happen to be lowest-priority — frequently low-slot nodes that
+        contain the most-recently-cached prefix prefix material. The
+        result is a multi-turn cache wipe per fire that regresses
+        steady-state TTFT worse than the actuator's KV expansion
+        helps.
+
+        Returns the number of mamba slots actually evicted. May be
+        less than `max_to_evict` if the cache contains fewer eligible
+        (above-threshold) nodes.
+        """
+        if self.disable or slot_threshold < 0:
+            return 0
+        # Walk evictable mamba snapshots and collect those whose
+        # mamba_value (a 1-element tensor of slot id) exceeds the
+        # threshold. Process oldest-LRU first within the eligible set
+        # so the eviction order is still deterministic.
+        candidates = []
+        for node in self.mamba_lru_list.cache.values():
+            if node.mamba_lock_ref > 0 or node.mamba_value is None:
+                continue
+            try:
+                slot = int(node.mamba_value.item())
+            except Exception:
+                continue
+            if slot > slot_threshold:
+                candidates.append(node)
+        if not candidates:
+            return 0
+        # Order by LRU (oldest last_access first) so we evict the
+        # least-recently-used among the slot-eligible set.
+        candidates.sort(key=lambda n: n.last_access_time)
+        cap = max_to_evict if max_to_evict > 0 else len(candidates)
+        evicted = 0
+        for node in candidates[:cap]:
+            if not self.mamba_lru_list.in_list(node):
+                continue
+            assert node.mamba_value is not None
+            assert node.mamba_lock_ref == 0
+            assert node != self.root_node
+            if len(node.children) > 0:
+                self.req_to_token_pool.mamba_pool.free(node.mamba_value)
+                evicted += len(node.mamba_value)
+                self.mamba_lru_list.remove_node(node)
+                self._tombstone_internal_node(node)
+            else:
+                _, delta, _, _ = self._evict_leaf_node(node, True)
+                evicted += delta
+        return evicted
+
     def evict_mamba(self, mamba_num: int) -> int:
         """Evict mamba states. Returns the number of mamba states evicted."""
         if self.disable or mamba_num <= 0:

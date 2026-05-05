@@ -339,8 +339,6 @@ class BudgetAgent:
             logger.info("T8: no scheduler ref — staying on legacy path")
             return False
         try:
-            from sglang.srt.arena.kv_migrator import KVPageMigrator
-            from sglang.srt.arena.mamba_migrator import MambaPageMigrator
             from sglang.srt.budgeter.fire_planner import XPoolFirePlanner
             from sglang.srt.budgeter.scheduler_owner_provider import (
                 SchedulerOwnerProvider,
@@ -348,115 +346,31 @@ class BudgetAgent:
         except ImportError as e:
             logger.warning("T8: import failed: %r", e)
             return False
-        provider = SchedulerOwnerProvider(sched)
+        provider = SchedulerOwnerProvider(
+            scheduler=sched,
+            kv_actuator=self._xpool_actuator.kv_actuator,
+            mamba_actuator=self._xpool_actuator.mamba_actuator,
+        )
         planner = XPoolFirePlanner(
             kv_actuator=self._xpool_actuator.kv_actuator,
             mamba_actuator=self._xpool_actuator.mamba_actuator,
             owner_provider=provider,
         )
-        kv_pool = self._xpool_actuator.kv_actuator.pool
-        kv_migrator = KVPageMigrator(
-            kv_pool=kv_pool,
-            req_to_token_pool=sched.req_to_token_pool,
-            allocator=self._xpool_actuator.kv_actuator.allocator,
-        )
-        mamba_migrator = None
-        mamba_act = self._xpool_actuator.mamba_actuator
-        if mamba_act is not None:
-            mamba_pool = getattr(mamba_act, "pool", None)
-            if mamba_pool is not None:
-                mamba_migrator = MambaPageMigrator(
-                    mamba_pool=mamba_pool, scheduler=sched,
-                )
 
-        # T9 drain callback: pinpoint-evict tree nodes whose value pages
-        # overlap the cap range, then sweep the freed pages back into
-        # `_capped_pages` (the tree's `evict` path frees pages through
-        # `allocator.free`, which lands them in `free_pages`; verify would
-        # then trip on cap-range pages reappearing in free).
-        # Falls back to LRU-evict-by-count if the tree cache lacks
-        # `evict_pages_in_range` (older RadixCache classes); in that mode
-        # the verify step still catches stragglers.
-        tree_cache = sched.tree_cache
-        kv_alloc = self._xpool_actuator.kv_actuator.allocator
-
-        def drain_callback(pages):
-            if not pages or tree_cache is None:
-                return 0
-            low = min(pages)
-            high = max(pages) + 1
-            n_freed = 0
-            evict_pinpoint = getattr(tree_cache, "evict_pages_in_range", None)
-            if evict_pinpoint is not None:
-                try:
-                    n_freed = int(evict_pinpoint(low, high))
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        "T9 drain_callback: evict_pages_in_range failed: %r", e
-                    )
-                    return 0
-            else:
-                # Fallback for tree caches without pinpoint API.
-                try:
-                    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-                    tree_cache.evict(EvictParams(num_tokens=len(pages)))
-                except (ImportError, AttributeError, TypeError):
-                    try:
-                        tree_cache.evict(len(pages))
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("T9 drain_callback: evict failed: %r", e)
-                        return 0
-                n_freed = len(pages)
-
-            # Cap-barrier sweep: evict freed pages through allocator.free,
-            # which routes them to `free_pages`. Re-mark the cap range as
-            # capped so verify sees them in the right bucket.
-            cap_t = torch.tensor(
-                list(range(low, high)),
-                dtype=torch.int64,
-                device=kv_alloc.device,
-            )
-            kv_alloc.mark_pages_capped(cap_t)
-            return n_freed
-
-        self._t8_state = {
-            "planner": planner,
-            "provider": provider,
-            "kv_migrator": kv_migrator,
-            "mamba_migrator": mamba_migrator,
-            "drain_callback": drain_callback,
-        }
+        self._t8_state = {"planner": planner, "provider": provider}
         logger.info("T8: state wired — fires will route through execute(plan)")
         return True
 
     def _maybe_t8_fire(self, direction: str, unit: int, snapshot: dict):
-        """Run a fire through the T8 plan-based path. Returns a stats
-        dict in the legacy shape (so the caller's snapshot logging code
-        works unchanged), or None if the T8 path could not produce a
-        plan (caller falls back to the legacy `*_chunks(unit)` path).
-        """
+        """Run a fire through the plan-based path. Returns a stats dict
+        in the legacy shape so callers' snapshot logging works unchanged,
+        or None if wiring isn't ready."""
         if not self._ensure_t8_state():
             return None
         st = self._t8_state
         actuator = self._xpool_actuator
-        if direction == "kv_to_mamba":
-            src_act = actuator.kv_actuator
-            migrate_cb = st["kv_migrator"].migrate
-        else:
-            src_act = actuator.mamba_actuator
-            mamba_mig = st.get("mamba_migrator")
-            if mamba_mig is None:
-                # No mamba migrator wired (mamba_actuator absent).
-                # Caller will fall back to legacy path.
-                return None
-            migrate_cb = mamba_mig.migrate
-        if src_act is None:
-            return None
-        target_drop_pages = unit * src_act.tokens_per_chunk
         plan = st["planner"].build(
-            direction=direction,
-            target_drop_pages=target_drop_pages,
-            dst_grant_chunks=unit,
+            direction=direction, n_pages_target=unit,
         )
         if plan is None:
             snapshot["xpool_t8_skipped"] = "plan_refused"
@@ -470,18 +384,12 @@ class BudgetAgent:
                 "skipped": "t8_plan_refused",
             }
         try:
-            res = actuator.execute(
-                plan,
-                drain_callback=st["drain_callback"],
-                migrate_callback=migrate_cb,
-            )
+            res = actuator.execute(plan)
         except RuntimeError as e:
             logger.error("T8 execute(plan) failed: %r", e)
             snapshot["xpool_t8_error"] = repr(e)
             return None
         snapshot["xpool_t8_plan_seq"] = res.plan_seq
-        snapshot["xpool_t8_drained_pages"] = res.drained_pages
-        snapshot["xpool_t8_migrated_pages"] = res.migrated_pages
         snapshot["xpool_t8_aborted"] = res.aborted
         if res.aborted:
             snapshot["xpool_t8_abort_reason"] = res.abort_reason
@@ -497,7 +405,7 @@ class BudgetAgent:
         return {
             "direction": direction,
             "unmapped_total": res.unmapped_pages,
-            "granted_total": res.granted_chunks,
+            "granted_total": res.granted_pages,
             "kv_capacity_tokens": actuator.kv.current_capacity_tokens(),
             "mamba_capacity_tokens": actuator.mamba.current_capacity_tokens(),
             "free_after_grow": actuator.shared.free_count(),

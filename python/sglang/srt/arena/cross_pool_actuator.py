@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.arena.fire_plan import FirePlan, FirePlanResult, MigrateOp
+from sglang.srt.arena.fire_plan import FirePlan, FirePlanResult
 
 
 if TYPE_CHECKING:
@@ -82,59 +82,21 @@ class CrossPoolTransferActuator:
     def _dst_actuator(self, dst: "MultiTensorArena"):
         return self.kv_actuator if dst is self.kv else self.mamba_actuator
 
-    # ---- Balanced (leftover-free) wrappers ---------------------------
+    # ---- Plan-based execution ----------------------------------------
 
-    # ---- T8 plan-based execution -------------------------------------
+    def execute(self, plan: "FirePlan") -> "FirePlanResult":
+        """Execute a planner-produced FirePlan. Three steps, no callbacks:
 
-    def execute(
-        self,
-        plan: "FirePlan",
-        drain_callback=None,
-        migrate_callback=None,
-    ) -> "FirePlanResult":
-        """T8 step 3: execute a planner-produced FirePlan.
+          1. cap-barrier — translate page-ids to allocator token-slots and
+                           mark them off-limits, blocking concurrent allocs;
+          2. verify      — confirm no target page leaked back into free;
+          3. unmap + map — physically `cuMemUnmap` source pages, `cuMemMap`
+                           the freed handles into the destination pool.
 
-        The plan already encodes which chunks to unmap, which tree refs
-        to drain, which active-req pages to migrate. The executor runs
-        a fixed 6-step protocol with no decisions:
-
-          1. cap-barrier   — pull every page in capped_page_range out of
-                             allocator.free_pages (no new alloc lands there)
-          2. drain         — call `drain_callback(pages_to_drain)` so the
-                             scheduler evicts referencing tree nodes; the
-                             pages return through allocator.free into the
-                             capped set (allocator handles this transition).
-          3. migrate       — call `migrate_callback(pages_to_migrate)` so
-                             the scheduler D2D-copies KV slices to dst_page
-                             and atomically updates req.kv_indices[slot].
-          4. verify        — assert every page in capped_page_range is now
-                             in capped state (free_pages disjoint from
-                             [low,high)). Aborts the fire if not.
-          5. unmap+map     — physically shrink_explicit on src, grow on dst.
-          6. uncap dst     — raise dst allocator's capacity to expose the
-                             newly-mapped chunks to alloc.
-
-        Callbacks are required when their corresponding lists are
-        non-empty. We refuse to silently no-op a non-empty list — that
-        was exactly the T7 v3 failure mode.
-
-        Returns a `FirePlanResult` capturing per-step timings + counts.
+        The planner has already guaranteed every page in `pages_to_unmap`
+        is currently fully free. The verify step is a sanity check that
+        should never trip in steady state.
         """
-        if plan.pages_to_drain and drain_callback is None:
-            raise RuntimeError(
-                f"FirePlan seq={plan.plan_seq} has {len(plan.pages_to_drain)} "
-                f"pages_to_drain but no drain_callback provided. Refusing "
-                f"to execute — silent skip would unmap pages still owned "
-                f"by tree nodes."
-            )
-        if plan.pages_to_migrate and migrate_callback is None:
-            raise RuntimeError(
-                f"FirePlan seq={plan.plan_seq} has {len(plan.pages_to_migrate)} "
-                f"pages_to_migrate but no migrate_callback provided. Refusing "
-                f"to execute — silent skip would unmap pages still owned "
-                f"by active reqs."
-            )
-
         if plan.direction == "kv_to_mamba":
             src, dst = self.kv, self.mamba
             src_act, dst_act = self.kv_actuator, self.mamba_actuator
@@ -147,21 +109,15 @@ class CrossPoolTransferActuator:
         if src_act is None or dst_act is None:
             raise RuntimeError(
                 "execute(plan) requires both per-pool actuators wired "
-                "(via __init__ kv_actuator + mamba_actuator). The plan-based "
-                "path does not have an idle-window-only fallback — the "
-                "scheduler-side wiring is mandatory."
+                "(via __init__ kv_actuator + mamba_actuator)."
             )
 
         result = FirePlanResult(
             plan_seq=plan.plan_seq,
             direction=plan.direction,
             unmapped_pages=0,
-            granted_chunks=0,
-            drained_pages=0,
-            migrated_pages=0,
+            granted_pages=0,
             cap_barrier_us=0,
-            drain_us=0,
-            migrate_us=0,
             unmap_us=0,
             map_us=0,
             total_us=0,
@@ -169,45 +125,25 @@ class CrossPoolTransferActuator:
         t_start = time.monotonic_ns()
 
         # --- Step 1: cap-barrier --------------------------------------
-        # The planner picked specific page-ids (chunk_id + 1 under T1's
-        # 1-indexed page layout). We cap exactly those pages; any
-        # intermediate page-ids inside `capped_page_range` that the
-        # planner did NOT select are left alone.
         cap_t0 = time.monotonic_ns()
         alloc = getattr(src_act, "allocator", None)
         if alloc is None or not hasattr(alloc, "mark_pages_capped"):
             raise RuntimeError(
-                "execute(plan): src allocator missing mark_pages_capped — "
-                "the plan-based path requires T3 cap-barrier API."
+                "execute(plan): src allocator missing mark_pages_capped."
             )
-        cap_pages = [c + 1 for c in plan.chunks_to_unmap_src]
-        cap_t = torch.tensor(cap_pages, dtype=torch.int64, device=alloc.device)
+        # Translation page-id → allocator token-slot ids is hidden in the
+        # actuator; the planner above never sees token slots.
+        cap_slots = src_act.expand_pages_to_token_slots(plan.pages_to_unmap)
+        cap_t = torch.tensor(cap_slots, dtype=torch.int64, device=alloc.device)
         moved_to_capped = alloc.mark_pages_capped(cap_t)
         result.cap_barrier_us = (time.monotonic_ns() - cap_t0) // 1000
         logger.info(
-            "execute[seq=%d] cap-barrier: pages=%d marked=%d "
-            "(free→capped) in %d us",
-            plan.plan_seq, len(cap_pages), moved_to_capped,
-            result.cap_barrier_us,
+            "execute[seq=%d] cap-barrier: pages=%d slots=%d marked=%d in %d us",
+            plan.plan_seq, len(plan.pages_to_unmap),
+            len(cap_slots), moved_to_capped, result.cap_barrier_us,
         )
 
-        # --- Step 2: drain --------------------------------------------
-        drain_t0 = time.monotonic_ns()
-        if plan.pages_to_drain:
-            result.drained_pages = drain_callback(plan.pages_to_drain)
-        result.drain_us = (time.monotonic_ns() - drain_t0) // 1000
-
-        # --- Step 3: migrate ------------------------------------------
-        mig_t0 = time.monotonic_ns()
-        if plan.pages_to_migrate:
-            result.migrated_pages = migrate_callback(plan.pages_to_migrate)
-        result.migrate_us = (time.monotonic_ns() - mig_t0) // 1000
-
-        # --- Step 4: verify -------------------------------------------
-        # Every page the planner selected must now be in capped state, not
-        # free. (Cap-barrier moved them out of free_pages in step 1; any
-        # callbacks should have left them capped.) If any selected page
-        # leaked back into free_pages, abort and restore the cap state.
+        # --- Step 2: verify -------------------------------------------
         free_pages_t = getattr(alloc, "free_pages", None)
         if free_pages_t is not None and free_pages_t.numel() > 0:
             in_target = torch.isin(free_pages_t, cap_t)
@@ -216,8 +152,8 @@ class CrossPoolTransferActuator:
                 alloc.unmark_pages_capped(cap_t)
                 result.aborted = True
                 result.abort_reason = (
-                    f"verify failed: {n_violations} of "
-                    f"{len(cap_pages)} target pages still in free_pages"
+                    f"verify failed: {n_violations} of {len(cap_slots)} "
+                    f"target slots still in free_pages"
                 )
                 result.total_us = (time.monotonic_ns() - t_start) // 1000
                 logger.error(
@@ -226,10 +162,9 @@ class CrossPoolTransferActuator:
                 )
                 return result
 
-        # --- Step 5: unmap + map --------------------------------------
+        # --- Step 3: unmap + map --------------------------------------
         src_names = self._all_subpool_names(src)
         dst_names = self._all_subpool_names(dst)
-
         try:
             torch.cuda.synchronize()
         except RuntimeError:
@@ -237,7 +172,7 @@ class CrossPoolTransferActuator:
         unmap_t0 = time.monotonic_ns()
         unmapped_total = 0
         for name in src_names:
-            unmapped_total += src._arena.shrink_explicit(name, plan.chunks_to_unmap_src)
+            unmapped_total += src._arena.shrink_explicit(name, plan.pages_to_unmap)
         try:
             torch.cuda.synchronize()
         except RuntimeError:
@@ -245,43 +180,32 @@ class CrossPoolTransferActuator:
         result.unmap_us = (time.monotonic_ns() - unmap_t0) // 1000
         result.unmapped_pages = unmapped_total
 
-        # Sanity: did we actually unmap what we expected?
-        # Per-subpool count of unmapped pages should equal
-        # len(chunks_to_unmap_src) * tpc; total is summed across subpools.
-        expected_total = plan.expected_unmap_pages * len(src_names)
-        if unmapped_total != expected_total:
-            logger.warning(
-                "execute[seq=%d] unmap count mismatch: got=%d expected=%d "
-                "(per-subpool %d * %d subpools). chunks may have been "
-                "skipped by shrink_explicit's bounds check.",
-                plan.plan_seq, unmapped_total, expected_total,
-                plan.expected_unmap_pages, len(src_names),
-            )
-
         map_t0 = time.monotonic_ns()
         granted_total = 0
         for name in dst_names:
-            granted_total += dst._arena.grow(name, plan.chunks_to_map_dst)
+            granted_total += dst._arena.grow(name, plan.pages_to_map_dst)
         try:
             torch.cuda.synchronize()
         except RuntimeError:
             pass
         result.map_us = (time.monotonic_ns() - map_t0) // 1000
-        result.granted_chunks = granted_total
+        result.granted_pages = granted_total
 
-        # --- Step 6: uncap dst ----------------------------------------
-        dst_grow_tokens = plan.chunks_to_map_dst * dst.tokens_per_chunk
-        new_dst_cap = dst_act.live_capacity_tokens() + dst_grow_tokens
+        # --- Step 4: uncap dst ----------------------------------------
+        # Translate granted pages to token-slots for the dst allocator's
+        # capacity bump. Reuse the same actuator-internal translation.
+        dst_grow_slots = len(dst_act.expand_pages_to_token_slots(
+            list(range(plan.pages_to_map_dst))
+        ))
+        new_dst_cap = dst_act.live_capacity_tokens() + dst_grow_slots
         dst_act.cap_allocator_only(new_dst_cap)
 
         result.total_us = (time.monotonic_ns() - t_start) // 1000
         logger.info(
             "execute[seq=%d] DONE dir=%s unmapped=%d granted=%d "
-            "drained=%d migrated=%d cap=%dus drain=%dus migrate=%dus "
-            "unmap=%dus map=%dus total=%dus",
+            "cap=%dus unmap=%dus map=%dus total=%dus",
             plan.plan_seq, plan.direction, result.unmapped_pages,
-            result.granted_chunks, result.drained_pages, result.migrated_pages,
-            result.cap_barrier_us, result.drain_us, result.migrate_us,
+            result.granted_pages, result.cap_barrier_us,
             result.unmap_us, result.map_us, result.total_us,
         )
         return result

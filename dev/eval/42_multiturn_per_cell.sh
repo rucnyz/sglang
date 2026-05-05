@@ -86,8 +86,10 @@ TURN_INPUT=${TURN_INPUT:-4096}
 TURN_OUTPUT=${TURN_OUTPUT:-4096}
 SESSION_CAP=${SESSION_CAP:-60000}
 MAX_TIME_S=${MAX_TIME_S:-300}
+STAGGER_S=${STAGGER_S:-0.0}
+MEASURE_AFTER_S=${MEASURE_AFTER_S:-0.0}
 
-echo "[$cell] running multi-turn client (concurrency=$NUM_CONCURRENCY, ${MAX_TIME_S}s)"
+echo "[$cell] running multi-turn client (concurrency=$NUM_CONCURRENCY, ${MAX_TIME_S}s, stagger=${STAGGER_S}s, measure_after=${MEASURE_AFTER_S}s)"
 .venv/bin/python dev/eval/multiturn_client.py \
   --api-base http://127.0.0.1:$PORT \
   --model Qwen/Qwen3.5-35B-A3B \
@@ -96,6 +98,8 @@ echo "[$cell] running multi-turn client (concurrency=$NUM_CONCURRENCY, ${MAX_TIM
   --turn-output-tokens $TURN_OUTPUT \
   --session-cap-tokens $SESSION_CAP \
   --max-time-s $MAX_TIME_S \
+  --stagger-s $STAGGER_S \
+  --measure-after-s $MEASURE_AFTER_S \
   --output-dir "$OUT_DIR" \
   > "$OUT_DIR/${cell}_client.log" 2>&1 || echo "[$cell] client failed"
 echo "[$cell] client done"

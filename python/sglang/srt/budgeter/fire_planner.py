@@ -21,7 +21,7 @@ import logging
 import os
 from typing import List, Optional, Tuple
 
-from sglang.srt.arena.fire_plan import FirePlan, MigrateOp
+from sglang.srt.arena.fire_plan import FirePlan
 from sglang.srt.arena.owner_provider import OwnerMap, OwnerProvider
 
 logger = logging.getLogger(__name__)
@@ -69,110 +69,64 @@ class XPoolFirePlanner:
     def build(
         self,
         direction: str,
-        target_drop_pages: int,
-        dst_grant_chunks: int,
+        n_pages_target: int,
     ) -> Optional[FirePlan]:
-        """Produce a FirePlan that physically drops `target_drop_pages`
-        page-equivalents from the source pool and grants `dst_grant_chunks`
-        chunks to the destination.
+        """Produce a FirePlan that physically transfers `n_pages_target`
+        2 MiB pages from the source pool to the destination.
 
-        Returns None when the plan can't be built safely (e.g., not enough
-        free dst pages to migrate every active page out of the tail).
-        Caller should either retry with a smaller delta next tick or skip
-        the fire entirely.
+        Returns None when no such plan is achievable from the current
+        free-page pool. Caller skips the fire and retries on the next
+        budgeter tick.
         """
         if direction not in ("kv_to_mamba", "mamba_to_kv"):
             raise ValueError(f"unknown direction: {direction!r}")
 
         if direction == "kv_to_mamba":
-            src_act = self.kv
             owner_map = self.owner_provider.build_kv_owner_map()
         else:
-            if self.mamba is None:
+            owner_map = self.owner_provider.build_mamba_owner_map()
+            if owner_map is None:
                 logger.warning(
-                    "XPoolFirePlanner.build: mamba_to_kv requested but no "
-                    "mamba actuator wired — refusing plan."
+                    "XPoolFirePlanner.build: mamba_to_kv but owner "
+                    "provider returned None — refusing plan."
                 )
                 return None
-            src_act = self.mamba
-            mamba_om = self.owner_provider.build_mamba_owner_map()
-            if mamba_om is None:
-                logger.warning(
-                    "XPoolFirePlanner.build: mamba_to_kv requested but "
-                    "owner provider returned None for mamba — refusing plan."
-                )
-                return None
-            owner_map = mamba_om
 
-        # Coverage check: planner refuses to fire if owner walker missed
-        # any pages. Better to log and skip than to unmap a page we can't
-        # account for (which is exactly the T7 v3 crash class).
-        try:
-            owner_map.assert_complete()
-        except RuntimeError as e:
-            logger.error("XPoolFirePlanner: owner map incomplete — %s", e)
-            return None
-
-        tpc = src_act.tokens_per_chunk
-        n_pages = owner_map.n_pages
-        if tpc <= 0 or n_pages <= 0:
+        n = max(1, n_pages_target)
+        if n >= owner_map.n_pages:
             logger.warning(
-                "XPoolFirePlanner: invalid pool state tpc=%d n_pages=%d", tpc, n_pages
+                "XPoolFirePlanner: target=%d would exhaust pool "
+                "(n_pages=%d); refusing.",
+                n_pages_target, owner_map.n_pages,
             )
             return None
 
-        n_to_drop = max(1, target_drop_pages)
-        if n_to_drop >= n_pages:
-            logger.warning(
-                "XPoolFirePlanner: target_drop_pages=%d would exhaust pool "
-                "(%d pages); refusing.",
-                target_drop_pages, n_pages,
-            )
-            return None
-
-        # Anywhere-free selection. The cost model of \S3.1 prices per-page
-        # actions; here we instantiate the cheapest case --- pages already
-        # in `free` state (cost 0) --- by picking $n_to_drop$ free pages
-        # from anywhere in $\\mathcal{P}_i$. We sort descending so high-id
-        # pages go first; under T2 placement bias these cluster at the
-        # tail naturally, but the planner does not require them to.
-        free_pages_sorted = sorted(owner_map.free_pages, reverse=True)
-        if len(free_pages_sorted) < n_to_drop:
+        free_pages = owner_map.free_pages
+        if len(free_pages) < n:
             logger.info(
                 "XPoolFirePlanner: insufficient free pages "
-                "(need=%d have=%d); refusing plan. Caller may retry "
-                "after pressure subsides or with a smaller target.",
-                n_to_drop, len(free_pages_sorted),
+                "(need=%d have=%d); refusing plan.",
+                n, len(free_pages),
             )
             return None
 
-        pages_to_unmap = sorted(free_pages_sorted[:n_to_drop])
-        # Chunk = page in T1 page-grain VMM. Page-id layout is 1-indexed
-        # (page 0 is the null sentinel), so chunk c owns page c+1.
-        chunks_to_unmap = [p - 1 for p in pages_to_unmap]
-        # capped_page_range is the bounding interval over the picked pages
-        # (logging only; the executor uses chunks_to_unmap_src as the
-        # source of truth for which specific pages to cap).
-        capped_low = pages_to_unmap[0]
-        capped_high = pages_to_unmap[-1] + 1
+        # Highest-id free pages first so under T2 placement bias the
+        # picked pages cluster at the tail (the head stays densely packed
+        # for live allocation). Without placement bias, any K free pages
+        # work equally well — page selection has no contiguity requirement.
+        pages_to_unmap = sorted(sorted(free_pages, reverse=True)[:n])
 
         self._seq += 1
         plan = FirePlan(
             direction=direction,
-            capped_page_range=(capped_low, capped_high),
-            chunks_to_unmap_src=chunks_to_unmap,
-            pages_to_drain=[],
-            pages_to_migrate=[],
-            chunks_to_map_dst=int(dst_grant_chunks),
-            expected_unmap_pages=n_to_drop,
+            pages_to_unmap=pages_to_unmap,
+            pages_to_map_dst=n,
             plan_seq=self._seq,
         )
         logger.info(
-            "XPoolFirePlanner.build: seq=%d dir=%s n_unmap=%d "
-            "(span=[%d,%d), n_free_in_pool=%d) grant_chunks=%d",
-            plan.plan_seq, plan.direction, n_to_drop,
-            capped_low, capped_high, len(free_pages_sorted),
-            plan.chunks_to_map_dst,
+            "XPoolFirePlanner.build: seq=%d dir=%s n_pages=%d "
+            "(n_free_in_pool=%d)",
+            plan.plan_seq, plan.direction, n, len(free_pages),
         )
         return plan
 

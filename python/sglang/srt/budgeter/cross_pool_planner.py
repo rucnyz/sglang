@@ -28,8 +28,10 @@ formal Lagrange equalization for the two-pool case.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -100,6 +102,16 @@ class CrossPoolPolicyConfig:
     # in usage units, exceeding hysteresis_delta=0.05).
     both_above_max_threshold: float = 0.95
     both_above_min_gap: float = 0.20
+    # Paper §sec:design-l2-firegate (Eq nb-direction-gate): direction-aware
+    # net benefit. For each ordered pair (σ_src, σ_dst) compute
+    #   NB(σ_src→σ_dst) = c_dst(L̄_dst)·P_save(σ_dst) - c_src(L̄_src)·P_loss(σ_src)
+    # with P_save = P_loss = max(0, (u_σ - u_low) / (1 - u_low)) keyed on
+    # the pool's own low-water; arg-max over directions and fire iff
+    # max-NB ≥ α·C_act. When enabled, this REPLACES the saturation-driven
+    # direction selection — the legacy edge-trigger / persist re-eval paths
+    # are not used. SGLANG_XPOOL_NB_DIRECTION_AWARE=0 to fall back to the
+    # legacy gate. Default ON to match paper.
+    nb_direction_aware: bool = True
 
 
 def _policy_from_env() -> CrossPoolPolicyConfig:
@@ -125,6 +137,7 @@ def _policy_from_env() -> CrossPoolPolicyConfig:
         hysteresis_delta=float(os.environ.get("SGLANG_XPOOL_HYSTERESIS_DELTA", "0.05")),
         both_above_max_threshold=float(os.environ.get("SGLANG_XPOOL_BOTH_ABOVE_MAX", "0.95")),
         both_above_min_gap=float(os.environ.get("SGLANG_XPOOL_BOTH_ABOVE_GAP", "0.20")),
+        nb_direction_aware=bool(int(os.environ.get("SGLANG_XPOOL_NB_DIRECTION_AWARE", "1"))),
     )
 
 
@@ -160,6 +173,30 @@ class CrossPoolPlanner:
             from sglang.srt.budgeter.pressure_adapter import get_default_adapter
             adapter = get_default_adapter()
         self._adapter = adapter
+        # Cost-curve handle (paper §sec:design-l2-firegate). The adapter
+        # carries the calibrated curves; we expose them on the planner so
+        # decision logging can quote c_σ(\bar{L}) and the L<L* / L>L* regime
+        # without re-loading.
+        self._cost_curves = getattr(adapter, "cost_curves", None)
+        # Optional JSONL log of every cost-aware decision (one record per
+        # decide() call regardless of fire/no-fire). Set SGLANG_XPOOL_COST_LOG
+        # to a writable path to enable.
+        self._cost_log_path: Optional[str] = (
+            os.environ.get("SGLANG_XPOOL_COST_LOG") or None
+        )
+        self._cost_log_fp = None
+        if self._cost_log_path:
+            try:
+                self._cost_log_fp = open(self._cost_log_path, "a", buffering=1)
+                logger.info(
+                    "[xpool-cost] decisions logged to %s", self._cost_log_path
+                )
+            except OSError as e:
+                logger.warning(
+                    "[xpool-cost] cannot open SGLANG_XPOOL_COST_LOG=%s: %s",
+                    self._cost_log_path, e,
+                )
+                self._cost_log_fp = None
         self._cooldown_remaining: int = 0
         self._tick_count: int = 0
         # Edge-triggered state per pool. Initialized to IN_BAND so the
@@ -189,6 +226,133 @@ class CrossPoolPlanner:
         if usage <= low:
             return self.BELOW_LOW
         return self.IN_BAND
+
+    @staticmethod
+    def _p_func(usage: float, low_water: float) -> float:
+        """P_save / P_loss as defined in paper Eq p-loss-save:
+            P(σ) = max(0, (u_σ - u_low) / (1 - u_low))
+        Hits 0 below low-water (slack regime), rises smoothly to 1 at
+        full saturation. Same shape for both save and loss.
+        """
+        if low_water >= 1.0:
+            return 1.0 if usage >= 1.0 else 0.0
+        return max(0.0, min(1.0, (usage - low_water) / (1.0 - low_water)))
+
+    def _pick_direction_by_nb(
+        self,
+        usage_kv: float,
+        usage_mamba: float,
+        snapshot: dict | None,
+    ) -> tuple[Optional[str], float, str]:
+        """Paper §sec:design-l2-firegate Eq nb-direction-gate.
+
+        Computes NB for each candidate direction and returns the arg-max if
+        it clears the gate; otherwise returns (None, ...).
+
+        Returns:
+            (best_direction, best_nb_us, reason_str)
+            best_direction is "kv_to_mamba" / "mamba_to_kv" or None.
+        """
+        if self._cost_curves is None:
+            return None, 0.0, "nb_direction: no cost curves"
+        c = self.config
+        # Per-pool live recovery length. Phase-1 wiring uses the same value
+        # for both pools (running-batch mean seq len); per-pool L̄_σ EWMAs
+        # are tracked separately as #65.
+        L_kv = float((snapshot or {}).get("mean_recovery_len_kv", 0) or 0)
+        L_m = float((snapshot or {}).get("mean_recovery_len_retract", L_kv) or L_kv)
+        if L_kv <= 0 and L_m <= 0:
+            # No L̄ observed yet — fall back to legacy path.
+            return None, 0.0, "nb_direction: no recovery_len observed"
+        c_kv = self._cost_curves.c_kv_us(L_kv if L_kv > 0 else L_m)
+        c_m = self._cost_curves.c_m_us(L_m if L_m > 0 else L_kv)
+
+        p_save_kv = self._p_func(usage_kv, c.kv_low_water)
+        p_loss_kv = p_save_kv  # same functional form per Eq p-loss-save
+        p_save_m = self._p_func(usage_mamba, c.mamba_low_water)
+        p_loss_m = p_save_m
+
+        # NB amortization: a fired chunk persists at least `cooldown_ticks`
+        # ticks before the gate re-evaluates. The per-chunk gain/loss
+        # accumulates over that interval, so we scale by lifetime to get a
+        # meaningful comparison against the (one-shot) actuator cost.
+        # Without this scaling the gate under-counts benefit by ~cooldown_ticks×
+        # and misses fires that are net-positive across their amortization
+        # window. We use cooldown_ticks as a conservative lower bound on
+        # chunk lifetime — actual chunks usually persist longer.
+        lifetime = max(1, c.cooldown_ticks)
+        # NB(kv_to_mamba): grow mamba (gain c_m × P_save_m), shrink kv
+        # (lose c_kv × P_loss_kv), amortized over lifetime ticks.
+        nb_k2m = lifetime * (c_m * p_save_m - c_kv * p_loss_kv)
+        # NB(mamba_to_kv): grow kv (gain c_kv × P_save_kv), shrink mamba
+        # (lose c_m × P_loss_m), amortized over lifetime ticks.
+        nb_m2k = lifetime * (c_kv * p_save_kv - c_m * p_loss_m)
+
+        # Saturation guard: a source pool above its high-water cannot
+        # afford to give up bytes, regardless of how cheap its per-byte
+        # recovery looks. The linear P_loss in Eq p-loss-save captures
+        # the per-chunk *re-prefill* cost but does not capture the
+        # super-linear queueing-breakdown cost when the source is already
+        # at admission-saturation: shrinking a 95%-full pool by even one
+        # chunk drives many subsequent requests to stall in admission,
+        # an effect the per-byte cost model under-counts. We reject any
+        # direction whose source's *admission-side* usage is at or above
+        # its high-water mark.
+        #
+        # Critically, the mamba pool's "usage" reported by the allocator
+        # mixes two semantically different occupancies: active slots
+        # (1 per running req — these are the admission gate; can't be
+        # shrunk without queueing breakdown) and radix-tree-cached
+        # snapshots (cache fill — can be cheaply LRU-evicted). When the
+        # snapshot decorates the saturation, m2k fires would be wrongly
+        # blocked even though shrinking the snapshot side is exactly
+        # what the c_M(L) × P_loss term is already pricing in. We
+        # therefore consult the active-only signal when the agent
+        # provides it (via snapshot["usage_mamba_active"]); fall back
+        # to total usage when that field is missing for back-compat.
+        # (The KV pool has no equivalent "snapshot-only" occupancy
+        # distinction, so usage_kv is used directly.)
+        kv_active_for_guard = usage_kv
+        m_active_for_guard = float(
+            (snapshot or {}).get("usage_mamba_active", usage_mamba) or usage_mamba
+        )
+        if kv_active_for_guard >= c.kv_high_water:
+            nb_k2m = float("-inf")  # KV is saturated, can't shrink it
+        if m_active_for_guard >= c.mamba_high_water:
+            nb_m2k = float("-inf")  # mamba ACTIVE-slots saturated, can't shrink it
+
+        # Actuator cost: prefer the runtime EWMA over the static config.
+        # Stage-0 / config nb_chunk_cost_us is an idle-time lower bound;
+        # under live traffic the cuMemUnmap+cuMemMap pair pays additional
+        # CUDA-graph deferral and allocator-contention cost. The runtime
+        # EWMA tracks fire wall-times observed via cudaSynchronize-bracketed
+        # measurement (paper §sec:design-l2-firegate runtime self-calibration).
+        from sglang.srt.budgeter.cost_model import get_runtime_actuator_cost
+        runtime_cost = get_runtime_actuator_cost()
+        c_actuator_us = (
+            runtime_cost.current_us if runtime_cost.is_calibrated
+            else max(runtime_cost.current_us, c.nb_chunk_cost_us)
+        )
+        threshold = c.nb_margin * c.dst_chunks_per_action * c_actuator_us
+
+        if nb_k2m >= nb_m2k and nb_k2m >= threshold:
+            best_dir = "kv_to_mamba"
+            best_nb = nb_k2m
+        elif nb_m2k > nb_k2m and nb_m2k >= threshold:
+            best_dir = "mamba_to_kv"
+            best_nb = nb_m2k
+        else:
+            best_dir = None
+            best_nb = max(nb_k2m, nb_m2k)
+
+        reason = (
+            f"NB[k2m]={nb_k2m:.0f}us NB[m2k]={nb_m2k:.0f}us "
+            f"threshold={threshold:.0f}us "
+            f"(c_kv={c_kv:.0f}us@L={L_kv:.0f}, c_m={c_m:.0f}us@L={L_m:.0f}, "
+            f"P_save: kv={p_save_kv:.2f} m={p_save_m:.2f}, "
+            f"P_loss: kv={p_loss_kv:.2f} m={p_loss_m:.2f})"
+        )
+        return best_dir, best_nb, reason
 
     def _net_benefit_ok(
         self,
@@ -226,17 +390,116 @@ class CrossPoolPlanner:
         )
         benefit_us = signals.total_benefit_us
         cost_us = c.dst_chunks_per_action * c.nb_chunk_cost_us
+
+        # Quote the c_σ(\bar{L}) regime so the asymmetry direction is
+        # visible in the log without re-deriving from raw fields.
+        regime_str = ""
+        if self._cost_curves is not None and snapshot:
+            kv_L = float(snapshot.get("mean_recovery_len_kv", 0) or 0)
+            if kv_L > 0:
+                kv_ms = self._cost_curves.c_kv_ms(kv_L)
+                m_ms = self._cost_curves.c_m_ms(kv_L)
+                ratio = m_ms / kv_ms if kv_ms > 0 else float("inf")
+                side = "M-expensive" if ratio > 1 else "KV-expensive"
+                regime_str = (
+                    f" [csigma@L={kv_L:.0f}: c_KV={kv_ms:.2f}ms "
+                    f"c_M={m_ms:.2f}ms ratio={ratio:.2f}x "
+                    f"L*={self._cost_curves.L_star:.0f} → {side}]"
+                )
+
         if benefit_us <= 0:
-            return False, f"nb: no pressure ({signals.reason_str()})"
+            return False, f"nb: no pressure ({signals.reason_str()}){regime_str}"
         if benefit_us < cost_us * c.nb_margin:
             return False, (
                 f"nb: B={benefit_us:.0f}us < C={cost_us:.0f}us × "
-                f"margin={c.nb_margin} ({signals.reason_str()})"
+                f"margin={c.nb_margin} ({signals.reason_str()}){regime_str}"
             )
         return True, (
             f"nb: B={benefit_us:.0f}us >= C={cost_us:.0f}us × "
-            f"margin={c.nb_margin} ({signals.reason_str()})"
+            f"margin={c.nb_margin} ({signals.reason_str()}){regime_str}"
         )
+
+    def close(self) -> None:
+        """Flush + close the cost JSONL handle (if any)."""
+        fp = self._cost_log_fp
+        if fp is not None:
+            try:
+                fp.flush()
+                fp.close()
+            except Exception:
+                pass
+            self._cost_log_fp = None
+
+    def _emit_cost_log(
+        self,
+        decision: "PlanDecision",
+        snapshot: dict | None,
+        edge_active: bool,
+    ) -> None:
+        """Append one JSONL record per decide() call when SGLANG_XPOOL_COST_LOG
+        is set. Carries enough state to plot the gate's behavior offline:
+        usage levels, recovery lengths, cost-curve evaluations, signals
+        breakdown from the adapter, fire direction.
+        """
+        if self._cost_log_fp is None:
+            return
+        rec: dict = dict(
+            ts=round(time.time(), 3),
+            tick=self._tick_count,
+            usage_kv=decision.usage_kv,
+            usage_mamba=decision.usage_mamba,
+            queue_depth=decision.queue_depth,
+            kv_state=self._kv_state,
+            mamba_state=self._mamba_state,
+            kv_consec=self._kv_above_high_consec,
+            mamba_consec=self._mamba_above_high_consec,
+            edge_active=edge_active,
+            cooldown=self._cooldown_remaining,
+            direction=decision.direction,
+            reason=decision.reason,
+        )
+        if snapshot:
+            for k in (
+                "mean_recovery_len_kv",
+                "mean_recovery_len_retract",
+                "num_evicted_tokens_recent",
+                "num_retracted_reqs",
+                "num_paused_reqs",
+                "num_queue_reqs",
+                "kv_used_tokens",
+                "mamba_usage",
+                # Active-slot mamba usage (saturation-guard input distinct
+                # from total mamba usage; see paper §sec:design-l2-firegate
+                # "Active-slot vs cache-fill saturation").
+                "usage_mamba_active",
+            ):
+                if k in snapshot:
+                    v = snapshot[k]
+                    t = getattr(v, "total", None)
+                    rec[k] = t if isinstance(t, (int, float)) else v
+        # Only attach the adapter's breakdown if it was produced THIS tick
+        # (otherwise we'd ship the previous decide()'s numbers, which is
+        # confusing on cooldown / no-pressure ticks that skip the gate).
+        breakdown = getattr(self._adapter, "last_breakdown", None)
+        breakdown_serial = breakdown.get("_serial") if breakdown else None
+        prev_serial = getattr(self, "_last_emitted_breakdown_serial", None)
+        if breakdown and breakdown_serial != prev_serial:
+            rec["benefit_breakdown"] = breakdown
+            self._last_emitted_breakdown_serial = breakdown_serial
+        if self._cost_curves is not None and snapshot:
+            kv_L = float(snapshot.get("mean_recovery_len_kv", 0) or 0)
+            if kv_L > 0:
+                rec["c_kv_ms_at_L"] = self._cost_curves.c_kv_ms(kv_L)
+                rec["c_m_ms_at_L"] = self._cost_curves.c_m_ms(kv_L)
+                rec["L_star"] = self._cost_curves.L_star
+                rec["regime"] = (
+                    "M-expensive" if kv_L < self._cost_curves.L_star
+                    else "KV-expensive"
+                )
+        try:
+            self._cost_log_fp.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
 
     def decide(
         self,
@@ -246,12 +509,47 @@ class CrossPoolPlanner:
         snapshot: dict | None = None,
         edge_active: bool = False,
     ) -> PlanDecision:
-        """Decide whether to fire a cross-pool transfer this tick.
+        """Wrapper around `_decide_inner` that emits one JSONL record per
+        call (SGLANG_XPOOL_COST_LOG) and INFO-logs every fire decision."""
+        decision = self._decide_inner(
+            usage_kv, usage_mamba, queue_depth, snapshot, edge_active
+        )
+        if decision.direction is not None:
+            # Fire decisions always at INFO; quote regime + benefit so post-
+            # hoc analysis can correlate fires with the asymmetry direction.
+            extra = ""
+            if self._cost_curves is not None and snapshot:
+                kv_L = float(snapshot.get("mean_recovery_len_kv", 0) or 0)
+                if kv_L > 0:
+                    kv_ms = self._cost_curves.c_kv_ms(kv_L)
+                    m_ms = self._cost_curves.c_m_ms(kv_L)
+                    side = (
+                        "M>KV" if kv_L < self._cost_curves.L_star else "KV>M"
+                    )
+                    extra = (
+                        f" csigma@L={kv_L:.0f}: c_KV={kv_ms:.2f}ms "
+                        f"c_M={m_ms:.2f}ms ({side})"
+                    )
+            logger.info(
+                "[xpool-cost] FIRE tick=%d direction=%s usage_kv=%.2f "
+                "usage_mamba=%.2f reason=%s%s",
+                self._tick_count, decision.direction,
+                decision.usage_kv, decision.usage_mamba,
+                decision.reason, extra,
+            )
+        self._emit_cost_log(decision, snapshot, edge_active)
+        return decision
 
-        `snapshot` is the budgeter snapshot dict (passed through from
-        agent.py). The pressure adapter reads engine-native fields from
-        it (num_evicted_tokens_recent / num_retracted_reqs /
-        num_paused_reqs / num_queue_reqs) when net-benefit gate is on.
+    def _decide_inner(
+        self,
+        usage_kv: float,
+        usage_mamba: float,
+        queue_depth: int = 0,
+        snapshot: dict | None = None,
+        edge_active: bool = False,
+    ) -> PlanDecision:
+        """Original decision logic. Same return/side-effect behavior as
+        before; logging is layered in `decide()` above.
         """
         self._tick_count += 1
         c = self.config
@@ -261,6 +559,50 @@ class CrossPoolPlanner:
             return PlanDecision(
                 direction=None,
                 reason=f"cooldown ({self._cooldown_remaining} left)",
+                usage_kv=usage_kv,
+                usage_mamba=usage_mamba,
+                queue_depth=queue_depth,
+            )
+
+        # Paper §sec:design-l2-firegate Eq nb-direction-gate: direction-aware
+        # net benefit over both candidate transfer pairs. When enabled,
+        # this REPLACES the legacy saturation-driven direction selection
+        # (and its persist re-eval / edge-trigger machinery) — fires are
+        # arg-max NB across {kv_to_mamba, mamba_to_kv}, gated by α·C_act.
+        # Always also update the consec counters before returning so any
+        # diagnostic logging downstream still sees the right values.
+        if c.nb_direction_aware:
+            new_kv = self._classify(
+                usage_kv, c.kv_low_water, c.kv_high_water
+            )
+            new_mamba = self._classify(
+                usage_mamba, c.mamba_low_water, c.mamba_high_water
+            )
+            self._kv_state, self._mamba_state = new_kv, new_mamba
+            self._kv_above_high_consec = (
+                self._kv_above_high_consec + 1
+                if new_kv == self.ABOVE_HIGH else 0
+            )
+            self._mamba_above_high_consec = (
+                self._mamba_above_high_consec + 1
+                if new_mamba == self.ABOVE_HIGH else 0
+            )
+            best_dir, best_nb, why = self._pick_direction_by_nb(
+                usage_kv, usage_mamba, snapshot
+            )
+            if best_dir is not None:
+                self._cooldown_remaining = c.cooldown_ticks
+                return PlanDecision(
+                    direction=best_dir,
+                    reason=f"nb_direction: best={best_dir} NB={best_nb:.0f}us "
+                           f"[{why}]",
+                    usage_kv=usage_kv,
+                    usage_mamba=usage_mamba,
+                    queue_depth=queue_depth,
+                )
+            return PlanDecision(
+                direction=None,
+                reason=f"nb_direction: no candidate cleared gate [{why}]",
                 usage_kv=usage_kv,
                 usage_mamba=usage_mamba,
                 queue_depth=queue_depth,

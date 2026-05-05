@@ -57,31 +57,49 @@ class KVArenaActuator:
         return self.set_capacity_tokens(int(self.max_tokens * frac))
 
     @property
-    def tokens_per_chunk(self) -> int:
-        """T7 fix (paper §3.2.2): expose the underlying arena's
-        tokens_per_chunk so cross_pool_actuator's smart-overcap helper
-        can pick chunks at the right granularity. Raises rather than
-        falling back to a default — silent fallback would re-introduce
-        the original T7 bug (helper picks chunks at wrong granularity,
-        shrink_explicit silently skips out-of-range indices, fire is a
-        no-op).
-        """
+    def n_pages(self) -> int:
+        """Total physical page count for this pool (= number of 2 MiB cuMem
+        handles owned). Higher layers reason in pages, not token-slots."""
+        return int(self.pool.size) // self._tokens_per_page()
+
+    def _tokens_per_page(self) -> int:
+        """Internal: how many SGLang allocator token-slots live in one
+        physical page. Used only by `expand_pages_to_token_slots` and
+        `chunks_for_pages` — never exposed to the planner."""
         arena = getattr(self.pool, "_kv_arena", None)
         if arena is None:
             raise RuntimeError(
-                "KVArenaActuator.tokens_per_chunk: pool has no _kv_arena. "
-                "Construction must have failed earlier (SGLANG_KV_ARENA / "
-                "SGLANG_ARENA_SHARED not set?). Don't fall back silently — "
-                "fix the wiring."
+                "KVArenaActuator: pool has no _kv_arena (SGLANG_KV_ARENA / "
+                "SGLANG_ARENA_SHARED not set?)."
             )
         tpc = getattr(arena, "tokens_per_chunk", None)
         if tpc is None:
             raise RuntimeError(
-                "KVArenaActuator.tokens_per_chunk: _kv_arena exists but has "
-                "no tokens_per_chunk attribute — probably a non-MultiTensorArena "
-                "stand-in. Investigate."
+                "KVArenaActuator: _kv_arena lacks tokens_per_chunk attribute."
             )
         return int(tpc)
+
+    def expand_pages_to_token_slots(self, page_ids):
+        """Translate page-ids (one per 2 MiB cuMem handle) to the
+        token-slot ids the SGLang allocator uses. Page p contains
+        token-slots [p * tps + 1, (p+1) * tps + 1), where tps =
+        tokens-per-page; slot 0 is the null sentinel.
+        """
+        tps = self._tokens_per_page()
+        out = []
+        for p in page_ids:
+            out.extend(range(p * tps + 1, (p + 1) * tps + 1))
+        return out
+
+    def page_is_fully_free(self, page_id: int, free_token_set: set) -> bool:
+        """Check whether every token-slot in `page_id` is in
+        `free_token_set`. Used by OwnerProvider to compute fully-free
+        pages."""
+        tps = self._tokens_per_page()
+        for s in range(page_id * tps + 1, (page_id + 1) * tps + 1):
+            if s not in free_token_set:
+                return False
+        return True
 
     def live_capacity_tokens(self) -> int:
         """Phase 2e.5.6.3: uniform getter so CrossPoolTransferActuator can

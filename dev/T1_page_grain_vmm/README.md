@@ -37,14 +37,21 @@ serving (no arena) is unaffected.
 
 ## Expected behavior
 
-| condition | boot time | per-fire wall | drain success | tokens/chunk |
+The numbers below are the \emph{design expectation} from paper §3.2.1, not
+measurements made by T1 itself. T1 only verifies boot + smoke at 2 MiB
+granularity. Real per-fire wall and commit-success rate are measured by T3
+(smart over-cap selection) and T7 (M2 swarm validation).
+
+| condition | boot time | per-fire wall (design) | commit rate (design) | tokens/chunk |
 |---|---|---|---|---|
 | 64 MiB chunks (legacy) | $\sim$5 s of cuMemMap | $\sim$3 s/fire (30 chunks) | $\sim$12% | $\sim$6500 (KV @ 10 KB/token) |
-| 2 MiB pages (T1 default) | $\sim$8--12 s of cuMemMap | $\sim$0.1 s/fire (3840 pages) | $\sim$95% | $\sim$200 (KV @ 10 KB/token) |
+| 2 MiB pages (T1 default) | $\sim$8--12 s of cuMemMap | $\sim$0.1 s/fire (3840 pages) | $\sim$95% (with T2+T3) | $\sim$200 (KV @ 10 KB/token) |
 
 The boot-time delta (~3-7 s extra cuMemMap calls) is a one-time cost; the
-per-fire wall reduction (~30×) and commit-success increase (~8×) more than
-amortize at any nontrivial fire frequency.
+per-fire wall reduction (~30×) and commit-success increase (~8×) are
+expected to amortize at any nontrivial fire frequency. \emph{Both deltas
+are unverified by T1 alone}; T1's contribution is the granularity flip
+that makes T2+T3 viable.
 
 ## A/B perf comparison
 
