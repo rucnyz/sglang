@@ -504,12 +504,12 @@ class BudgetAgent:
         usage_kv_inst = 0.0
         usage_mamba_inst = 0.0
         usage_mamba_active_inst = 0.0
-        live = getattr(alloc, "live_size", alloc.size)
+        live = alloc.live_size
         avail = alloc.available_size()
         if live > 0:
             usage_kv_inst = max(0.0, min(1.0, (live - avail) / live))
         if mamba_pool is not None:
-            ms_live = getattr(mamba_pool, "live_size", mamba_pool.size)
+            ms_live = mamba_pool.live_size
             ms_avail = mamba_pool.available_size()
             if ms_live > 0:
                 usage_mamba_inst = max(0.0, min(1.0, (ms_live - ms_avail) / ms_live))
