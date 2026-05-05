@@ -59,11 +59,13 @@ else
     INCLUDE_STATIC_BEST=${INCLUDE_STATIC_BEST:-1}
 fi
 
-# --baseline forces only (0,0); skips static-best + vLLM by default
-# (user can re-enable explicitly with INCLUDE_STATIC_BEST=1 etc).
+# --baseline forces only (0,0); also disables static-best + vLLM unless
+# explicitly re-enabled with `INCLUDE_VLLM=1 BASELINE=1 ...`. Use direct
+# assignment (not `:-`) so this overrides values set by the SMOKE/else
+# branches above.
 if [ "$BASELINE" = "1" ]; then
-    INCLUDE_VLLM=${INCLUDE_VLLM:-0}
-    INCLUDE_STATIC_BEST=${INCLUDE_STATIC_BEST:-0}
+    [ "${INCLUDE_VLLM_FORCE:-}" != "1" ] && INCLUDE_VLLM=0
+    [ "${INCLUDE_STATIC_BEST_FORCE:-}" != "1" ] && INCLUDE_STATIC_BEST=0
     echo "[main-orch] BASELINE mode: only (0,0) stock cell will be run"
 fi
 
