@@ -1,5 +1,5 @@
 """
-Phase 2e.5.6 — Process-singleton SharedHandlePool helper.
+Process-singleton SharedHandlePool helper.
 
 When `SGLANG_ARENA_SHARED=1`, both `MHATokenToKVPool` and `MambaPool`
 build their `MultiTensorArena`s on top of one shared `SharedHandlePool`

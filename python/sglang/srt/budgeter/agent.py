@@ -75,11 +75,10 @@ class BudgetAgent:
     """Observes pool pressure each scheduler tick.
 
     Cheap to construct; cheap to `tick()` (rate-limited internally). Holds a
-    handle to the scheduler so it can later actuate via `tree_cache.evict(...)`,
-    etc.
-
-    For now (Phase 2a) this is read-only — it logs a JSONL line per
-    `tick_interval_s` and never mutates state.
+    handle to the scheduler so it can drive cross-pool VMM transfers via
+    `_maybe_xpool_planner` (paper §sec:design-l2). Snapshot-only when the
+    cross-pool actuator can't be wired (e.g. non-hybrid model, or
+    SGLANG_ARENA_SHARED=0).
     """
 
     def __init__(self, scheduler: Any):
@@ -236,7 +235,7 @@ class BudgetAgent:
                     self._arena_actuator.max_tokens)
 
     def _ensure_xpool_actuator(self) -> None:
-        """Phase 2e.5.6.2: lazily attach the cross-pool transfer actuator.
+        """Lazily attach the cross-pool transfer actuator (paper §sec:design-l2).
 
         Walks the scheduler to find the hybrid pool (full_kv_pool +
         mamba_pool), then wraps both arenas in a CrossPoolTransferActuator

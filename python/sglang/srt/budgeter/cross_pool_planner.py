@@ -1,11 +1,10 @@
 """
-Phase 2e.5.6.3.c — cross-pool capacity planner driven by real per-pool
+Cross-pool capacity planner (paper §sec:design-l2) driven by real per-pool
 pressure signals.
 
 Reads engine snapshot fields (`kv_used_tokens`, `mamba_usage`,
 `num_running_reqs`, `num_queue_reqs`, `cache_hit_rate`) and decides
-whether to fire a cross-pool transfer in either direction. Replaces
-the 2e.5.6.2 / 2e.5.6.3.a oscillator with a workload-aware policy.
+whether to fire a cross-pool transfer in either direction.
 
 Policy form (paper §4.3 reduced to threshold-with-hysteresis):
   Marginal value of holding capacity in pool σ ≈ usage_σ. The Lagrange

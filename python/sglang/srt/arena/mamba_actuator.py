@@ -1,7 +1,6 @@
 """
-Phase 2e.5.6.3 — MambaArenaActuator.
-
-Mirror of `KVArenaActuator` for `MambaPool`. Wraps a single MambaPool
+MambaArenaActuator (paper §sec:design-l2): mirror of `KVArenaActuator`
+for `MambaPool`. Wraps a single MambaPool
 instance (built with `SGLANG_MAMBA_ARENA=1`, optionally with
 `SGLANG_ARENA_SHARED=1`) and exposes a single `set_capacity_tokens(n)`
 that resizes both the underlying `MultiTensorArena` and MambaPool's
@@ -27,7 +26,7 @@ class MambaArenaActuator:
             )
         if not hasattr(pool, "set_capacity_slots"):
             raise RuntimeError(
-                "MambaPool is missing set_capacity_slots — Phase 2e.5.6.3 "
+                "MambaPool is missing set_capacity_slots — capacity-coordinated "
                 "wiring not present in this build."
             )
         # Cache initial slot capacity (= MambaPool.size).
@@ -107,7 +106,7 @@ class MambaArenaActuator:
         return True
 
     def cap_allocator_only(self, n_tokens: int) -> int:
-        """Phase 2e.5.6.3: same contract as KVArenaActuator.cap_allocator_only.
+        """Same contract as KVArenaActuator.cap_allocator_only.
         For MambaPool this is identical to set_capacity_tokens because
         MambaPool.set_capacity_slots already touches only the slot
         free-list — it does not call into the underlying MultiTensorArena.

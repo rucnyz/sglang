@@ -1,7 +1,5 @@
 """
-Phase 2e.2 — ChunkArena: shared-VA multi-pool allocator over CUDA VMM.
-
-Design (paper §4.4):
+ChunkArena: shared-VA multi-pool allocator over CUDA VMM (paper §sec:design-l2).
   - One contiguous virtual-address range, divided into uniform-size chunks.
   - Each pool gets a contiguous *sub-range* of the arena (its own VA window).
   - A central pool of `cuMemCreate`-d physical handles is the actuator's
@@ -97,8 +95,8 @@ class SharedHandlePool:
     """Owns a pool of cuMemCreate'd physical handles that may be shared
     between multiple ChunkArenas on the same device.
 
-    Phase 2e.5.6: cross-arena (KV ↔ mamba) transfer needs both arenas to
-    share a single bag of handles. `ChunkArena.__init__(external_handle_pool=...)`
+    Cross-arena (KV ↔ mamba) transfer needs both arenas to share a single
+    bag of handles. `ChunkArena.__init__(external_handle_pool=...)`
     references this object instead of creating its own handle list.
 
     The pool can be created empty and grown incrementally: each arena
@@ -232,9 +230,9 @@ class ChunkArena:
             pool_capacities: list of (pool_name, max_chunks_in_pool).
                 The sum of max_chunks may exceed n_handles (over-provisioned VA).
             external_handle_pool: if provided, this arena's handle list and
-                free-list are aliased to the shared pool. Phase 2e.5.6:
-                two ChunkArenas with the same external pool can transfer
-                handles between each other via `cross_arena_transfer`.
+                free-list are aliased to the shared pool. Two ChunkArenas
+                with the same external pool can transfer handles between
+                each other via `cross_arena_transfer`.
         """
         self.device_id = device_id
         self.chunk_size = chunk_size
@@ -477,8 +475,8 @@ def cross_arena_transfer(
     Both arenas MUST share the same `SharedHandlePool` (i.e. they were
     constructed with the same `external_handle_pool=`); otherwise the
     handles would not be reachable from `to_arena`'s grow path. This is
-    the cross-arena equivalent of `transfer_chunks`, used by Phase 2e.5.6
-    for KV ↔ mamba physical-byte movement.
+    the cross-arena equivalent of `transfer_chunks`, used for KV ↔ mamba
+    physical-byte movement (paper §sec:design-l2).
 
     Returns: number of chunks actually transferred.
     """

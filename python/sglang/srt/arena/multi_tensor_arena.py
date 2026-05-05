@@ -1,5 +1,5 @@
 """
-Phase 2e.4 — MultiTensorArena: a ChunkArena pool group for the KV-style layout.
+MultiTensorArena: a ChunkArena pool group for the KV-style layout.
 
 SGLang's KV pool exposes per-layer per-kind (k, v) tensors of shape
 `(N_tokens, head_num, head_dim)`. Token rows are contiguous within each
@@ -109,9 +109,9 @@ class MultiTensorArena:
         self.per_token_shape = per_token_shape
         self.dtype = dtype
         self.max_tokens = max_tokens
-        # Phase 2e.5.6: shift C-side pool indices when sharing arena_multi64.so
-        # between two MultiTensorArenas (e.g., KV at offset 0, mamba at
-        # offset n_kv_subpools). Logical sub-pool index `i` maps to C index
+        # Shift C-side pool indices when sharing arena_multi64.so between
+        # two MultiTensorArenas (e.g., KV at offset 0, mamba at offset
+        # n_kv_subpools). Logical sub-pool index `i` maps to C index
         # `subpool_offset + i`.
         self._subpool_offset = subpool_offset
 
@@ -152,8 +152,8 @@ class MultiTensorArena:
 
         # Self-owned: provision physical handles for the full max-chunks
         # range so any planner-requested grow within [init, max] succeeds.
-        # Phase 2e.5.6 shared mode: each arena pays for its INITIAL
-        # handle quota — these are cuMemCreate'd at boot. Of these,
+        # Shared mode: each arena pays for its INITIAL handle quota —
+        # these are cuMemCreate'd at boot. Of these,
         # `static_min_chunks_per_pool` worth are cuMemMap'd into each
         # sub-pool's static-min region; the remaining (init - static_min)
         # × n_subpools handles live in the shared pool's free queue as
@@ -204,14 +204,14 @@ class MultiTensorArena:
 
         # Tensor construction. Two paths:
         #
-        # Phase 2e.5.6.2 path (SGLANG_ARENA_FROM_BLOB=0, default):
+        # MemPool path (SGLANG_ARENA_FROM_BLOB=0, default):
         #   Per-sub-pool MemPool + CUDAPluggableAllocator. Pays a +6-7%
         #   TTFT regression because PyTorch silently disables
         #   expandable_segments when a user MemPool is active
         #   (CUDACachingAllocator.cpp:1587-1591); see
         #   https://github.com/pytorch/pytorch/issues/165419.
         #
-        # Phase 2e.5.6.3.b path (SGLANG_ARENA_FROM_BLOB=1):
+        # from_blob path (SGLANG_ARENA_FROM_BLOB=1):
         #   Bypass PyTorch's caching allocator entirely via
         #   `at::from_blob` (vAttention's pattern). Tensor's storage
         #   has a no-op deleter; arena owns the VA lifetime. This

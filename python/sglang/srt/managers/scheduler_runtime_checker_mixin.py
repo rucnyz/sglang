@@ -302,18 +302,16 @@ class SchedulerRuntimeCheckerMixin:
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             protected = self.tree_cache.full_protected_size()
             session_held = self._session_held_tokens()
-            # Phase 2e.5.6.3: honor live_size when the cross-pool actuator
-            # has capped this allocator. Mirrors the non-hybrid branch
-            # below (added for KV-only resize in 2e.4.d).
+            # Honor live_size when the cross-pool actuator has capped
+            # this allocator. Mirrors the non-hybrid branch below.
             alloc = self.token_to_kv_pool_allocator
             live = getattr(alloc, "live_size", None)
             total = live if live is not None else alloc.size
         else:
             protected = self.tree_cache.protected_size()
             session_held = self._session_held_tokens()
-            # Honor live_size if the allocator was capped by the budgeter
-            # (Phase 2e.4.d). Falls back to static max for unmodified
-            # allocators.
+            # Honor live_size if the allocator was capped by the budgeter.
+            # Falls back to static max for unmodified allocators.
             alloc = self.token_to_kv_pool_allocator
             live = getattr(alloc, "live_size", None)
             page_size = getattr(alloc, "page_size", 1)
@@ -345,7 +343,7 @@ class SchedulerRuntimeCheckerMixin:
         )
 
     def _check_mamba_pool(self: Scheduler, ps: PoolStats) -> Tuple[bool, str]:
-        # Phase 2e.5.6.3: when the cross-pool actuator caps mamba via
+        # When the cross-pool actuator caps mamba via
         # MambaPool.set_capacity_slots, capped slot ids are stashed in
         # `_capped_slots` and don't appear in `free_slots`. The leak
         # invariant `total == available + evictable + protected` would

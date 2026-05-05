@@ -783,7 +783,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.prealloc_symmetric_memory_pool()
 
-        # Arena KV-pool TLB warmup (Phase 2e.5.6.3.b follow-up):
+        # Arena KV-pool TLB warmup:
         #   Walk every page of the cuMemMap'd KV/mamba arena via a
         #   streaming-read kernel to populate per-SM L1 TLBs before the
         #   first real request arrives. Without this, the first batches

@@ -1007,7 +1007,7 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
 
-        # Phase 2 budgeter (gated by SGLANG_BUDGETER env var; no-op otherwise)
+        # Budgeter (gated by SGLANG_BUDGETER env var; no-op otherwise)
         from sglang.srt.budgeter import BudgetAgent
         self.budget_agent = BudgetAgent(self)
 
@@ -1497,7 +1497,7 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
-            # Phase 2 budgeter tick (rate-limited internally; no-op when disabled)
+            # Budgeter tick (rate-limited internally; no-op when disabled)
             self.budget_agent.tick()
 
     @DynamicGradMode()
@@ -1556,7 +1556,7 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
-            # Phase 2 budgeter tick (rate-limited internally; no-op when disabled)
+            # Budgeter tick (rate-limited internally; no-op when disabled)
             self.budget_agent.tick()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:

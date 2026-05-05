@@ -1,4 +1,4 @@
-// Phase 2e.4 — 64-slot multi-pool C allocator.
+// 64-slot multi-pool C allocator.
 //
 // Same mechanism as arena_multi.c but with 64 pool pairs, enough to back
 // every layer-tensor of a typical KV pool (e.g., Qwen3-Next has ~30 attn

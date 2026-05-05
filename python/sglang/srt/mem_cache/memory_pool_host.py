@@ -1214,7 +1214,7 @@ class MambaPoolHost(HostKVCache):
         self.conv_state_shapes = [
             conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
         ]
-        # Phase 2e.5.1: support both stacked (Tensor) and per-layer (List[Tensor]) temporal.
+        # Support both stacked (Tensor) and per-layer (List[Tensor]) temporal.
         if isinstance(device_pool.mamba_cache.temporal, list):
             self.temporal_state_shape = device_pool.mamba_cache.temporal[0].shape[1:]
             self.temporal_dtype = device_pool.mamba_cache.temporal[0].dtype

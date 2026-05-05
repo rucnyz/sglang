@@ -65,9 +65,9 @@ class TreeNode:
 
     counter = 0
     last_access_time_counter_float = float64(1.0)
-    # Phase 3 (paper §4.2): sliding-window in seconds for hits-per-byte
-    # eviction signal. Configurable via SGLANG_HPB_WINDOW_S; default 60s
-    # matches the paper's narrative.
+    # Paper §sec:design-l1 (eq:hpb-lru): sliding-window in seconds for
+    # hits-per-byte eviction signal. Configurable via SGLANG_HPB_WINDOW_S;
+    # default 60s matches the paper's narrative.
     hpb_window_s = float(os.environ.get("SGLANG_HPB_WINDOW_S", "60.0"))
 
     def __init__(self, id: Optional[int] = None):
@@ -87,10 +87,11 @@ class TreeNode:
         # last access time is only used for sanity check. LRU is maintained by the lru list.
         self.last_access_time = get_last_access_time()
 
-        # Phase 3 (paper §4.2): hits-per-byte eviction. `hit_count` is the
-        # cumulative count (defined by upstream but never incremented).
-        # `_hit_times` is the windowed deque of timestamps used for the
-        # actual signal — `hits_in_window()` lazily prunes old entries.
+        # Paper §sec:design-l1 (eq:hpb-lru): hits-per-byte eviction.
+        # `hit_count` is the cumulative count (defined by upstream but
+        # never incremented). `_hit_times` is the windowed deque of
+        # timestamps used for the actual signal — `hits_in_window()`
+        # lazily prunes old entries.
         self.hit_count = 0
         self._hit_times: collections.deque = collections.deque()
         self.host_ref_counter = 0
@@ -166,7 +167,7 @@ class TreeNode:
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
-    # ---- Phase 3 (paper §4.2) hits-per-byte eviction signal -----------
+    # ---- HPB eviction signal (paper §sec:design-l1, eq:hpb-lru) ------
 
     def record_hit(self) -> None:
         """Append a hit timestamp to the windowed deque.
@@ -570,7 +571,7 @@ class MambaRadixCache(BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
 
-        # Phase 3.d (paper §4.2 first refinement): heterogeneous granularity.
+        # Heterogeneous granularity (paper §sec:design-l1).
         # Snapshots (mamba_value) are taken only at depths that are multiples
         # of K_big. Small-page leaves (depth NOT aligned to K_big) get KV but
         # no mamba snapshot. The engine's existing match-walk falls back to
@@ -625,7 +626,7 @@ class MambaRadixCache(BasePrefixCache):
             # fork it built. Same signal as "the radix already had a snapshot
             # at this node", which is the existing semantics for `mamba_exist`.
             mamba_exist = True
-        # Phase 3 debug: log every insert at INFO level (gated by env
+        # Debug: log every insert at INFO level (gated by env
         # SGLANG_RADIX_DEBUG=1 to keep prod logs clean).
         if os.environ.get("SGLANG_RADIX_DEBUG") == "1":
             logger.info(
@@ -904,7 +905,7 @@ class MambaRadixCache(BasePrefixCache):
         )
 
     def _hpb_pick_mamba_eviction(self) -> Optional[TreeNode]:
-        """Phase 3 (paper §4.2): pick the lowest hits-per-byte mamba node
+        """Paper §sec:design-l1 (eq:hpb-lru): pick the lowest hits-per-byte mamba node
         not currently locked. O(n) scan over the mamba LRU list's
         evictable set; for tree sizes up to ~10K nodes (typical hybrid
         deployments) this is bounded at ~10 us per call. Falls back to
@@ -989,7 +990,7 @@ class MambaRadixCache(BasePrefixCache):
         """Evict mamba states. Returns the number of mamba states evicted."""
         if self.disable or mamba_num <= 0:
             return 0
-        # Phase 3 (paper §4.2): SGLANG_HPB_LRU=1 selects by hits-per-byte;
+        # Paper §sec:design-l1: SGLANG_HPB_LRU=1 selects by hits-per-byte;
         # default off preserves the recency-LRU baseline.
         use_hpb = os.environ.get("SGLANG_HPB_LRU") == "1"
         if use_hpb:
@@ -1242,7 +1243,7 @@ class MambaRadixCache(BasePrefixCache):
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
-        # Phase 3 (paper §4.2): record hit on every visited child so
+        # Paper §sec:design-l1: record hit on every visited child so
         # eviction_priority() reflects recent value to the workload.
         # Without this, hit_count never increments — the paper's exact
         # observation. We always record (cost: a deque append + int++);
@@ -1408,8 +1409,8 @@ class MambaRadixCache(BasePrefixCache):
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first.
-        # Phase 3.d: mamba_value can now be None (heterogeneous granularity
-        # path suppresses snapshots at non-K_big-aligned depths). The leaf
+        # mamba_value can now be None (heterogeneous granularity path
+        # suppresses snapshots at non-K_big-aligned depths). The leaf
         # branches below treat None as "tombstone-on-create".
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
@@ -1422,7 +1423,7 @@ class MambaRadixCache(BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
-        # Phase 3.d: track the deepest-snapshot depth during traversal so
+        # Track the deepest-snapshot depth during traversal so
         # that the value we return mirrors what _match_prefix_helper would
         # return (it stops updating best_value_len at the deepest mamba_value
         # node). Required for the cache_unfinished_req invariant
@@ -1460,8 +1461,8 @@ class MambaRadixCache(BasePrefixCache):
             if len(key):
                 child_key = key.child_key(self.page_size)
 
-        # Phase 3.d: mamba_value can be None (heterogeneous-granularity
-        # path suppresses the snapshot for non-K_big-aligned inserts).
+        # mamba_value can be None (heterogeneous-granularity path
+        # suppresses the snapshot for non-K_big-aligned inserts).
         # When None AND we'd be creating a NEW leaf, we do NOT create a
         # tombstone leaf. Two reasons:
         #   1. _match_prefix_helper only updates `best_value_len` at nodes
@@ -1511,7 +1512,7 @@ class MambaRadixCache(BasePrefixCache):
             node.last_access_time = get_last_access_time()
             deepest_snapshot_depth = total_prefix_length
 
-        # Phase 3.d: when k_big suppression is active we never create a
+        # When k_big suppression is active we never create a
         # tombstone leaf (see above), so the only remaining concern is
         # existing tombstone-internal-nodes in the traversal path.
         # `total_prefix_length` is the full traversal depth; the engine's

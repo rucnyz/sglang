@@ -310,11 +310,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def clear(self):
-        # Phase 2e.5.6.3.c: respect the budgeter's capacity cap if set.
-        # Without this, /flush_cache (or scheduler.flush_cache) would
-        # reinstate ALL pages 1..size into free_pages, including ones
-        # whose underlying chunks have been unmapped by the cross-pool
-        # actuator. Subsequent leak check trips because available > live.
+        # Respect the budgeter's capacity cap if set. Without this,
+        # /flush_cache (or scheduler.flush_cache) would reinstate ALL
+        # pages 1..size into free_pages, including ones whose underlying
+        # chunks have been unmapped by the cross-pool actuator. Subsequent
+        # leak check trips because available > live.
         cap = getattr(self, "_cap", None)
         upper = cap if cap is not None else self.size
         # The padded slot 0 is used for writing dummy outputs from padded tokens.

@@ -1,7 +1,7 @@
 """
-Phase 2e.5.6.3.b — bypass PyTorch's MemPool/CUDAPluggableAllocator
-machinery by constructing tensors directly from cuMemMap'd VA via
-`at::from_blob`. This avoids the +6-7% TTFT regression caused by:
+Bypass PyTorch's MemPool/CUDAPluggableAllocator machinery by
+constructing tensors directly from cuMemMap'd VA via `at::from_blob`.
+This avoids the +6-7% TTFT regression caused by:
   - PyTorch silently disabling expandable_segments when a user MemPool
     is active (CUDACachingAllocator.cpp:1587-1591).
   - Per-malloc mutex + hash-map work in CUDAPluggableAllocator

@@ -1,5 +1,6 @@
 """
-Phase 2e.4.d — KVArenaActuator.
+KVArenaActuator (paper §sec:design-l2): KV-side per-pool actuator for
+the cross-pool fire path.
 
 Wraps a (MHATokenToKVPool, BaseTokenToKVPoolAllocator) pair and exposes a
 single `set_capacity_tokens(n)` method that resizes both in lockstep.
@@ -102,19 +103,17 @@ class KVArenaActuator:
         return True
 
     def live_capacity_tokens(self) -> int:
-        """Phase 2e.5.6.3: uniform getter so CrossPoolTransferActuator can
-        use either KVArenaActuator or MambaArenaActuator interchangeably.
-        """
+        """Uniform getter so CrossPoolTransferActuator can use either
+        KVArenaActuator or MambaArenaActuator interchangeably."""
         return self.live_tokens
 
     def cap_allocator_only(self, n_tokens: int) -> int:
-        """Phase 2e.5.6.3: cap ONLY the allocator's free-page list,
-        without touching the underlying MultiTensorArena's physical
-        chunk mapping. Used by `CrossPoolTransferActuator` which
-        orchestrates arena shrink/grow itself via `cross_arena_transfer`
-        (calling the regular `set_capacity_tokens` here would shrink
-        the arena a second time, leaking handles to the shared free
-        pool).
+        """Cap ONLY the allocator's free-page list, without touching the
+        underlying MultiTensorArena's physical chunk mapping. Used by
+        `CrossPoolTransferActuator` which orchestrates arena shrink/grow
+        itself via `cross_arena_transfer` (calling the regular
+        `set_capacity_tokens` here would shrink the arena a second time,
+        leaking handles to the shared free pool).
         """
         n_tokens = max(self.pool.page_size, min(n_tokens, self.max_tokens))
         page_size = max(1, self.pool.page_size)

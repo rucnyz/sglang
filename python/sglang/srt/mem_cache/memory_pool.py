@@ -276,15 +276,15 @@ class MambaPool:
                 # CPU uses a different layout of conv_state for kernel optimization
                 conv_state = _init_amx_conv_state(conv_state)
 
-            # Phase 2e.5.1 (A2): when SGLANG_MAMBA_PERLAYER=1, temporal_state is
-            # a List[Tensor] of length num_mamba_layers, each shape
+            # When SGLANG_MAMBA_PERLAYER=1, temporal_state is a List[Tensor]
+            # of length num_mamba_layers, each shape
             # (size+1, *temporal_state_shape). Mirrors the per-layer KV pool
             # layout, makes the pool VMM-arena-friendly. Default off.
             #
-            # Phase 2e.5.5 (A2 + arena): when SGLANG_MAMBA_ARENA=1 (implies
-            # SGLANG_MAMBA_PERLAYER=1), temporal_state's per-layer tensors
-            # come from a MultiTensorArena, sharing the chunk-bitmap actuator
-            # with the KV pool so cross-pool transfer can move physical bytes.
+            # When SGLANG_MAMBA_ARENA=1 (implies SGLANG_MAMBA_PERLAYER=1),
+            # temporal_state's per-layer tensors come from a MultiTensorArena,
+            # sharing the chunk-bitmap actuator with the KV pool so cross-pool
+            # transfer can move physical bytes.
             shared_arena = os.environ.get("SGLANG_ARENA_SHARED") == "1"
             self._mamba_arena = (
                 os.environ.get("SGLANG_MAMBA_ARENA") == "1"
@@ -537,9 +537,9 @@ class MambaPool:
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
-        # Phase 2e.5.6.3: a freed slot whose id is above the current live cap
-        # must go to _capped_slots, not back to free_slots; otherwise the next
-        # alloc would hand it back out, but its underlying chunk has been
+        # A freed slot whose id is above the current live cap must go to
+        # _capped_slots, not back to free_slots; otherwise the next alloc
+        # would hand it back out, but its underlying chunk has been
         # unmapped via cross-pool transfer.
         cap = getattr(self, "_cap_slots", None)
         if cap is not None:
@@ -618,7 +618,7 @@ class MambaPool:
         return True
 
     def clear(self):
-        # Phase 2e.5.6.3.c: respect the budgeter's capacity cap, mirroring
+        # Respect the budgeter's capacity cap, mirroring
         # BaseTokenToKVPoolAllocator.clear's fix. Without this, flush_cache
         # would reinstate slots above the cap whose underlying mamba arena
         # chunks have been unmapped by the cross-pool actuator.
@@ -641,7 +641,7 @@ class MambaPool:
         return cap if cap is not None else self.size
 
     def set_capacity_slots(self, n_slots: int) -> int:
-        """Phase 2e.5.6.3: restrict allocations to slot ids <= `n_slots`.
+        """Restrict allocations to slot ids <= `n_slots`.
 
         Slot 0 is the padding slot; live capacity must always include at
         least 1 usable slot. The free-slot list is partitioned into a live
@@ -756,10 +756,9 @@ class MambaPool:
         Only returns conv and temporal state buffers, excluding intermediate buffers
         used for speculative decoding (intermediate_ssm, intermediate_conv_window).
 
-        Phase 2e.5.1: when temporal is a per-layer-split List[Tensor]
-        (len == num_mamba_layers, entries don't carry a layer axis), the
-        entries are treated directly as per-layer buffers (no extra
-        layer-indexing).
+        When temporal is a per-layer-split List[Tensor] (len ==
+        num_mamba_layers, entries don't carry a layer axis), the entries
+        are treated directly as per-layer buffers (no extra layer-indexing).
         """
         # Per-logical-state list of "layer-indexable views"; each entry is
         # something where `entry[layer_id]` returns the per-layer buffer.
@@ -804,8 +803,8 @@ class MambaPool:
 
         Each logical state-tensor contributes num_mamba_layers entries.
 
-        Phase 2e.5.1 (SGLANG_MAMBA_PERLAYER=1): when temporal is a
-        List[Tensor] of length num_mamba_layers (each entry shape
+        When SGLANG_MAMBA_PERLAYER=1 and temporal is a List[Tensor] of
+        length num_mamba_layers (each entry shape
         (size+1, sliceable_dim, ...)), it counts as ONE logical
         state-tensor (sliceable_dim = entry[0].shape[1], repeated
         num_mamba_layers times).
@@ -1236,13 +1235,13 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        # Phase 2e.4.c: optional ChunkArena-backed allocation. Gated by
+        # Optional ChunkArena-backed allocation. Gated by
         # SGLANG_KV_ARENA=1. Restricted to head_dim == v_head_dim for now;
         # falls through to default for the asymmetric case.
-        # Phase 2e.5.6: SGLANG_ARENA_SHARED=1 implies KV_ARENA=1 and routes
-        # this arena's MultiTensorArena onto the process-singleton
-        # SharedHandlePool so cross-pool (KV ↔ mamba) transfer can move
-        # physical handles between the two pools.
+        # SGLANG_ARENA_SHARED=1 implies KV_ARENA=1 and routes this arena's
+        # MultiTensorArena onto the process-singleton SharedHandlePool so
+        # cross-pool (KV ↔ mamba) transfer can move physical handles
+        # between the two pools.
         shared_arena = os.environ.get("SGLANG_ARENA_SHARED") == "1"
         use_arena = (
             (os.environ.get("SGLANG_KV_ARENA") == "1" or shared_arena)
