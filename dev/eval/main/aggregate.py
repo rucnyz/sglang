@@ -20,14 +20,24 @@ from pathlib import Path
 
 
 def read_bench(p: Path) -> dict | None:
-    """Read bench.json (multiturn_summary.json or sglang.bench_serving output)."""
+    """Read bench.json — handles both formats:
+    - multiturn_summary.json: pretty-printed dict
+    - sglang.bench_serving output: one JSON object per line (last is summary)
+    """
     if not p.exists():
         return None
     try:
         with open(p) as f:
             content = f.read().strip()
-        # bench_serving output is a single JSON line (or last line if multiple)
-        last = content.splitlines()[-1] if content else ""
+        if not content:
+            return None
+        # Try parse as a single pretty JSON first (multi-turn case)
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+        # Fall back to last-line (bench_serving multi-row case)
+        last = content.splitlines()[-1]
         return json.loads(last)
     except Exception:
         return None
@@ -62,8 +72,11 @@ def summarize_cell(cell_dirs: list[Path]) -> dict | None:
         "out_tps":      col("output_throughput", "out_throughput", "output_tps"),
         "mean_ttft_ms": col("mean_ttft_ms", "ttft_mean_ms"),
         "p99_ttft_ms":  col("p99_ttft_ms", "ttft_p99_ms"),
-        "median_e2e_ms": col("median_e2e_latency_ms", "e2e_median_ms", "median_e2e_ms"),
-        "reqs":         col("completed", "n_requests", "total_requests"),
+        "median_e2e_ms": col("median_e2e_latency_ms", "e2e_median_ms",
+                             "median_e2e_ms", "p50_e2e_ms"),
+        "mean_e2e_ms":  col("mean_e2e_latency_ms", "mean_e2e_ms", "e2e_mean_ms"),
+        "reqs":         col("completed", "n_requests", "total_requests",
+                            "num_requests_valid"),
     }
     # xpool stats from the first cell with budgeter.jsonl summary present
     fires_total = 0; granted_total = 0
@@ -136,7 +149,8 @@ def main():
         print("no rows produced", file=sys.stderr); sys.exit(1)
 
     cols = ["model", "regime", "cell", "n_trials",
-            "out_tps", "mean_ttft_ms", "p99_ttft_ms", "median_e2e_ms",
+            "out_tps", "mean_ttft_ms", "p99_ttft_ms",
+            "median_e2e_ms", "mean_e2e_ms",
             "reqs", "xfers_total", "xfers_granted"]
     print(",".join(cols))
     for r in rows:
