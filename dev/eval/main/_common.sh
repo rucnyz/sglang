@@ -49,7 +49,9 @@ model_specific_flags() {
             echo "--reasoning-parser qwen3 --enforce-piecewise-cuda-graph"
             ;;
         *Kimi*)
-            echo "--enforce-piecewise-cuda-graph"
+            # Kimi-Linear's tokenizer + model both ship custom code on HF;
+            # SGLang refuses to load without --trust-remote-code.
+            echo "--trust-remote-code --enforce-piecewise-cuda-graph"
             ;;
         *)
             echo ""
