@@ -109,18 +109,10 @@ class BudgetAgent:
         self._arena_actuator = None
         self._arena_phase = 0  # for the oscillator
 
-        # Phase 2e.5.6.2 cross-pool transfer demo. Requires
-        # SGLANG_ARENA_SHARED=1 at engine boot. Each budgeter tick alternates
-        # one balanced kv→mamba and one balanced mamba→kv transfer; the
-        # planner/policy logic for what to actually transfer is the next
-        # milestone (real pressure signals via LagrangePlanner).
-        self.xpool_demo = _env_flag("SGLANG_BUDGETER_XPOOL_DEMO", False)
+        # Cross-pool transfer actuator. Requires SGLANG_ARENA_SHARED=1 at
+        # engine boot; lazy-built on first tick.
         self._xpool_actuator = None
-        self._xpool_phase = 0
-        # Balanced-unit multiplier. Default 1 → smallest leftover-free
-        # round-trip the actuator supports (uses lcm of sub-pool counts).
-        self._xpool_unit = int(os.environ.get("SGLANG_BUDGETER_XPOOL_UNIT", "1"))
-        # Phase 2e.5.6.3: when SGLANG_BUDGETER_XPOOL_COORDINATED=1, the
+        # When SGLANG_BUDGETER_XPOOL_COORDINATED=1, the
         # cross-pool actuator is constructed with per-pool actuators
         # (KVArenaActuator + MambaArenaActuator) so capacity changes
         # propagate to allocators. Otherwise (legacy / 2e.5.6.2 path),
@@ -230,14 +222,7 @@ class BudgetAgent:
             except Exception as e:
                 logger.warning("BudgetAgent arena actuation failed: %s", e, exc_info=True)
 
-        # Phase 2e.5.6.2: cross-pool KV ↔ mamba transfer demo.
-        if self.xpool_demo:
-            try:
-                self._maybe_xpool_actuate(snapshot)
-            except Exception as e:
-                logger.warning("BudgetAgent xpool actuation failed: %s", e, exc_info=True)
-
-        # Phase 2e.5.6.3.c: planner-driven cross-pool transfers.
+        # Planner-driven cross-pool transfers.
         if self.xpool_planner_enabled:
             try:
                 self._maybe_xpool_planner(snapshot)
@@ -345,9 +330,9 @@ class BudgetAgent:
             mamba_actuator=mamba_act,
         )
         logger.info(
-            "BudgetAgent xpool: actuator attached, unit=%d, "
-            "coordinated=%s (kv_act=%s, mamba_act=%s)",
-            self._xpool_unit, self.xpool_coordinated,
+            "BudgetAgent xpool: actuator attached, coordinated=%s "
+            "(kv_act=%s, mamba_act=%s)",
+            self.xpool_coordinated,
             kv_act is not None, mamba_act is not None,
         )
 
@@ -476,55 +461,6 @@ class BudgetAgent:
         except Exception:
             return 0
 
-    def _maybe_xpool_actuate(self, snapshot: dict) -> None:
-        """Phase 2e.5.6.2 demo. Safe-by-design: only transfers when there are
-        zero running/queued requests (i.e., during warmup or quiescent
-        windows). Live-serving cross-pool resize requires the scheduler to
-        know about the shrunken capacity (via KVArenaActuator and a
-        not-yet-implemented MambaArenaActuator); that's the next milestone.
-        Until then we restrict to safe windows so the demo doesn't unmap
-        slots the engine is using.
-        """
-        self._ensure_xpool_actuator()
-        if self._xpool_actuator is None:
-            return
-
-        # Safety gate: only act when nothing is in flight. snapshot fields
-        # may be QueueCount objects with a `.total` attribute; unwrap to int.
-        def _to_int(v):
-            t = getattr(v, "total", None)
-            if isinstance(t, (int, float)):
-                return int(t)
-            try:
-                return int(v) if v is not None else 0
-            except (TypeError, ValueError):
-                return 0
-        n_running = _to_int(snapshot.get("num_running_reqs", 0))
-        n_queued = _to_int(snapshot.get("num_queue_reqs", 0))
-        if n_running > 0 or n_queued > 0:
-            snapshot["xpool_skipped"] = "engine_busy"
-            snapshot["xpool_state"] = self._xpool_actuator.state()
-            return
-
-        # Oscillator demo: alternate kv→mamba and mamba→kv via T8 path.
-        # The lcm-balanced wrappers were dropped with the legacy actuator;
-        # planner picks tail chunks at the configured unit, drift is
-        # bounded by free-handle accounting in the shared pool.
-        self._xpool_phase = (self._xpool_phase + 1) % 2
-        direction = "kv_to_mamba" if self._xpool_phase == 1 else "mamba_to_kv"
-        stats = self._maybe_t8_fire(direction, self._xpool_unit, snapshot)
-        if stats is None:
-            snapshot["xpool_skipped"] = "t8_wiring_unavailable"
-            return
-
-        # Inline a few key fields into the snapshot for easy grep.
-        snapshot["xpool_direction"] = stats["direction"]
-        snapshot["xpool_unmapped_total"] = stats["unmapped_total"]
-        snapshot["xpool_granted_total"] = stats["granted_total"]
-        snapshot["xpool_kv_capacity_tokens"] = stats["kv_capacity_tokens"]
-        snapshot["xpool_mamba_capacity_tokens"] = stats["mamba_capacity_tokens"]
-        snapshot["xpool_free_handles"] = stats["free_after_grow"]
-
     def try_admission_time_fire(
         self,
         direction: str = "rec_to_kv",
@@ -586,17 +522,13 @@ class BudgetAgent:
             self._emergency_fire_in_progress = False
 
     def _maybe_xpool_planner(self, snapshot: dict) -> None:
-        """Phase 2e.5.6.3.c: planner-driven cross-pool transfers.
+        """Planner-driven cross-pool transfers.
 
-        Reuses `_ensure_xpool_actuator` to attach the cross-pool actuator,
-        then a CrossPoolPlanner reads pressure signals from the snapshot
-        and decides direction. Compared to the oscillator
-        (SGLANG_BUDGETER_XPOOL_DEMO=1), transfers are now sparse — only
-        when a pool is actually stressed.
-
-        Safety: same gate as the oscillator path — skip when engine is
-        busy. Capacity-coordinated path (the actuator updates per-pool
-        allocators) is implied by SGLANG_BUDGETER_XPOOL_COORDINATED=1.
+        Attaches the cross-pool actuator on first call, then a
+        CrossPoolPlanner reads pressure signals from the snapshot and
+        decides direction. Capacity-coordinated path (the actuator
+        updates per-pool allocators) is implied by
+        SGLANG_BUDGETER_XPOOL_COORDINATED=1.
         """
         self._ensure_xpool_actuator()
         if self._xpool_actuator is None:
