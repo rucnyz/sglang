@@ -1,4 +1,4 @@
-"""Engine-native pressure adapter for L2's net-benefit gate.
+"""Engine-native pressure adapter for the admission gate's net-benefit check.
 
 Paper §sec:design-l2 states the gate as `B (benefit) ≥ C (cost) × margin`.
 The benefit term `B` is the sum of admission-pressure signals translated
@@ -39,7 +39,7 @@ class PressureSignals:
     benefit-microsecond space.
 
     Each field is "expected GPU time (us) saved by averting one tick's
-    worth of accumulated pressure of that type". The L2 fire decision
+    worth of accumulated pressure of that type". The admission gate
     sums all fields; the gate fires when sum ≥ chunk_cost_us × margin.
 
     Why microseconds: matches `chunk_cost_us` units (the empirically
@@ -66,7 +66,7 @@ class PressureSignals:
 
 class EnginePressureAdapter(ABC):
     """Translates engine-native pool-pressure signals to uniform
-    benefit-microseconds usable by L2's net-benefit gate.
+    benefit-microseconds usable by the admission gate's net-benefit check.
 
     Subclasses must implement `signals_from_snapshot`. The budgeter calls
     this on every gate evaluation; it should be cheap (no I/O, just

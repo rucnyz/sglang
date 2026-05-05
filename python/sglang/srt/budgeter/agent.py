@@ -205,12 +205,12 @@ class BudgetAgent:
                 ", ".join(missing),
             )
             return False
-        # Pre-init the L2 eviction counter on tree_cache. schedule_batch.py
+        # Pre-init the cumulative eviction counter on tree_cache. schedule_batch.py
         # lazy-creates it on the first non-zero evict; pre-creating here
         # lets the snapshot path read the attribute directly without a
         # getattr-default fallback.
-        if not hasattr(tree_cache, "_l2_cumulative_evicted_tokens"):
-            tree_cache._l2_cumulative_evicted_tokens = 0
+        if not hasattr(tree_cache, "_admission_cumulative_evicted_tokens"):
+            tree_cache._admission_cumulative_evicted_tokens = 0
         self._tree_cache = tree_cache
         return True
 
@@ -995,7 +995,7 @@ class BudgetAgent:
         # schedule_batch.py; we emit the per-tick delta as
         # `num_evicted_tokens_recent` for the SGLangPressureAdapter to
         # convert into benefit-microseconds via prefill_save_us_per_token.
-        cum_evict = self._tree_cache._l2_cumulative_evicted_tokens
+        cum_evict = self._tree_cache._admission_cumulative_evicted_tokens
         last = getattr(self, "_last_evicted_cumulative", 0)
         recent = max(0, cum_evict - last)
         self._last_evicted_cumulative = cum_evict

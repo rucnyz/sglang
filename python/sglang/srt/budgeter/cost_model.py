@@ -7,9 +7,9 @@ SGLANG_CSIGMA_* env vars (preferred, eval-able) or from the JSON path
 SGLANG_CSIGMA_JSON. Falls back to a Qwen3.5-35B-A3B / H200 reference
 default with a one-time warning when no calibration is present.
 
-The L2 budgeter consumes these curves to make recovery-cost-aware fire
-decisions: at observed mean recovery length \bar{L}_σ, the cost of a
-miss is c_σ(\bar{L}_σ) milliseconds; the gate compares net benefit
+The admission gate consumes these curves to make recovery-cost-aware
+fire decisions: at observed mean recovery length \bar{L}_σ, the cost of
+a miss is c_σ(\bar{L}_σ) milliseconds; the gate compares net benefit
 across pools using these L-aware costs rather than fixed scalars.
 """
 from __future__ import annotations
