@@ -1070,6 +1070,8 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or full_num_tokens <= 0:
             return 0
 
+        from sglang.srt.mem_cache.common import record_recovery_len_kv
+
         full_num_evicted = 0
         # get the least recently used leaf node that is not locked
         x = self.full_lru_list.get_leaf_lru_no_lock()
@@ -1079,6 +1081,8 @@ class MambaRadixCache(BasePrefixCache):
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
             full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
+            if full_num_evicted_delta > 0:
+                record_recovery_len_kv(self, full_num_evicted_delta)
             full_num_evicted += full_num_evicted_delta
 
             # if parent has no more children, it is a leaf. It is possible that this node is lru, so

@@ -2176,6 +2176,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            # Paper §sec:design-formalism-offline: feed the retract-pool
+            # recovery-length EWMA with the actual seq_len being retracted.
+            from sglang.srt.mem_cache.common import record_recovery_len_retract
+            L_retract = len(req.origin_input_ids) + len(req.output_ids)
+            record_recovery_len_retract(self.tree_cache, L_retract)
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 

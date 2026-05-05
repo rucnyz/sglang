@@ -325,6 +325,37 @@ def alloc_token_slots(
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
+# Recovery-length EWMA: paper §sec:design-formalism-offline evaluates c_i
+# at the EWMA mean recovery length \bar L_i per pool. KV side is fed by
+# the length of each leaf evicted from the prefix cache; retract side is
+# fed by each retracted req's seq_len. Budgeter snapshot reads the two
+# fields directly. Cold-start (no events yet): EWMA stays at 0, snapshot
+# falls back to SGLANG_XPOOL_DEFAULT_L.
+_RECOVERY_LEN_EWMA_ALPHA = 0.05  # ~14-event half-life
+
+
+def record_recovery_len_kv(tree_cache, L: int) -> None:
+    if tree_cache is None or L <= 0:
+        return
+    prev = getattr(tree_cache, "_recovery_len_kv_ewma", 0.0)
+    tree_cache._recovery_len_kv_ewma = (
+        float(L)
+        if prev <= 0
+        else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev
+    )
+
+
+def record_recovery_len_retract(tree_cache, L: int) -> None:
+    if tree_cache is None or L <= 0:
+        return
+    prev = getattr(tree_cache, "_recovery_len_retract_ewma", 0.0)
+    tree_cache._recovery_len_retract_ewma = (
+        float(L)
+        if prev <= 0
+        else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev
+    )
+
+
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return

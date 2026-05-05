@@ -198,12 +198,15 @@ class BudgetAgent:
             )
             return False
         tree_cache = self.scheduler.tree_cache
-        # Pre-init the cumulative eviction counter on tree_cache. schedule_batch.py
-        # lazy-creates it on the first non-zero evict; pre-creating here
-        # lets the snapshot path read the attribute directly without a
-        # getattr-default fallback.
+        # Pre-init counters on tree_cache. The eviction / retract sites
+        # lazy-create these on the first event; pre-creating here lets
+        # the snapshot path read attributes directly without getattr.
         if not hasattr(tree_cache, "_admission_cumulative_evicted_tokens"):
             tree_cache._admission_cumulative_evicted_tokens = 0
+        if not hasattr(tree_cache, "_recovery_len_kv_ewma"):
+            tree_cache._recovery_len_kv_ewma = 0.0
+        if not hasattr(tree_cache, "_recovery_len_retract_ewma"):
+            tree_cache._recovery_len_retract_ewma = 0.0
         self._tree_cache = tree_cache
         return True
 
@@ -1000,28 +1003,22 @@ class BudgetAgent:
                     0.0, min(1.0, (m_total - m_avail) / m_total)
                 )
 
-        # Stage-0 calibration consumer (paper §sec:design-l2-firegate):
-        # plumb observed mean recovery length so the SGLangPressureAdapter
-        # can evaluate c_σ(L) at the live operating point instead of using
-        # the constructor scalar. L_recover ≈ running-batch mean seq length:
-        # what a retracted-then-resumed request has to re-prefill, and
-        # within an order of magnitude what a tree-cache eviction-driven
-        # re-prefill pays per evicted prefix entry.
-        # Read DIRECTLY from running_batch.seq_lens_cpu — the stats-attribute
-        # path is unreliable on multi-turn workloads (decode_sum_seq_lens
-        # only populates on certain scheduler iterations). When the batch
-        # is empty, fall back to SGLANG_XPOOL_DEFAULT_L (4096) so the gate
-        # still has a reasonable c_σ evaluation point.
-        try:
-            seq_lens_cpu = getattr(self.scheduler.running_batch, "seq_lens_cpu", None)
-            if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
-                mean_L = float(seq_lens_cpu.float().mean().item())
-            else:
-                mean_L = float(os.environ.get("SGLANG_XPOOL_DEFAULT_L", "4096"))
-            snap["mean_recovery_len_kv"] = mean_L
-            snap["mean_recovery_len_retract"] = mean_L
-        except Exception:
-            pass
+        # Paper §sec:design-formalism-offline: c_i(L) is evaluated at the
+        # EWMA mean recovery length \bar L_i per pool. Each side is fed
+        # by the actual L of the corresponding event:
+        #   - kv:     length of each leaf evicted from the prefix tree
+        #             (radix_cache.evict / mamba_radix_cache.evict_full /
+        #              radix_cache.evict_pages_in_range)
+        #   - retract: seq_len of each req retracted in retract_decode
+        # Cold-start (no events seen yet → ewma is 0): fall back to
+        # SGLANG_XPOOL_DEFAULT_L so the gate still has a usable c_i point.
+        tc = self._tree_cache
+        default_L = float(os.environ.get("SGLANG_XPOOL_DEFAULT_L", "4096"))
+        kv_L = tc._recovery_len_kv_ewma if tc._recovery_len_kv_ewma > 0 else default_L
+        retract_ewma = tc._recovery_len_retract_ewma
+        retract_L = retract_ewma if retract_ewma > 0 else kv_L
+        snap["mean_recovery_len_kv"] = kv_L
+        snap["mean_recovery_len_retract"] = retract_L
 
         # Phase 3.b (paper §4.2 Eq 4.4): V_prefix' marginal-value report.
         # Available on MambaRadixCache (and Hi*); other tree caches don't

@@ -617,12 +617,16 @@ class RadixCache(BasePrefixCache):
         ]
         heapq.heapify(eviction_heap)
 
+        from sglang.srt.mem_cache.common import record_recovery_len_kv
+
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            L_evicted = len(x.value)
             self.token_to_kv_pool_allocator.free(x.value)
-            num_evicted += len(x.value)
+            num_evicted += L_evicted
+            record_recovery_len_kv(self, L_evicted)
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
@@ -679,8 +683,11 @@ class RadixCache(BasePrefixCache):
                 in_range = ((v >= low) & (v < high)).any().item()
                 if not in_range:
                     continue
+                from sglang.srt.mem_cache.common import record_recovery_len_kv
+                L_evicted = int(v.numel())
                 self.token_to_kv_pool_allocator.free(v)
-                num_evicted += int(v.numel())
+                num_evicted += L_evicted
+                record_recovery_len_kv(self, L_evicted)
                 self._delete_leaf(node)
                 self._record_remove_event(node)
                 progress = True
