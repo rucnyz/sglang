@@ -88,8 +88,9 @@ boot_sglang() {
     SV_PID=$!
     echo "[$cell] server pid=$SV_PID"
 
+    local boot_timeout=${BOOT_TIMEOUT_S:-1500}
     local waited=0
-    while [ $waited -lt 600 ]; do
+    while [ $waited -lt $boot_timeout ]; do
         sleep 10; waited=$((waited + 10))
         if [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
                 "http://127.0.0.1:$PORT/health" 2>/dev/null)" = "200" ]; then
