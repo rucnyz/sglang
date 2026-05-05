@@ -119,7 +119,10 @@ run_model_regime() {
     # of the same cell are independent and benefit from running in
     # parallel on different GPUs.
     local total_jobs=$((ncells * n_trials))
-    local parallel=$((8 / tp))
+    # Default parallelism: GPUs available / TP. Override with PARALLEL=2 etc
+    # to reduce IO/GPU contention (genai-bench multi-turn is sensitive to
+    # cross-trial variance when 5+ servers compete for the same disk).
+    local parallel=${PARALLEL:-$((8 / tp))}
     [ $parallel -gt $total_jobs ] && parallel=$total_jobs
 
     echo "[main-orch] model=$model_key ($hf, tp=$tp) regime=$regime trials=$n_trials cells=$ncells jobs=$total_jobs parallel=$parallel"
