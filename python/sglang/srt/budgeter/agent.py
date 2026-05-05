@@ -97,6 +97,10 @@ class BudgetAgent:
         self._last_tick = 0.0
         self._tick_count = 0
         self._last_evicted_cumulative = 0
+        # JSONL snapshot logging. log_enabled flips True only after a
+        # successful open(); read paths gate on the flag, never on the
+        # raw file handle.
+        self.log_enabled = False
         self._log_fp = None
 
         # KV-side arena actuator. Lazy-built on first use; serves as the
@@ -130,9 +134,9 @@ class BudgetAgent:
         if self.enabled:
             try:
                 self._log_fp = open(self.log_path, "a", buffering=1)
+                self.log_enabled = True
             except OSError as e:
                 logger.warning("BudgetAgent: failed to open %s: %s", self.log_path, e)
-                self._log_fp = None
             logger.info(
                 "BudgetAgent enabled (tick=%.1fs, log=%s, pid=%d)",
                 self.tick_interval_s, self.log_path, os.getpid(),
@@ -214,7 +218,7 @@ class BudgetAgent:
         except Exception as e:
             logger.warning("BudgetAgent xpool planner failed: %s", e, exc_info=True)
 
-        if self._log_fp is not None:
+        if self.log_enabled:
             try:
                 self._log_fp.write(json.dumps(snapshot, default=_json_default) + "\n")
             except Exception as e:
@@ -883,10 +887,11 @@ class BudgetAgent:
         return snap
 
     def close(self) -> None:
-        if self._log_fp is not None:
+        if self.log_enabled:
             try:
                 self._log_fp.flush()
                 self._log_fp.close()
             except Exception:
                 pass
+            self.log_enabled = False
             self._log_fp = None

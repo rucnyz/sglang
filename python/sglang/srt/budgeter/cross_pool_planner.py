@@ -184,10 +184,12 @@ class CrossPoolPlanner:
         self._cost_log_path: Optional[str] = (
             os.environ.get("SGLANG_XPOOL_COST_LOG") or None
         )
+        self.cost_log_enabled = False
         self._cost_log_fp = None
         if self._cost_log_path:
             try:
                 self._cost_log_fp = open(self._cost_log_path, "a", buffering=1)
+                self.cost_log_enabled = True
                 logger.info(
                     "[xpool-cost] decisions logged to %s", self._cost_log_path
                 )
@@ -196,7 +198,6 @@ class CrossPoolPlanner:
                     "[xpool-cost] cannot open SGLANG_XPOOL_COST_LOG=%s: %s",
                     self._cost_log_path, e,
                 )
-                self._cost_log_fp = None
         self._cooldown_remaining: int = 0
         self._tick_count: int = 0
         # Edge-triggered state per pool. Initialized to IN_BAND so the
@@ -422,13 +423,13 @@ class CrossPoolPlanner:
 
     def close(self) -> None:
         """Flush + close the cost JSONL handle (if any)."""
-        fp = self._cost_log_fp
-        if fp is not None:
+        if self.cost_log_enabled:
             try:
-                fp.flush()
-                fp.close()
+                self._cost_log_fp.flush()
+                self._cost_log_fp.close()
             except Exception:
                 pass
+            self.cost_log_enabled = False
             self._cost_log_fp = None
 
     def _emit_cost_log(
@@ -442,7 +443,7 @@ class CrossPoolPlanner:
         usage levels, recovery lengths, cost-curve evaluations, signals
         breakdown from the adapter, fire direction.
         """
-        if self._cost_log_fp is None:
+        if not self.cost_log_enabled:
             return
         rec: dict = dict(
             ts=round(time.time(), 3),
