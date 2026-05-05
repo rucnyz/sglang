@@ -102,6 +102,7 @@ class BudgetAgent:
         )
         self._last_tick = 0.0
         self._tick_count = 0
+        self._last_evicted_cumulative = 0
         self._log_fp = None
 
         # Phase 2b policy + actuation state. Lazily initialized so the import
@@ -996,7 +997,7 @@ class BudgetAgent:
         # `num_evicted_tokens_recent` for the SGLangPressureAdapter to
         # convert into benefit-microseconds via prefill_save_us_per_token.
         cum_evict = self._tree_cache._admission_cumulative_evicted_tokens
-        last = getattr(self, "_last_evicted_cumulative", 0)
+        last = self._last_evicted_cumulative
         recent = max(0, cum_evict - last)
         self._last_evicted_cumulative = cum_evict
         snap["num_evicted_tokens_recent"] = recent
