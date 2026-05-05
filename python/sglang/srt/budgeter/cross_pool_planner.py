@@ -256,11 +256,12 @@ class CrossPoolPlanner:
         if self._cost_curves is None:
             return None, 0.0, "nb_direction: no cost curves"
         c = self.config
-        # Per-pool live recovery length. Phase-1 wiring uses the same value
-        # for both pools (running-batch mean seq len); per-pool L̄_σ EWMAs
-        # are tracked separately as #65.
+        # Per-pool L̄_i (paper §sec:design-formalism-offline). Each pool's
+        # EWMA is fed by its own evict events: KV evict for L_kv, mamba
+        # snapshot evict for L_m. mean_recovery_len_retract (req kicked
+        # out) is a separate retract-pressure signal and not used here.
         L_kv = float((snapshot or {}).get("mean_recovery_len_kv", 0) or 0)
-        L_m = float((snapshot or {}).get("mean_recovery_len_retract", L_kv) or L_kv)
+        L_m = float((snapshot or {}).get("mean_recovery_len_rec", L_kv) or L_kv)
         if L_kv <= 0 and L_m <= 0:
             # No L̄ observed yet — fall back to legacy path.
             return None, 0.0, "nb_direction: no recovery_len observed"
@@ -461,6 +462,7 @@ class CrossPoolPlanner:
         if snapshot:
             for k in (
                 "mean_recovery_len_kv",
+                "mean_recovery_len_rec",
                 "mean_recovery_len_retract",
                 "num_evicted_tokens_recent",
                 "num_retracted_reqs",

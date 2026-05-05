@@ -239,23 +239,21 @@ class SGLangPressureAdapter(EnginePressureAdapter):
         # from re-allocation.
         max_consec = max(kv_consec, mamba_consec)
 
-        # L-aware recovery cost (paper §sec:design-l2-firegate). Two paths:
-        #   1. Calibrated curves present → evict_us is the total re-prefill
-        #      wall-clock for the per-tick batch of evicted tokens, treated
-        #      as a single chunked-prefill of length=evicted_tokens. This is
-        #      semantically correct: the engine re-prefills the evicted tail
-        #      as one batch when the cache miss fires, paying c_KV(L) once,
-        #      not c_KV(L)/L per token.
-        #   2. No calibration / explicit scalar override → fall back to the
-        #      legacy `evicted_tokens × prefill_save_us_per_token` formula
-        #      so existing deployments are bit-for-bit unchanged.
+        # L-aware recovery cost (paper §sec:design-l2-firegate). Paper Eq
+        # for c_2: ∑_b n_b · c_i(\\bar L_i). Per-tick we observe a total
+        # token-count `evicted_tokens` which is the sum of per-leaf L's;
+        # the number of misses is approx evicted_tokens / \\bar L_KV, and
+        # each miss pays c_KV(\\bar L_KV). Total ≈ (N/\\bar L) · c_KV(\\bar L).
+        # No-calibration path keeps the legacy per-token scalar so existing
+        # deployments are bit-for-bit unchanged.
         kv_L = self._to_float(snapshot.get("mean_recovery_len_kv", 0.0))
         retract_L = self._to_float(snapshot.get("mean_recovery_len_retract", 0.0))
         use_curves = self.cost_curves.source != "legacy_default" or \
                      snapshot.get("mean_recovery_len_kv") is not None
-        if use_curves and evicted_tokens > 0:
-            evict_us = self.cost_curves.c_kv_us(float(evicted_tokens))
-            evict_path = "calibrated_total"
+        if use_curves and evicted_tokens > 0 and kv_L > 0:
+            num_misses = evicted_tokens / kv_L
+            evict_us = num_misses * self.cost_curves.c_kv_us(kv_L)
+            evict_path = f"calibrated_n_misses={num_misses:.2f}@L={kv_L:.0f}"
         else:
             evict_us = evicted_tokens * self.prefill_save_us_per_token
             evict_path = "legacy_per_tok"

@@ -205,6 +205,8 @@ class BudgetAgent:
             tree_cache._admission_cumulative_evicted_tokens = 0
         if not hasattr(tree_cache, "_recovery_len_kv_ewma"):
             tree_cache._recovery_len_kv_ewma = 0.0
+        if not hasattr(tree_cache, "_recovery_len_rec_ewma"):
+            tree_cache._recovery_len_rec_ewma = 0.0
         if not hasattr(tree_cache, "_recovery_len_retract_ewma"):
             tree_cache._recovery_len_retract_ewma = 0.0
         self._tree_cache = tree_cache
@@ -1004,20 +1006,23 @@ class BudgetAgent:
                 )
 
         # Paper §sec:design-formalism-offline: c_i(L) is evaluated at the
-        # EWMA mean recovery length \bar L_i per pool. Each side is fed
-        # by the actual L of the corresponding event:
-        #   - kv:     length of each leaf evicted from the prefix tree
-        #             (radix_cache.evict / mamba_radix_cache.evict_full /
-        #              radix_cache.evict_pages_in_range)
-        #   - retract: seq_len of each req retracted in retract_decode
-        # Cold-start (no events seen yet → ewma is 0): fall back to
-        # SGLANG_XPOOL_DEFAULT_L so the gate still has a usable c_i point.
+        # EWMA mean recovery length \\bar L_i per pool i ∈ {KV, rec}.
+        # Each EWMA is fed by the actual L of pool-specific events:
+        #   - kv:  prefix-tree leaf evict (re-prefill length)
+        #   - rec: prefix-tree mamba snapshot evict (chunked-scan distance)
+        # The retract EWMA is a separate retract-pressure signal (req kicked
+        # out under KV pressure) for the SGLang adapter — NOT \\bar L_rec.
+        # Cold-start fallback: SGLANG_XPOOL_DEFAULT_L so the gate has a
+        # usable c_i evaluation point before the first event lands.
         tc = self._tree_cache
         default_L = float(os.environ.get("SGLANG_XPOOL_DEFAULT_L", "4096"))
         kv_L = tc._recovery_len_kv_ewma if tc._recovery_len_kv_ewma > 0 else default_L
-        retract_ewma = tc._recovery_len_retract_ewma
-        retract_L = retract_ewma if retract_ewma > 0 else kv_L
+        rec_L = tc._recovery_len_rec_ewma if tc._recovery_len_rec_ewma > 0 else kv_L
+        retract_L = (
+            tc._recovery_len_retract_ewma if tc._recovery_len_retract_ewma > 0 else kv_L
+        )
         snap["mean_recovery_len_kv"] = kv_L
+        snap["mean_recovery_len_rec"] = rec_L
         snap["mean_recovery_len_retract"] = retract_L
 
         # Phase 3.b (paper §4.2 Eq 4.4): V_prefix' marginal-value report.

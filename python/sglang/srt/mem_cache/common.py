@@ -345,7 +345,23 @@ def record_recovery_len_kv(tree_cache, L: int) -> None:
     )
 
 
+def record_recovery_len_rec(tree_cache, L: int) -> None:
+    """Recurrent-pool recovery length: chunked-scan distance to rebuild
+    a mamba snapshot when it gets evicted from the prefix tree."""
+    if tree_cache is None or L <= 0:
+        return
+    prev = getattr(tree_cache, "_recovery_len_rec_ewma", 0.0)
+    tree_cache._recovery_len_rec_ewma = (
+        float(L)
+        if prev <= 0
+        else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev
+    )
+
+
 def record_recovery_len_retract(tree_cache, L: int) -> None:
+    """Retract pressure signal: full seq_len of a req kicked out of the
+    decode batch under KV pressure. Conceptually distinct from c_i(\\bar L_i):
+    feeds the SGLang adapter's `retract_us` admission-pressure term."""
     if tree_cache is None or L <= 0:
         return
     prev = getattr(tree_cache, "_recovery_len_retract_ewma", 0.0)

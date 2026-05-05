@@ -855,9 +855,19 @@ class MambaRadixCache(BasePrefixCache):
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
-        # 1. a leaf node, free full tokens and mamba
+        # 1. a leaf node, free full tokens and mamba. Record both pools'
+        # \\bar L_i (paper §sec:design-formalism-offline): the per-segment
+        # token count is the re-prefill length on KV side and the
+        # chunked-scan distance to rebuild on the recurrent side.
+        from sglang.srt.mem_cache.common import (
+            record_recovery_len_kv,
+            record_recovery_len_rec,
+        )
+        L_segment = len(x.value)
+        record_recovery_len_kv(self, L_segment)
+        record_recovery_len_rec(self, L_segment)
         self.token_to_kv_pool_allocator.free(x.value)
-        full_num_evicted = len(x.value)
+        full_num_evicted = L_segment
         self.req_to_token_pool.mamba_pool.free(x.mamba_value)
         mamba_num_evicted = len(x.mamba_value)
 
@@ -964,6 +974,8 @@ class MambaRadixCache(BasePrefixCache):
             assert node.mamba_lock_ref == 0
             assert node != self.root_node
             if len(node.children) > 0:
+                from sglang.srt.mem_cache.common import record_recovery_len_rec
+                record_recovery_len_rec(self, len(node.value))
                 self.req_to_token_pool.mamba_pool.free(node.mamba_value)
                 evicted += len(node.mamba_value)
                 self.mamba_lru_list.remove_node(node)
@@ -997,7 +1009,11 @@ class MambaRadixCache(BasePrefixCache):
             assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
 
             if len(x.children) > 0:
-                # 1. an internal node, free mamba tokens.
+                # 1. an internal node, free mamba tokens. Record \\bar L_rec:
+                # chunked-scan distance from parent boundary to this node
+                # = the KV segment length still owned by this node.
+                from sglang.srt.mem_cache.common import record_recovery_len_rec
+                record_recovery_len_rec(self, len(x.value))
                 self.req_to_token_pool.mamba_pool.free(x.mamba_value)
                 mamba_num_evicted += len(x.mamba_value)
 
@@ -1070,8 +1086,6 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or full_num_tokens <= 0:
             return 0
 
-        from sglang.srt.mem_cache.common import record_recovery_len_kv
-
         full_num_evicted = 0
         # get the least recently used leaf node that is not locked
         x = self.full_lru_list.get_leaf_lru_no_lock()
@@ -1081,8 +1095,6 @@ class MambaRadixCache(BasePrefixCache):
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
             full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
-            if full_num_evicted_delta > 0:
-                record_recovery_len_kv(self, full_num_evicted_delta)
             full_num_evicted += full_num_evicted_delta
 
             # if parent has no more children, it is a leaf. It is possible that this node is lru, so
