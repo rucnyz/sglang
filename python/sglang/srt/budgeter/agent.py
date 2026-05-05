@@ -69,8 +69,10 @@ class BudgetAgent:
 
     def __init__(self, scheduler: Any):
         self.scheduler = scheduler
-        # Cached references; refreshed lazily because some are created late.
+        # Required scheduler deps; populated on first tick by _do_health_check.
+        # If any required dep is missing the agent hard-disables itself.
         self._tree_cache = None
+        self._health_checked = False
 
         self.enabled = _env_flag("SGLANG_BUDGETER", False)
         self.actuate_enabled = _env_flag("SGLANG_BUDGETER_ACTUATE", False)
@@ -157,10 +159,45 @@ class BudgetAgent:
 
     # ---- Public API used from scheduler.event_loop_* ----
 
+    def _do_health_check(self) -> bool:
+        """One-shot dependency check on first tick. Returns True iff every
+        scheduler attribute the budgeter needs is present. We hard-disable
+        rather than silently degrade so missing deps surface as a log error
+        instead of mysterious empty jsonl rows."""
+        sched = self.scheduler
+        missing = []
+        if getattr(sched, "stats", None) is None:
+            missing.append("scheduler.stats (need --enable-metrics?)")
+        tree_cache = getattr(sched, "tree_cache", None)
+        if tree_cache is None:
+            missing.append("scheduler.tree_cache")
+        if getattr(sched, "token_to_kv_pool_allocator", None) is None:
+            missing.append("scheduler.token_to_kv_pool_allocator")
+        if missing:
+            logger.error(
+                "BudgetAgent health check failed — missing scheduler deps: %s",
+                ", ".join(missing),
+            )
+            return False
+        self._tree_cache = tree_cache
+        return True
+
     def tick(self) -> None:
         """Called every scheduler iteration. Internally rate-limited."""
         if not self.enabled:
             return
+        if not self._health_checked:
+            if not self._do_health_check():
+                # Hard-disable: the scheduler is missing dependencies the
+                # budgeter requires. Don't silently degrade — refuse to run
+                # so an operator can see the error in the log.
+                self.enabled = False
+                logger.error(
+                    "BudgetAgent: hard-disabled (health check failed). "
+                    "Set the missing scheduler deps and restart."
+                )
+                return
+            self._health_checked = True
         now = time.time()
         if now - self._last_tick < self.tick_interval_s:
             return
@@ -898,46 +935,40 @@ class BudgetAgent:
     def _snapshot(self, now: float) -> dict:
         """Capture all signals Phase 2's policy might consume."""
         sched = self.scheduler
-        stats = getattr(sched, "stats", None)
-
-        # Lazy: tree_cache gets assigned partway through scheduler init.
-        if self._tree_cache is None:
-            self._tree_cache = getattr(sched, "tree_cache", None)
+        stats = sched.stats
 
         snap: dict[str, Any] = {
             "ts": round(now, 3),
             "tick": self._tick_count,
         }
 
-        if stats is not None:
-            for k in (
-                # KV
-                "max_total_num_tokens",
-                "kv_used_tokens",
-                "kv_evictable_tokens",
-                "kv_available_tokens",
-                "token_usage",
-                "full_token_usage",
-                "swa_token_usage",
-                # SSM / mamba
-                "mamba_usage",
-                # cache
-                "cache_hit_rate",
-                # queue / running
-                "num_running_reqs",
-                "num_queue_reqs",
-                "num_paused_reqs",
-                "num_retracted_reqs",
-                # throughput
-                "gen_throughput",
-            ):
-                if hasattr(stats, k):
-                    snap[k] = getattr(stats, k)
+        for k in (
+            # KV
+            "max_total_num_tokens",
+            "kv_used_tokens",
+            "kv_evictable_tokens",
+            "kv_available_tokens",
+            "token_usage",
+            "full_token_usage",
+            "swa_token_usage",
+            # SSM / mamba
+            "mamba_usage",
+            # cache
+            "cache_hit_rate",
+            # queue / running
+            "num_running_reqs",
+            "num_queue_reqs",
+            "num_paused_reqs",
+            "num_retracted_reqs",
+            # throughput
+            "gen_throughput",
+        ):
+            if hasattr(stats, k):
+                snap[k] = getattr(stats, k)
 
-        # Whether tree_cache supports unified eviction (will matter for 2b)
-        snap["unified_radix"] = bool(
-            self._tree_cache
-            and self._tree_cache.__class__.__name__ == "UnifiedRadixCache"
+        # Whether tree_cache supports unified eviction (matters for 2b).
+        snap["unified_radix"] = (
+            self._tree_cache.__class__.__name__ == "UnifiedRadixCache"
         )
 
         # Paper §design-l2 SGLang adapter: tree-cache eviction is the
