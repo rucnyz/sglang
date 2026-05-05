@@ -1,14 +1,9 @@
-"""BudgetAgent — in-process pool-pressure observer (Phase 2a, read-only).
+"""BudgetAgent — in-process pool-pressure observer.
 
 The scheduler instantiates one of these and calls `tick()` on every event-loop
 iteration. The agent rate-limits internally: it only does real work every
-`tick_interval_s` seconds.
-
-Phase 2a (this file): SNAPSHOT ONLY. We log per-pool state to a JSONL and verify
-that the scheduler's hot path is not affected. No actuation.
-
-Phase 2b/2c will add `LagrangePolicy.compute_evict_targets()` + actuators on top
-of this scaffolding.
+`tick_interval_s` seconds. Each tick snapshots per-pool state to a JSONL and
+optionally drives cross-pool VMM transfers via the planner / actuator path.
 """
 
 from __future__ import annotations
@@ -95,7 +90,6 @@ class BudgetAgent:
         self._health_checked = False
 
         self.enabled = _env_flag("SGLANG_BUDGETER", False)
-        self.actuate_enabled = _env_flag("SGLANG_BUDGETER_ACTUATE", False)
         self.tick_interval_s = _env_float("SGLANG_BUDGETER_TICK_S", 30.0)
         self.log_path = _env_str(
             "SGLANG_BUDGETER_LOG", "/tmp/sglang_budgeter.jsonl"
@@ -105,17 +99,7 @@ class BudgetAgent:
         self._last_evicted_cumulative = 0
         self._log_fp = None
 
-        # Phase 2b policy + actuation state. Lazily initialized so the import
-        # cost is paid only once and only when the budgeter is enabled.
-        self._policy = None
-        self._evict_params_cls = None
-        if self.enabled and self.actuate_enabled:
-            from sglang.srt.budgeter.policy import PressurePolicy
-            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-            self._policy = PressurePolicy()
-            self._evict_params_cls = EvictParams
-
-        # Phase 2e.4.d arena actuator. Lazy-built on first tick once
+        # Arena actuator. Lazy-built on first tick once
         # the scheduler has populated `token_to_kv_pool` and
         # `token_to_kv_pool_allocator`. SGLANG_BUDGETER_ARENA=1 turns
         # this on; SGLANG_BUDGETER_ARENA_DEMO=1 oscillates capacity for
@@ -165,8 +149,8 @@ class BudgetAgent:
                 logger.warning("BudgetAgent: failed to open %s: %s", self.log_path, e)
                 self._log_fp = None
             logger.info(
-                "BudgetAgent enabled (actuate=%s, tick=%.1fs, log=%s, pid=%d)",
-                self.actuate_enabled, self.tick_interval_s, self.log_path, os.getpid(),
+                "BudgetAgent enabled (tick=%.1fs, log=%s, pid=%d)",
+                self.tick_interval_s, self.log_path, os.getpid(),
             )
             # Register process-singleton so admission-time hooks can
             # find the agent without restructuring tree_cache.
@@ -238,14 +222,8 @@ class BudgetAgent:
         except Exception as e:  # never break the scheduler hot path
             logger.warning("BudgetAgent.tick snapshot failed: %s", e, exc_info=True)
             return
-        # Phase 2b: actuate via UnifiedRadixCache.evict.
-        if self.actuate_enabled and self._policy is not None:
-            try:
-                self._maybe_evict(snapshot)
-            except Exception as e:
-                logger.warning("BudgetAgent actuation failed: %s", e, exc_info=True)
 
-        # Phase 2e.4.d: arena actuator (cross-pool VMM-aware resize).
+        # Arena actuator (cross-pool VMM-aware resize).
         if self.arena_enabled:
             try:
                 self._maybe_arena_actuate(snapshot)
@@ -908,40 +886,10 @@ class BudgetAgent:
         if "skipped" in stats:
             snapshot["xpool_skipped"] = stats["skipped"]
 
-    def _maybe_evict(self, snapshot: dict) -> None:
-        """Phase 2b actuation: ask the policy what to evict; call tree_cache.evict."""
-        target = self._policy.decide(snapshot, self._tick_count)
-        # Annotate the snapshot with the decision so the JSONL records what we did.
-        snapshot["budgeter_decision"] = target.reason
-        snapshot["budgeter_evict_kv"] = target.num_tokens
-        snapshot["budgeter_evict_swa"] = target.swa_num_tokens
-        snapshot["budgeter_evict_mamba"] = target.mamba_num
-        if target.is_noop():
-            return
-        try:
-            params = self._evict_params_cls(
-                num_tokens=target.num_tokens,
-                swa_num_tokens=target.swa_num_tokens,
-                mamba_num=target.mamba_num,
-            )
-            result = self._tree_cache.evict(params)
-            # Prefer the actual evicted counts back from the cache, when it returns them.
-            actually_kv = getattr(result, "num_tokens_evicted", target.num_tokens)
-            actually_mamba = getattr(result, "mamba_num_evicted", target.mamba_num)
-            snapshot["budgeter_actually_evicted_kv"] = actually_kv
-            snapshot["budgeter_actually_evicted_mamba"] = actually_mamba
-            logger.debug(
-                "Budgeter evicted kv=%s mamba=%s reason=%s",
-                actually_kv, actually_mamba, target.reason,
-            )
-        except Exception as e:
-            logger.warning("Budgeter evict() raised: %r", e, exc_info=True)
-        # Phase 2a: no actuation.
-
     # ---- Internal ----
 
     def _snapshot(self, now: float) -> dict:
-        """Capture all signals Phase 2's policy might consume."""
+        """Capture all signals the cross-pool planner / pressure adapter consume."""
         sched = self.scheduler
         stats = sched.stats
 
