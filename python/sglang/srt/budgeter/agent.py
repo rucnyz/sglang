@@ -270,13 +270,8 @@ class BudgetAgent:
     def _ensure_arena_actuator(self) -> None:
         if self._arena_actuator is not None:
             return
-        sched = self.scheduler
-        alloc = getattr(sched, "token_to_kv_pool_allocator", None)
-        if alloc is None:
-            return
-        pool = alloc.get_kvcache() if hasattr(alloc, "get_kvcache") else None
-        if pool is None:
-            return
+        alloc = self.scheduler.token_to_kv_pool_allocator
+        pool = alloc.get_kvcache()
         # Hybrid models route through HybridLinearKVPool (a thin wrapper):
         # the actual MHATokenToKVPool with `_kv_arena` is `pool.full_kv_pool`.
         # Single-pool (non-hybrid) models put the arena directly on `pool`.
@@ -316,13 +311,8 @@ class BudgetAgent:
         """
         if self._xpool_actuator is not None:
             return
-        sched = self.scheduler
-        alloc = getattr(sched, "token_to_kv_pool_allocator", None)
-        if alloc is None:
-            return
-        pool = alloc.get_kvcache() if hasattr(alloc, "get_kvcache") else None
-        if pool is None:
-            return
+        alloc = self.scheduler.token_to_kv_pool_allocator
+        pool = alloc.get_kvcache()
         full_kv = getattr(pool, "full_kv_pool", None)
         mamba_pool = getattr(pool, "mamba_pool", None)
         if full_kv is None or mamba_pool is None:
@@ -395,10 +385,6 @@ class BudgetAgent:
         if self._xpool_actuator.kv_actuator is None:
             logger.info("T8: no kv_actuator wired — staying on legacy path")
             return False
-        sched = self.scheduler
-        if sched is None:
-            logger.info("T8: no scheduler ref — staying on legacy path")
-            return False
         try:
             from sglang.srt.budgeter.fire_planner import XPoolFirePlanner
             from sglang.srt.budgeter.scheduler_owner_provider import (
@@ -408,7 +394,7 @@ class BudgetAgent:
             logger.warning("T8: import failed: %r", e)
             return False
         provider = SchedulerOwnerProvider(
-            scheduler=sched,
+            scheduler=self.scheduler,
             kv_actuator=self._xpool_actuator.kv_actuator,
             mamba_actuator=self._xpool_actuator.mamba_actuator,
         )
@@ -642,12 +628,8 @@ class BudgetAgent:
         # the pools/allocators to get the LIVE state at tick time, then
         # peak-track across consecutive ticks (peaks decay exponentially)
         # so the planner sees the recent maximum, not the just-now zero.
-        sched = self.scheduler
-        alloc = getattr(sched, "token_to_kv_pool_allocator", None)
-        kv_pool = alloc.get_kvcache() if alloc and hasattr(alloc, "get_kvcache") else None
-        mamba_pool = None
-        if kv_pool is not None:
-            mamba_pool = getattr(kv_pool, "mamba_pool", None)
+        kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+        mamba_pool = getattr(kv_pool, "mamba_pool", None)
 
         usage_kv_inst = 0.0
         usage_mamba_inst = 0.0
@@ -672,13 +654,11 @@ class BudgetAgent:
             # active slots forces queueing breakdown.
             try:
                 active_count = 0
-                rb = getattr(sched, "running_batch", None)
-                if rb is not None:
-                    for r in (getattr(rb, "reqs", None) or []):
-                        mi = getattr(r, "mamba_pool_idx", None)
-                        if mi is None:
-                            continue
-                        active_count += 1
+                for r in (getattr(self.scheduler.running_batch, "reqs", None) or []):
+                    mi = getattr(r, "mamba_pool_idx", None)
+                    if mi is None:
+                        continue
+                    active_count += 1
                 if ms_live > 0:
                     usage_mamba_active_inst = max(
                         0.0, min(1.0, active_count / float(ms_live))
@@ -1003,32 +983,22 @@ class BudgetAgent:
         # Snapshot-fill is the right "real bubble" measure for the
         # motivation figure. Computed unconditionally — does NOT depend
         # on whether the cross-pool actuator is initialized.
-        try:
-            alloc_for_usage = getattr(sched, "token_to_kv_pool_allocator", None)
-            if alloc_for_usage is not None:
-                kv_total = getattr(alloc_for_usage, "size", 0)
-                kv_avail = alloc_for_usage.available_size()
-                if kv_total > 0:
-                    snap["pool_fill_kv"] = max(
-                        0.0, min(1.0, (kv_total - kv_avail) / kv_total)
-                    )
-            kv_pool = (
-                alloc_for_usage.get_kvcache()
-                if alloc_for_usage and hasattr(alloc_for_usage, "get_kvcache")
-                else None
+        alloc = self.scheduler.token_to_kv_pool_allocator
+        kv_total = alloc.size
+        kv_avail = alloc.available_size()
+        if kv_total > 0:
+            snap["pool_fill_kv"] = max(
+                0.0, min(1.0, (kv_total - kv_avail) / kv_total)
             )
-            mamba_pool = (
-                getattr(kv_pool, "mamba_pool", None) if kv_pool else None
-            )
-            if mamba_pool is not None:
-                m_total = getattr(mamba_pool, "size", 0)
-                m_avail = mamba_pool.available_size()
-                if m_total > 0:
-                    snap["pool_fill_mamba"] = max(
-                        0.0, min(1.0, (m_total - m_avail) / m_total)
-                    )
-        except Exception:
-            pass
+        kv_pool = alloc.get_kvcache()
+        mamba_pool = getattr(kv_pool, "mamba_pool", None)
+        if mamba_pool is not None:
+            m_total = mamba_pool.size
+            m_avail = mamba_pool.available_size()
+            if m_total > 0:
+                snap["pool_fill_mamba"] = max(
+                    0.0, min(1.0, (m_total - m_avail) / m_total)
+                )
 
         # Stage-0 calibration consumer (paper §sec:design-l2-firegate):
         # plumb observed mean recovery length so the SGLangPressureAdapter
@@ -1043,8 +1013,7 @@ class BudgetAgent:
         # is empty, fall back to SGLANG_XPOOL_DEFAULT_L (4096) so the gate
         # still has a reasonable c_σ evaluation point.
         try:
-            running = getattr(sched, "running_batch", None)
-            seq_lens_cpu = getattr(running, "seq_lens_cpu", None) if running else None
+            seq_lens_cpu = getattr(self.scheduler.running_batch, "seq_lens_cpu", None)
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 mean_L = float(seq_lens_cpu.float().mean().item())
             else:
