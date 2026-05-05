@@ -22,21 +22,42 @@ set -euo pipefail
 cd /scratch/yuzhou/projects/sglang
 
 SMOKE=${SMOKE:-0}
-MODELS=${MODELS:-"qwen3.5 qwen3next kimi"}
-REGIMES=${REGIMES:-"m1 m2 m3"}
-N_TRIALS_M1=${N_TRIALS_M1:-5}
-N_TRIALS_M2=${N_TRIALS_M2:-5}
-N_TRIALS_M3=${N_TRIALS_M3:-3}
-INCLUDE_VLLM=${INCLUDE_VLLM:-1}
-INCLUDE_STATIC_BEST=${INCLUDE_STATIC_BEST:-1}
+BASELINE=${BASELINE:-0}    # 1 → only run the (0,0) stock cell; skip (1,0)/(0,1)/(1,1)
 PORT_BASE=${PORT_BASE:-33000}
 
+# Long-form CLI flags map to the same env knobs.
+for arg in "$@"; do
+    case "$arg" in
+        --baseline) BASELINE=1 ;;
+        --smoke)    SMOKE=1 ;;
+    esac
+done
+
 if [ "$SMOKE" = "1" ]; then
-    N_TRIALS_M1=1; N_TRIALS_M2=1; N_TRIALS_M3=1
-    REGIMES=${REGIMES:-"m1 m2 m3"}
+    # Smoke defaults — force-override the full-run defaults.
     MODELS=${MODELS:-"qwen3.5"}
+    REGIMES=${REGIMES:-"m1 m2 m3"}
+    N_TRIALS_M1=${N_TRIALS_M1:-1}
+    N_TRIALS_M2=${N_TRIALS_M2:-1}
+    N_TRIALS_M3=${N_TRIALS_M3:-1}
     INCLUDE_VLLM=${INCLUDE_VLLM:-0}
     INCLUDE_STATIC_BEST=${INCLUDE_STATIC_BEST:-0}
+else
+    MODELS=${MODELS:-"qwen3.5 qwen3next kimi"}
+    REGIMES=${REGIMES:-"m1 m2 m3"}
+    N_TRIALS_M1=${N_TRIALS_M1:-5}
+    N_TRIALS_M2=${N_TRIALS_M2:-5}
+    N_TRIALS_M3=${N_TRIALS_M3:-3}
+    INCLUDE_VLLM=${INCLUDE_VLLM:-1}
+    INCLUDE_STATIC_BEST=${INCLUDE_STATIC_BEST:-1}
+fi
+
+# --baseline forces only (0,0); skips static-best + vLLM by default
+# (user can re-enable explicitly with INCLUDE_STATIC_BEST=1 etc).
+if [ "$BASELINE" = "1" ]; then
+    INCLUDE_VLLM=${INCLUDE_VLLM:-0}
+    INCLUDE_STATIC_BEST=${INCLUDE_STATIC_BEST:-0}
+    echo "[main-orch] BASELINE mode: only (0,0) stock cell will be run"
 fi
 
 TS=$(date +%Y%m%d-%H%M%S)
@@ -77,13 +98,16 @@ run_model_regime() {
         *) echo "unknown regime $regime"; return ;;
     esac
 
-    local ncells=4   # 4-cell ablation
+    local CELLS=("0 0" "1 0" "0 1" "1 1")
+    if [ "$BASELINE" = "1" ]; then
+        CELLS=("0 0")
+    fi
+    local ncells=${#CELLS[@]}
     local parallel=$((8 / tp))
     [ $parallel -gt $ncells ] && parallel=$ncells
 
-    echo "[main-orch] model=$model_key ($hf, tp=$tp) regime=$regime trials=$n_trials parallel=$parallel"
+    echo "[main-orch] model=$model_key ($hf, tp=$tp) regime=$regime trials=$n_trials cells=$ncells parallel=$parallel"
 
-    local CELLS=("0 0" "1 0" "0 1" "1 1")
     local job_idx=0
     for trial in $(seq 1 $n_trials); do
         for pair in "${CELLS[@]}"; do
