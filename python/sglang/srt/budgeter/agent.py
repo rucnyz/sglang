@@ -980,19 +980,19 @@ class BudgetAgent:
         snap["num_evicted_tokens_recent"] = recent
         snap["num_evicted_tokens_cumulative"] = cum_evict
 
-        # Pool-fill metrics (paper §motivation, Figure
+        # Pool-occupancy metrics (paper §motivation, Figure
         # bubble_two_workloads): (pool.size - pool.available_size()) /
-        # pool.size INCLUDES radix-tree-cached prefix/snapshots, unlike
-        # the scheduler's `full_token_usage` / `mamba_usage` which
-        # subtract evictable size for the admission-pressure framing.
-        # Snapshot-fill is the right "real bubble" measure for the
-        # motivation figure. Computed unconditionally — does NOT depend
-        # on whether the cross-pool actuator is initialized.
+        # pool.size = used / total, INCLUDING radix-tree-cached prefix/
+        # snapshots — unlike the scheduler's `full_token_usage` /
+        # `mamba_usage` which subtract evictable size for the
+        # admission-pressure framing. Occupancy is the right "real bubble"
+        # measure for the motivation figure. Computed unconditionally —
+        # does NOT depend on whether the cross-pool actuator is initialized.
         alloc = self.scheduler.token_to_kv_pool_allocator
         kv_total = alloc.size
         kv_avail = alloc.available_size()
         if kv_total > 0:
-            snap["pool_fill_kv"] = max(
+            snap["pool_occupancy_kv"] = max(
                 0.0, min(1.0, (kv_total - kv_avail) / kv_total)
             )
         kv_pool = alloc.get_kvcache()
@@ -1001,7 +1001,7 @@ class BudgetAgent:
             m_total = mamba_pool.size
             m_avail = mamba_pool.available_size()
             if m_total > 0:
-                snap["pool_fill_mamba"] = max(
+                snap["pool_occupancy_mamba"] = max(
                     0.0, min(1.0, (m_total - m_avail) / m_total)
                 )
 

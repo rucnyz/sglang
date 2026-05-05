@@ -65,14 +65,19 @@ def _read_budgeter_jsonl(path: str):
         except Exception:
             continue
         ts = r.get("ts")
-        # Prefer pool_fill_* (computed unconditionally in _snapshot,
-        # includes radix-cached prefix/snapshots — the real "pool fill"
-        # for the bubble figure). Fall back to xpool_plan_usage_*_inst
-        # (planner-side, only present when arena is enabled).
-        kv_v = r.get("pool_fill_kv")
+        # Prefer pool_occupancy_* (computed unconditionally in _snapshot,
+        # includes radix-cached prefix/snapshots — the real "occupied
+        # fraction" for the bubble figure). Fall back to xpool_plan_usage_*_inst
+        # (planner-side, only present when arena is enabled). Older runs
+        # used pool_fill_* — kept as a third fallback.
+        kv_v = r.get("pool_occupancy_kv")
+        if kv_v is None:
+            kv_v = r.get("pool_fill_kv")
         if kv_v is None:
             kv_v = r.get("xpool_plan_usage_kv_inst")
-        m_v = r.get("pool_fill_mamba")
+        m_v = r.get("pool_occupancy_mamba")
+        if m_v is None:
+            m_v = r.get("pool_fill_mamba")
         if m_v is None:
             m_v = r.get("xpool_plan_usage_mamba_inst")
         nr_v = r.get("num_running_reqs", 0)
