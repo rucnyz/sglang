@@ -22,16 +22,23 @@ set -euo pipefail
 cd /scratch/yuzhou/projects/sglang
 
 SMOKE=${SMOKE:-0}
-BASELINE=${BASELINE:-0}    # 1 → only run the (0,0) stock cell; skip (1,0)/(0,1)/(1,1)
+BASELINE=${BASELINE:-0}    # 1 → only (0,0) stock cell
+ABLATION=${ABLATION:-0}    # 1 → only (1,0), (0,1), (1,1) cells
 PORT_BASE=${PORT_BASE:-33000}
 
 # Long-form CLI flags map to the same env knobs.
 for arg in "$@"; do
     case "$arg" in
         --baseline) BASELINE=1 ;;
+        --ablation) ABLATION=1 ;;
         --smoke)    SMOKE=1 ;;
     esac
 done
+
+if [ "$BASELINE" = "1" ] && [ "$ABLATION" = "1" ]; then
+    echo "[main-orch] error: --baseline and --ablation are mutually exclusive" >&2
+    exit 2
+fi
 
 if [ "$SMOKE" = "1" ]; then
     # Smoke defaults — force-override the full-run defaults.
@@ -101,6 +108,8 @@ run_model_regime() {
     local CELLS=("0 0" "1 0" "0 1" "1 1")
     if [ "$BASELINE" = "1" ]; then
         CELLS=("0 0")
+    elif [ "$ABLATION" = "1" ]; then
+        CELLS=("1 0" "0 1" "1 1")
     fi
     local ncells=${#CELLS[@]}
     # `parallel` = how many cell-runs in flight at once. Capped by
