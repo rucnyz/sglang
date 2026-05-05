@@ -99,15 +99,10 @@ class BudgetAgent:
         self._last_evicted_cumulative = 0
         self._log_fp = None
 
-        # Arena actuator. Lazy-built on first tick once
-        # the scheduler has populated `token_to_kv_pool` and
-        # `token_to_kv_pool_allocator`. SGLANG_BUDGETER_ARENA=1 turns
-        # this on; SGLANG_BUDGETER_ARENA_DEMO=1 oscillates capacity for
-        # a smoke demo.
-        self.arena_enabled = _env_flag("SGLANG_BUDGETER_ARENA", False)
-        self.arena_demo = _env_flag("SGLANG_BUDGETER_ARENA_DEMO", False)
+        # KV-side arena actuator. Lazy-built on first use; serves as the
+        # KV per-pool actuator for the coordinated cross-pool fire path
+        # (xpool_coordinated=1).
         self._arena_actuator = None
-        self._arena_phase = 0  # for the oscillator
 
         # Cross-pool transfer actuator. Requires SGLANG_ARENA_SHARED=1 at
         # engine boot; lazy-built on first tick.
@@ -215,13 +210,6 @@ class BudgetAgent:
             logger.warning("BudgetAgent.tick snapshot failed: %s", e, exc_info=True)
             return
 
-        # Arena actuator (cross-pool VMM-aware resize).
-        if self.arena_enabled:
-            try:
-                self._maybe_arena_actuate(snapshot)
-            except Exception as e:
-                logger.warning("BudgetAgent arena actuation failed: %s", e, exc_info=True)
-
         # Planner-driven cross-pool transfers.
         if self.xpool_planner_enabled:
             try:
@@ -252,23 +240,6 @@ class BudgetAgent:
         self._arena_actuator = KVArenaActuator(kv_pool, alloc)
         logger.info("BudgetAgent: arena actuator attached (max=%d)",
                     self._arena_actuator.max_tokens)
-
-    def _maybe_arena_actuate(self, snapshot: dict) -> None:
-        self._ensure_arena_actuator()
-        if self._arena_actuator is None:
-            return
-        if self.arena_demo:
-            # Oscillator: full -> half -> full -> half on each ARENA tick.
-            self._arena_phase = (self._arena_phase + 1) % 2
-            target = (
-                self._arena_actuator.max_tokens
-                if self._arena_phase == 0
-                else self._arena_actuator.max_tokens // 2
-            )
-            actual = self._arena_actuator.set_capacity_tokens(target)
-            snapshot["budgeter_arena_target"] = target
-            snapshot["budgeter_arena_actual"] = actual
-            snapshot["budgeter_arena_phase"] = self._arena_phase
 
     def _ensure_xpool_actuator(self) -> None:
         """Phase 2e.5.6.2: lazily attach the cross-pool transfer actuator.
