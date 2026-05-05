@@ -103,10 +103,15 @@ run_model_regime() {
         CELLS=("0 0")
     fi
     local ncells=${#CELLS[@]}
+    # `parallel` = how many cell-runs in flight at once. Capped by
+    # available GPU groups (8/tp). NOT capped by ncells — multiple trials
+    # of the same cell are independent and benefit from running in
+    # parallel on different GPUs.
+    local total_jobs=$((ncells * n_trials))
     local parallel=$((8 / tp))
-    [ $parallel -gt $ncells ] && parallel=$ncells
+    [ $parallel -gt $total_jobs ] && parallel=$total_jobs
 
-    echo "[main-orch] model=$model_key ($hf, tp=$tp) regime=$regime trials=$n_trials cells=$ncells parallel=$parallel"
+    echo "[main-orch] model=$model_key ($hf, tp=$tp) regime=$regime trials=$n_trials cells=$ncells jobs=$total_jobs parallel=$parallel"
 
     local job_idx=0
     for trial in $(seq 1 $n_trials); do
