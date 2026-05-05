@@ -61,7 +61,7 @@ class BudgetAgent:
 
     Cheap to construct; cheap to `tick()` (rate-limited internally). Holds a
     handle to the scheduler so it can later actuate via `tree_cache.evict(...)`,
-    `lora_manager.set_capacity(...)`, etc.
+    etc.
 
     For now (Phase 2a) this is read-only — it logs a JSONL line per
     `tick_interval_s` and never mutates state.
@@ -71,7 +71,6 @@ class BudgetAgent:
         self.scheduler = scheduler
         # Cached references; refreshed lazily because some are created late.
         self._tree_cache = None
-        self._lora_manager = None
 
         self.enabled = _env_flag("SGLANG_BUDGETER", False)
         self.actuate_enabled = _env_flag("SGLANG_BUDGETER_ACTUATE", False)
@@ -901,17 +900,9 @@ class BudgetAgent:
         sched = self.scheduler
         stats = getattr(sched, "stats", None)
 
-        # Lazy: tree_cache and lora_manager get assigned partway through scheduler init
+        # Lazy: tree_cache gets assigned partway through scheduler init.
         if self._tree_cache is None:
             self._tree_cache = getattr(sched, "tree_cache", None)
-        if self._lora_manager is None:
-            tp_worker = getattr(sched, "tp_worker", None)
-            if tp_worker is not None:
-                model_runner = getattr(tp_worker, "_model_runner", None) or getattr(
-                    tp_worker, "model_runner", None
-                )
-                if model_runner is not None:
-                    self._lora_manager = getattr(model_runner, "lora_manager", None)
 
         snap: dict[str, Any] = {
             "ts": round(now, 3),
@@ -930,10 +921,6 @@ class BudgetAgent:
                 "swa_token_usage",
                 # SSM / mamba
                 "mamba_usage",
-                # LoRA
-                "lora_pool_slots_used",
-                "lora_pool_slots_total",
-                "lora_pool_utilization",
                 # cache
                 "cache_hit_rate",
                 # queue / running
@@ -952,7 +939,6 @@ class BudgetAgent:
             self._tree_cache
             and self._tree_cache.__class__.__name__ == "UnifiedRadixCache"
         )
-        snap["lora_present"] = self._lora_manager is not None
 
         # Paper §design-l2 SGLang adapter: tree-cache eviction is the
         # primary admission-pressure relief mechanism. The cumulative
