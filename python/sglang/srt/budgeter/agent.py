@@ -181,31 +181,23 @@ class BudgetAgent:
     # ---- Public API used from scheduler.event_loop_* ----
 
     def _do_health_check(self) -> bool:
-        """One-shot dependency check on first tick. Returns True iff every
-        scheduler attribute the budgeter needs is present (including each
-        required stats field). We hard-disable rather than silently degrade
-        so missing deps surface as a log error instead of mysterious empty
-        jsonl rows."""
-        sched = self.scheduler
-        missing = []
-        stats = getattr(sched, "stats", None)
-        if stats is None:
-            missing.append("scheduler.stats (need --enable-metrics?)")
-        else:
-            for f in _REQUIRED_STATS_FIELDS:
-                if not hasattr(stats, f):
-                    missing.append(f"scheduler.stats.{f}")
-        tree_cache = getattr(sched, "tree_cache", None)
-        if tree_cache is None:
-            missing.append("scheduler.tree_cache")
-        if getattr(sched, "token_to_kv_pool_allocator", None) is None:
-            missing.append("scheduler.token_to_kv_pool_allocator")
+        """One-shot schema check on first tick. SGLang init order
+        guarantees scheduler.stats / .tree_cache / .token_to_kv_pool_allocator
+        are non-None by the time the event loop runs (otherwise scheduler
+        init would have crashed). The real failure mode this guards is
+        upstream renaming a field on `SchedulerStats`: we check every
+        field the snapshot path reads and hard-disable on drift so the
+        error surfaces as one log line instead of per-tick AttributeError."""
+        stats = self.scheduler.stats
+        missing = [f"scheduler.stats.{f}" for f in _REQUIRED_STATS_FIELDS
+                   if not hasattr(stats, f)]
         if missing:
             logger.error(
-                "BudgetAgent health check failed — missing scheduler deps: %s",
+                "BudgetAgent health check failed — SchedulerStats schema drift: %s",
                 ", ".join(missing),
             )
             return False
+        tree_cache = self.scheduler.tree_cache
         # Pre-init the cumulative eviction counter on tree_cache. schedule_batch.py
         # lazy-creates it on the first non-zero evict; pre-creating here
         # lets the snapshot path read the attribute directly without a
