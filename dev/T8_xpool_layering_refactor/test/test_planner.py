@@ -51,33 +51,42 @@ def _make_complete_om(n_pages, tpc, *, tree_pages=None, active_pages=None):
     )
 
 
-def test_clean_tail_drain_only():
+def test_pick_free_pages_from_tail():
+    """Anywhere-free planner: with most pages free at tail, picks tail K.
+    """
     from sglang.srt.budgeter.fire_planner import XPoolFirePlanner
 
     tpc = 8
-    n_pages = 64  # 8 chunks of 8 pages each
-    # Tail chunk (chunk 7, pages 57-64) holds 4 tree pages, rest free.
+    n_pages = 64
+    # Tree owns {57, 59, 61, 63}; everything else free.
     tree = {57, 59, 61, 63}
     om = _make_complete_om(n_pages, tpc, tree_pages=tree)
 
     planner = XPoolFirePlanner(_FakeAct(tpc), None, _FakeProvider(om))
     plan = planner.build("kv_to_mamba", target_drop_pages=8, dst_grant_chunks=1)
 
-    assert plan is not None, "clean tail must build"
-    assert plan.chunks_to_unmap_src == [7]
-    assert plan.capped_page_range == (57, 65)
-    assert sorted(plan.pages_to_drain) == [57, 59, 61, 63]
+    assert plan is not None
+    # 8 free pages selected from anywhere; planner takes highest-id free.
+    # Free pages = all of {1..64} \ {57,59,61,63} = 60 pages. Top 8 (by id)
+    # = {64, 62, 60, 58, 56, 55, 54, 53}.
+    expected_pages = {64, 62, 60, 58, 56, 55, 54, 53}
+    actual_pages = {c + 1 for c in plan.chunks_to_unmap_src}
+    assert actual_pages == expected_pages, f"got {actual_pages}, want {expected_pages}"
+    # No drain or migrate in anywhere-free mode.
+    assert plan.pages_to_drain == []
     assert plan.pages_to_migrate == []
     assert plan.expected_unmap_pages == 8
-    print(f"[step2] clean tail drain-only: {plan.plan_seq=} drain={len(plan.pages_to_drain)}")
+    print(f"[step2] pick from tail: {plan.plan_seq=} pages={sorted(actual_pages)}")
 
 
-def test_active_in_tail_triggers_migrate():
+def test_pick_free_pages_skipping_active_and_tree():
+    """When tail pages are owned (active or tree), planner skips them and
+    picks free pages from anywhere — no migration triggered."""
     from sglang.srt.budgeter.fire_planner import XPoolFirePlanner
 
     tpc = 8
     n_pages = 64
-    # Tail chunk has 2 tree + 2 active + 4 free.
+    # Active reqs occupy {59, 60}; tree owns {57, 58}.
     tree = {57, 58}
     active = {59: (3, 0), 60: (3, 1)}
     om = _make_complete_om(n_pages, tpc, tree_pages=tree, active_pages=active)
@@ -86,37 +95,32 @@ def test_active_in_tail_triggers_migrate():
     plan = planner.build("kv_to_mamba", target_drop_pages=8, dst_grant_chunks=1)
 
     assert plan is not None
-    assert sorted(plan.pages_to_drain) == [57, 58]
-    assert len(plan.pages_to_migrate) == 2
-    cap_low, cap_high = plan.capped_page_range
-    for op in plan.pages_to_migrate:
-        assert op.src_page in active
-        assert not (cap_low <= op.dst_page < cap_high), (
-            f"dst {op.dst_page} fell in capped range [{cap_low},{cap_high})"
-        )
-        assert op.req_pool_idx == 3
-    print(
-        f"[step2] active-in-tail migrate: "
-        f"drain={len(plan.pages_to_drain)} migrate={len(plan.pages_to_migrate)} "
-        f"dsts={[op.dst_page for op in plan.pages_to_migrate]}"
-    )
+    # No migrate or drain.
+    assert plan.pages_to_drain == []
+    assert plan.pages_to_migrate == []
+    # The 8 picked pages are all free.
+    actual_pages = {c + 1 for c in plan.chunks_to_unmap_src}
+    for p in actual_pages:
+        assert p not in tree
+        assert p not in active
+    print(f"[step2] skipped active+tree: pages={sorted(actual_pages)}")
 
 
-def test_insufficient_free_below_refuses():
+def test_insufficient_free_refuses():
+    """When total free pages < target, planner returns None."""
     from sglang.srt.budgeter.fire_planner import XPoolFirePlanner
 
     tpc = 8
-    n_pages = 16  # only 2 chunks
-    # All head pages are owned (tree-held); tail has 4 active. No free
-    # pages below cap_low → migrate impossible.
-    tree = set(range(1, 9))  # entire chunk 0
+    n_pages = 16
+    # Only 4 free pages.
+    tree = set(range(1, 9))                           # chunk 0 fully tree
     active = {9: (0, 0), 10: (0, 1), 11: (0, 2), 12: (0, 3)}
     om = _make_complete_om(n_pages, tpc, tree_pages=tree, active_pages=active)
 
     planner = XPoolFirePlanner(_FakeAct(tpc), None, _FakeProvider(om))
     plan = planner.build("kv_to_mamba", target_drop_pages=8, dst_grant_chunks=1)
-    assert plan is None, "no free dst → must refuse"
-    print("[step2] insufficient-free-below correctly refused")
+    assert plan is None, "free=4 < target=8 → must refuse"
+    print("[step2] insufficient-free correctly refused")
 
 
 def test_broken_coverage_refuses():
@@ -160,9 +164,9 @@ def test_flag_default_off():
 
 
 def main():
-    test_clean_tail_drain_only()
-    test_active_in_tail_triggers_migrate()
-    test_insufficient_free_below_refuses()
+    test_pick_free_pages_from_tail()
+    test_pick_free_pages_skipping_active_and_tree()
+    test_insufficient_free_refuses()
     test_broken_coverage_refuses()
     test_flag_default_off()
     print("\nT8 step2 planner test PASS")

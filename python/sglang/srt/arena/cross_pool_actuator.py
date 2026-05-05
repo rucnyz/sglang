@@ -169,22 +169,25 @@ class CrossPoolTransferActuator:
         t_start = time.monotonic_ns()
 
         # --- Step 1: cap-barrier --------------------------------------
+        # The planner picked specific page-ids (chunk_id + 1 under T1's
+        # 1-indexed page layout). We cap exactly those pages; any
+        # intermediate page-ids inside `capped_page_range` that the
+        # planner did NOT select are left alone.
         cap_t0 = time.monotonic_ns()
-        cap_low, cap_high = plan.capped_page_range
         alloc = getattr(src_act, "allocator", None)
         if alloc is None or not hasattr(alloc, "mark_pages_capped"):
             raise RuntimeError(
                 "execute(plan): src allocator missing mark_pages_capped — "
                 "the plan-based path requires T3 cap-barrier API."
             )
-        cap_pages = list(range(cap_low, cap_high))
+        cap_pages = [c + 1 for c in plan.chunks_to_unmap_src]
         cap_t = torch.tensor(cap_pages, dtype=torch.int64, device=alloc.device)
         moved_to_capped = alloc.mark_pages_capped(cap_t)
         result.cap_barrier_us = (time.monotonic_ns() - cap_t0) // 1000
         logger.info(
-            "execute[seq=%d] cap-barrier: range=[%d,%d) marked=%d "
+            "execute[seq=%d] cap-barrier: pages=%d marked=%d "
             "(free→capped) in %d us",
-            plan.plan_seq, cap_low, cap_high, moved_to_capped,
+            plan.plan_seq, len(cap_pages), moved_to_capped,
             result.cap_barrier_us,
         )
 
@@ -201,22 +204,20 @@ class CrossPoolTransferActuator:
         result.migrate_us = (time.monotonic_ns() - mig_t0) // 1000
 
         # --- Step 4: verify -------------------------------------------
-        # Every page in [cap_low, cap_high) must NOT be in free_pages
-        # anymore (cap-barrier moved free → capped; drain/migrate moved
-        # tree/active → capped via allocator.free path). If anything is
-        # still in free_pages, drain/migrate didn't complete and unmap
-        # would corrupt active state.
+        # Every page the planner selected must now be in capped state, not
+        # free. (Cap-barrier moved them out of free_pages in step 1; any
+        # callbacks should have left them capped.) If any selected page
+        # leaked back into free_pages, abort and restore the cap state.
         free_pages_t = getattr(alloc, "free_pages", None)
         if free_pages_t is not None and free_pages_t.numel() > 0:
-            in_range = (free_pages_t >= cap_low) & (free_pages_t < cap_high)
-            n_violations = int(in_range.sum().item())
+            in_target = torch.isin(free_pages_t, cap_t)
+            n_violations = int(in_target.sum().item())
             if n_violations > 0:
-                # Restore the cap state so a retry next tick is clean.
                 alloc.unmark_pages_capped(cap_t)
                 result.aborted = True
                 result.abort_reason = (
-                    f"verify failed: {n_violations} pages still in free_pages "
-                    f"after drain+migrate (range=[{cap_low},{cap_high}))"
+                    f"verify failed: {n_violations} of "
+                    f"{len(cap_pages)} target pages still in free_pages"
                 )
                 result.total_us = (time.monotonic_ns() - t_start) // 1000
                 logger.error(

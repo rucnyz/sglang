@@ -121,86 +121,58 @@ class XPoolFirePlanner:
             )
             return None
 
-        # Round target up to whole chunks; clamp to what's available.
-        n_chunks_drop = max(1, (target_drop_pages + tpc - 1) // tpc)
-        n_total_chunks = n_pages // tpc
-        if n_chunks_drop >= n_total_chunks:
+        n_to_drop = max(1, target_drop_pages)
+        if n_to_drop >= n_pages:
             logger.warning(
                 "XPoolFirePlanner: target_drop_pages=%d would exhaust pool "
-                "(%d chunks of tpc=%d); refusing.",
-                target_drop_pages, n_total_chunks, tpc,
+                "(%d pages); refusing.",
+                target_drop_pages, n_pages,
             )
             return None
 
-        # Tail-shrink: the last n_chunks_drop chunks. Page-id layout is
-        # 1-indexed (page 0 is null), chunk c owns pages [c*tpc+1, (c+1)*tpc+1).
-        chunks_to_unmap = list(range(n_total_chunks - n_chunks_drop, n_total_chunks))
-        capped_low = chunks_to_unmap[0] * tpc + 1
-        capped_high = chunks_to_unmap[-1] * tpc + tpc + 1  # exclusive
+        # Anywhere-free selection. The cost model of \S3.1 prices per-page
+        # actions; here we instantiate the cheapest case --- pages already
+        # in `free` state (cost 0) --- by picking $n_to_drop$ free pages
+        # from anywhere in $\\mathcal{P}_i$. We sort descending so high-id
+        # pages go first; under T2 placement bias these cluster at the
+        # tail naturally, but the planner does not require them to.
+        free_pages_sorted = sorted(owner_map.free_pages, reverse=True)
+        if len(free_pages_sorted) < n_to_drop:
+            logger.info(
+                "XPoolFirePlanner: insufficient free pages "
+                "(need=%d have=%d); refusing plan. Caller may retry "
+                "after pressure subsides or with a smaller target.",
+                n_to_drop, len(free_pages_sorted),
+            )
+            return None
 
-        # Walk capped range, classify each page.
-        pages_to_drain: List[int] = []
-        active_in_range: List[int] = []
-        for p in range(capped_low, capped_high):
-            if p in owner_map.tree_pages:
-                pages_to_drain.append(p)
-            elif p in owner_map.active_pages:
-                active_in_range.append(p)
-            elif p in owner_map.free_pages:
-                pass  # Already free — nothing to do.
-            else:
-                logger.error(
-                    "XPoolFirePlanner: page %d in capped range [%d,%d) is "
-                    "unaccounted — refusing plan.",
-                    p, capped_low, capped_high,
-                )
-                return None
-
-        # Reserve dst pages for migration from FREE pages strictly below
-        # the capped range. We sort free_pages and take from the head so
-        # migrated pages land deep in the live region (T2 placement bias
-        # also benefits: live → head).
-        if active_in_range:
-            free_below = sorted(p for p in owner_map.free_pages if p < capped_low)
-            if len(free_below) < len(active_in_range):
-                logger.info(
-                    "XPoolFirePlanner: not enough free dst pages for migrate "
-                    "(need=%d have=%d below cap_low=%d) — refusing plan; "
-                    "caller should retry with smaller delta.",
-                    len(active_in_range), len(free_below), capped_low,
-                )
-                return None
-            pages_to_migrate: List[MigrateOp] = []
-            for src_p, dst_p in zip(active_in_range, free_below[: len(active_in_range)]):
-                req_pool_idx, slot_in_req = owner_map.active_pages[src_p]
-                pages_to_migrate.append(
-                    MigrateOp(
-                        src_page=src_p,
-                        dst_page=dst_p,
-                        req_pool_idx=req_pool_idx,
-                        slot_in_req=slot_in_req,
-                    )
-                )
-        else:
-            pages_to_migrate = []
+        pages_to_unmap = sorted(free_pages_sorted[:n_to_drop])
+        # Chunk = page in T1 page-grain VMM. Page-id layout is 1-indexed
+        # (page 0 is the null sentinel), so chunk c owns page c+1.
+        chunks_to_unmap = [p - 1 for p in pages_to_unmap]
+        # capped_page_range is the bounding interval over the picked pages
+        # (logging only; the executor uses chunks_to_unmap_src as the
+        # source of truth for which specific pages to cap).
+        capped_low = pages_to_unmap[0]
+        capped_high = pages_to_unmap[-1] + 1
 
         self._seq += 1
         plan = FirePlan(
             direction=direction,
             capped_page_range=(capped_low, capped_high),
             chunks_to_unmap_src=chunks_to_unmap,
-            pages_to_drain=pages_to_drain,
-            pages_to_migrate=pages_to_migrate,
+            pages_to_drain=[],
+            pages_to_migrate=[],
             chunks_to_map_dst=int(dst_grant_chunks),
-            expected_unmap_pages=n_chunks_drop * tpc,
+            expected_unmap_pages=n_to_drop,
             plan_seq=self._seq,
         )
         logger.info(
-            "XPoolFirePlanner.build: seq=%d dir=%s cap=[%d,%d) "
-            "unmap_chunks=%d drain_pages=%d migrate_pages=%d grant_chunks=%d",
-            plan.plan_seq, plan.direction, capped_low, capped_high,
-            len(plan.chunks_to_unmap_src), len(plan.pages_to_drain),
-            len(plan.pages_to_migrate), plan.chunks_to_map_dst,
+            "XPoolFirePlanner.build: seq=%d dir=%s n_unmap=%d "
+            "(span=[%d,%d), n_free_in_pool=%d) grant_chunks=%d",
+            plan.plan_seq, plan.direction, n_to_drop,
+            capped_low, capped_high, len(free_pages_sorted),
+            plan.chunks_to_map_dst,
         )
         return plan
 

@@ -150,14 +150,13 @@ def _build_actuator(allocator, kv_pool, rt_pool):
     return a, kv_act, mamba_act, kv_arena, mamba_arena
 
 
-def test_end_to_end_plan_execute_migrate():
-    from sglang.srt.arena.kv_migrator import KVPageMigrator
+def test_end_to_end_anywhere_free_plan_execute():
     from sglang.srt.budgeter.fire_planner import XPoolFirePlanner
     from sglang.srt.budgeter.scheduler_owner_provider import SchedulerOwnerProvider
 
     n_pages, n_layers, alloc, kv_pool, rt_pool, sched, tree_node = _build_world()
 
-    # Step A: provider builds OwnerMap.
+    # Step A: provider builds OwnerMap. Tree owns 11, 12; active owns 13, 14.
     provider = SchedulerOwnerProvider(sched)
     om = provider.build_kv_owner_map()
     om.assert_complete()
@@ -170,7 +169,9 @@ def test_end_to_end_plan_execute_migrate():
         f"active={len(om.active_pages)} capped={len(om.capped_pages)}"
     )
 
-    # Step B: planner builds a FirePlan that targets the tail chunk.
+    # Step B: planner picks 8 free pages from anywhere — no drain, no
+    # migrate. Free = {1..10, 15, 16}; top 8 highest-id = {16, 15, 10, 9,
+    # 8, 7, 6, 5}.
     planner = XPoolFirePlanner(
         kv_actuator=SimpleNamespace(tokens_per_chunk=8),
         mamba_actuator=None,
@@ -178,85 +179,41 @@ def test_end_to_end_plan_execute_migrate():
     )
     plan = planner.build("kv_to_mamba", target_drop_pages=8, dst_grant_chunks=1)
     assert plan is not None
-    assert plan.chunks_to_unmap_src == [1]
-    assert plan.capped_page_range == (9, 17)
-    assert sorted(plan.pages_to_drain) == [11, 12]
-    assert len(plan.pages_to_migrate) == 2
-    migrated_srcs = sorted(op.src_page for op in plan.pages_to_migrate)
-    assert migrated_srcs == [13, 14]
-    # dst pages must come from below cap_low=9 → free pages {1..10}
-    # (sorted asc, planner takes from head).
-    for op in plan.pages_to_migrate:
-        assert op.dst_page < 9
-        assert op.dst_page in {1, 2, 3, 4, 5, 6, 7, 8}
+    assert plan.pages_to_drain == []
+    assert plan.pages_to_migrate == []
+    expected_pages = {16, 15, 10, 9, 8, 7, 6, 5}
+    actual_pages = {c + 1 for c in plan.chunks_to_unmap_src}
+    assert actual_pages == expected_pages, f"got {actual_pages}, want {expected_pages}"
     print(
-        f"[integ] FirePlan: cap=[{plan.capped_page_range[0]},{plan.capped_page_range[1]}) "
-        f"drain={plan.pages_to_drain} migrate=[{','.join(f'{op.src_page}->{op.dst_page}' for op in plan.pages_to_migrate)}]"
+        f"[integ] FirePlan: pages={sorted(actual_pages)} (no drain, no migrate)"
     )
 
-    # Step C: actuator executes plan with real migrator + fake drain cb.
+    # Step C: actuator executes — purely cap + unmap + map, no callbacks.
     a, kv_act, mamba_act, kv_arena, mamba_arena = _build_actuator(alloc, kv_pool, rt_pool)
-    migrator = KVPageMigrator(kv_pool, rt_pool, alloc)
-
-    # Drain callback: simulates tree_cache.evict_node by moving the tree
-    # pages out of the tree. After eviction, tree pages return to allocator
-    # — they were already capped by cap-barrier, so they should land
-    # back in capped_pages (or at least not in free_pages). For this
-    # integration test we just confirm the callback was invoked with
-    # the right list and we manually mark them capped to reflect
-    # reality (the real path goes through allocator.free which routes
-    # to capped if cap is set).
-    drain_seen = []
-
-    def drain_cb(pages):
-        drain_seen.extend(pages)
-        # Mark them capped to simulate eviction-into-capped state.
-        t = torch.tensor(pages, dtype=torch.int64)
-        alloc.mark_pages_capped(t)
-        return len(pages)
-
-    res = a.execute(plan, drain_callback=drain_cb, migrate_callback=migrator.migrate)
+    res = a.execute(plan)
 
     assert res.aborted is False, f"unexpected abort: {res.abort_reason}"
-    assert res.drained_pages == 2
-    assert res.migrated_pages == 2
-    assert sorted(drain_seen) == [11, 12]
-    # KV data verify: dst page now contains src's pattern.
-    op13 = next(o for o in plan.pages_to_migrate if o.src_page == 13)
-    op14 = next(o for o in plan.pages_to_migrate if o.src_page == 14)
-    for L in range(n_layers):
-        assert torch.allclose(
-            kv_pool.k_buffer[L][op13.dst_page],
-            torch.full_like(kv_pool.k_buffer[L][op13.dst_page], L * 1000.0 + 13),
-        )
-        assert torch.allclose(
-            kv_pool.v_buffer[L][op14.dst_page],
-            torch.full_like(kv_pool.v_buffer[L][op14.dst_page], L * 1000.0 + 14 + 0.5),
-        )
-    # req_to_token rewritten: req 5 slots 0,1 now point to dst pages.
-    assert int(rt_pool.req_to_token[5, 0]) == op13.dst_page
-    assert int(rt_pool.req_to_token[5, 1]) == op14.dst_page
-    # dst pages claimed (not in free_pages anymore).
+    assert res.drained_pages == 0
+    assert res.migrated_pages == 0
+    # The 8 picked pages should now be capped, not in free.
     free_now = set(alloc.free_pages.tolist())
-    assert op13.dst_page not in free_now
-    assert op14.dst_page not in free_now
-    # capped contains the originally capped range pages MINUS what
-    # the drain put back PLUS what unmark would have done. Easier:
-    # check that the capped range pages are not in free_pages.
-    for p in range(9, 17):
-        assert p not in free_now, f"capped page {p} leaked back to free"
+    for p in expected_pages:
+        assert p not in free_now, f"target page {p} leaked back to free"
+    # Tree node and active req unchanged (planner ignored them).
+    assert 11 in {p for p in om.tree_pages}  # om snapshot — still tree
+    assert int(rt_pool.req_to_token[5, 0]) == 13  # active still on 13
+    assert int(rt_pool.req_to_token[5, 1]) == 14  # active still on 14
     print(
-        f"[integ] execute: aborted={res.aborted} drained={res.drained_pages} "
-        f"migrated={res.migrated_pages} unmap_us={res.unmap_us} total_us={res.total_us}"
+        f"[integ] execute: aborted={res.aborted} unmap_us={res.unmap_us} "
+        f"total_us={res.total_us}"
     )
 
-    # Mock arena calls happened.
     assert kv_arena.shrink_explicit.call_count == 1
     assert mamba_arena.grow.call_count == 1
 
 
 def main():
-    test_end_to_end_plan_execute_migrate()
+    test_end_to_end_anywhere_free_plan_execute()
     print("\nT8 step5 integration test PASS")
     return 0
 

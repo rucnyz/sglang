@@ -105,10 +105,11 @@ def test_happy_path_no_drain_no_migrate():
     assert res.plan_seq == 42
     assert res.direction == "kv_to_mamba"
 
-    # cap-barrier was called with the full capped range.
+    # cap-barrier was called with the planner's specific page list.
+    # plan.chunks_to_unmap_src=[7] → page-id 7+1=8 (with 1-indexed offset).
     args, _ = alloc.mark_pages_capped.call_args
     capped_arg = args[0]
-    assert capped_arg.tolist() == list(range(57, 65))
+    assert capped_arg.tolist() == [8]
 
     # shrink_explicit invoked once per src subpool (k + v = 2).
     assert kv_inner.shrink_explicit.call_count == 2
@@ -199,28 +200,19 @@ def test_callbacks_invoked_with_correct_lists():
     )
 
 
-def test_verify_aborts_when_free_pages_overlap_capped_range():
-    from sglang.srt.arena.fire_plan import MigrateOp
-
+def test_verify_aborts_when_target_page_still_in_free():
     a, alloc, _, _, kv_inner, _ = _make_actuator()
-    # Stage: after our callbacks "run", page 60 (in capped range 57..65)
-    # is still in free_pages. The verifier must catch it and abort.
-    alloc.free_pages = torch.tensor([1, 2, 60], dtype=torch.int64)
+    # Stage: even after cap-barrier (mocked to no-op on free_pages here),
+    # target page 8 (= chunk 7 + 1) is still in free_pages. The verifier
+    # must detect this and abort.
+    alloc.free_pages = torch.tensor([1, 2, 8], dtype=torch.int64)
 
-    op = MigrateOp(src_page=60, dst_page=1, req_pool_idx=0, slot_in_req=0)
-    plan = _make_plan(migrate=[op])
+    plan = _make_plan()  # chunks_to_unmap_src=[7] → target page 8
 
-    def migrate_cb(ops):
-        # Simulate a buggy migrate that doesn't actually take page 60
-        # out of free_pages.
-        return len(ops)
-
-    res = a.execute(plan, migrate_callback=migrate_cb)
+    res = a.execute(plan)
     assert res.aborted is True
     assert "verify failed" in res.abort_reason
-    # unmap MUST NOT have run.
     assert kv_inner.shrink_explicit.call_count == 0
-    # And we restored the cap state.
     alloc.unmark_pages_capped.assert_called_once()
     print(f"[step3] verify abort: {res.abort_reason}")
 
@@ -230,7 +222,7 @@ def main():
     test_drain_without_callback_raises()
     test_migrate_without_callback_raises()
     test_callbacks_invoked_with_correct_lists()
-    test_verify_aborts_when_free_pages_overlap_capped_range()
+    test_verify_aborts_when_target_page_still_in_free()
     print("\nT8 step3 executor test PASS")
     return 0
 
