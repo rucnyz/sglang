@@ -115,11 +115,9 @@ class BudgetAgent:
         # windows.
         self.xpool_coordinated = _env_flag("SGLANG_BUDGETER_XPOOL_COORDINATED", False)
 
-        # Phase 2e.5.6.3.c: planner-driven cross-pool transfers based on
-        # real per-pool pressure signals (replaces the oscillator).
-        # Requires xpool actuator + per-pool actuators to be useful.
-        self.xpool_planner_enabled = _env_flag("SGLANG_BUDGETER_XPOOL_PLANNER", False)
-        self._xpool_planner = None  # lazy-built on first tick
+        # Cross-pool planner state (paper §sec:design-l2). Lazy-built on
+        # first tick; runs every tick whenever the budgeter is enabled.
+        self._xpool_planner = None
 
         # T6 (paper §3.2.4): admission-time fire enable.
         self.admission_time_fire_enabled = _env_flag(
@@ -210,12 +208,11 @@ class BudgetAgent:
             logger.warning("BudgetAgent.tick snapshot failed: %s", e, exc_info=True)
             return
 
-        # Planner-driven cross-pool transfers.
-        if self.xpool_planner_enabled:
-            try:
-                self._maybe_xpool_planner(snapshot)
-            except Exception as e:
-                logger.warning("BudgetAgent xpool planner failed: %s", e, exc_info=True)
+        # Planner-driven cross-pool transfers (paper §sec:design-l2).
+        try:
+            self._maybe_xpool_planner(snapshot)
+        except Exception as e:
+            logger.warning("BudgetAgent xpool planner failed: %s", e, exc_info=True)
 
         if self._log_fp is not None:
             try:
@@ -445,7 +442,6 @@ class BudgetAgent:
         Returns True iff a fire was actually committed (bytes moved).
         Safe to call from the scheduler hot path; no-op when:
           - SGLANG_ADMISSION_TIME_FIRE=0 (default)
-          - actuator not wired (xpool_planner_enabled=False)
           - another emergency fire is already in flight on this thread
           - cross-pool slack is insufficient (planner declines)
 
@@ -453,8 +449,6 @@ class BudgetAgent:
         size of the requested transfer in chunks.
         """
         if not self.admission_time_fire_enabled:
-            return False
-        if not self.xpool_planner_enabled:
             return False
         if self._emergency_fire_in_progress:
             return False  # Reentrancy guard
