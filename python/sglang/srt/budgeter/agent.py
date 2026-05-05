@@ -24,6 +24,26 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+# Stats fields the budgeter requires from `scheduler.stats`. Validated
+# once at health-check time; subsequent snapshots access them directly.
+_REQUIRED_STATS_FIELDS = (
+    "max_total_num_tokens",
+    "kv_used_tokens",
+    "kv_evictable_tokens",
+    "kv_available_tokens",
+    "token_usage",
+    "full_token_usage",
+    "swa_token_usage",
+    "mamba_usage",
+    "cache_hit_rate",
+    "num_running_reqs",
+    "num_queue_reqs",
+    "num_paused_reqs",
+    "num_retracted_reqs",
+    "gen_throughput",
+)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     v = os.environ.get(name, "")
     if not v:
@@ -161,13 +181,19 @@ class BudgetAgent:
 
     def _do_health_check(self) -> bool:
         """One-shot dependency check on first tick. Returns True iff every
-        scheduler attribute the budgeter needs is present. We hard-disable
-        rather than silently degrade so missing deps surface as a log error
-        instead of mysterious empty jsonl rows."""
+        scheduler attribute the budgeter needs is present (including each
+        required stats field). We hard-disable rather than silently degrade
+        so missing deps surface as a log error instead of mysterious empty
+        jsonl rows."""
         sched = self.scheduler
         missing = []
-        if getattr(sched, "stats", None) is None:
+        stats = getattr(sched, "stats", None)
+        if stats is None:
             missing.append("scheduler.stats (need --enable-metrics?)")
+        else:
+            for f in _REQUIRED_STATS_FIELDS:
+                if not hasattr(stats, f):
+                    missing.append(f"scheduler.stats.{f}")
         tree_cache = getattr(sched, "tree_cache", None)
         if tree_cache is None:
             missing.append("scheduler.tree_cache")
@@ -940,36 +966,24 @@ class BudgetAgent:
         snap: dict[str, Any] = {
             "ts": round(now, 3),
             "tick": self._tick_count,
+            "max_total_num_tokens": stats.max_total_num_tokens,
+            "kv_used_tokens": stats.kv_used_tokens,
+            "kv_evictable_tokens": stats.kv_evictable_tokens,
+            "kv_available_tokens": stats.kv_available_tokens,
+            "token_usage": stats.token_usage,
+            "full_token_usage": stats.full_token_usage,
+            "swa_token_usage": stats.swa_token_usage,
+            "mamba_usage": stats.mamba_usage,
+            "cache_hit_rate": stats.cache_hit_rate,
+            "num_running_reqs": stats.num_running_reqs,
+            "num_queue_reqs": stats.num_queue_reqs,
+            "num_paused_reqs": stats.num_paused_reqs,
+            "num_retracted_reqs": stats.num_retracted_reqs,
+            "gen_throughput": stats.gen_throughput,
+            "unified_radix": (
+                self._tree_cache.__class__.__name__ == "UnifiedRadixCache"
+            ),
         }
-
-        for k in (
-            # KV
-            "max_total_num_tokens",
-            "kv_used_tokens",
-            "kv_evictable_tokens",
-            "kv_available_tokens",
-            "token_usage",
-            "full_token_usage",
-            "swa_token_usage",
-            # SSM / mamba
-            "mamba_usage",
-            # cache
-            "cache_hit_rate",
-            # queue / running
-            "num_running_reqs",
-            "num_queue_reqs",
-            "num_paused_reqs",
-            "num_retracted_reqs",
-            # throughput
-            "gen_throughput",
-        ):
-            if hasattr(stats, k):
-                snap[k] = getattr(stats, k)
-
-        # Whether tree_cache supports unified eviction (matters for 2b).
-        snap["unified_radix"] = (
-            self._tree_cache.__class__.__name__ == "UnifiedRadixCache"
-        )
 
         # Paper §design-l2 SGLang adapter: tree-cache eviction is the
         # primary admission-pressure relief mechanism. The cumulative
