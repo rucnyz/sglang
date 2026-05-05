@@ -75,7 +75,7 @@ class BudgetAgent:
 
         self.enabled = _env_flag("SGLANG_BUDGETER", False)
         self.actuate_enabled = _env_flag("SGLANG_BUDGETER_ACTUATE", False)
-        self.tick_interval_s = _env_float("SGLANG_BUDGETER_TICK_S", 1.0)
+        self.tick_interval_s = _env_float("SGLANG_BUDGETER_TICK_S", 30.0)
         self.log_path = _env_str(
             "SGLANG_BUDGETER_LOG", "/tmp/sglang_budgeter.jsonl"
         )
