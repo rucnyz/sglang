@@ -93,9 +93,16 @@ class SchedulerOwnerProvider:
             # to avoid building a large CPU-host buffer for the whole pool.
             row = req_to_token[idx, :seqlen].cpu().tolist()
             for slot, p in enumerate(row):
-                if p == 0:
+                pi = int(p)
+                if pi == 0:
                     continue  # 0 is the null-sentinel page
-                active_pages[int(p)] = (int(idx), slot)
+                # Allocator is authoritative: a page in `free_pages` is
+                # not actively held, regardless of stale req_to_token
+                # entries (e.g., a finished req whose req_pool_idx was
+                # released without zeroing its row).
+                if pi in free_set:
+                    continue
+                active_pages[pi] = (int(idx), slot)
 
         # --- 3. tree pages (DFS, skip pages already active) --------------
         tree_pages: dict[int, TreeNodeRef] = {}
