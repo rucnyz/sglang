@@ -21,7 +21,7 @@ mkdir -p "$OUT_DIR"
 # Workload knobs (paper §sec:eval-l2-transfers defaults)
 NUM_CONCURRENCY=${NUM_CONCURRENCY:-14}
 TRAFFIC_SCENARIO=${TRAFFIC_SCENARIO:-D(4096,4096)}
-SESSION_CAP=${SESSION_CAP:-60000}
+SESSION_CAP=${SESSION_CAP:-150000}
 MAX_TIME_MIN=${MAX_TIME_MIN:-10}    # paper says 480s = 8 min; 10 gives slack
 
 apply_cell_env

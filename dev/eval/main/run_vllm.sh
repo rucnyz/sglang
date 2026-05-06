@@ -62,10 +62,10 @@ done
 # Workload-specific client.
 case "$REGIME" in
     m1)
-        GENAI_BENCH_MT_SESSION_CAP_TOKENS=60000 \
+        GENAI_BENCH_MT_SESSION_CAP_TOKENS=150000 \
         .venv/bin/python -m genai_bench.cli.cli benchmark \
             --api-backend openai \
-            --api-base "http://127.0.0.1:$PORT/v1" \
+            --api-base "http://127.0.0.1:$PORT" \
             --api-key dummy \
             --api-model-name "$MODEL" \
             --model-tokenizer "$MODEL" \
@@ -79,10 +79,10 @@ case "$REGIME" in
             > "$OUT_DIR/client.log" 2>&1 || echo "[$cell] client failed"
         ;;
     m2)
-        GENAI_BENCH_MT_SESSION_CAP_TOKENS=3000 \
+        GENAI_BENCH_MT_SESSION_CAP_TOKENS=5000 \
         .venv/bin/python -m genai_bench.cli.cli benchmark \
             --api-backend openai \
-            --api-base "http://127.0.0.1:$PORT/v1" \
+            --api-base "http://127.0.0.1:$PORT" \
             --api-key dummy \
             --api-model-name "$MODEL" \
             --model-tokenizer "$MODEL" \

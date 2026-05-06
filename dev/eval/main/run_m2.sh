@@ -21,7 +21,7 @@ mkdir -p "$OUT_DIR"
 # Workload knobs (paper §sec:eval-main-swarm defaults)
 NUM_CONCURRENCY=${NUM_CONCURRENCY:-800}
 TRAFFIC_SCENARIO=${TRAFFIC_SCENARIO:-D(256,256)}
-SESSION_CAP=${SESSION_CAP:-3000}
+SESSION_CAP=${SESSION_CAP:-5000}
 MAX_TIME_MIN=${MAX_TIME_MIN:-10}    # paper says 480s; give slack to 10min
 
 apply_cell_env
