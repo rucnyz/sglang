@@ -77,8 +77,7 @@ boot_sglang() {
 
     echo "[$cell] boot model=$MODEL tp=$TP gpus=$GPU_LIST port=$PORT mem_frac=$mem_frac"
 
-    pkill -f "launch_server.*--port $PORT" 2>/dev/null || true
-    sleep 4
+    cleanup_before_boot "$PORT" "$GPU_LIST"
 
     CUDA_VISIBLE_DEVICES=$GPU_LIST nohup \
         /scratch/yuzhou/projects/sglang/.venv/bin/python -m sglang.launch_server \
@@ -112,6 +111,45 @@ boot_sglang() {
 
 teardown_sglang() {
     [ -n "${SV_PID:-}" ] && kill -9 $SV_PID 2>/dev/null || true
+    sleep 4
+}
+
+# cleanup_before_boot: kill anything that would block a fresh server boot —
+# stale processes on the requested PORT (TIME_WAIT-bound listeners or actual
+# stragglers from a previous run that pkill missed) and any CUDA process
+# still mapping memory on the requested GPUs. Uses sudo so we can also clean
+# up other-user / orphaned processes when needed.
+#
+# Args:
+#   $1 PORT      : TCP port the new server will bind
+#   $2 GPU_LIST  : comma-separated GPU indices (e.g. "0" or "0,1")
+cleanup_before_boot() {
+    local port=$1 gpus=$2
+
+    # 1. Same-user pkill of any sglang/vllm server bound to this port
+    pkill -9 -f "launch_server.*--port $port" 2>/dev/null || true
+    pkill -9 -f "vllm.entrypoints.*--port $port" 2>/dev/null || true
+
+    # 2. Anything else still holding the TCP port (incl. cross-user stragglers)
+    if command -v fuser >/dev/null 2>&1; then
+        sudo -n fuser -k "${port}/tcp" 2>/dev/null || true
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        local stuck_pids
+        stuck_pids=$(sudo -n lsof -ti:"$port" 2>/dev/null || true)
+        [ -n "$stuck_pids" ] && sudo -n kill -9 $stuck_pids 2>/dev/null || true
+    fi
+
+    # 3. Any CUDA process still mapping memory on the GPUs we're about to use
+    local gpu pid pids
+    for gpu in ${gpus//,/ }; do
+        pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i "$gpu" 2>/dev/null | tr -d ' \r\n,')
+        for pid in $pids; do
+            [ -z "$pid" ] && continue
+            sudo -n kill -9 "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+        done
+    done
+
     sleep 4
 }
 

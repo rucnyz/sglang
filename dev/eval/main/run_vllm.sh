@@ -33,7 +33,28 @@ case "$MODEL" in
 esac
 
 echo "[$cell] boot vLLM model=$MODEL tp=$TP gpus=$GPU_LIST port=$PORT"
-pkill -f "vllm.*--port $PORT" 2>/dev/null || true
+
+# Cleanup any stragglers (port stuck in TIME_WAIT, leftover CUDA processes
+# on the GPUs we want, etc.) before launching. Mirrors _common.sh's
+# cleanup_before_boot — duplicated here because run_vllm.sh stands alone
+# (does not source _common.sh, since the SGLang-only knobs in apply_cell_env
+# are not relevant to the vLLM cross-engine baseline).
+pkill -9 -f "vllm.entrypoints.*--port $PORT" 2>/dev/null || true
+pkill -9 -f "launch_server.*--port $PORT" 2>/dev/null || true
+if command -v fuser >/dev/null 2>&1; then
+    sudo -n fuser -k "${PORT}/tcp" 2>/dev/null || true
+fi
+if command -v lsof >/dev/null 2>&1; then
+    stuck=$(sudo -n lsof -ti:"$PORT" 2>/dev/null || true)
+    [ -n "$stuck" ] && sudo -n kill -9 $stuck 2>/dev/null || true
+fi
+for gpu in ${GPU_LIST//,/ }; do
+    pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i "$gpu" 2>/dev/null | tr -d ' \r\n,')
+    for pid in $pids; do
+        [ -z "$pid" ] && continue
+        sudo -n kill -9 "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+    done
+done
 sleep 4
 
 CUDA_VISIBLE_DEVICES=$GPU_LIST nohup \
