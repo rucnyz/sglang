@@ -44,23 +44,17 @@ apply_cell_env() {
 }
 
 model_specific_flags() {
-    # --schedule-policy lpm: longest-prefix-match scheduling. CC traj &
-    # multi-turn shared-prefix workloads see ~+8% TPS / -37% P99 vs the
-    # default fcfs (sanity Qwen3.5 single-trial: 963→1038 TPS, 5038→3164 ms).
-    # Random-token workloads degenerate to fcfs (no prefix overlap) — flag
-    # is a no-op, so safe as a global default.
-    local common_flags="--schedule-policy lpm --enforce-piecewise-cuda-graph"
     case "$MODEL" in
         */Qwen3*|*Qwen3.5*)
-            echo "--reasoning-parser qwen3 $common_flags"
+            echo "--reasoning-parser qwen3 --enforce-piecewise-cuda-graph"
             ;;
         *Kimi*)
             # Kimi-Linear's tokenizer + model both ship custom code on HF;
             # SGLang refuses to load without --trust-remote-code.
-            echo "--trust-remote-code $common_flags"
+            echo "--trust-remote-code --enforce-piecewise-cuda-graph"
             ;;
         *)
-            echo "$common_flags"
+            echo ""
             ;;
     esac
 }
