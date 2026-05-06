@@ -168,5 +168,14 @@ json.dump(out, open('$OUT_DIR/bench.json', 'w'), indent=2)
 fi
 
 kill -9 $SV_PID 2>/dev/null || true
+# vLLM TP=2 spawns Worker_TP0/Worker_TP1 as orphan-able children — the
+# parent kill above doesn't catch them. SIGKILL by GPU PID lookup.
+for gpu in ${GPU_LIST//,/ }; do
+    pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i "$gpu" 2>/dev/null | tr -d ' \r\n,')
+    for pid in $pids; do
+        [ -z "$pid" ] && continue
+        sudo -n kill -9 "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null || true
+    done
+done
 sleep 4
 echo "[$cell] vLLM regime=$REGIME done -> $OUT_DIR"
