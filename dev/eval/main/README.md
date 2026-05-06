@@ -86,30 +86,85 @@ done
 this dir. (ii) Claude Code trajectory replay is what the runners below
 produce.
 
-### SGLang Claude Code trajectory replay — n=5
+### SGLang Claude Code trajectory replay — n=5 per model
+
+Default trace dataset: `dev/eval/datasets/cc_long_traces.jsonl` (n=106 unique
+≥100K-token public Claude Code sessions). Override with `TRACES_FILE=`.
+For \sys{} flip `INTRA=1 INTER=1` on any of the commands below.
+
+Qwen3.5-35B-A3B (TP=1, 5 GPUs in parallel, one per trial):
 
 ```bash
 for trial in 1 2 3 4 5; do
-    MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
+    MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=$((trial - 1)) \
         INTRA=0 INTER=0 \
-        PORT=33000 OUT_DIR=dev/eval/runs/q35-cc-stock-trial${trial} \
-        bash dev/eval/main/run_cc_traj.sh
+        PORT=$((33000 + trial)) \
+        OUT_DIR=dev/eval/runs/q35-cc-stock/trial${trial} \
+        bash dev/eval/main/run_cc_traj.sh &
 done
+wait
 ```
 
-For \sys{} flip `INTRA=1 INTER=1`.
+Qwen3-Next 80B-A3B (TP=2, 4 GPU pairs in parallel + trial 5 sequential after one pair frees):
 
-Default trace dataset: `dev/eval/datasets/cc_long_traces.jsonl` (n=106 unique ≥100K-token public Claude Code sessions).
-Override with `TRACES_FILE=`.
+```bash
+for trial in 1 2 3 4; do
+    pair=$(( (trial - 1) * 2 )); pair_str="${pair},$((pair + 1))"
+    MODEL=Qwen/Qwen3-Next-80B-A3B-Instruct TP=2 GPU_LIST="$pair_str" \
+        INTRA=0 INTER=0 \
+        PORT=$((33100 + trial)) \
+        OUT_DIR=dev/eval/runs/q3n-cc-stock/trial${trial} \
+        bash dev/eval/main/run_cc_traj.sh &
+done
+wait -n; sleep 30
+MODEL=Qwen/Qwen3-Next-80B-A3B-Instruct TP=2 GPU_LIST="0,1" \
+    INTRA=0 INTER=0 \
+    PORT=33105 OUT_DIR=dev/eval/runs/q3n-cc-stock/trial5 \
+    bash dev/eval/main/run_cc_traj.sh
+wait
+```
 
-### vLLM Claude Code trajectory replay — n=5
+Kimi-Linear 48B-A3B — same 4-parallel + 1-sequential layout as Qwen3-Next,
+TP=2 (TP=1 KV-cache headroom too tight for 14 conc × ≥100K context):
+
+```bash
+# Same shape as Qwen3-Next above; swap MODEL=moonshotai/Kimi-Linear-48B-A3B-Instruct
+```
+
+### vLLM Claude Code trajectory replay — n=5 per model
+
+vLLM TP convention: Qwen3.5 = 1, Qwen3-Next = 2, Kimi = **2** (vLLM v0.20
+OOMs at TP=1 with default `--gpu-memory-utilization 0.85`).
+
+Qwen3.5-35B-A3B (TP=1, 5 GPUs in parallel):
 
 ```bash
 for trial in 1 2 3 4 5; do
-    MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
-        PORT=33000 OUT_DIR=dev/eval/runs/q35-cc-vllm-trial${trial} \
-        bash dev/eval/main/run_cc_traj_vllm.sh
+    MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=$((trial - 1)) \
+        PORT=$((34100 + trial)) \
+        OUT_DIR=dev/eval/runs/q35-cc-vllm/trial${trial} \
+        bash dev/eval/main/run_cc_traj_vllm.sh &
 done
+wait
+```
+
+Qwen3-Next 80B-A3B / Kimi-Linear 48B-A3B (TP=2, 4 pairs parallel + 1 sequential):
+
+```bash
+for trial in 1 2 3 4; do
+    pair=$(( (trial - 1) * 2 )); pair_str="${pair},$((pair + 1))"
+    MODEL=Qwen/Qwen3-Next-80B-A3B-Instruct TP=2 GPU_LIST="$pair_str" \
+        PORT=$((34200 + trial)) \
+        OUT_DIR=dev/eval/runs/q3n-cc-vllm/trial${trial} \
+        bash dev/eval/main/run_cc_traj_vllm.sh &
+done
+wait -n; sleep 30
+MODEL=Qwen/Qwen3-Next-80B-A3B-Instruct TP=2 GPU_LIST="0,1" \
+    PORT=34205 OUT_DIR=dev/eval/runs/q3n-cc-vllm/trial5 \
+    bash dev/eval/main/run_cc_traj_vllm.sh
+wait
+
+# Kimi: same shape, swap MODEL=moonshotai/Kimi-Linear-48B-A3B-Instruct
 ```
 
 ---
