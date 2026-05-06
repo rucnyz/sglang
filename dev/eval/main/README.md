@@ -99,7 +99,8 @@ done
 
 For \sys{} flip `INTRA=1 INTER=1`.
 
-Default trace dataset: `dev/eval/datasets/cc_long_traces.jsonl` (n=106 unique ≥100K-token public Claude Code sessions). Override with `TRACES_FILE=`.
+Default trace dataset: `dev/eval/datasets/cc_long_traces.jsonl` (n=106 unique ≥100K-token public Claude Code sessions).
+Override with `TRACES_FILE=`.
 
 ### vLLM Claude Code trajectory replay — n=5
 
@@ -121,16 +122,3 @@ python3 dev/eval/main/aggregate.py dev/eval/runs/<run_dir>
 
 Reads every `bench.json` under `<run_dir>/<model>/<regime>/<cell>/`,
 emits `main_table.csv` mean ± std per cell.
-
----
-
-## Files
-
-- `_common.sh` — `apply_cell_env`, `boot_sglang`, `cleanup_before_boot`
-- `run_m1.sh` / `run_m2.sh` / `run_m3.sh` — single SGLang cell, one regime each
-- `run_cc_traj.sh` — single SGLang Claude Code trajectory replay cell
-- `run_vllm.sh` — single vLLM cell (m1 / m2 / m3 via `REGIME` env)
-- `run_cc_traj_vllm.sh` — single vLLM Claude Code trajectory replay cell
-- `cc_trace_replay.py` — async OpenAI-compatible replay client
-- `vllm_baseline.sh` — full vLLM cross-engine baseline orchestrator
-- `aggregate.py` — bench.json → CSV
