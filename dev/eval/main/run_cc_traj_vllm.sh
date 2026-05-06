@@ -62,6 +62,7 @@ CUDA_VISIBLE_DEVICES=$GPU_LIST nohup \
     --model "$MODEL" --host 127.0.0.1 --port "$PORT" \
     --tensor-parallel-size "$TP" \
     --gpu-memory-utilization "$MEM_FRAC" \
+    --enable-prefix-caching \
     $extra \
     > "$log" 2>&1 &
 SV_PID=$!
