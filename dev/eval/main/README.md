@@ -1,60 +1,33 @@
-# dev/eval/main — paper §sec:eval-main runners
+# dev/eval/main — runners for paper §sec:eval-main
 
-Per-cell scripts produce one `bench.json` (compatible with `aggregate.py`).
-Run the same cell with different `INTRA` / `INTER` flags to fill the
-4-cell ablation; loop trials externally to get $n{=}5$.
+Each section below maps to one paper table. Run dirs default to
+`dev/eval/runs/<name>/`. Passwordless `sudo` required (pre-boot port +
+GPU cleanup).
 
-The 8-GPU H200 host is assumed; passwordless `sudo` is required for the
-pre-boot port + GPU cleanup. Run dirs default to `dev/eval/runs/<name>/`.
+---
 
-## Single SGLang cell
+## Table 1 — `tab:main-cross-model` (3 models × 3 regimes × 4 baselines)
+
+Cells: SGLang stock, SGLang static-best, vLLM, **\sys{}** (full system $L_\text{intra}{=}1, L_\text{inter}{=}1$).
+
+### SGLang stock (cell `intra=0, inter=0`) — n=5
 
 ```bash
-# regime ∈ {m1, m2, m3, cc_traj}; cell = (INTRA, INTER) ∈ {0,1}²
-MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
-    INTRA=0 INTER=0 \
-    PORT=33000 OUT_DIR=dev/eval/runs/q35-m1-stock \
-    bash dev/eval/main/run_m1.sh
+# Per regime: regime ∈ {m1, m2, m3} → run_m{1,2,3}.sh
+for trial in 1 2 3 4 5; do
+    MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
+        INTRA=0 INTER=0 \
+        PORT=33000 OUT_DIR=dev/eval/runs/q35-m1-stock-trial${trial} \
+        bash dev/eval/main/run_m1.sh
+done
 ```
 
-Swap the runner for the regime: `run_m2.sh`, `run_m3.sh`, `run_cc_traj.sh`.
+Per-model native TP: Qwen3.5 = 1, Qwen3-Next 80B = 2, Kimi 48B = 1.
 
-`cc_traj` defaults to `dev/eval/datasets/cc_long_traces.jsonl`
-(106 unique ≥100K-token public Claude Code sessions); override with
-`TRACES_FILE=`.
-
-## Single vLLM cell
+### SGLang static-best (4-ratio sweep + n=5 at the winner)
 
 ```bash
-# regime ∈ {m1, m2, m3} via run_vllm.sh; cc_traj via run_cc_traj_vllm.sh
-MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 REGIME=m1 \
-    PORT=33000 OUT_DIR=dev/eval/runs/q35-m1-vllm \
-    bash dev/eval/main/run_vllm.sh
-
-MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
-    PORT=33000 OUT_DIR=dev/eval/runs/q35-cc-vllm \
-    bash dev/eval/main/run_cc_traj_vllm.sh
-```
-
-Per-model native TP: Qwen3.5 = 1, Qwen3-Next 80B = 2 (single H200 too small),
-Kimi 48B = 1 in SGLang / **2 in vLLM** (vLLM v0.20 OOMs at TP=1 with default
-`--gpu-memory-utilization 0.85`).
-
-## Full vLLM cross-engine baseline (3 models × 3 regimes × n trials)
-
-```bash
-bash dev/eval/main/vllm_baseline.sh        # n=5 default
-bash dev/eval/main/vllm_baseline.sh 1      # n=1 sanity first
-```
-
-Three sequential phases, each filling all 8 GPUs at the model's native TP
-(Kimi/Qwen3-Next at TP=2 → 4 workers on GPU pairs; Qwen3.5 at TP=1 → 8
-workers on single GPUs). Per-cell logs validate `bench.json` (catches
-0-reqs invalid runs that get `rc=0`); main log + `_summary.tsv` in run dir.
-
-## Static-best sweep
-
-```bash
+# 1) Sweep ratios (single trial per ratio)
 for r in 0.3 0.5 0.7 0.9; do
     MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
         INTRA=0 INTER=0 \
@@ -63,10 +36,82 @@ for r in 0.3 0.5 0.7 0.9; do
         CELL_LABEL_OVERRIDE="static_best_r${r}" \
         bash dev/eval/main/run_m1.sh
 done
+# 2) Pick the best ratio per regime; rerun n=5 at that ratio
 ```
 
-Pick the best ratio per regime; rerun $n{=}5$ at the chosen ratio for
-mean ± std.
+### vLLM cross-engine baseline (full Table 1 column, all 3 models × 3 regimes × n=5)
+
+```bash
+bash dev/eval/main/vllm_baseline.sh        # n=5 default
+bash dev/eval/main/vllm_baseline.sh 1      # n=1 sanity first
+```
+
+vLLM TP convention: Qwen3.5 = 1, Qwen3-Next = 2, Kimi = **2** (vLLM v0.20
+OOMs at TP=1 with default `--gpu-memory-utilization 0.85`).
+
+### \sys{} cell `intra=1, inter=1` — n=5
+
+```bash
+# Same regime-runner as stock; toggle the cell flags
+for trial in 1 2 3 4 5; do
+    MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
+        INTRA=1 INTER=1 \
+        PORT=33000 OUT_DIR=dev/eval/runs/q35-m1-fulcrum-trial${trial} \
+        bash dev/eval/main/run_m1.sh
+done
+```
+
+### Per-regime 4-cell ablation (`tab:multiturn-headline`, `tab:swarm-headline`, `tab:phase-shift-headline`)
+
+Same runner, all four `(INTRA, INTER) ∈ {0,1}²` combinations at n=5
+trials each on Qwen3.5-35B-A3B:
+
+```bash
+for cell in "0 0" "1 0" "0 1" "1 1"; do
+    read intra inter <<< "$cell"
+    for trial in 1 2 3 4 5; do
+        MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
+            INTRA=$intra INTER=$inter \
+            PORT=33000 OUT_DIR=dev/eval/runs/q35-m1-i${intra}j${inter}-t${trial} \
+            bash dev/eval/main/run_m1.sh
+    done
+done
+```
+
+---
+
+## Table 2 — `tab:real-workload` (SWE-Bench-Pro + Claude Code trajectory replay)
+
+(i) SWE-Bench-Pro is run externally through Harbor + Claude Code; not in
+this dir. (ii) Claude Code trajectory replay is what the runners below
+produce.
+
+### SGLang Claude Code trajectory replay — n=5
+
+```bash
+for trial in 1 2 3 4 5; do
+    MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
+        INTRA=0 INTER=0 \
+        PORT=33000 OUT_DIR=dev/eval/runs/q35-cc-stock-trial${trial} \
+        bash dev/eval/main/run_cc_traj.sh
+done
+```
+
+For \sys{} flip `INTRA=1 INTER=1`.
+
+Default trace dataset: `dev/eval/datasets/cc_long_traces.jsonl` (n=106 unique ≥100K-token public Claude Code sessions). Override with `TRACES_FILE=`.
+
+### vLLM Claude Code trajectory replay — n=5
+
+```bash
+for trial in 1 2 3 4 5; do
+    MODEL=Qwen/Qwen3.5-35B-A3B TP=1 GPU_LIST=0 \
+        PORT=33000 OUT_DIR=dev/eval/runs/q35-cc-vllm-trial${trial} \
+        bash dev/eval/main/run_cc_traj_vllm.sh
+done
+```
+
+---
 
 ## Aggregate
 
@@ -74,8 +119,10 @@ mean ± std.
 python3 dev/eval/main/aggregate.py dev/eval/runs/<run_dir>
 ```
 
-Reads every `bench.json` under `<run_dir>/<model>/<regime>/<cell>/`, emits
-`main_table.csv` mean ± std per cell.
+Reads every `bench.json` under `<run_dir>/<model>/<regime>/<cell>/`,
+emits `main_table.csv` mean ± std per cell.
+
+---
 
 ## Files
 
@@ -85,5 +132,5 @@ Reads every `bench.json` under `<run_dir>/<model>/<regime>/<cell>/`, emits
 - `run_vllm.sh` — single vLLM cell (m1 / m2 / m3 via `REGIME` env)
 - `run_cc_traj_vllm.sh` — single vLLM Claude Code trajectory replay cell
 - `cc_trace_replay.py` — async OpenAI-compatible replay client
-- `vllm_baseline.sh` — orchestrates the full vLLM cross-engine baseline
+- `vllm_baseline.sh` — full vLLM cross-engine baseline orchestrator
 - `aggregate.py` — bench.json → CSV
