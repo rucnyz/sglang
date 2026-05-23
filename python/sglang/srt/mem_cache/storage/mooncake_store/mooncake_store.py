@@ -550,6 +550,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        # V4 HiCache uses a LogicalHostPool as the KV anchor: it tracks page
+        # indices but holds no KV tensor (kv_buffer is None). The real per-pool
+        # buffers are registered later via register_mem_host_pool_v2() for each
+        # DeepSeekV4PagedHostPool / DeepSeekV4StateHostPool sidecar.
+        if getattr(mem_pool_host, "kv_buffer", None) is None:
+            self.gb_per_page = 0.0
+            return
         assert self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
