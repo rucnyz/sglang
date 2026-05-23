@@ -350,9 +350,25 @@ class SWAComponent(TreeComponent):
                 x = x_next
 
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
+
+        # Host-side single-node lock (mirrors FullComponent / MambaComponent).
+        # The HiCache D<->H pipeline calls inc_host_lock_ref on the last host
+        # node it backed up; we only need to protect that node's host_value,
+        # not walk the SWA window (which only matters for device-side locks).
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return result
+            cd.host_lock_ref += 1
+            self.cache._update_evictable_leaf_sets(node)
+            return result
+
         root = self.cache.root_node
         sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
@@ -384,9 +400,23 @@ class SWAComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
         ct = self.component_type
+
+        # Pair with acquire_component_lock(lock_host=True): release the host
+        # lock_ref on this single node without touching the SWA window state.
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None or cd.host_lock_ref == 0:
+                return
+            cd.host_lock_ref -= 1
+            self.cache._update_evictable_leaf_sets(node)
+            return
+
         root = self.cache.root_node
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
