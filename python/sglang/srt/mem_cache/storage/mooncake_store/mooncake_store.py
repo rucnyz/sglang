@@ -597,8 +597,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
         # A logical "page" may map to multiple physical objects in storage.
-        # - INDEXER: one key per page
-        # - MAMBA  : one temporal key + N conv keys per page
+        # - INDEXER : one key per page
+        # - MAMBA   : one temporal key + N conv keys per page
+        # - V4 side : one key per V4 sidecar pool (per-pool unique suffix)
         # key_multiplier records how many component keys are generated per page.
         name = transfer.name
         suffixes = []
@@ -612,6 +613,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes = [f"{base_suffix}_temporal"] + [
                 f"{base_suffix}_conv_{i}" for i in range(conv_num)
             ]
+        elif name in (
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        ):
+            # One Mooncake object per logical page per V4 sidecar pool.
+            # The pool-name suffix keeps the keys disjoint from the FULL/SWA
+            # anchor and from each other.
+            suffixes = [f"_{self.mha_suffix}_{name}"]
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
