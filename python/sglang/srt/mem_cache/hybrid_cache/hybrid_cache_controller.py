@@ -624,6 +624,12 @@ class HybridCacheController(BaseHiCacheController):
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
+        # The anchor KV pool may be purely logical (V4 LogicalHostPool with
+        # kv_buffer=None) -- all real KV bytes were already moved through
+        # batch_get_v2 above, so there's no per-anchor read to do.
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return
+
         # Transfer kv pools
         super()._page_transfer(operation)
 
@@ -633,6 +639,11 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+
+        # Skip anchor backup when the anchor holds no real KV (V4 case); the
+        # per-sidecar bytes are already in flight via batch_set_v2 above.
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return
 
         # Backup kv pools
         super()._page_backup(operation)
