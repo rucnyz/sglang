@@ -1704,9 +1704,17 @@ class GetAginferStateReq(BaseReq):
 @dataclass
 class GetAginferStateReqOutput(BaseReq):
     """Per-DP-rank snapshot.  aginfer state is the JSON-serialisable dict
-    described in dev/aginfer/DESIGN.md §sglang surface."""
+    described in dev/aginfer/DESIGN.md §sglang surface.
 
-    state: Dict[str, Any]
+    Fast path: when the underlying tree cache supports it the scheduler
+    pre-serialises the snapshot to JSON bytes (``state_bytes``) inside its
+    own process, so the ZMQ pickle hop only carries a single bytes payload
+    and the HTTP layer can write it without re-encoding.  ``state`` stays
+    populated only when the cache cannot pre-serialise (e.g. the
+    "unsupported" placeholder)."""
+
+    state: Optional[Dict[str, Any]] = None
+    state_bytes: Optional[bytes] = None
 
 
 @dataclass

@@ -652,12 +652,25 @@ async def server_info():
 # {"per_rank": [...]} so the daemon can still address each rank.
 @app.get("/aginfer/state")
 async def aginfer_state():
-    states: List[Dict[str, Any]] = (
-        await _global_state.tokenizer_manager.get_aginfer_state()
-    )
-    if len(states) == 1:
-        return ORJSONResponse(states[0])
-    return ORJSONResponse({"per_rank": states})
+    # Each entry is a GetAginferStateReqOutput; ``state_bytes`` is the
+    # pre-serialised fast path (UnifiedRadixCache), ``state`` is the
+    # legacy dict fallback (unsupported tree caches).
+    responses = await _global_state.tokenizer_manager.get_aginfer_state()
+    if len(responses) == 1:
+        r = responses[0]
+        if r.state_bytes is not None:
+            return Response(content=r.state_bytes, media_type="application/json")
+        return ORJSONResponse(r.state)
+    # Multi-DP: have to re-aggregate.  Decode the bytes lazily (orjson
+    # round-trip is still faster than building Python dicts during the
+    # tree walk).
+    import orjson
+
+    per_rank = [
+        orjson.loads(r.state_bytes) if r.state_bytes is not None else r.state
+        for r in responses
+    ]
+    return ORJSONResponse({"per_rank": per_rank})
 
 
 @app.get("/get_load")

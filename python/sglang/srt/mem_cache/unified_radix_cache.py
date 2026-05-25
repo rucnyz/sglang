@@ -2210,41 +2210,41 @@ class UnifiedRadixCache(BasePrefixCache):
         host pool when HiCache is on; otherwise 0.  ``session_ids`` is
         populated by the T3 passthrough (empty when not yet wired in).
         """
-        units = []
+        return self._dump_aginfer_state_impl(want_bytes=False)
+
+    def dump_aginfer_state_bytes(self) -> bytes:
+        """Same snapshot as :meth:`dump_aginfer_state`, but pre-serialised to
+        JSON bytes inside the scheduler process.
+
+        Two wins vs returning a dict:
+          1. We avoid pickling a 10k-element list-of-dicts across the ZMQ
+             control channel; a single ``bytes`` payload is much cheaper.
+          2. The HTTP layer can stream the bytes through ``Response`` without
+             re-encoding via orjson.
+
+        The wire format (the JSON the daemon parses) is identical.
+        """
+        return self._dump_aginfer_state_impl(want_bytes=True)
+
+    def _dump_aginfer_state_impl(self, want_bytes: bool):
+        # Hot path.
+        #
+        # We have two consumers:
+        #   * fast path (``want_bytes=True``): the scheduler emits JSON bytes
+        #     directly; we never materialise a Python dict per unit, so the
+        #     per-dump allocation rate stays low enough that the scheduler
+        #     process does NOT trip a Gen-2 cyclic GC sweep from this work
+        #     alone (empirically a Gen-2 sweep on the live radix tree +
+        #     KV-pool state is a ~500 ms stall — the main p99 tail).
+        #   * legacy path (``want_bytes=False``, ``dump_aginfer_state``):
+        #     build the dict-of-lists for in-process callers that need a
+        #     Python object.  This is no longer on the HTTP hot path.
+        root = self.root_node
+        base_ct = BASE_COMPONENT_TYPE
         hbm_used = 0
         dram_used = 0
-        # DFS over children (iterative to avoid recursion limits at depth).
-        stack = [self.root_node]
-        while stack:
-            node = stack.pop()
-            if node is not self.root_node:
-                cd = node.component_data[BASE_COMPONENT_TYPE]
-                has_device = cd.value is not None and len(cd.value) > 0
-                has_host = cd.host_value is not None and len(cd.host_value) > 0
-                if has_device or has_host:
-                    n_tokens = len(cd.value) if has_device else len(cd.host_value)
-                    tier = "HBM" if has_device else "DRAM"
-                    if has_device:
-                        hbm_used += n_tokens
-                    else:
-                        dram_used += n_tokens
-                    if node.hash_value:
-                        unit_hash = str(node.hash_value[-1])
-                    else:
-                        unit_hash = f"node-{node.id}"
-                    sids = getattr(node, "session_ids", None)
-                    units.append(
-                        {
-                            "hash": unit_hash,
-                            "tier": tier,
-                            "n_tokens": int(n_tokens),
-                            "last_access_time": int(node.last_access_time),
-                            "hit_count": int(node.hit_count),
-                            "session_ids": sorted(sids) if sids else [],
-                        }
-                    )
-            stack.extend(node.children.values())
 
+        # Compute tier caps once (root-level state, identical between paths).
         hbm_cap = 0
         if self.token_to_kv_pool_allocator is not None:
             hbm_cap = int(getattr(self.token_to_kv_pool_allocator, "size", 0))
@@ -2255,15 +2255,180 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_pool = getattr(self.cache_controller, "host_pool", None)
             if host_pool is not None:
                 dram_cap = int(getattr(host_pool, "size", 0))
+        page_size = int(self.page_size)
+
+        if want_bytes:
+            return self._dump_aginfer_state_bytes_inner(
+                root, base_ct, hbm_cap, dram_cap, page_size
+            )
+
+        # Legacy dict path.
+        units: list = []
+        units_append = units.append
+        stack = [root]
+        stack_pop = stack.pop
+        stack_extend = stack.extend
+        while stack:
+            node = stack_pop()
+            stack_extend(node.children.values())
+            if node is root:
+                continue
+            cd = node.component_data[base_ct]
+            v = cd.value
+            if v is not None and len(v) > 0:
+                n_tokens = len(v)
+                hbm_used += n_tokens
+                tier = "HBM"
+            else:
+                hv = cd.host_value
+                if hv is not None and len(hv) > 0:
+                    n_tokens = len(hv)
+                    dram_used += n_tokens
+                    tier = "DRAM"
+                else:
+                    continue
+            hv_list = node.hash_value
+            if hv_list:
+                unit_hash = hv_list[-1]
+                if type(unit_hash) is not str:
+                    unit_hash = str(unit_hash)
+            else:
+                unit_hash = f"node-{node.id}"
+            try:
+                sids = node.session_ids
+            except AttributeError:
+                sids = None
+            units_append(
+                {
+                    "hash": unit_hash,
+                    "tier": tier,
+                    "n_tokens": n_tokens,
+                    "last_access_time": int(node.last_access_time),
+                    "hit_count": node.hit_count,
+                    "session_ids": sorted(sids) if sids else [],
+                }
+            )
 
         return {
             "tier_usage": {
-                "HBM": {"used_tokens": int(hbm_used), "cap_tokens": hbm_cap},
-                "DRAM": {"used_tokens": int(dram_used), "cap_tokens": dram_cap},
+                "HBM": {"used_tokens": hbm_used, "cap_tokens": hbm_cap},
+                "DRAM": {"used_tokens": dram_used, "cap_tokens": dram_cap},
             },
             "units": units,
-            "page_size": int(self.page_size),
+            "page_size": page_size,
         }
+
+    def _dump_aginfer_state_bytes_inner(
+        self,
+        root,
+        base_ct: int,
+        hbm_cap: int,
+        dram_cap: int,
+        page_size: int,
+    ) -> bytes:
+        """Allocation-light JSON builder for the daemon snapshot.
+
+        Every node contributes a fixed-shape unit object; we write them
+        directly into a ``bytearray`` instead of materialising one Python
+        dict per node.  Hash strings are hex SHA-256 (alnum, JSON-safe);
+        session_ids are escaped via ``orjson`` only on the rare non-empty
+        path.  All numeric fields are coerced to ints before formatting so
+        we never emit numpy scalars or floats into the wire JSON.
+        """
+        # Pre-bind locals: removing the LOAD_ATTR / LOAD_GLOBAL per node is
+        # the single biggest per-node speedup in CPython.
+        # We accumulate the units-list bytes during the walk and assemble
+        # the final response (with tier_usage in its original slot) at the
+        # end.  Order matches the legacy dict iteration order so the wire
+        # JSON is byte-stable.
+        hbm_used = 0
+        dram_used = 0
+        units_buf = bytearray()
+        buf_extend = units_buf.extend
+        first = True
+
+        stack = [root]
+        stack_pop = stack.pop
+        stack_extend = stack.extend
+        # Local import: orjson string-encode is only needed on the rare
+        # non-empty session_ids branch; keep it out of the global path so the
+        # import doesn't happen unless we need it.
+        _orjson_dumps = None
+        while stack:
+            node = stack_pop()
+            stack_extend(node.children.values())
+            if node is root:
+                continue
+            cd = node.component_data[base_ct]
+            v = cd.value
+            if v is not None and len(v) > 0:
+                n_tokens = len(v)
+                hbm_used += n_tokens
+                tier_lit = b'"HBM"'
+            else:
+                hv = cd.host_value
+                if hv is not None and len(hv) > 0:
+                    n_tokens = len(hv)
+                    dram_used += n_tokens
+                    tier_lit = b'"DRAM"'
+                else:
+                    continue
+            hv_list = node.hash_value
+            if hv_list:
+                unit_hash = hv_list[-1]
+                if type(unit_hash) is not str:
+                    unit_hash = str(unit_hash)
+            else:
+                unit_hash = f"node-{node.id}"
+            try:
+                sids = node.session_ids
+            except AttributeError:
+                sids = None
+
+            if first:
+                first = False
+            else:
+                units_buf += b","
+            units_buf += b'{"hash":"'
+            # hex SHA-256 / "node-<int>" — both JSON-safe ASCII, never
+            # contain "/\\" / control chars.
+            buf_extend(unit_hash.encode("ascii", "backslashreplace"))
+            units_buf += b'","tier":'
+            units_buf += tier_lit
+            units_buf += b',"n_tokens":'
+            buf_extend(str(n_tokens).encode("ascii"))
+            units_buf += b',"last_access_time":'
+            # last_access_time may be numpy.float64; coerce once.
+            buf_extend(str(int(node.last_access_time)).encode("ascii"))
+            units_buf += b',"hit_count":'
+            buf_extend(str(int(node.hit_count)).encode("ascii"))
+            if sids:
+                units_buf += b',"session_ids":'
+                if _orjson_dumps is None:
+                    import orjson  # noqa: WPS433
+                    _orjson_dumps = orjson.dumps
+                buf_extend(_orjson_dumps(sorted(sids)))
+            else:
+                units_buf += b',"session_ids":[]'
+            units_buf += b"}"
+
+        # Assemble: tier_usage first, then units, then page_size — matches
+        # the order of the legacy dict so wire JSON stays byte-stable.
+        out = bytearray()
+        out += b'{"tier_usage":{"HBM":{"used_tokens":'
+        out += str(hbm_used).encode("ascii")
+        out += b',"cap_tokens":'
+        out += str(hbm_cap).encode("ascii")
+        out += b'},"DRAM":{"used_tokens":'
+        out += str(dram_used).encode("ascii")
+        out += b',"cap_tokens":'
+        out += str(dram_cap).encode("ascii")
+        out += b'}},"units":['
+        out += units_buf
+        out += b'],"page_size":'
+        out += str(page_size).encode("ascii")
+        out += b"}"
+        return bytes(out)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

@@ -793,14 +793,18 @@ class TokenizerControlMixin:
         # Many DP ranks
         return [res.internal_state for res in responses]
 
-    async def get_aginfer_state(self: TokenizerManager) -> List[Dict[str, Any]]:
-        """aginfer daemon snapshot.  Returns one dict per DP rank."""
+    async def get_aginfer_state(
+        self: TokenizerManager,
+    ) -> List[GetAginferStateReqOutput]:
+        """aginfer daemon snapshot.  Returns one ``GetAginferStateReqOutput``
+        per DP rank; callers choose between the pre-serialised bytes fast
+        path (``state_bytes``) and the dict form (``state``)."""
         self.auto_create_handle_loop()
         req = GetAginferStateReq()
         responses: List[GetAginferStateReqOutput] = (
             await self.get_aginfer_state_communicator(req)
         )
-        return [res.state for res in responses]
+        return responses
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq

@@ -3328,7 +3328,16 @@ class Scheduler(
 
         Only UnifiedRadixCache supports this; for other cache implementations
         the daemon receives an explicit "unsupported" marker.
+
+        Fast path: when the cache exposes ``dump_aginfer_state_bytes`` we
+        serialise to JSON bytes inside this process so the ZMQ pickle hop
+        carries a single ``bytes`` payload (much cheaper than pickling a
+        10k-element list-of-dicts) and the HTTP layer can stream the bytes
+        without re-encoding.
         """
+        dump_bytes = getattr(self.tree_cache, "dump_aginfer_state_bytes", None)
+        if dump_bytes is not None:
+            return GetAginferStateReqOutput(state_bytes=dump_bytes())
         dump = getattr(self.tree_cache, "dump_aginfer_state", None)
         if dump is None:
             return GetAginferStateReqOutput(
