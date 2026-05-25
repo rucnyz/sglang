@@ -57,6 +57,19 @@ Normalized against `ours_greedy`:
 | infercept     |     0.246 |       0.993 |          1.007 | wall-clock looks great (100 % hits) but pays 18 × the r3 holding tax |
 | **kvflow**    |    −2.628 |       0.993 |          1.007 | wall-clock identical to Continuum but r3 is **81 × higher** — the most catastrophic sustainability score in the table |
 
+> **`ours_greedy` simulator vs. real serving.** The row above is the
+> closed-form simulator with synthetic ReuseUnits.  For the real-serving
+> validation see **Run H'** in [`SUMMARY.md`](SUMMARY.md): the exact same
+> `OursGreedyPolicy` plugged into sglang via the
+> `SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:ours_greedy_score`
+> hook (adapter at [`baselines/sglang_adapter.py`](../baselines/sglang_adapter.py)).
+> Against the matched LRU baseline (Run F', same backend topology),
+> per-trial mean is tied within noise (885 s vs 873 s, +1.4 %); **p99
+> drops 28 % (1336 s vs 1857 s) and standard deviation drops 19 %**.
+> Total compute is preserved (sum within 1.4 %), matching the simulator's
+> r1−r2−r3 tradeoff prediction: Ours pays slightly more on r3 (holding)
+> to dramatically cut r1 misses on the tail trials.
+
 > Note on the simulated `thunder_agent` row: this is the **paper §8 specialization**
 > ("Actions {keep, invalidate}"), not a port of the reference implementation.
 > The simulator treats every program as eligible for HBM-or-drop demotion on

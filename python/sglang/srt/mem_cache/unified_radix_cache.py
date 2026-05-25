@@ -49,6 +49,50 @@ from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.session.streaming_session import StreamingSession
 
+# --- aginfer: pluggable eviction scorer -------------------------------------
+# When set, replaces the default LRU heap key (= node.last_access_time) used by
+# component drive_eviction / drive_host_eviction.  Lower score -> evict first.
+#
+# Wired via the env var SGLANG_KV_POLICY_MODULE="pkg.module:callable".  The
+# callable signature is (node: UnifiedTreeNode, layer: EvictLayer) -> float.
+# The default fallback below preserves stock sglang LRU behaviour.
+import os
+import importlib
+
+
+def _default_eviction_score(node, layer) -> float:
+    return float(node.last_access_time)
+
+
+def _load_eviction_scorer():
+    spec = os.environ.get("SGLANG_KV_POLICY_MODULE", "").strip()
+    if not spec:
+        return _default_eviction_score
+    if ":" not in spec:
+        logger.warning(
+            "SGLANG_KV_POLICY_MODULE=%r is malformed (need 'module:callable'); "
+            "falling back to LRU.",
+            spec,
+        )
+        return _default_eviction_score
+    mod_name, attr = spec.split(":", 1)
+    try:
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, attr)
+        logger.info(
+            "[aginfer] eviction scorer overridden by SGLANG_KV_POLICY_MODULE=%s",
+            spec,
+        )
+        return fn
+    except Exception as e:
+        logger.warning(
+            "Failed to load SGLANG_KV_POLICY_MODULE=%r (%s); falling back to LRU.",
+            spec,
+            e,
+        )
+        return _default_eviction_score
+# ---------------------------------------------------------------------------
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -276,6 +320,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
+        # aginfer: pluggable eviction scorer (default = LRU).  See module-level
+        # _load_eviction_scorer above.
+        self._eviction_scorer = _load_eviction_scorer()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def reset(self) -> None:

@@ -49,11 +49,19 @@ if [[ -n "${EVICTION_POLICY:-}" ]]; then
     EVICTION_POLICY_ARG="--radix-eviction-policy $EVICTION_POLICY"
 fi
 
+TP="${SGLANG_TP:-2}"
+EP="${SGLANG_EP:-$TP}"
+
+# aginfer eviction-scorer plug-in.  Format: 'pkg.mod:callable' (loaded by
+# UnifiedRadixCache._load_eviction_scorer).  Unset / empty = stock LRU.
+# Run H sets SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:ours_greedy_score.
+SGLANG_KV_POLICY_MODULE="${SGLANG_KV_POLICY_MODULE:-}" \
+PYTHONPATH="$AGINFER_ROOT:${PYTHONPATH:-}" \
 CUDA_VISIBLE_DEVICES="$AGINFER_GPUS" \
 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
     --host "$HOST" --port "$PORT" \
-    --tp 2 --ep 2 \
+    --tp "$TP" --ep "$EP" \
     --moe-a2a-backend none \
     --moe-runner-backend deep_gemm \
     --mem-fraction-static 0.85 \
