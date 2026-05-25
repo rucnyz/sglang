@@ -53,21 +53,27 @@ regression and re-open the TODO row.
 
 ## Index
 
-| order | TODO | Component | Verify | Status |
-|---|---|---|---|---|
-| 1 | T1 | `GET /aginfer/state` | [`t1_state_endpoint.md`](t1_state_endpoint.md) | **passed** (2026-05-25, sha `82d2732d6`) |
-| 2 | T2 | `POST /aginfer/migrate` | [`t2_migrate_endpoint.md`](t2_migrate_endpoint.md) | pending |
-| 3 | T3 | session_id passthrough into tree nodes | [`t3_session_passthrough.md`](t3_session_passthrough.md) | pending |
-| **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6_program_state.md`](t6_program_state.md) | pending |
-| 5 | T4 | daemon HTTP proxy + paper §4 event emission | [`t4_proxy.md`](t4_proxy.md) | pending |
-| 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5_event_router.md`](t5_event_router.md) | pending |
-| 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7_policy.md`](t7_policy.md) | pending |
-| 8 | T8 | admission_controller + watermark sensitivity | [`t8_admission.md`](t8_admission.md) | pending |
-| 9 | T9 | Run K + K-a ablation; revised acceptance (mean < 716 s) | [`t9_run_k.md`](t9_run_k.md) | pending |
-| 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies | [`t10_integration.md`](t10_integration.md) | pending |
+Each task lives in its own folder `tN/` with:
+* `tN/README.md` — capability + cost ceiling + worst-case contract
+* `tN/verify.py` (or `verify.sh`) — runnable verifier
+* `tN/results/` — raw logs, optimization notes, before/after writeups
 
-`results/` holds raw outputs (logs, JSON, harbor result dirs) referenced
-from each row.
+| order | TODO | Component | Folder | Status |
+|---|---|---|---|---|
+| 1 | T1 | `GET /aginfer/state` | [`t1/`](t1/) | **passed** (2026-05-25, sha `82d2732d6`) |
+| 2 | T2 | `POST /aginfer/migrate` | [`t2/`](t2/) | pending |
+| 3 | T3 | session_id passthrough into tree nodes | [`t3/`](t3/) | pending |
+| **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6/`](t6/) | pending |
+| 5 | T4 | daemon HTTP proxy + paper §4 event emission | [`t4/`](t4/) | pending |
+| 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | pending |
+| 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | pending |
+| 8 | T8 | admission_controller + watermark sensitivity | [`t8/`](t8/) | pending |
+| 9 | T9 | Run K + K-a ablation; revised acceptance (mean < 716 s) | [`t9/`](t9/) | pending |
+| 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies | [`t10/`](t10/) | pending |
+
+Per-task `tN/results/` directories hold raw outputs (logs, JSON, harbor
+result dirs, optimization writeups) for that task only — no cross-task
+mixing, no shared `results/` folder.
 
 ## Cross-cutting invariants
 

@@ -245,16 +245,16 @@ T4's verify uses `program_tracker.pause/resume`):
 
 | ID | Task | Verify | Estimate |
 |---|---|---|---|
-| T1 | `GET /aginfer/state` | [t1_state_endpoint.md](verify/t1_state_endpoint.md) | 2-3 h |
-| T2 | `POST /aginfer/migrate` | [t2_migrate_endpoint.md](verify/t2_migrate_endpoint.md) | 2-3 h |
-| T3 | session_id passthrough | [t3_session_passthrough.md](verify/t3_session_passthrough.md) | 1 h |
-| **T6** | program_tracker state machine *(moved up — T4 depends on it)* | [t6_program_state.md](verify/t6_program_state.md) | 2-3 h |
-| T4 | daemon proxy + emits 6 paper §4 events | [t4_proxy.md](verify/t4_proxy.md) | half day |
-| T5 | sglang→daemon webhook (transition + 5 s heartbeat in HIGH/CRITICAL) + daemon event router | [t5_event_router.md](verify/t5_event_router.md) | 3-4 h |
-| T7 | kv_scheduler event handlers | [t7_policy.md](verify/t7_policy.md) | 2-3 h |
-| T8 | admission_controller event handlers + correct aggregation | [t8_admission.md](verify/t8_admission.md) | 2-3 h |
-| T9 | Run K + K-a ablation | [t9_run_k.md](verify/t9_run_k.md) | half day |
-| T10 | integration / concurrency / restart / GC + forced-fault verifies | [t10_integration.md](verify/t10_integration.md) | half day |
+| T1 | `GET /aginfer/state` | [verify/t1/](verify/t1/) | 2-3 h |
+| T2 | `POST /aginfer/migrate` | [verify/t2/](verify/t2/) | 2-3 h |
+| T3 | session_id passthrough | [verify/t3/](verify/t3/) | 1 h |
+| **T6** | program_tracker state machine *(moved up — T4 depends on it)* | [verify/t6/](verify/t6/) | 2-3 h |
+| T4 | daemon proxy + emits 6 paper §4 events | [verify/t4/](verify/t4/) | half day |
+| T5 | sglang→daemon webhook (transition + 5 s heartbeat in HIGH/CRITICAL) + daemon event router | [verify/t5/](verify/t5/) | 3-4 h |
+| T7 | kv_scheduler event handlers | [verify/t7/](verify/t7/) | 2-3 h |
+| T8 | admission_controller event handlers + correct aggregation | [verify/t8/](verify/t8/) | 2-3 h |
+| T9 | Run K + K-a ablation | [verify/t9/](verify/t9/) | half day |
+| T10 | integration / concurrency / restart / GC + forced-fault verifies | [verify/t10/](verify/t10/) | half day |
 
 Total: ~2.5 days.
 

