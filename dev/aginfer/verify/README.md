@@ -55,7 +55,7 @@ regression and re-open the TODO row.
 
 | order | TODO | Component | Verify | Status |
 |---|---|---|---|---|
-| 1 | T1 | `GET /aginfer/state` | [`t1_state_endpoint.md`](t1_state_endpoint.md) | pending |
+| 1 | T1 | `GET /aginfer/state` | [`t1_state_endpoint.md`](t1_state_endpoint.md) | **passed** (2026-05-25, sha `82d2732d6`) |
 | 2 | T2 | `POST /aginfer/migrate` | [`t2_migrate_endpoint.md`](t2_migrate_endpoint.md) | pending |
 | 3 | T3 | session_id passthrough into tree nodes | [`t3_session_passthrough.md`](t3_session_passthrough.md) | pending |
 | **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6_program_state.md`](t6_program_state.md) | pending |

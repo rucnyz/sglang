@@ -45,11 +45,27 @@ Mechanism (no harbor needed). `verify/t1_state_endpoint.py`:
 ```
 
 ## RESULTS
-* date: _pending_
-* sglang sha:
-* lines added (`git diff --stat`):
-* schema valid: _pending_
-* p50 latency (1 K nodes):
-* p99 latency (10 K nodes):
-* delta vs ceiling: _pending_
-* raw log: `verify/results/t1_<datetime>.log`
+
+**PASSED** — happy path + worst-case forced injection, on Qwen3-0.6B + `--attention-backend flashinfer` (trtllm_mha auto-picks page_size=1 and bypasses sglang radix insertion; flashinfer + UnifiedRadixCache does insert).
+
+* date: 2026-05-25
+* sglang sha (initial impl): `bbf3e7b33`
+* sglang sha (after 10× perf opt): `82d2732d6`
+* lines added: 150 (initial) + 322 (after opt: refactor + bytes-path)
+* schema valid: ✓ (100 % across all measured snapshots)
+* invariants: ✓ no duplicate hash within a single response; Σ unit.n_tokens per tier == tier_usage.used_tokens within page_size
+
+| Stage | metric | before opt | after opt | bound |
+|---|---|---:|---:|---:|
+| 2 (~50 → carry-over ~4.3-4.8k units) | p50 / p99 (10 calls) | 24 ms / 32 ms | 29 ms / 34 ms | n/a |
+| 3 (stress ~6.3-6.9k units) | p50 / p99 (20 calls) | 37 ms / **469 ms** | 40 ms / **48 ms** | `200 + 0.100·N` ms = 836 ms |
+| 4 WORST CASE (15 s concurrent walker + traffic) | walker ok / fail / p99 | 487 / 0 / **955 ms** | 459-662 / 0 / **196 ms** | 0 fail (strict) |
+
+* delta vs ceiling: **10× under** at the stress regime (48 ms vs 836 ms bound); 5× tail-latency improvement under concurrent stress.
+* root cause discovered: Gen-2 cyclic-GC fired every ~50 dumps because each dump allocated 10k Python dicts + lists, and the sweep over the live radix tree + KV-pool descriptors took 300-500 ms. Fix: direct-to-bytearray JSON in `dump_aginfer_state_bytes`, no per-node dict allocation. Walk itself is only ~14 ms at 4300 nodes.
+* raw logs:
+  * `verify/results/t1_20260525_224238_baseline.log` (before opt)
+  * `verify/results/t1_20260525_232021_optimized.log` (after opt)
+  * `verify/results/t1_20260525_232149_optimized_run2.log`
+  * `verify/results/t1_20260525_232258_optimized_run3.log`
+  * `verify/results/t1_optimization_notes.md` (writeup)
