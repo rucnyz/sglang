@@ -673,6 +673,39 @@ async def aginfer_state():
     return ORJSONResponse({"per_rank": per_rank})
 
 
+# POST /aginfer/migrate -- apply paper §4 (u, τ_target) actions in batch.
+# Body: {"actions": [{"hash": str, "target_tier": "HBM"|"DRAM"|"DISK"|"DROP"}, ...]}
+# Response: {"applied": int, "skipped": [{"hash":..., "reason":...}, ...]}
+# Unresolved or unsupported actions are listed in `skipped` rather than
+# raised, so the daemon's idempotent re-issue loop stays simple.
+@app.post("/aginfer/migrate")
+async def aginfer_migrate(raw_request: Request):
+    try:
+        payload = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    actions = payload.get("actions") if isinstance(payload, dict) else None
+    if not isinstance(actions, list):
+        raise HTTPException(
+            status_code=400, detail="missing or non-list 'actions' field"
+        )
+    from sglang.srt.managers.io_struct import MigrateAginferReq
+
+    responses = await _global_state.tokenizer_manager.migrate_aginfer(
+        MigrateAginferReq(actions=actions)
+    )
+    if len(responses) == 1:
+        out = responses[0]
+        return ORJSONResponse({"applied": out.applied, "skipped": out.skipped})
+    return ORJSONResponse(
+        {
+            "per_rank": [
+                {"applied": r.applied, "skipped": r.skipped} for r in responses
+            ]
+        }
+    )
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).

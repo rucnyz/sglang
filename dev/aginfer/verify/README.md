@@ -61,7 +61,7 @@ Each task lives in its own folder `tN/` with:
 | order | TODO | Component | Folder | Status |
 |---|---|---|---|---|
 | 1 | T1 | `GET /aginfer/state` | [`t1/`](t1/) | **passed** (2026-05-25, sha `82d2732d6`) |
-| 2 | T2 | `POST /aginfer/migrate` | [`t2/`](t2/) | pending |
+| 2 | T2 | `POST /aginfer/migrate` | [`t2/`](t2/) | **passed** (2026-05-25) |
 | 3 | T3 | session_id passthrough into tree nodes | [`t3/`](t3/) | pending |
 | **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6/`](t6/) | pending |
 | 5 | T4 | daemon HTTP proxy + paper §4 event emission | [`t4/`](t4/) | pending |

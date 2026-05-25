@@ -41,6 +41,8 @@ from sglang.srt.managers.io_struct import (
     GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    MigrateAginferReq,
+    MigrateAginferReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
@@ -119,6 +121,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("get_aginfer_state", GetAginferStateReqOutput),
+    ("migrate_aginfer", MigrateAginferReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
@@ -803,6 +806,22 @@ class TokenizerControlMixin:
         req = GetAginferStateReq()
         responses: List[GetAginferStateReqOutput] = (
             await self.get_aginfer_state_communicator(req)
+        )
+        return responses
+
+    async def migrate_aginfer(
+        self: TokenizerManager, obj: MigrateAginferReq
+    ) -> List[MigrateAginferReqOutput]:
+        """Apply a batch of paper §4 (u, τ_target) actions across all DP ranks.
+
+        Each rank reports its own ``applied`` count + ``skipped`` list — the
+        daemon owns the same hash space across replicas in our deployment, so
+        the same action is sent to every rank and either applied or skipped
+        with a reason consistent with that rank's local cache state.
+        """
+        self.auto_create_handle_loop()
+        responses: List[MigrateAginferReqOutput] = (
+            await self.migrate_aginfer_communicator(obj)
         )
         return responses
 

@@ -1702,6 +1702,25 @@ class GetAginferStateReq(BaseReq):
 
 
 @dataclass
+class MigrateAginferReq(BaseReq):
+    """Apply a batch of paper §4 ``(u, τ_target)`` migration actions.
+
+    ``actions`` is a list of ``{"hash": str, "target_tier": "HBM"|"DRAM"|
+    "DISK"|"DROP"}``.  Unresolved or unsupported actions are reported in
+    ``MigrateAginferReqOutput.skipped`` rather than raised, so the daemon
+    can keep its idempotent re-issue loop simple.
+    """
+
+    actions: List[Dict[str, Any]]
+
+
+@dataclass
+class MigrateAginferReqOutput(BaseReq):
+    applied: int
+    skipped: List[Dict[str, Any]]
+
+
+@dataclass
 class GetAginferStateReqOutput(BaseReq):
     """Per-DP-rank snapshot.  aginfer state is the JSON-serialisable dict
     described in dev/aginfer/DESIGN.md §sglang surface.

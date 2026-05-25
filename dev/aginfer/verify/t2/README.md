@@ -43,12 +43,28 @@ Mechanism. `verify/t2_migrate_endpoint.py`:
 ```
 
 ## RESULTS
-* date: _pending_
-* sglang sha:
-* lines added (`git diff --stat`):
-* drop applied: _pending_
-* demote applied: _pending_
-* promote applied: _pending_
-* per-action latency (mean): _pending_
-* delta vs ceiling: _pending_
-* raw log: `verify/results/t2_<datetime>.log`
+
+**PASSED** — happy path (DROP) + 4 forced-injection worst-case rows. Run on Qwen3-0.6B + `--attention-backend flashinfer`, GPU 7, single-DP.
+
+* date: 2026-05-25
+* sglang sha: (this commit)
+* lines added: ~120 (io_struct + scheduler dispatch + mixin pair + HTTP handler + tree migration logic)
+* DROP applied: ✓ 21 of 44 HBM units successfully dropped (the other 23 were internal nodes → `not_a_leaf` reason, daemon should drop bottom-up). All 21 reported-applied hashes were gone from `/aginfer/state` on re-fetch.
+* DRAM demote: not yet exercised — requires HiCache backup to populate `host_value`. Smoke test runs without `--enable-hierarchical-cache`. v1 contract: returns `demote_requires_existing_host_backup` skip reason. Will exercise in T9 / Run K (V4-Flash + HiCache).
+* HBM promote: not yet wired (v1 contract). Returns `promote_not_yet_wired`. Daemon falls back to sglang's normal cache-hit auto-load.
+* DISK tier: returns `disk_tier_not_yet_wired` (v1 contract).
+* not_in_tree: 2 bogus hashes → both skipped with correct reason.
+* unknown target_tier: 1 bogus tier → skipped with `unknown_target_tier:'...'` reason.
+* Malformed payload (empty, non-list actions, non-JSON body): all return 400.
+* Per-action latency:
+  - 44-action mixed (real hashes): **0.14 ms/action** (6 ms total)
+  - 1000-action all-bogus (not_in_tree fast path): **0.010 ms/action** (10 ms total)
+  - both well under the 1 ms/action ceiling.
+* Idempotent replay: re-issuing the same DROP set after the targets are gone returns sane responses — no crash.
+* raw log: `results/<YYYYMMDD_HHMMSS>_run1.log`
+
+### Caveats (deferred, NOT regressions)
+
+* HiCache backup capacity-full row of the worst-case table (#14) is deferred to T9 / Run K because it requires `--enable-hierarchical-cache`. v1 daemon already refuses DRAM demote without a host backup, so the failure mode reduces to `demote_requires_existing_host_backup` — equivalent safety floor.
+* HBM-promote-under-capacity-full row is deferred for the same reason: HBM promote is not yet wired in v1; v1 simply trusts sglang's normal cache-hit auto-load. Promote semantics will land in T9.
+* 1k-actions-under-30RPS row tested without concurrent traffic; ran 1000-action batch standalone since RPS generator is not yet wired. T10 will re-run this under concurrent load.

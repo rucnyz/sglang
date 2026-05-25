@@ -2186,6 +2186,113 @@ class UnifiedRadixCache(BasePrefixCache):
         """Flush pending write-through acknowledgements."""
         self.writing_check()
 
+    # ---- aginfer daemon migrate (paper §4 action a_t) ----
+    def apply_aginfer_migrations(self, actions: list[dict]) -> dict:
+        """Apply a batch of paper §4 ``(u, τ_target)`` actions.
+
+        Returns ``{"applied": int, "skipped": [{"hash":..., "reason":...}]}``.
+        Unresolved actions never raise — the daemon re-issues idempotently
+        on the next event.
+
+        Semantics per target tier:
+          DROP  : clear all KV (device+host), remove leaf from tree.
+                  Internal nodes (with children) skipped to keep prefix
+                  matching consistent — daemon should drop bottom-up.
+          DRAM  : demote HBM→DRAM. Works when the node has both device
+                  and host data (= write_through_selective already backed
+                  it up). Without an existing host backup we skip; the
+                  daemon can retry once HiCache's backup_thread catches
+                  up, or fall back to DROP.
+          HBM   : promote DRAM→HBM. v1: not wired (sglang's existing
+                  cache-hit path auto-loads back on next request, so this
+                  is optimisation-only). Returns "promote_not_yet_wired".
+          DISK  : Mooncake/SSD spill. v1: not exposed. Returns
+                  "disk_tier_not_yet_wired".
+        """
+        # Build hash → node lookup with one DFS (O(N), same cost as state walk).
+        hash_to_node = {}
+        stack = [self.root_node]
+        root = self.root_node
+        while stack:
+            node = stack.pop()
+            if node is not root:
+                if node.hash_value:
+                    hash_to_node[str(node.hash_value[-1])] = node
+                else:
+                    hash_to_node[f"node-{node.id}"] = node
+            stack.extend(node.children.values())
+
+        applied = 0
+        skipped: list[dict] = []
+        components = self._components_tuple
+        base = BASE_COMPONENT_TYPE
+        new_tracker = lambda: {ct: 0 for ct in self.tree_components}
+
+        for action in actions:
+            h = action.get("hash")
+            target = (action.get("target_tier") or "").upper()
+            node = hash_to_node.get(h)
+            if node is None:
+                skipped.append({"hash": h, "reason": "not_in_tree"})
+                continue
+            cd = node.component_data[base]
+            has_device = cd.value is not None and len(cd.value) > 0
+            has_host = cd.host_value is not None and len(cd.host_value) > 0
+            is_leaf = len(node.children) == 0
+
+            if target == "DROP":
+                if not (has_device or has_host):
+                    skipped.append({"hash": h, "reason": "no_data"})
+                    continue
+                if not is_leaf:
+                    # Daemon should drop descendants first; we refuse to
+                    # tombstone internal nodes (would break prefix matching
+                    # downstream).
+                    skipped.append({"hash": h, "reason": "not_a_leaf"})
+                    continue
+                tracker = new_tracker()
+                for comp in components:
+                    self._evict_component_and_detach_lru(
+                        node, comp, target=EvictLayer.ALL, tracker=tracker
+                    )
+                self.evictable_device_leaves.discard(node)
+                self.evictable_host_leaves.discard(node)
+                self._remove_leaf_from_parent(node)
+                self._iteratively_delete_tombstone_leaf(node, tracker)
+                applied += 1
+            elif target == "DRAM":
+                if has_device and has_host:
+                    tracker = new_tracker()
+                    for comp in components:
+                        self._evict_component_and_detach_lru(
+                            node, comp, target=EvictLayer.DEVICE, tracker=tracker
+                        )
+                    self._update_evictable_leaf_sets(node)
+                    applied += 1
+                elif has_host:
+                    skipped.append({"hash": h, "reason": "already_on_dram"})
+                elif has_device:
+                    skipped.append(
+                        {"hash": h, "reason": "demote_requires_existing_host_backup"}
+                    )
+                else:
+                    skipped.append({"hash": h, "reason": "no_data"})
+            elif target == "HBM":
+                if has_device:
+                    skipped.append({"hash": h, "reason": "already_on_hbm"})
+                elif has_host:
+                    skipped.append({"hash": h, "reason": "promote_not_yet_wired"})
+                else:
+                    skipped.append({"hash": h, "reason": "no_data"})
+            elif target == "DISK":
+                skipped.append({"hash": h, "reason": "disk_tier_not_yet_wired"})
+            else:
+                skipped.append(
+                    {"hash": h, "reason": f"unknown_target_tier:{target!r}"}
+                )
+
+        return {"applied": applied, "skipped": skipped}
+
     # ---- aginfer daemon snapshot (paper §3 state s_t) ----
     def dump_aginfer_state(self) -> dict:
         """Walk the radix tree once and return a JSON-serialisable snapshot

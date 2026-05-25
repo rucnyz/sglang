@@ -109,6 +109,8 @@ from sglang.srt.managers.io_struct import (
     GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    MigrateAginferReq,
+    MigrateAginferReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -1433,6 +1435,7 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (GetAginferStateReq, self.get_aginfer_state),
+                (MigrateAginferReq, self.migrate_aginfer),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -3352,6 +3355,26 @@ class Scheduler(
                 }
             )
         return GetAginferStateReqOutput(state=dump())
+
+    def migrate_aginfer(self, recv_req: MigrateAginferReq) -> MigrateAginferReqOutput:
+        """Apply paper §4 (u, τ_target) migrations dispatched by the daemon."""
+        apply = getattr(self.tree_cache, "apply_aginfer_migrations", None)
+        if apply is None:
+            return MigrateAginferReqOutput(
+                applied=0,
+                skipped=[
+                    {
+                        "hash": a.get("hash"),
+                        "reason": f"unsupported_tree_cache:{type(self.tree_cache).__name__}",
+                    }
+                    for a in (recv_req.actions or [])
+                ],
+            )
+        result = apply(recv_req.actions or [])
+        return MigrateAginferReqOutput(
+            applied=int(result.get("applied", 0)),
+            skipped=list(result.get("skipped", [])),
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
