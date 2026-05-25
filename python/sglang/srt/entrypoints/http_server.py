@@ -645,6 +645,21 @@ async def server_info():
     }
 
 
+# ---- aginfer external scheduler API ----
+# Read-only snapshot of the radix cache + per-tier occupancy that the
+# aginfer daemon (see dev/aginfer/DESIGN.md) consumes on every event.
+# Single-DP deployments get a flat dict; multi-DP deployments get
+# {"per_rank": [...]} so the daemon can still address each rank.
+@app.get("/aginfer/state")
+async def aginfer_state():
+    states: List[Dict[str, Any]] = (
+        await _global_state.tokenizer_manager.get_aginfer_state()
+    )
+    if len(states) == 1:
+        return ORJSONResponse(states[0])
+    return ORJSONResponse({"per_rank": states})
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).

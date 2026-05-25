@@ -1690,6 +1690,26 @@ class GetInternalStateReqOutput(BaseReq):
 
 
 @dataclass
+class GetAginferStateReq(BaseReq):
+    """Snapshot the radix cache for the aginfer daemon.
+
+    Returns per-unit state (tier, age, hit_count, session_ids) and per-tier
+    occupancy.  Cheap; read-only; safe to call frequently from an external
+    process.
+    """
+
+    pass
+
+
+@dataclass
+class GetAginferStateReqOutput(BaseReq):
+    """Per-DP-rank snapshot.  aginfer state is the JSON-serialisable dict
+    described in dev/aginfer/DESIGN.md §sglang surface."""
+
+    state: Dict[str, Any]
+
+
+@dataclass
 class SetInternalStateReq(BaseReq):
     server_args: Dict[str, Any]
 

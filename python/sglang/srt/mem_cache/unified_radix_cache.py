@@ -2186,6 +2186,85 @@ class UnifiedRadixCache(BasePrefixCache):
         """Flush pending write-through acknowledgements."""
         self.writing_check()
 
+    # ---- aginfer daemon snapshot (paper §3 state s_t) ----
+    def dump_aginfer_state(self) -> dict:
+        """Walk the radix tree once and return a JSON-serialisable snapshot
+        for the aginfer external scheduler.  Read-only, no locks held.
+
+        Schema matches dev/aginfer/DESIGN.md §sglang surface:
+            {
+              "tier_usage": {
+                "HBM":  {"used_tokens": int, "cap_tokens": int},
+                "DRAM": {"used_tokens": int, "cap_tokens": int},
+              },
+              "units": [
+                {"hash": str, "tier": "HBM"|"DRAM", "n_tokens": int,
+                 "last_access_time": int, "hit_count": int,
+                 "session_ids": list[str]},
+                ...
+              ],
+              "page_size": int,
+            }
+
+        Per-tier ``cap_tokens`` for DRAM is taken from the cache controller's
+        host pool when HiCache is on; otherwise 0.  ``session_ids`` is
+        populated by the T3 passthrough (empty when not yet wired in).
+        """
+        units = []
+        hbm_used = 0
+        dram_used = 0
+        # DFS over children (iterative to avoid recursion limits at depth).
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node is not self.root_node:
+                cd = node.component_data[BASE_COMPONENT_TYPE]
+                has_device = cd.value is not None and len(cd.value) > 0
+                has_host = cd.host_value is not None and len(cd.host_value) > 0
+                if has_device or has_host:
+                    n_tokens = len(cd.value) if has_device else len(cd.host_value)
+                    tier = "HBM" if has_device else "DRAM"
+                    if has_device:
+                        hbm_used += n_tokens
+                    else:
+                        dram_used += n_tokens
+                    if node.hash_value:
+                        unit_hash = str(node.hash_value[-1])
+                    else:
+                        unit_hash = f"node-{node.id}"
+                    sids = getattr(node, "session_ids", None)
+                    units.append(
+                        {
+                            "hash": unit_hash,
+                            "tier": tier,
+                            "n_tokens": int(n_tokens),
+                            "last_access_time": int(node.last_access_time),
+                            "hit_count": int(node.hit_count),
+                            "session_ids": sorted(sids) if sids else [],
+                        }
+                    )
+            stack.extend(node.children.values())
+
+        hbm_cap = 0
+        if self.token_to_kv_pool_allocator is not None:
+            hbm_cap = int(getattr(self.token_to_kv_pool_allocator, "size", 0))
+        dram_cap = 0
+        if self.cache_controller is not None:
+            host_pool = getattr(self.cache_controller, "host_mem_pool", None)
+            if host_pool is None:
+                host_pool = getattr(self.cache_controller, "host_pool", None)
+            if host_pool is not None:
+                dram_cap = int(getattr(host_pool, "size", 0))
+
+        return {
+            "tier_usage": {
+                "HBM": {"used_tokens": int(hbm_used), "cap_tokens": hbm_cap},
+                "DRAM": {"used_tokens": int(dram_used), "cap_tokens": dram_cap},
+            },
+            "units": units,
+            "page_size": int(self.page_size),
+        }
+
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
         if self.cache_controller is not None:

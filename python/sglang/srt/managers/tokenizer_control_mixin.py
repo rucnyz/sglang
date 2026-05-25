@@ -37,6 +37,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetAginferStateReq,
+    GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
@@ -116,6 +118,7 @@ _COMMUNICATOR_SPECS = [
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
+    ("get_aginfer_state", GetAginferStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
@@ -789,6 +792,15 @@ class TokenizerControlMixin:
         )
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_aginfer_state(self: TokenizerManager) -> List[Dict[str, Any]]:
+        """aginfer daemon snapshot.  Returns one dict per DP rank."""
+        self.auto_create_handle_loop()
+        req = GetAginferStateReq()
+        responses: List[GetAginferStateReqOutput] = (
+            await self.get_aginfer_state_communicator(req)
+        )
+        return [res.state for res in responses]
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq

@@ -105,6 +105,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetAginferStateReq,
+    GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
@@ -1430,6 +1432,7 @@ class Scheduler(
                 ),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
+                (GetAginferStateReq, self.get_aginfer_state),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -3319,6 +3322,27 @@ class Scheduler(
         ret.pop("model_config", None)
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def get_aginfer_state(self, recv_req: GetAginferStateReq) -> GetAginferStateReqOutput:
+        """Snapshot the radix cache for the aginfer daemon (paper §3 s_t).
+
+        Only UnifiedRadixCache supports this; for other cache implementations
+        the daemon receives an explicit "unsupported" marker.
+        """
+        dump = getattr(self.tree_cache, "dump_aginfer_state", None)
+        if dump is None:
+            return GetAginferStateReqOutput(
+                state={
+                    "unsupported_tree_cache": type(self.tree_cache).__name__,
+                    "tier_usage": {
+                        "HBM": {"used_tokens": 0, "cap_tokens": 0},
+                        "DRAM": {"used_tokens": 0, "cap_tokens": 0},
+                    },
+                    "units": [],
+                    "page_size": int(getattr(self.tree_cache, "page_size", 0)),
+                }
+            )
+        return GetAginferStateReqOutput(state=dump())
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
