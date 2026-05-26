@@ -61,7 +61,7 @@ case "$VARIANT" in
         ;;
 esac
 
-RESULTS_DIR="$AGINFER_RESULTS/run_K_${VARIANT}"
+RESULTS_DIR="$AGINFER_RESULTS/run_K_${VARIANT}${RUN_K_RESULTS_TAG:+_${RUN_K_RESULTS_TAG}}"
 mkdir -p "$RESULTS_DIR"
 
 MOONCAKE_LOG="$RESULTS_DIR/mooncake_master.log"
@@ -257,12 +257,24 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
         --ak api_base=http://172.17.0.1:9100/v1 \
         --ak api_key="${OPENAI_API_KEY}" \
         --ak max_turns=200 \
+        --ak temperature=0.0 \
+        --ak seed=42 \
         -n 32 \
         --jobs-dir "$HARBOR_RESULTS" \
     >"$HARBOR_LOG" 2>&1) || HARBOR_EXIT=$?
 
 echo "[run_k:$VARIANT] harbor exit code: ${HARBOR_EXIT:-0}"
 echo "[run_k:$VARIANT] harbor results: $HARBOR_RESULTS"
+
+# Copy the real sglang log into the cycle's results dir (the launch
+# script writes to $AGINFER_LOGS/sglang_v4flash.log; the orchestrator's
+# stdout-redirected $SGLANG_LOG only catches wrapper output).  Needed
+# for offline TTFT / cache-hit analysis (parse_matrix.py).
+if [[ -e "$SGLANG_LOG_REAL" ]]; then
+    cp -- "$SGLANG_LOG_REAL" "$RESULTS_DIR/sglang_v4flash.log"
+    echo "[run_k:$VARIANT] copied sglang log → $RESULTS_DIR/sglang_v4flash.log"
+fi
+
 echo "[run_k:$VARIANT] DONE — variant complete"
 
 # Cleanup happens via trap.

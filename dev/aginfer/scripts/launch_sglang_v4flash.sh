@@ -78,4 +78,5 @@ python -m sglang.launch_server \
     --reasoning-parser deepseek-r1 \
     --trust-remote-code \
     --enable-metrics \
+    --random-seed "${SGLANG_RANDOM_SEED:-42}" \
     >>"$LOG" 2>&1
