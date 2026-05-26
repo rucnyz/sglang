@@ -56,7 +56,12 @@ def migrate(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def hbm_used(state: Dict[str, Any]) -> int:
-    return int(state["tier_usage"]["HBM"]["used_tokens"])
+    """HBM used in BYTES (the paper §7 currency).
+
+    Per-unit n_bytes is exposed for the same reason -- the daemon's per-unit
+    value rule divides VALUE by COST, and cost is bytes.
+    """
+    return int(state["tier_usage"]["HBM"]["used_bytes"])
 
 
 def warm_distinct_leaves(n: int, salt: str = "") -> None:
@@ -71,14 +76,14 @@ def main() -> None:
     print("\n[1] populate tree")
     warm_distinct_leaves(20, salt="round1-")
     state0 = fetch_state()
-    n_tokens_by_hash = {u["hash"]: u["n_tokens"] for u in state0["units"]}
+    n_bytes_by_hash = {u["hash"]: u["n_bytes"] for u in state0["units"]}
     hbm0 = hbm_used(state0)
     targets = [
         {"hash": u["hash"], "target_tier": "DROP"}
         for u in state0["units"]
         if u["tier"] == "HBM" and u["n_tokens"] > 0
     ]
-    print(f"    units: {len(state0['units'])}, HBM used_tokens: {hbm0}, DROP targets: {len(targets)}")
+    print(f"    units: {len(state0['units'])}, HBM used_bytes: {hbm0}, DROP targets: {len(targets)}")
 
     print("[2] POST migrate; check applied_hashes + tier_usage delta")
     t0 = time.perf_counter()
@@ -101,18 +106,18 @@ def main() -> None:
     leaked = applied_hashes & after_hashes
     assert not leaked, f"{len(leaked)} applied DROPs still in tree: {sorted(leaked)[:5]}"
     # (D) applied_hashes were in pre-snapshot (server didn't fabricate)
-    fabricated = applied_hashes - set(n_tokens_by_hash.keys())
+    fabricated = applied_hashes - set(n_bytes_by_hash.keys())
     assert not fabricated, f"server fabricated {len(fabricated)} applied_hashes"
-    # (E) tier_usage delta -- the audit BLOCKER #1 invariant.  HBM used_tokens
-    #     must decrease by AT LEAST the sum of dropped n_tokens.  ">=" allows
+    # (E) tier_usage delta -- the audit BLOCKER #1 invariant.  HBM used_bytes
+    #     must decrease by AT LEAST the sum of dropped n_bytes.  ">=" allows
     #     cascade through tombstones to free more; "<" would mean the migrate
     #     reported success without freeing buffers.
     hbm1 = hbm_used(state1)
-    expected_drop = sum(n_tokens_by_hash[h] for h in applied_hashes)
+    expected_drop = sum(n_bytes_by_hash[h] for h in applied_hashes)
     actual_drop = hbm0 - hbm1
-    print(f"    HBM tokens: {hbm0} -> {hbm1} (delta {actual_drop}, expected >= {expected_drop})")
+    print(f"    HBM bytes: {hbm0} -> {hbm1} (delta {actual_drop}, expected >= {expected_drop})")
     assert actual_drop >= expected_drop, (
-        f"HBM used_tokens dropped by only {actual_drop}, expected >= {expected_drop} "
+        f"HBM used_bytes dropped by only {actual_drop}, expected >= {expected_drop} "
         f"-- migrate reported applied but did not free buffers"
     )
     print("    causal checks (count, absence, anti-fabrication, tier_usage delta) ✓")

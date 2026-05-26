@@ -2321,6 +2321,51 @@ class UnifiedRadixCache(BasePrefixCache):
         return {"applied": applied, "applied_hashes": applied_hashes, "skipped": skipped}
 
     # ---- aginfer daemon snapshot (paper §3 state s_t) ----
+    def _aginfer_bytes_per_token(self) -> int:
+        """Best-effort device-KV bytes-per-token.
+
+        Used to convert n_tokens -> n_bytes in /aginfer/state.  The daemon's
+        per-unit value rule (paper §7) compares units by value-per-byte, so
+        we need a precise byte count.  Per-pool API:
+
+          * DSV4 / HiSparse: ``KVCache.get_bytes_per_token()`` (precise)
+          * MHA / MLA       : derive from ``get_kv_size_bytes() / size``
+          * unknown         : return 0 — the daemon falls back to tokens
+
+        Result is cached on the instance after the first computation; the
+        KV layout never changes for the lifetime of the scheduler.
+        """
+        cached = getattr(self, "_aginfer_bpt_cache", None)
+        if cached is not None:
+            return cached
+        pool_alloc = self.token_to_kv_pool_allocator
+        kv = None
+        if pool_alloc is not None:
+            kv = getattr(pool_alloc, "_kvcache", None)
+            if kv is None and hasattr(pool_alloc, "get_kvcache"):
+                try:
+                    kv = pool_alloc.get_kvcache()
+                except Exception:
+                    kv = None
+        bpt = 0
+        if kv is not None:
+            if hasattr(kv, "get_bytes_per_token"):
+                try:
+                    bpt = int(kv.get_bytes_per_token())
+                except Exception:
+                    bpt = 0
+            if bpt == 0 and hasattr(kv, "get_kv_size_bytes"):
+                try:
+                    k_size, v_size = kv.get_kv_size_bytes()
+                    total_bytes = int(k_size) + int(v_size)
+                    size = int(getattr(kv, "size", 0) or 0)
+                    if size > 0:
+                        bpt = total_bytes // size
+                except Exception:
+                    bpt = 0
+        self._aginfer_bpt_cache = bpt
+        return bpt
+
     def dump_aginfer_state(self) -> dict:
         """Walk the radix tree once and return a JSON-serialisable snapshot
         for the aginfer external scheduler.  Read-only, no locks held.
@@ -2328,21 +2373,31 @@ class UnifiedRadixCache(BasePrefixCache):
         Schema matches dev/aginfer/DESIGN.md §sglang surface:
             {
               "tier_usage": {
-                "HBM":  {"used_tokens": int, "cap_tokens": int},
-                "DRAM": {"used_tokens": int, "cap_tokens": int},
+                "HBM":  {"used_bytes": int, "cap_bytes": int},
+                "DRAM": {"used_bytes": int, "cap_bytes": int},
               },
               "units": [
-                {"hash": str, "tier": "HBM"|"DRAM", "n_tokens": int,
+                {"hash": str, "tier": "HBM"|"DRAM",
+                 "n_tokens": int, "n_bytes": int,
                  "last_access_time": int, "hit_count": int,
                  "session_ids": list[str]},
                 ...
               ],
               "page_size": int,
+              "bytes_per_token": int,
             }
 
-        Per-tier ``cap_tokens`` for DRAM is taken from the cache controller's
-        host pool when HiCache is on; otherwise 0.  ``session_ids`` is
-        populated by the T3 passthrough (empty when not yet wired in).
+        Bytes are the paper §7 currency: per-unit value rule divides by
+        memory cost in bytes, and tier capacities are inherently byte
+        quantities.  ``n_tokens`` is also kept per unit because the value
+        NUMERATOR (hit_count * tokens_saved) is token-counted.
+
+        ``bytes_per_token`` is queried from the device KV pool once per
+        scheduler lifetime (the layout never changes); zero if the pool
+        doesn't expose the per-token size.  Per-tier ``cap_bytes`` for DRAM
+        is taken from the cache controller's host pool when HiCache is on,
+        otherwise 0.  ``session_ids`` is populated by the T3 passthrough
+        (empty when not yet wired in).
         """
         return self._dump_aginfer_state_impl(want_bytes=False)
 
@@ -2379,21 +2434,26 @@ class UnifiedRadixCache(BasePrefixCache):
         dram_used = 0
 
         # Compute tier caps once (root-level state, identical between paths).
-        hbm_cap = 0
+        hbm_cap_tokens = 0
         if self.token_to_kv_pool_allocator is not None:
-            hbm_cap = int(getattr(self.token_to_kv_pool_allocator, "size", 0))
-        dram_cap = 0
+            hbm_cap_tokens = int(
+                getattr(self.token_to_kv_pool_allocator, "size", 0)
+            )
+        dram_cap_tokens = 0
         if self.cache_controller is not None:
             host_pool = getattr(self.cache_controller, "host_mem_pool", None)
             if host_pool is None:
                 host_pool = getattr(self.cache_controller, "host_pool", None)
             if host_pool is not None:
-                dram_cap = int(getattr(host_pool, "size", 0))
+                dram_cap_tokens = int(getattr(host_pool, "size", 0))
         page_size = int(self.page_size)
+        bytes_per_token = self._aginfer_bytes_per_token()
+        hbm_cap = hbm_cap_tokens * bytes_per_token
+        dram_cap = dram_cap_tokens * bytes_per_token
 
         if want_bytes:
             return self._dump_aginfer_state_bytes_inner(
-                root, base_ct, hbm_cap, dram_cap, page_size
+                root, base_ct, hbm_cap, dram_cap, page_size, bytes_per_token
             )
 
         # Legacy dict path.
@@ -2440,6 +2500,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     "hash": unit_hash,
                     "tier": tier,
                     "n_tokens": n_tokens,
+                    "n_bytes": n_tokens * bytes_per_token,
                     "last_access_time": int(node.last_access_time),
                     "hit_count": node.hit_count,
                     "session_ids": sorted(sids) if sids else [],
@@ -2448,11 +2509,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
         return {
             "tier_usage": {
-                "HBM": {"used_tokens": hbm_used, "cap_tokens": hbm_cap},
-                "DRAM": {"used_tokens": dram_used, "cap_tokens": dram_cap},
+                "HBM": {
+                    "used_bytes": hbm_used * bytes_per_token,
+                    "cap_bytes": hbm_cap,
+                },
+                "DRAM": {
+                    "used_bytes": dram_used * bytes_per_token,
+                    "cap_bytes": dram_cap,
+                },
             },
             "units": units,
             "page_size": page_size,
+            "bytes_per_token": bytes_per_token,
         }
 
     def _dump_aginfer_state_bytes_inner(
@@ -2462,6 +2530,7 @@ class UnifiedRadixCache(BasePrefixCache):
         hbm_cap: int,
         dram_cap: int,
         page_size: int,
+        bytes_per_token: int,
     ) -> bytes:
         """Allocation-light JSON builder for the daemon snapshot.
 
@@ -2537,6 +2606,8 @@ class UnifiedRadixCache(BasePrefixCache):
             units_buf += tier_lit
             units_buf += b',"n_tokens":'
             buf_extend(str(n_tokens).encode("ascii"))
+            units_buf += b',"n_bytes":'
+            buf_extend(str(n_tokens * bytes_per_token).encode("ascii"))
             units_buf += b',"last_access_time":'
             # last_access_time may be numpy.float64; coerce once.
             buf_extend(str(int(node.last_access_time)).encode("ascii"))
@@ -2552,21 +2623,24 @@ class UnifiedRadixCache(BasePrefixCache):
                 units_buf += b',"session_ids":[]'
             units_buf += b"}"
 
-        # Assemble: tier_usage first, then units, then page_size — matches
-        # the order of the legacy dict so wire JSON stays byte-stable.
+        # Assemble: tier_usage first, then units, then page_size, then
+        # bytes_per_token — matches the order of the legacy dict so wire
+        # JSON stays byte-stable.
         out = bytearray()
-        out += b'{"tier_usage":{"HBM":{"used_tokens":'
-        out += str(hbm_used).encode("ascii")
-        out += b',"cap_tokens":'
+        out += b'{"tier_usage":{"HBM":{"used_bytes":'
+        out += str(hbm_used * bytes_per_token).encode("ascii")
+        out += b',"cap_bytes":'
         out += str(hbm_cap).encode("ascii")
-        out += b'},"DRAM":{"used_tokens":'
-        out += str(dram_used).encode("ascii")
-        out += b',"cap_tokens":'
+        out += b'},"DRAM":{"used_bytes":'
+        out += str(dram_used * bytes_per_token).encode("ascii")
+        out += b',"cap_bytes":'
         out += str(dram_cap).encode("ascii")
         out += b'}},"units":['
         out += units_buf
         out += b'],"page_size":'
         out += str(page_size).encode("ascii")
+        out += b',"bytes_per_token":'
+        out += str(bytes_per_token).encode("ascii")
         out += b"}"
         return bytes(out)
 

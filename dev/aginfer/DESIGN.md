@@ -110,18 +110,139 @@ These are real risks of going fully reactive. Each verify file checks the mitiga
 | Debounce: state oscillates around θ_hi | sglang fires webhook on `OK↔HIGH↔CRITICAL` transitions; in `HIGH` or `CRITICAL` it ALSO fires a heartbeat at `interval=5 s` so the daemon can re-evaluate pause victims during plateau (matches TA's polling cadence at the only point it matters) | T5 |
 | Inline scorer module fails to load (ImportError) | sglang logs a structured `kv_policy_loaded={module}` line at startup; T9 / T10 grep that line and fail the run if the configured module is not loaded | T9 |
 
-## sglang surface — final, ≈ 130 lines
+## sglang surface — final, ≈ 350 lines after T1/T2 reality
 
 | Endpoint | Direction | Purpose | LoC |
 |---|---|---|---|
-| `GET /aginfer/state` | sglang ← daemon | snapshot `s_t` (per-unit + per-tier) | ~40 |
-| `POST /aginfer/migrate` | sglang ← daemon | apply `a_t = {(u, τ_target)}` | ~40 |
+| `GET /aginfer/state` | sglang ← daemon | snapshot `s_t` (per-unit + per-tier) | ~160 |
+| `POST /aginfer/migrate` | sglang ← daemon | apply `a_t = {(u, τ_target)}` | ~170 |
 | `POST <notify_url>/aginfer/event` | sglang → daemon | webhook on watermark transition | ~30 |
 | `session_id` passthrough to `UnifiedTreeNode.session_ids` | internal | wire `extra_body.program_id` into tree node | ~20 |
 
+(T1 ≈ 150 LoC, T2 ≈ 170 LoC after the duplicate-batch defensive set and
+the depth-audit additions; the ≈ 130 budget was pre-audit, re-baselined.)
 No new core algorithms in sglang. The inline scorer is already shipped
 on commit `c784e51ee`. Webhook is fire-and-forget; never blocks sglang's
 scheduler step.
+
+### `/aginfer/state` schema (paper §3 state s_t)
+
+```json
+{
+  "page_size": 1,
+  "bytes_per_token": 576,
+  "tier_usage": {
+    "HBM":  {"used_bytes": int, "cap_bytes": int},
+    "DRAM": {"used_bytes": int, "cap_bytes": int}
+  },
+  "units": [
+    {"hash": str, "tier": "HBM"|"DRAM",
+     "n_tokens": int, "n_bytes": int,
+     "last_access_time": int, "hit_count": int,
+     "session_ids": list[str]}
+  ]
+}
+```
+
+Bytes are the paper §7 currency: per-unit value rule divides by
+memory cost in bytes, and tier capacities are inherently byte
+quantities. `n_tokens` is also kept per unit because the value
+NUMERATOR (hit_count × tokens_saved) is token-counted.
+
+`hash` is hex SHA-256 of the radix node's committed KV when HiCache
+backup has populated it; otherwise the fallback `node-<id>` where
+`id` is `UnifiedTreeNode.counter`, a class-level **monotonic** integer
+that never recycles within a scheduler process. After scheduler
+process restart the counter resets — T10's restart story handles this.
+
+### `/aginfer/migrate` schema (paper §4 action a_t)
+
+Request:
+```json
+{"actions": [{"hash": str, "target_tier": "HBM"|"DRAM"|"DISK"|"DROP"}, ...]}
+```
+
+Response:
+```json
+{"applied": int, "applied_hashes": [str, ...], "skipped": [{"hash": str, "reason": str}, ...]}
+```
+
+`applied_hashes` lets the daemon's idempotent retry loop prune its
+retry set in O(applied) without re-walking `/aginfer/state`. T5/T7/T8
+all consume it. Cost is O(applied) per call, dominated by JSON
+serialisation; gate with `with_applied_hashes: bool = True` request
+flag only if a profile shows it dominates.
+
+### Daemon retry-set classification (canonical mapping)
+
+The daemon must classify every skip reason into one of three buckets:
+
+* **Retryable / idempotent** (re-issue once the tree changes):
+  `not_in_tree`, `no_data`, `not_a_leaf`,
+  `demote_requires_existing_host_backup`, `already_on_dram`,
+  `already_on_hbm`.
+* **Programmer error** (do not retry; investigate upstream):
+  `already_acted_this_batch`, `unknown_target_tier:'<X>'`,
+  `unsupported_tree_cache:<ClassName>`.
+* **v1 not-yet-wired** (will become retryable in T9/T10):
+  `promote_not_yet_wired`, `disk_tier_not_yet_wired`.
+
+T5/T7 imports `RETRYABLE_REASONS` from a single canonical place; the
+verify suite double-checks every emitted reason string falls into the
+expected bucket.
+
+### Cost characteristics and HTTP caps
+
+Measured (verify/t2 round-3, Qwen3-0.6B + flashinfer + UnifiedRadixCache):
+
+* Slow path (real DROP, mutates tree): ≈ 0.04 ms/action
+* Fast path (`not_in_tree` rejection, dict miss): ≈ 0.01 ms/action
+
+`apply_aginfer_migrations` blocks the scheduler thread for the duration
+of a call. The daemon picks its own batch size to fit its per-event
+latency budget (see "Acknowledged costs"). sglang does NOT prescribe.
+
+HTTP guard rails:
+
+* `MAX_ACTIONS_PER_BATCH = 100_000` — over-cap requests return HTTP 400.
+* `MAX_HASH_LEN = 1024` chars — covers hex SHA-256 (64) + `node-N` (~12)
+  with generous slack; rejects pathological 1 MB hash strings that
+  would dominate the `hash_to_node` dict-build cost.
+
+The caps exist purely as DoS guards. A 100 k batch is legal but blocks
+the scheduler thread for seconds; whether that's acceptable is the
+daemon's call, not sglang's.
+
+### Startup invariants (T9 verification target)
+
+Two classes of invariants — universal (every Run) vs Run-specific.
+
+**Universal** (every Run J / K / K-a; halts the run if missing):
+
+* `tree_cache=UnifiedRadixCache` — `apply_aginfer_migrations` is only
+  defined on this class. T9's startup-log grep MUST fail the run if
+  the configured tree cache is not `UnifiedRadixCache`; otherwise
+  every migrate skips with `unsupported_tree_cache:<X>`, which is a
+  silent functional regression that the v1 daemon's retry loop
+  cannot detect.
+* `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1` — required env to opt into
+  the unified radix code path. T9 reads the configured value and
+  asserts the loaded tree cache class matches.
+* `kv_policy_loaded=<module>` — the inline scorer module name; T9
+  greps this line and fails the run if not loaded (see Reliability
+  table row above for the existing requirement).
+
+**Run-specific**:
+
+* **Run K only**: `--enable-hierarchical-cache` MUST be active. The
+  daemon does NOT hard-require HiCache (Run J explicitly runs without
+  it), but Run K's paper-figure-relevance depends on the 4-tier
+  coordination story. T9's Run-K-config grep halts if HiCache is not
+  on.
+* **Run J only**: `--enable-hierarchical-cache` MUST be OFF. Verifies
+  the daemon's §9 deployment claim that the three layers work without
+  HiCache. T9's Run-J-config grep halts if HiCache is on (would
+  invalidate the ablation).
 
 ## Daemon entry points
 
@@ -220,21 +341,45 @@ Realistic acceptance — pre-committed before the run:
 * startup-log invariant: sglang logs `kv_policy_loaded=…` and daemon
   logs `kv_scheduler=enabled, admission_controller=enabled`. If
   either is missing, **halt the run** (audit #11).
+* **Run K specifically requires HiCache enabled.** The daemon as a
+  whole does NOT hard-require HiCache (see Run J below), but Run K's
+  startup invariant grep MUST find HiCache in the active config.
 
 Stretch:
 * `K.mean < 666 s` (beat TA on mean — aspirational, expected 720-790 s
   per audit prediction).
 * `K.std < 280 s` (= Run H' std).
 
-Ablation:
-* **Run K-a** — daemon with kv_scheduler ON, admission_controller OFF,
-  inline scorer ON. Expected ≈ Run H' (885 s); shows value rule alone.
+Ablations:
+* **Run J — daemon without HiCache** (validates the §9 deployment
+  architecture claim that the three daemon layers are independent
+  of HiCache). All three daemon layers active; `--enable-hierarchical-
+  cache` OFF; same V4-Flash workload as Run K. The kv_scheduler
+  degrades to DROP-only (DRAM/HBM tier transitions skip with their
+  v1 reasons), but admission_controller and proxy continue to drive
+  program-level back-pressure exactly as in Run K.
+  - Acceptance: `J.mean < H' 885 s` — strict improvement over inline
+    scorer alone, proving the daemon's program-level admission has
+    independent value.
+  - Expectation: `J.mean ≈ G 666 s ± 50 s` — matches TA's program-
+    level pause mechanism using paper §7 value-based victim selection
+    instead of TA's BFD-by-token-count.
+  - Stretch: `J.mean < G` — paper §7 value-based admission beats TA's
+    BFD heuristic.
+  - Rationale: paper §9 claims the daemon architecture is deployable
+    without HiCache. Even if the resulting performance band is
+    similar to TA (not novel), the ablation is required to substantiate
+    that claim — claims need evidence, regardless of novelty.
+* **Run K-a — kv_scheduler ON, admission_controller OFF, HiCache ON.**
+  Expected ≈ Run H' (885 s); shows the value rule alone (decoupled
+  from admission). With HiCache on, kv_scheduler can demote/drop;
+  without admission, no program back-pressure.
 * ~~Run K-b~~ **dropped** per v2 audit: replicating TA's pause-victim
   selection inside our admission_controller requires either a token-
   count BFD fallback or duplicating TA's heuristic. We already have
   Run G as a real TA measurement; use that directly rather than
   rebuild TA inside our daemon.
-* **Run K** (full): all three layers active. Target < 666 s.
+* **Run K** (full): all three layers active + HiCache. Target < 666 s.
 
 ## TODO (revised)
 
@@ -253,7 +398,7 @@ T4's verify uses `program_tracker.pause/resume`):
 | T5 | sglang→daemon webhook (transition + 5 s heartbeat in HIGH/CRITICAL) + daemon event router | [verify/t5/](verify/t5/) | 3-4 h |
 | T7 | kv_scheduler event handlers | [verify/t7/](verify/t7/) | 2-3 h |
 | T8 | admission_controller event handlers + correct aggregation | [verify/t8/](verify/t8/) | 2-3 h |
-| T9 | Run K + K-a ablation | [verify/t9/](verify/t9/) | half day |
+| T9 | Run K + K-a + J ablation (J validates daemon's §9 deployment claim w/o HiCache) | [verify/t9/](verify/t9/) | half day + 1h Run J |
 | T10 | integration / concurrency / restart / GC + forced-fault verifies | [verify/t10/](verify/t10/) | half day |
 
 Total: ~2.5 days.
@@ -270,6 +415,7 @@ within the documented floor. Headline floors:
 | admission_controller off | no program back-pressure | ≈ Run F' 873 s |
 | daemon crashes | sglang alone with inline scorer | ≈ Run H' 885 s |
 | inline scorer crashes (and daemon survives) | LRU + daemon migrate hints | ≈ Run F' to Run H' band |
+| HiCache disabled at startup | daemon's kv_scheduler degrades to DROP-only; admission_controller + proxy continue | ≈ Run J target band (H' to G) |
 | **all three layers fail** | bare sglang LRU | ≈ Run F' 873 s |
 
 So Run K's absolute worst case (if every daemon-side mechanism is

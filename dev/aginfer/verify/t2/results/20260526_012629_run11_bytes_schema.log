@@ -1,0 +1,54 @@
+=== T2 verify: POST /aginfer/migrate (depth-audit) ===
+
+[1] populate tree
+    units: 4766, HBM used_bytes: 4212182903, DROP targets: 4766
+[2] POST migrate; check applied_hashes + tier_usage delta
+    applied=2268, dur=80.8ms (0.017 ms/action)
+    skip reasons: ['not_a_leaf']
+    HBM bytes: 4212182903 -> 3171265539 (delta 1040917364, expected >= 1040917364)
+    causal checks (count, absence, anti-fabrication, tier_usage delta) ✓
+
+[3] warm fresh nodes for branch probes
+[4] DRAM on HBM-only: applied=0, skip=[{'hash': 'node-112', 'reason': 'demote_requires_existing_host_backup'}]
+[5] HBM on HBM-resident: applied=0, skip=[{'hash': 'node-4773', 'reason': 'already_on_hbm'}]
+[6] explicit not_a_leaf: applied=0, skip=[{'hash': 'node-112', 'reason': 'not_a_leaf'}]
+
+[7] duplicate hashes in same batch
+    sent 20 actions (10 unique hashes, each twice), applied=8, unique applied=8
+    skipped reason counts: {'not_a_leaf': 8, 'already_acted_this_batch': 4}
+    first-applied + dup-blocked: 4 / 4 (defensive check fired); cascade-promoted: 4
+    no double-apply ✓; defensive already_acted_this_batch fired ✓
+
+[8] malformed action shapes (must not 5xx)
+    4 malformed shapes handled cleanly
+[9] empty list: {'applied': 0, 'applied_hashes': [], 'skipped': []}
+[10] IPC unknown keys: applied=0, skipped=[{'hash': 'node-112', 'reason': 'not_a_leaf'}]
+
+[11] COST: slow-path real-DROP batch
+    2654 actions, 63 ms total (0.024 ms/action), applied=2342
+[12] COST: 1k all-bogus fast path
+    7 ms (0.007 ms/action), applied=0
+[13] malformed HTTP payload returns 400
+[14] cascade: loop migrate(targets) until applied == 0
+    terminated in 6 iterations, cumulative applied=344; HBM 221693837 -> 0 (221693837 freed); leftover-with-data: 0
+[15] round-2 applied_hashes must be absent post-replay
+    round-2 applied=15, all absent ✓
+[16] concurrency: 2 threads, disjoint batches
+    thread A: applied=11/33, thread B: applied=31/33
+
+[17] TOCTOU: fetch_state -> chats interleave -> migrate
+    applied=41/66, skip reasons: {'not_a_leaf'}
+
+[18] mixed-tier batch
+    15 mixed actions, applied=2, reasons: {'not_a_leaf', 'demote_requires_existing_host_backup', 'already_on_hbm'}
+
+[19] overlapping concurrent batches (same 20 hashes)
+    thread A applied=8, thread B applied=8, overlap=0, total=16, batch_size=20
+
+[20] adversarial inputs: HTTP caps
+    long-hash and 100001-action batch both correctly 400'd
+
+[21] soak: 1000 small migrate calls, latency must stay bounded
+    p50=3.03ms, p99=4.46ms, early-median=2.49ms, late-median=3.69ms
+
+=== T2 PASSED (depth-audit + round-3) ===

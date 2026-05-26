@@ -7,6 +7,13 @@
   used_bytes + cap_bytes) and `units` (list of all evictable nodes).
 * Each unit object has at minimum: `hash, tier, n_tokens, n_bytes,
   last_access_time, hit_count, session_ids`.
+* Top-level: `page_size`, `bytes_per_token`, `tier_usage` (HBM + DRAM,
+  each `{used_bytes, cap_bytes}`).
+* **Forward-compat note**: the dump reads `node.session_ids` via
+  `try/except AttributeError` and emits `[]` when absent. T3
+  (`session_id` passthrough) just needs to populate the attribute
+  during tree insertion — the read path is already wired here. T3 does
+  NOT need to touch `dump_aginfer_state`.
 * Read-only — does not change cache state.
 
 **Cost ceiling** (revised after measuring on Qwen3-0.6B + flashinfer)
@@ -48,12 +55,30 @@ Mechanism (no harbor needed). `verify/t1_state_endpoint.py`:
 
 **PASSED** — happy path + worst-case forced injection, on Qwen3-0.6B + `--attention-backend flashinfer` (trtllm_mha auto-picks page_size=1 and bypasses sglang radix insertion; flashinfer + UnifiedRadixCache does insert).
 
-* date: 2026-05-25
+* date: 2026-05-25 (initial) / 2026-05-26 (bytes-schema rewrite)
 * sglang sha (initial impl): `bbf3e7b33`
 * sglang sha (after 10× perf opt): `82d2732d6`
-* lines added: 150 (initial) + 322 (after opt: refactor + bytes-path)
+* lines added: 150 (initial) + 322 (after opt) + ~40 (bytes-schema rewrite)
 * schema valid: ✓ (100 % across all measured snapshots)
-* invariants: ✓ no duplicate hash within a single response; Σ unit.n_tokens per tier == tier_usage.used_tokens within page_size
+* invariants: ✓ no duplicate hash within a single response;
+  Σ unit.n_bytes per tier == tier_usage.used_bytes within
+  page_size × bytes_per_token; n_bytes == n_tokens × bytes_per_token
+  for every unit
+* **Schema rewrite (2026-05-26)** after design audit found
+  `n_tokens`-vs-`n_bytes` drift (T1 README promised `n_bytes` but code
+  only emitted `n_tokens`). Paper §7 per-unit value rule needs BYTES
+  (the cost denominator); sticking to tokens-only would silently break
+  cross-tier value comparison when HiCache lands in T9. Now the
+  schema has:
+  - top-level: `page_size`, `bytes_per_token` (computed once from the
+    device KV pool's `get_bytes_per_token()` or
+    `get_kv_size_bytes() / size`)
+  - `tier_usage.{HBM,DRAM}.{used_bytes, cap_bytes}` (no `_tokens` fields)
+  - each unit: `n_tokens` AND `n_bytes` (the value NUMERATOR is
+    token-counted; the cost DENOMINATOR is byte-counted)
+* Measured on Qwen3-0.6B + flashinfer: `bytes_per_token = 114688`
+  (= 28 layers × 8 KV heads × 128 head_dim × 2 (K+V) × bf16; matches
+  the model config). HBM cap = 65 536 tokens × 114 688 = 7.5 GB.
 
 | Stage | metric | before opt | after opt | bound |
 |---|---|---:|---:|---:|

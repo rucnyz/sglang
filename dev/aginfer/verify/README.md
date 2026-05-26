@@ -68,7 +68,7 @@ Each task lives in its own folder `tN/` with:
 | 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | pending |
 | 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | pending |
 | 8 | T8 | admission_controller + watermark sensitivity | [`t8/`](t8/) | pending |
-| 9 | T9 | Run K + K-a ablation; revised acceptance (mean < 716 s) | [`t9/`](t9/) | pending |
+| 9 | T9 | Run K + K-a + J ablation (J validates §9 deployment claim w/o HiCache) | [`t9/`](t9/) | pending |
 | 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies | [`t10/`](t10/) | pending |
 
 Per-task `tN/results/` directories hold raw outputs (logs, JSON, harbor

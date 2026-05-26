@@ -46,16 +46,18 @@ def validate_schema(state: Dict[str, Any]) -> None:
     assert "tier_usage" in state, "missing tier_usage"
     assert "units" in state, "missing units"
     assert "page_size" in state, "missing page_size"
+    assert "bytes_per_token" in state, "missing bytes_per_token"
     tu = state["tier_usage"]
     for tier in ("HBM", "DRAM"):
         assert tier in tu, f"tier_usage missing {tier}"
-        assert "used_tokens" in tu[tier]
-        assert "cap_tokens" in tu[tier]
+        assert "used_bytes" in tu[tier], f"tier_usage[{tier}] missing used_bytes"
+        assert "cap_bytes" in tu[tier], f"tier_usage[{tier}] missing cap_bytes"
     for u in state["units"]:
         for k in (
             "hash",
             "tier",
             "n_tokens",
+            "n_bytes",
             "last_access_time",
             "hit_count",
             "session_ids",
@@ -69,15 +71,23 @@ def validate_invariants(state: Dict[str, Any]) -> None:
     assert len(hashes) == len(set(hashes)), (
         f"duplicate hash in single snapshot: {len(hashes) - len(set(hashes))} dups"
     )
-    # Sum-of-unit n_tokens per tier should match tier_usage.used_tokens.
-    by_tier = {"HBM": 0, "DRAM": 0}
+    # Sum-of-unit n_bytes per tier should match tier_usage.used_bytes.
+    by_tier_bytes = {"HBM": 0, "DRAM": 0}
     for u in state["units"]:
-        by_tier[u["tier"]] = by_tier.get(u["tier"], 0) + u["n_tokens"]
-    for tier, want in by_tier.items():
-        got = state["tier_usage"][tier]["used_tokens"]
+        by_tier_bytes[u["tier"]] = by_tier_bytes.get(u["tier"], 0) + u["n_bytes"]
+    bpt = state["bytes_per_token"]
+    page_bytes = state["page_size"] * max(1, bpt)
+    for tier, want in by_tier_bytes.items():
+        got = state["tier_usage"][tier]["used_bytes"]
         # Allow a one-page slack for race between walk + tier_usage read.
-        assert abs(want - got) <= state["page_size"], (
-            f"{tier}: Σ units={want}, tier_usage={got}"
+        assert abs(want - got) <= page_bytes, (
+            f"{tier}: Σ unit.n_bytes={want}, tier_usage.used_bytes={got}"
+        )
+    # n_bytes consistency: every unit must satisfy n_bytes == n_tokens * bytes_per_token.
+    for u in state["units"]:
+        expected = u["n_tokens"] * bpt
+        assert u["n_bytes"] == expected, (
+            f"unit {u['hash']}: n_bytes={u['n_bytes']} != n_tokens*bpt={expected}"
         )
 
 
@@ -96,9 +106,9 @@ def main() -> None:
     validate_invariants(state)
     n_units = len(state["units"])
     print(f"    units count: {n_units}")
-    print(f"    HBM used/cap: {state['tier_usage']['HBM']}")
-    print(f"    DRAM used/cap: {state['tier_usage']['DRAM']}")
-    print(f"    page_size: {state['page_size']}")
+    print(f"    HBM used/cap (bytes): {state['tier_usage']['HBM']}")
+    print(f"    DRAM used/cap (bytes): {state['tier_usage']['DRAM']}")
+    print(f"    page_size: {state['page_size']}, bytes_per_token: {state['bytes_per_token']}")
     assert n_units >= 30, f"expected >= 30 units, got {n_units}"
 
     # Stage 2: latency at small scale
