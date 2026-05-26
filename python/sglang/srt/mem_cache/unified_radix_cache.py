@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
+    peek_time_counter,
 )
 from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
@@ -2571,6 +2572,10 @@ class UnifiedRadixCache(BasePrefixCache):
             "units": units,
             "page_size": page_size,
             "bytes_per_token": bytes_per_token,
+            # Monotonic access-tick counter; daemon computes unit age
+            # as `time_counter - last_access_time`.  Same scale as the
+            # counter that stamps each node's last_access_time.
+            "time_counter": int(peek_time_counter()),
         }
 
     def _dump_aginfer_state_bytes_inner(
@@ -2693,6 +2698,8 @@ class UnifiedRadixCache(BasePrefixCache):
         out += str(page_size).encode("ascii")
         out += b',"bytes_per_token":'
         out += str(bytes_per_token).encode("ascii")
+        out += b',"time_counter":'
+        out += str(int(peek_time_counter())).encode("ascii")
         out += b"}"
         return bytes(out)
 

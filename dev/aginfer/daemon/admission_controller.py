@@ -197,7 +197,7 @@ class AdmissionController:
                 state_json = await router.fetch_state()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "admission: state fetch failed for %s: %s",
+                    "admission: state fetch failed for %s: %r",
                     event.kind.value, exc,
                 )
                 return
@@ -268,7 +268,7 @@ class AdmissionController:
                 state_json = await router.fetch_state()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "admission: state fetch failed for %s: %s",
+                    "admission: state fetch failed for %s: %r",
                     event.kind.value, exc,
                 )
                 return

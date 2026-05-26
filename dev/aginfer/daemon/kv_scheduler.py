@@ -551,7 +551,7 @@ class KvScheduler:
             state_json = await router.fetch_state()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "kv_scheduler: /aginfer/state fetch failed for %s: %s",
+                "kv_scheduler: /aginfer/state fetch failed for %s: %r",
                 event.kind.value, exc,
             )
             return
