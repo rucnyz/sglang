@@ -18,6 +18,24 @@ adversarial conditions a real long-running deployment will see.
   identified on resume (no permanent stall, no all-resume-storm).
 * **program_tracker GC bounds memory**: 24 h synthetic load with 10 k
   unique program_ids → memory < 100 MB.
+* **Daemon-controlled L3 (DISK) tier via Mooncake**: today
+  `apply_aginfer_migrations` returns `"disk_tier_not_yet_wired"` for
+  `target_tier="DISK"` and `dump_aginfer_state` emits DISK as a zero
+  placeholder.  T10 wires the full path:
+  - `UnifiedTreeNode` gains a `disk_state` field (or analogous lookup
+    via `hicache_storage_backend`) tracking which L3 keys reference
+    this node.
+  - `dump_aginfer_state` reports real `DISK.{used_bytes, cap_bytes}`
+    from the Mooncake/HiCache storage backend.
+  - `apply_aginfer_migrations` accepts `DISK` target: calls
+    `cache_controller.write_through_to_storage(...)` (or equivalent
+    L3 sink) on host_value, marks the node as disk-backed, returns
+    `applied`.
+  - kv_scheduler treats DISK as a real demote target in
+    `_top_k_by_regret` (currently filtered to HBM only — paper §7.1
+    says the regret proxy should rank across all current-tier units).
+  Done correctly, daemon's memory_pressure response can push cold
+  prefixes to Mooncake's RDMA pool, freeing both HBM AND DRAM.
 
 **Cost ceiling**
 * No additional sglang code beyond T1-T5; T10 is purely test code.
@@ -78,6 +96,27 @@ E2E and stress combo. `verify/t10_integration.sh`:
 4. Assert: RSS < 100 MB at all sample points; program_tracker.size()
    stays < 200 (= idle programs GC'd).
 
+=== Stress F: daemon-controlled L3 (DISK) tier round-trip ===
+1. Launch sglang with `--hicache-storage-backend mooncake` and a
+   Mooncake test cluster (or in-process mock store).
+2. Send a tagged chat completion with a long shared prefix so HBM
+   + DRAM both have data for that node.
+3. Daemon issues `POST /aginfer/migrate` with
+   `{"hash": <node>, "target_tier": "DISK"}`.
+4. Assert:
+   - sglang returns `applied: 1` (NOT `skipped: disk_tier_not_yet_wired`).
+   - Subsequent `GET /aginfer/state` shows non-zero `DISK.used_bytes`
+     AND the node is no longer in HBM / DRAM `used_bytes`.
+   - A new request that hits the same prefix triggers a `prefetch`
+     from Mooncake; tagging preserved.
+5. Repeat 100× with varied prefixes; assert sglang's `cache_hit`
+   counter includes the L3-restored prefixes.
+
+This stress validates the paper §3 4-tier story end-to-end, not just
+HBM↔DRAM.  Prereq: `UnifiedTreeNode.disk_state` field + migrate-to-
+disk codepath that lands in T10 (not in T1 / T2 scope; T1/T2 only
+pin the wire schema for HBM/DRAM).
+
 === Stress E: webhook flood + idempotency ===
 1. Stub sglang fires 10 k memory_pressure events in 10 s (i.e. 1000/s),
    half of which are duplicates of the previous payload.
@@ -99,6 +138,7 @@ T10 IS the worst-case test suite. The "predicted floor" per row:
 | C daemon restart | Run K mean within ± 10 % of clean Run K; ≤ 1 extra errored trial |
 | D program_tracker GC | RSS < 100 MB at 24 h; tracker.size() < 200 |
 | E webhook flood | All events handled within 20 s; no exception; ≤ 10 k migrate POSTs |
+| F L3 (DISK) tier round-trip | sglang accepts `target_tier="DISK"` (no `disk_tier_not_yet_wired`); `/aginfer/state` shows `DISK.used_bytes > 0` after demote; cache_hit counter increments on L3 prefetch |
 
 If any row exceeds the floor, that floor row's component owner reopens
 their TODO.
@@ -110,4 +150,5 @@ their TODO.
 * C daemon restart Run K mean: _pending_
 * D GC RSS @ 24 h: _pending_
 * E flood handling time: _pending_
+* F L3 demote+prefetch round-trip: _pending_
 * raw log: `verify/results/t10_<datetime>.log`

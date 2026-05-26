@@ -402,7 +402,10 @@ def _top_k_by_regret(
     items: List[Tuple[float, str]] = []
     for uid, u in units.items():
         if u.tier != Tier.HBM:
-            # Only HBM-resident units are candidates for "free me up".
+            # v1: only HBM-resident units are demote candidates.  T10
+            # extends this to also rank DRAM units once the daemon-
+            # controlled DISK (L3 / Mooncake) tier is wired — paper §7.1
+            # says regret should rank across all current-tier units.
             continue
         saved = u.p_hat * (rho_disk - rho_hbm) * u.n_tokens
         # Holding tax proxy (per unit time):

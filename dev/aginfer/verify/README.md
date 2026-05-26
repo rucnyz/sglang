@@ -69,7 +69,7 @@ Each task lives in its own folder `tN/` with:
 | 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | **passed** (2026-05-26, 10 verify steps, ~390 LoC daemon code; build 3.2 ms / decide 1.4 ms @ 1k units) |
 | 8 | T8 | admission_controller + watermark sensitivity | [`t8/`](t8/) | pending |
 | 9 | T9 | Run K + K-a + J ablation (J validates §9 deployment claim w/o HiCache) | [`t9/`](t9/) | pending |
-| 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies | [`t10/`](t10/) | pending |
+| 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies + daemon-controlled L3 (DISK) tier via Mooncake (paper §3 4-tier completion) | [`t10/`](t10/) | pending |
 
 Per-task `tN/results/` directories hold raw outputs (logs, JSON, harbor
 result dirs, optimization writeups) for that task only — no cross-task
