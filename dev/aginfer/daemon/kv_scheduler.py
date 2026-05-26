@@ -169,9 +169,16 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         "DRAM": {"used_bytes": 0, "cap_bytes": 0},
         "DISK": {"used_bytes": 0, "cap_bytes": 0},
     }
+    # Track each hash's index in agg_units so we can update on tier
+    # disagreement (audit round-5 MINOR: mid-migration race where
+    # rank-0 still reports HBM while rank-1 already reports DRAM —
+    # prefer the COLDER tier under the assumption the migration is
+    # in-progress and the unit is on its way out of hot tiers).
     agg_units: List[Dict[str, Any]] = []
-    seen_hashes: set = set()
+    hash_to_idx: Dict[str, int] = {}
     agg_time = 0
+    # Tier ordering (colder = lower value): DROP < DISK < DRAM < HBM.
+    _tier_rank = {"HBM": 3, "DEVICE": 3, "DRAM": 2, "HOST": 2, "DISK": 1, "DROP": 0}
     for rank in per_rank:
         rank_tu = rank["tier_usage"]
         for label in agg_tu:
@@ -180,13 +187,17 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
             agg_tu[label]["cap_bytes"] += int(sub["cap_bytes"])
         for u in rank["units"]:
             uhash = str(u["hash"])
-            if uhash in seen_hashes:
-                # Replicated-prefix case: same logical unit on multiple
-                # ranks.  Broadcast migrate is correct; dedupe here so
-                # the policy doesn't see two ReuseUnits competing for
-                # the same hash.
+            if uhash in hash_to_idx:
+                # Replicated-prefix or in-flight migration: same hash
+                # on multiple ranks.  If tiers disagree, keep the
+                # COLDER one (assume migration is in progress).
+                existing = agg_units[hash_to_idx[uhash]]
+                new_rank = _tier_rank.get(str(u["tier"]).upper(), 99)
+                old_rank = _tier_rank.get(str(existing["tier"]).upper(), 99)
+                if new_rank < old_rank:
+                    agg_units[hash_to_idx[uhash]] = dict(u)
                 continue
-            seen_hashes.add(uhash)
+            hash_to_idx[uhash] = len(agg_units)
             agg_units.append(dict(u))
         agg_time = max(agg_time, int(rank["time_counter"]))
     return {
@@ -243,6 +254,17 @@ def build_paper_state(
         last_access_time, hit_count, session_ids
       * time_counter: int
     """
+    # Audit round-5 MAJOR: scheduler emits ``unsupported_tree_cache``
+    # marker when the tree cache doesn't expose ``dump_aginfer_state``
+    # (e.g. a non-Unified RadixCache).  Daemon used to silently see
+    # all-zero state and make no decisions — log a one-shot warning
+    # per tree-cache class name so ops can grep for the misconfig.
+    marker = state_json.get("unsupported_tree_cache")
+    if marker:
+        _log_unknown_tier_once(
+            f"unsupported_tree_cache:{marker}", unknown_tier_log
+        )
+
     # Audit round-1 B2: multi-rank sglang (TP × DP > 1) emits
     # ``{"per_rank": [...]}``; aggregate into a single global view.
     state_json = _flatten_per_rank(state_json)

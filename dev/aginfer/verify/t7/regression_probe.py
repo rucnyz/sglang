@@ -1594,6 +1594,193 @@ async def probe_r3_depth4_null_fetch_state() -> None:
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
 
+# ---------------------------------------------------------------- R5-MINOR
+
+
+def probe_r5_per_rank_tier_disagree_prefers_colder() -> None:
+    """R5-MINOR: when the same hash appears on TWO ranks with
+    different ``tier`` values (mid-migration race), the dedupe should
+    keep the COLDER tier — the migration is in-progress, so the
+    unit is on its way out of HBM, not arriving.
+
+    PRE-FIX (`continue` on dup): rank-0's stale HBM view wins; the
+    policy sees a "hot HBM unit" that's actually being demoted to
+    DRAM right now → could schedule contradictory migrations.
+    POST-FIX (prefer colder tier): dedup keeps the DRAM-side row,
+    safer under in-flight migration.
+    """
+    name = "R5-MINOR (per_rank tier-disagree dedupe prefers colder)"
+
+    per_rank_state = {
+        "per_rank": [
+            {
+                "tier_usage": {
+                    "HBM": {"used_bytes": 1 << 20, "cap_bytes": 1 << 30},
+                    "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DISK": {"used_bytes": 0, "cap_bytes": 0},
+                },
+                "units": [
+                    {
+                        "hash": "u-mid-migration",
+                        "tier": "HBM",            # rank-0 still sees HBM
+                        "n_tokens": 1024,
+                        "n_bytes": 1 << 20,
+                        "last_access_time": 0,
+                        "hit_count": 1,
+                        "session_ids": [],
+                    }
+                ],
+                "time_counter": 10,
+            },
+            {
+                "tier_usage": {
+                    "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DRAM": {"used_bytes": 1 << 20, "cap_bytes": 1 << 30},
+                    "DISK": {"used_bytes": 0, "cap_bytes": 0},
+                },
+                "units": [
+                    {
+                        "hash": "u-mid-migration",
+                        "tier": "DRAM",           # rank-1 already demoted
+                        "n_tokens": 1024,
+                        "n_bytes": 1 << 20,
+                        "last_access_time": 0,
+                        "hit_count": 1,
+                        "session_ids": [],
+                    }
+                ],
+                "time_counter": 10,
+            },
+        ]
+    }
+
+    def _check() -> bool:
+        s = kvs_mod.build_paper_state(
+            per_rank_state,
+            event=Event(kind=EventKind.MEMORY_PRESSURE),
+            tracker=ProgramTracker(),
+            unknown_tier_log=set(),
+        )
+        from baselines.base import Tier
+        return s.units["u-mid-migration"].tier == Tier.DRAM
+
+    post_fix_passed = _check()
+
+    # PRE-FIX: monkey-patch _flatten_per_rank to use the OLD "first
+    # rank wins" dedupe (continue on dup).
+    saved = kvs_mod._flatten_per_rank
+
+    def _bug_flatten(state_json):
+        if "per_rank" not in state_json:
+            return state_json
+        per_rank = state_json["per_rank"]
+        agg_tu = {
+            "HBM": {"used_bytes": 0, "cap_bytes": 0},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 0},
+            "DISK": {"used_bytes": 0, "cap_bytes": 0},
+        }
+        agg_units = []
+        seen = set()
+        agg_time = 0
+        for rank in per_rank:
+            rank_tu = rank["tier_usage"]
+            for label in agg_tu:
+                sub = rank_tu[label]
+                agg_tu[label]["used_bytes"] += int(sub["used_bytes"])
+                agg_tu[label]["cap_bytes"] += int(sub["cap_bytes"])
+            for u in rank["units"]:
+                uhash = str(u["hash"])
+                if uhash in seen:
+                    continue  # BUG: first rank wins
+                seen.add(uhash)
+                agg_units.append(dict(u))
+            agg_time = max(agg_time, int(rank["time_counter"]))
+        return {
+            "tier_usage": agg_tu,
+            "units": agg_units,
+            "time_counter": agg_time,
+        }
+
+    kvs_mod._flatten_per_rank = _bug_flatten
+    try:
+        pre_fix_passed = _check()
+    finally:
+        kvs_mod._flatten_per_rank = saved
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
+# ---------------------------------------------------------------- R5-MAJOR
+
+
+def probe_r5_unsupported_tree_cache_log() -> None:
+    """R5-MAJOR: scheduler's unsupported-tree-cache fallback emits an
+    ``unsupported_tree_cache: <class-name>`` marker on the state
+    payload, BUT the daemon never consumes it.  round-4 commit
+    message promised "daemon logs a one-shot warning" — that promise
+    was unmet (no consumer for the marker → silent zero behavior
+    when sglang's tree cache doesn't support aginfer dump).
+
+    POST-FIX: build_paper_state detects the marker on first sight
+    and emits a `logger.warning` (deduped per class name via the
+    same instance log set used for unknown tiers).
+    PRE-FIX: nothing logged.
+    """
+    name = "R5-MAJOR (unsupported_tree_cache marker is logged once)"
+    import logging
+    import io
+
+    state_with_marker = {
+        "unsupported_tree_cache": "MysteryTreeCache",
+        "tier_usage": {
+            "HBM": {"used_bytes": 0, "cap_bytes": 0},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 0},
+            "DISK": {"used_bytes": 0, "cap_bytes": 0},
+        },
+        "units": [],
+        "time_counter": 0,
+    }
+
+    def _capture_logs(monkey_patch_strip_logger: bool) -> str:
+        # Reset module logger to capture into a buffer.
+        log_buf = io.StringIO()
+        handler = logging.StreamHandler(log_buf)
+        handler.setLevel(logging.WARNING)
+        logger = logging.getLogger("daemon.kv_scheduler")
+        prev_handlers = logger.handlers[:]
+        logger.handlers = [handler]
+        logger.setLevel(logging.WARNING)
+        # Optionally simulate the BUG by monkey-patching the build to
+        # NOT emit any warning (pre-fix behavior).
+        saved = kvs_mod.build_paper_state
+        if monkey_patch_strip_logger:
+            def _bug_build(state_json_in, **kw):
+                # Pre-fix: ignore the marker entirely.
+                sj = {k: v for k, v in state_json_in.items() if k != "unsupported_tree_cache"}
+                return saved(sj, **kw)
+            kvs_mod.build_paper_state = _bug_build
+        try:
+            kvs_mod.build_paper_state(
+                state_with_marker,
+                event=Event(kind=EventKind.MEMORY_PRESSURE),
+                tracker=ProgramTracker(),
+                unknown_tier_log=set(),
+            )
+        finally:
+            kvs_mod.build_paper_state = saved
+            logger.handlers = prev_handlers
+        return log_buf.getvalue()
+
+    post_logs = _capture_logs(monkey_patch_strip_logger=False)
+    pre_logs = _capture_logs(monkey_patch_strip_logger=True)
+
+    # FIX: marker class name appears in the warning output.
+    post_fix_passed = "MysteryTreeCache" in post_logs
+    pre_fix_passed = "MysteryTreeCache" in pre_logs
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
 # ---------------------------------------------------------------- R3.5 tier-missing
 
 
@@ -2068,6 +2255,8 @@ def main() -> None:
     asyncio.run(probe_r3_depth4_null_fetch_state())
     asyncio.run(probe_r3_depth5_no_caching_contract())
     probe_r35_tier_field_missing()
+    probe_r5_unsupported_tree_cache_log()
+    probe_r5_per_rank_tier_disagree_prefers_colder()
     print()
     print("=== T7 regression_probe PASSED ===")
 
