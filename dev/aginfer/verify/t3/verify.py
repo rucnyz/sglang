@@ -321,27 +321,55 @@ def main() -> None:
             assert len(sid) <= 64, f"sid not truncated: len={len(sid)}: {sid[:80]}"
     print("    5 bogus shapes handled cleanly; all session_ids <= 64 chars")
 
-    # ---- [7] Latency micro-bench: tagging overhead vs untagged ----
-    print("\n[7] latency micro-bench: tagged vs untagged")
-    # Tagged
-    t0 = time.perf_counter()
-    for i in range(20):
-        chat(f"micro tagged {i}", program_id="micro-bench")
-    tagged_ms = (time.perf_counter() - t0) * 1000
-    # Untagged
-    t0 = time.perf_counter()
-    for i in range(20):
-        chat(f"micro untagged {i}", program_id=None)
-    untagged_ms = (time.perf_counter() - t0) * 1000
-    print(f"    20 tagged: {tagged_ms:.0f} ms, 20 untagged: {untagged_ms:.0f} ms")
-    # Cost ceiling per README: < 0.1 ms/req amortized for the tag overhead.
-    # Total cost is dominated by inference; this is just a sanity check that
-    # tagging doesn't add a measurable fraction.
-    overhead_per_req_ms = (tagged_ms - untagged_ms) / 20
-    print(f"    estimated overhead: {overhead_per_req_ms:+.2f} ms/req "
-          f"(noise tolerated; ceiling 5 ms)")
-    assert abs(overhead_per_req_ms) < 5.0, (
-        f"tagging adds {overhead_per_req_ms:.2f} ms/req — way above 0.1 ms ceiling"
+    # ---- [7] Sanitizer microbench: pure _sanitize_program_id cost ----
+    #
+    # Audit round-2 ("audit of tests"): the previous version compared
+    # end-to-end tagged vs untagged chat() latency, where total cost is
+    # dominated by inference jitter (hundreds of ms).  The cost ceiling
+    # claim is < 0.1 ms PER CALL for the sanitize/tag path; that signal
+    # was completely buried — a 30× regression in the sanitizer would
+    # not move the 5 ms ceiling.  We now microbench the sanitizer
+    # directly: 5 runs × 10 000 calls each, report mean+std per call,
+    # assert mean+3σ well below the 0.1 ms/call claim.  Per
+    # memory:feedback-latency-multi-run.
+    print("\n[7] sanitizer microbench: _sanitize_program_id direct cost")
+    import statistics
+    from sglang.srt.managers.schedule_batch import _sanitize_program_id
+
+    N_RUNS = 5
+    N_PER_RUN = 10_000
+    # Mix of shapes the production path actually sees:
+    #   * happy short str  (the >99 % case)
+    #   * None             (untagged path)
+    #   * long str         (truncation branch)
+    #   * list-of-one      (recursion branch)
+    sample_inputs = [
+        "prog-A",
+        None,
+        "x" * 200,
+        ["nested-pid"],
+    ]
+    run_means: list[float] = []
+    for _ in range(N_RUNS):
+        t0 = time.perf_counter()
+        for i in range(N_PER_RUN):
+            _sanitize_program_id(sample_inputs[i & 3])
+        elapsed_us = (time.perf_counter() - t0) * 1e6
+        run_means.append(elapsed_us / N_PER_RUN)
+    mean_us = statistics.mean(run_means)
+    std_us = statistics.stdev(run_means)
+    envelope_us = mean_us + 3.0 * std_us
+    print(
+        f"    _sanitize_program_id: {mean_us:.2f} ± {std_us:.2f} µs/call "
+        f"({N_RUNS} runs × {N_PER_RUN} calls; mean+3σ {envelope_us:.2f} µs)"
+    )
+    # Ceiling: 10 µs/call (0.01 ms) — 10× the claim (0.001 ms / call
+    # would be sub-microsecond, unreliable under Python timer jitter)
+    # but 100× tighter than the old 5 ms ceiling.  Catches a 3–5×
+    # regression (e.g., adding json.loads + json.dumps to the path).
+    assert envelope_us < 10.0, (
+        f"_sanitize_program_id mean+3σ = {envelope_us:.2f} µs/call exceeds "
+        f"10 µs ceiling (mean={mean_us:.2f}, std={std_us:.2f})"
     )
 
     # ---- [8] Retro-tagging: untagged then tagged on the same prefix ----

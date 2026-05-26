@@ -122,6 +122,43 @@ daemon-bound POSTs for assertion.
 **PASSED** — Layer A (10 steps post-audit) + Layer B (full sglang
 webhook path on a real GPU) both clean.
 
+### Audit round-2: "are tests real tests?"
+
+A follow-up audit checked whether the round-1 production fixes were
+actually PINNED by regression-catching tests (per the meta-rule that
+fake / vacuous tests slipped through T3/T4 earlier rounds).  Findings:
+
+* A1 (M3 `ts_monotonic`) was **unpinned** — no test asserted the
+  field existed in the payload.  Fixed: new step [A11] asserts both
+  `ts` and `ts_monotonic` are floats.  Bisect demo: deleting the
+  field trips the assertion immediately.
+* A3 (retry-on-500 path) was **entirely untested** — `fail_first_n`
+  helper existed but no call site used it.  Fixed: step [A11] uses
+  `fail_first_n=2`; asserts capturer ultimately receives the body.
+  Bisect demo: changing `range(3)` → `range(1)` in `_send` trips
+  the assertion.
+* A4 (M5 `task_done` pairing) was unpinned — no `queue.join()`
+  anywhere.  Fixed: `la_serial_dispatch` now calls
+  `await asyncio.wait_for(router.bus.queue.join(), timeout=2.0)`
+  after the 100-event burst.  A regression removing the
+  `finally: task_done()` would hang here forever.
+* A5 (M1 non-default theta plumb) was unpinned — only default
+  0.7/0.9 was tested.  Fixed: `la_cold_start_probe` now runs two
+  scenarios — (a) default 0.7 + occ=0.885, (b) theta_hi=0.5 +
+  occ=0.595.  Pre-M1 hardcoded 0.7 would skip (b).
+* A7 (Layer B `still_high >= 1` floor) was trivially loose.  Fixed:
+  tightened to `>= 2` (matches plateau hold ~6 s @ heartbeat 2 s).
+* A2 (B2 close lifecycle) and A6 (T4 round-1 MAJOR broader-except)
+  were partially addressed:
+  - A2: step [A11] does construct + close the firer; the close()
+    path is exercised, though without an in-flight request to
+    stress-test the `aclose()`-on-pending-client branch.
+  - A6: NEW step [11a] in T4 verify monkey-patches the daemon's
+    http_client to raise a non-RequestError; asserts the 502
+    response AND that `tracker.state(pid) != REASONING`.  A revert
+    of T4 round-1 MAJOR's broader `except Exception` would re-raise
+    and skip `_emit_completion`, failing this test.
+
 ### Audit round-1 findings + resolution
 
 Found 2 BLOCKER + 7 MINOR + 5 NIT.  Real fixes:
@@ -219,9 +256,12 @@ Documented (not coded around) for v1:
 | event arrival → handler entry **p99** | **1.08 ± 0.10 ms** |
 
 Budget per DESIGN.md "Acknowledged costs": event-handler latency p99
-< 80 ms.  Measurement ≈75× under the budget (in-process loopback +
-noop handler).  T7 / T8 will register real handlers and re-measure
-end-to-end "event arrival → migrate POST returns".
+< 80 ms.  Audit round-2 ("audit of tests") tightened the verify
+assertion from ``p99_mean + p99_std < 80 ms`` (which would have
+passed at 100× regression) to ``mean + 3σ < 5 ms`` for both p50 and
+p99 — current envelope ~1.4 ms.  T7 / T8 will register real handlers
+and re-measure end-to-end "event arrival → migrate POST returns";
+the 80 ms DESIGN budget remains the system-wide ceiling.
 
 ### Layer B summary (real sglang on GPU 4)
 

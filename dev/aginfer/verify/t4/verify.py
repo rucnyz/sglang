@@ -433,6 +433,65 @@ async def step_streaming_connect_error() -> None:
     )
 
 
+async def step_unary_non_request_error_recovers() -> None:
+    """[11b] Round-tests audit A6: T4 round-1 added a broader
+    ``except Exception`` to the unary path so a non-RequestError
+    (e.g. httpx.RemoteProtocolError, JSON decode failure on the
+    response, anything raised by Response() construction) doesn't
+    leave the program stuck in REASONING.
+
+    A regression that narrows the catch to ``except httpx.RequestError``
+    would not be caught by step [8] (which already raises a real
+    RequestError -- the existing narrow except handles it).
+
+    Force the broader catch by monkey-patching the daemon's
+    httpx client.post to raise a non-RequestError.
+    """
+    import httpx as _hx
+
+    bus = EventBus()
+    tracker = ProgramTracker()
+    daemon = create_app(
+        sglang_base_url="http://127.0.0.1:1",  # not used; we patch
+        event_bus=bus,
+        program_tracker=tracker,
+        enable_event_router=False,
+    )
+    daemon_p = _free_port()
+    async with run_server(daemon, "127.0.0.1", daemon_p):
+        # After startup, replace the client.post with one that raises
+        # a NON-RequestError subclass of HTTPError.
+        class _StubError(Exception):
+            """Not a subclass of httpx.RequestError -- exercises the
+            broader except Exception branch."""
+
+        original_post = daemon.state.http_client.post
+
+        async def _bad_post(*a, **kw):
+            raise _StubError("simulated non-RequestError")
+
+        daemon.state.http_client.post = _bad_post
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(
+                    f"http://127.0.0.1:{daemon_p}/v1/chat/completions",
+                    json={
+                        "model": "stub",
+                        "messages": [{"role": "user", "content": "weird"}],
+                        "max_tokens": 4,
+                        "program_id": "prog-WEIRD-EXCEPTION",
+                    },
+                )
+            assert r.status_code == 502, r.status_code
+            # tracker recovered -- not stuck in REASONING.
+            from daemon.program_tracker import State as _State
+            assert tracker.state("prog-WEIRD-EXCEPTION") != _State.REASONING, (
+                tracker.state("prog-WEIRD-EXCEPTION")
+            )
+        finally:
+            daemon.state.http_client.post = original_post
+
+
 async def step_stream_field_is_strict_bool() -> None:
     """[11] MINOR (round-1 audit): ``"stream": "false"`` (string,
     truthy) must NOT trigger the streaming branch.  Only ``True`` does.
@@ -611,16 +670,21 @@ async def step_latency_overhead(daemon_url: str, stub_url: str) -> dict:
         f"{stats['overhead_p99_std']:.2f} ms"
     )
 
-    # Use (mean + 1 std) for the assertion so a single noisy run
-    # doesn't flake the suite.  Ceiling is intentionally generous
-    # for in-process loopback; a real regression blows past it.
-    p50_ceiling = stats["overhead_p50_mean"] + stats["overhead_p50_std"]
-    p99_ceiling = stats["overhead_p99_mean"] + stats["overhead_p99_std"]
-    assert p50_ceiling < 10.0, (
-        f"proxy p50 overhead mean+std = {p50_ceiling:.2f} ms exceeds 10 ms"
+    # Audit round-2 ("audit of tests"): previous floor was p50<10 ms /
+    # p99<25 ms but actual is ~1.5 ms / ~2 ms — a 5–10× regression in
+    # the proxy hot path (e.g., synchronous deepcopy per request) would
+    # slip through.  Tighten to mean + 3σ < 5 ms (~3.3× current actual,
+    # ~3σ tolerance over 5 runs of 50 reqs).  Per memory:feedback-
+    # latency-multi-run.
+    p50_envelope = stats["overhead_p50_mean"] + 3.0 * stats["overhead_p50_std"]
+    p99_envelope = stats["overhead_p99_mean"] + 3.0 * stats["overhead_p99_std"]
+    assert p50_envelope < 5.0, (
+        f"proxy p50 overhead mean+3σ = {p50_envelope:.2f} ms exceeds 5 ms "
+        f"(mean={stats['overhead_p50_mean']:.2f}, std={stats['overhead_p50_std']:.2f})"
     )
-    assert p99_ceiling < 25.0, (
-        f"proxy p99 overhead mean+std = {p99_ceiling:.2f} ms exceeds 25 ms"
+    assert p99_envelope < 5.0, (
+        f"proxy p99 overhead mean+3σ = {p99_envelope:.2f} ms exceeds 5 ms "
+        f"(mean={stats['overhead_p99_mean']:.2f}, std={stats['overhead_p99_std']:.2f})"
     )
     return stats
 
@@ -646,13 +710,18 @@ async def main() -> None:
     stub_port = _free_port()
     stub_url = f"http://127.0.0.1:{stub_port}"
 
-    # Build daemon pointing at stub.
+    # Build daemon pointing at stub.  T4 tests inspect the EventBus's
+    # queue directly via _drain_queue; the T5 event_router worker
+    # would race us to drain those events.  Disable the router for
+    # the T4 happy-path daemon (event_router is independently covered
+    # by T5 verify).
     bus = EventBus()
     tracker = ProgramTracker()
     daemon_app = create_app(
         sglang_base_url=stub_url,
         event_bus=bus,
         program_tracker=tracker,
+        enable_event_router=False,
     )
     daemon_port = _free_port()
     daemon_url = f"http://127.0.0.1:{daemon_port}"
@@ -703,6 +772,10 @@ async def main() -> None:
     await step_streaming_connect_error()
     print("[10] BLOCKER 2 fix: streaming with dead upstream -> real "
           "502, not 200 with in-band error frame ✓")
+
+    await step_unary_non_request_error_recovers()
+    print("[11a] round-1 MAJOR fix: unary path catches non-RequestError "
+          "exceptions, tracker recovers (no stuck-in-REASONING) ✓")
 
     await step_stream_field_is_strict_bool()
     print("[11] MINOR fix: stream=\"false\" (string, truthy) does NOT "

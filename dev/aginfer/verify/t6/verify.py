@@ -179,31 +179,70 @@ async def step_concurrent_arrival_completion() -> None:
 
     asyncio is single-threaded so there's no actual race.  After
     asyncio.gather both bursts of length N, the deterministic
-    interleave puts the LAST observe call as ``observe_completion``
-    (both bursts yield with sleep(0); the gather drives them in turn
-    and the longer-ending one writes last; both have same length, so
-    the second-scheduled wins).  We tighten the assertion to: final
-    state is whatever the FINAL call set it to, observable by checking
-    state==ACTING (last completion ran after last arrival on this loop).
+    interleave puts the LAST observe call as ``observe_completion``.
+
+    Audit round-2 ("audit of tests"): the previous version derived
+    its prediction from ``history[-1]`` and then asserted the same
+    quantity, which would pass even if the tracker silently dropped
+    every other transition (history would be missing the same
+    entries).  We now (a) snapshot the tracker's state immediately
+    after EACH observe_*, which catches a silently-no-op observe
+    call (state would stay stale), and (b) count the matching
+    snapshots — a regression that drops 50 % of transitions would
+    show up as a mismatch count.  The final-state check is kept as
+    the smoke / convergence assertion.
     """
     pt = ProgramTracker()
     N = 100
     PID = "p-spam"
     history: list[str] = []
+    arrival_snapshots: list[State] = []
+    completion_snapshots: list[State] = []
 
     async def arrival_burst():
         for _ in range(N):
             pt.observe_arrival(PID)
+            arrival_snapshots.append(pt.state(PID))
             history.append("A")
             await asyncio.sleep(0)
 
     async def completion_burst():
         for _ in range(N):
             pt.observe_completion(PID)
+            completion_snapshots.append(pt.state(PID))
             history.append("C")
             await asyncio.sleep(0)
 
     await asyncio.gather(arrival_burst(), completion_burst())
+
+    assert len(arrival_snapshots) == N, (
+        f"arrival burst ran {len(arrival_snapshots)} of {N} iterations"
+    )
+    assert len(completion_snapshots) == N, (
+        f"completion burst ran {len(completion_snapshots)} of {N} iterations"
+    )
+    bad_arrival = [
+        i for i, s in enumerate(arrival_snapshots) if s is not State.REASONING
+    ]
+    assert not bad_arrival, (
+        f"observe_arrival did NOT transition to REASONING at indices "
+        f"{bad_arrival[:5]}... ({len(bad_arrival)}/{N}); tracker is "
+        f"silently dropping arrival transitions"
+    )
+    # Completion snapshots tolerate one quirk: if scheduler runs a full
+    # arrival burst first (it shouldn't with sleep(0), but be precise),
+    # the completion seen right after that may briefly observe ACTING
+    # then REASONING.  Single-threaded asyncio with sleep(0) actually
+    # round-robins, so each observe_completion lands on a state that
+    # was just REASONING — we expect ACTING after every completion.
+    bad_completion = [
+        i for i, s in enumerate(completion_snapshots) if s is not State.ACTING
+    ]
+    assert not bad_completion, (
+        f"observe_completion did NOT transition to ACTING at indices "
+        f"{bad_completion[:5]}... ({len(bad_completion)}/{N}); tracker is "
+        f"silently dropping completion transitions"
+    )
     final = pt.state(PID)
     last_event = history[-1]
     expected = State.REASONING if last_event == "A" else State.ACTING
@@ -217,32 +256,42 @@ async def step_concurrent_arrival_completion() -> None:
 async def step_program_churn_memory_bound() -> None:
     """[7] WORST CASE: 10 k unique program_ids; tracker memory bounded.
 
-    Per-program cost is ~300 bytes (state str + asyncio.Event); 10k
-    programs ≈ 3 MB.  v1 has no GC; T8/T9 may add an LRU cap if
-    profiling shows churn-driven growth.  We measure RSS delta to
-    pin the actual cost (audit round-1 MINOR 6: the "memory bounded"
-    claim was previously unverified).
-    """
-    import os
-    import resource
+    Per-program cost claim is ~300 bytes (state str + asyncio.Event
+    lazy slot); 10k programs ≈ 3 MB.  v1 has no GC; T8/T9 may add an
+    LRU cap if profiling shows churn-driven growth.
 
-    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    pt = ProgramTracker()
+    Audit round-2 ("audit of tests"): the previous version used
+    ``resource.getrusage().ru_maxrss`` which is the high-watermark
+    (not a delta) and capped at 50 MB — both flaws meant a 15×
+    per-program regression would slip through silently.  We now use
+    ``tracemalloc`` for a true delta and cap at 5 MB, which still
+    leaves headroom over the 3 MB nominal but catches an order-of-
+    magnitude regression.  Per memory:feedback-latency-multi-run
+    spirit (cost claims must be tight).
+    """
+    import tracemalloc
+
+    pt = ProgramTracker()  # allocate the bare tracker BEFORE measuring
+    tracemalloc.start()
+    before, _peak_before = tracemalloc.get_traced_memory()
     for i in range(10_000):
         pid = f"churn-{i}"
         pt.observe_arrival(pid)
         pt.observe_completion(pid)
+    after, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
     assert pt.size() == 10_000
-    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # ru_maxrss is kilobytes on Linux; MB on macOS.  Treat as KB.
-    delta_kb = rss_after - rss_before
-    delta_mb = delta_kb / 1024
-    # Generous cap: 10k programs should fit in 50 MB even with Python
-    # overhead, asyncio.Event internals, dict resizing etc.
-    assert delta_mb < 50, (
-        f"10k programs added {delta_mb:.1f} MB to RSS; expected <50 MB. "
-        f"This suggests per-program overhead is much larger than the "
-        f"~300 B/program docstring estimate."
+    delta_bytes = after - before
+    delta_mb = delta_bytes / (1024 * 1024)
+    bytes_per_program = delta_bytes / 10_000
+    # 5 MB cap: 3 MB nominal + ~60 % headroom for dict resize amortization
+    # and lazy asyncio.Event allocation.  This catches a 1.7× regression
+    # and definitely catches the 15× regression the old 50 MB cap missed.
+    assert delta_mb < 5.0, (
+        f"10k programs added {delta_mb:.2f} MB (tracemalloc) ≈ "
+        f"{bytes_per_program:.0f} B/program; expected < 5 MB total / "
+        f"< 500 B/program.  Old 50 MB cap masked the 5 KB/program "
+        f"regression flagged in audit round-2."
     )
 
 

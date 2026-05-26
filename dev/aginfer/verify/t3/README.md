@@ -242,9 +242,15 @@ audit round-5) on Qwen3-0.6B + `--attention-backend flashinfer
   ≤64-char string at Req construction; no HTTP 400, no 5xx. ✓
   Pydantic field needed `Optional[Any]` (otherwise Pydantic rejects
   bogus shapes at the HTTP layer before our sanitizer runs).
-* Tagging overhead (step [7]): -0.18 ms/req (noise level) for 20
-  tagged vs 20 untagged chat completions. Well under the 5 ms
-  ceiling. ✓
+* Sanitizer overhead (step [7], audit-of-tests round-2 rewrite):
+  ``_sanitize_program_id`` direct microbench — 5 runs × 10 000
+  calls over a representative input mix (happy str / None / long /
+  list).  Result: **0.22 ± 0.00 µs/call** (mean + 3σ ≈ 0.23 µs)
+  vs the new 10 µs/call ceiling.  The previous version compared
+  end-to-end tagged vs untagged ``chat()`` latency where inference
+  jitter (hundreds of ms) drowned the < 0.1 ms/req cost claim — a
+  30× regression in the sanitizer would have been invisible.  Per
+  memory:feedback-latency-multi-run. ✓
 * Session multi-turn (step [11]): a request with `session_params.id`
   set via the native `/generate` endpoint tags the shared-session
   nodes via `Session.create_req`. Round-3 audit caught the silent

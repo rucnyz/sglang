@@ -98,8 +98,8 @@ Daemon code lives at `dev/aginfer/daemon/proxy.py` (~270 LoC),
 
 ## RESULTS
 
-**PASSED** — all 12 steps (post audit round-1) including a 5-run
-multi-trial latency benchmark.
+**PASSED** — all 13 steps (post audit round-1 + audit-of-tests round-2)
+including a 5-run multi-trial latency benchmark.
 
 * date: 2026-05-26
 * daemon code: ~370 LoC across `daemon/proxy.py` + `daemon/events.py`
@@ -122,6 +122,12 @@ multi-trial latency benchmark.
   dict / list / "x"\*10k / `[None, "deep"]`) all forward cleanly.
 * upstream dead (unary): ✓ 502; tracker recovers (not stuck in
   REASONING).
+* unary non-RequestError recovery (audit round-2 pin for round-1
+  MAJOR): ✓ step [11a] monkey-patches the http_client to raise a
+  custom non-httpx exception; daemon returns 502 AND the program
+  tracker exits REASONING (not stuck).  A revert of the broader
+  `except Exception` to bare `except httpx.RequestError` re-raises
+  and trips this assertion.
 
 ### Latency (multi-run, per memory:feedback-latency-multi-run)
 
@@ -134,9 +140,14 @@ multi-trial latency benchmark.
 | **p99** (mean ± std)  | 1.31 ± 0.09 ms | 3.25 ± 0.55 ms | **+1.94 ± 0.47 ms** |
 
 Both well inside the design budget (<2 ms p50 / <5 ms p99 added
-latency).  The verify assertion uses (mean + 1·std) so a single
-noisy trial doesn't flake the suite.
+latency).  Audit round-2 tightened the floor: assertion now uses
+``mean + 3σ < 5 ms`` (was ``mean + 1σ < 10 / 25 ms`` which would
+have masked a 5–10× regression).  Current envelope ≈ 1.5 ms p50 /
+~2 ms p99 — leaves ~2.5× headroom but catches a 3× regression in
+the proxy hot path.
 
 * raw logs (relative to this directory):
-  * `results/<YYYYMMDD_HHMMSS>_run4_audit.log` — current state
-    (post round-1 audit, 12 steps + 5-run latency)
+  * `results/<YYYYMMDD_HHMMSS>_run4_audit.log` — round-1 audit
+    state (12 steps + 5-run latency)
+  * `results/<YYYYMMDD_HHMMSS>_run5_audit2.log` — round-2
+    "audit of tests" state (13 steps + 5-run latency)

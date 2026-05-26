@@ -90,8 +90,27 @@ Daemon code lives at `dev/aginfer/daemon/program_tracker.py` —
 
 ## RESULTS
 
-**PASSED** — all 10 steps (post audit round-1) in ~60 ms on the
-agsched env.
+**PASSED** — all 10 steps (post audit round-1 + audit-of-tests
+round-2) in ~60 ms on the agsched env.
+
+### Audit round-2 "audit of tests"
+
+Two steps had previously-loose assertions that would not catch a
+realistic regression in the production code:
+
+* Step [6] (concurrent arrival/completion) used to derive its
+  prediction from ``history[-1]`` and then assert the same quantity
+  — a regression silently dropping every other transition would
+  also drop matching entries from ``history`` and pass.  Now snapshots
+  ``pt.state(PID)`` immediately after EACH ``observe_*`` and
+  asserts all N arrival snapshots are ``REASONING`` and all N
+  completion snapshots are ``ACTING``.  A silent no-op observe_*
+  would now trip the per-call assertion.
+* Step [7] memory cap was 50 MB with ``ru_maxrss`` (high-watermark,
+  not delta).  Docstring claims ~300 B/program, so a 15× regression
+  to 5 KB/program would silently pass.  Switched to ``tracemalloc``
+  for a true delta and tightened cap to 5 MB; now catches a 1.7×
+  regression instead of letting a 15× one slip through.
 
 * date: 2026-05-26
 * daemon code: `dev/aginfer/daemon/program_tracker.py` (~140 LoC

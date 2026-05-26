@@ -151,6 +151,10 @@ async def la_serial_dispatch(daemon_url: str, router: EventRouter) -> None:
     """[A2] 100 events enqueued in a burst; handlers run serially.
 
     Replace the noop handler with one that records concurrency.
+    Also pins M5 (task_done): after drain, asserts the queue's join
+    completes within 2 s -- a regression that removes the
+    ``finally: task_done()`` pairing in event_router would make
+    queue.join() hang forever.
     """
     in_flight = 0
     max_in_flight = 0
@@ -184,6 +188,10 @@ async def la_serial_dispatch(daemon_url: str, router: EventRouter) -> None:
     assert max_in_flight == 1, (
         f"observed max_in_flight={max_in_flight} -- event_worker not serial"
     )
+    # Round-1-of-tests audit A4 -- M5 fix (task_done pairing) is
+    # unpinned without a queue.join() somewhere.  Without the fix,
+    # this hangs forever.
+    await asyncio.wait_for(router.bus.queue.join(), timeout=2.0)
 
 
 async def la_idempotent(daemon_url: str, router: EventRouter) -> None:
@@ -293,37 +301,56 @@ async def la_still_high_routes_as_memory_pressure(
 
 async def la_cold_start_probe() -> None:
     """[A7] Cold-start probe synthesises memory_pressure when stub
-    sglang already reports HBM_occ > 0.7."""
-    stub = make_stub_sglang(state_hbm_used=58000, state_hbm_cap=65536)  # 0.885
-    stub_port = _free_port()
-    bus = EventBus()
-    saw_synthetic = 0
+    sglang already reports HBM_occ > theta_hi.
 
-    async def _h(evt: Event, _r: EventRouter) -> None:
-        nonlocal saw_synthetic
-        if evt.payload.get("synthetic"):
-            saw_synthetic += 1
+    Runs TWO scenarios:
+      (a) default thresholds (theta_hi=0.7); occ=0.885 -> synth.
+      (b) non-default thresholds (theta_hi=0.5); occ=0.6 -> synth.
+          A regression that hardcodes 0.7 would silently miss (b)
+          (audit A5 / M1 fix).
+    """
+    async def _scenario(*, used, cap, theta_hi, theta_crit, expect_synth):
+        stub = make_stub_sglang(state_hbm_used=used, state_hbm_cap=cap)
+        stub_port = _free_port()
+        bus = EventBus()
+        saw_synthetic = 0
 
-    daemon = create_app(
-        sglang_base_url=f"http://127.0.0.1:{stub_port}",
-        event_bus=bus,
-        program_tracker=ProgramTracker(),
-    )
-    # Register handler before startup.  startup() runs cold_start_probe.
-    # We install the handler by reaching into app.state.event_router
-    # which is created in create_app pre-startup.
-    daemon.state.event_router.set_handler(EventKind.MEMORY_PRESSURE, _h)
-    daemon_port = _free_port()
-    async with run_server(stub, "127.0.0.1", stub_port):
-        async with run_server(daemon, "127.0.0.1", daemon_port):
-            # Probe runs at startup; give it time.
-            for _ in range(50):
-                if saw_synthetic >= 1:
-                    break
-                await asyncio.sleep(0.02)
-    assert saw_synthetic == 1, (
-        "cold_start_probe didn't synthesise memory_pressure despite "
-        "stub reporting 0.885 HBM occ"
+        async def _h(evt: Event, _r: EventRouter) -> None:
+            nonlocal saw_synthetic
+            if evt.payload.get("synthetic"):
+                saw_synthetic += 1
+
+        daemon = create_app(
+            sglang_base_url=f"http://127.0.0.1:{stub_port}",
+            event_bus=bus,
+            program_tracker=ProgramTracker(),
+            theta_hi=theta_hi,
+            theta_crit=theta_crit,
+        )
+        daemon.state.event_router.set_handler(EventKind.MEMORY_PRESSURE, _h)
+        daemon_port = _free_port()
+        async with run_server(stub, "127.0.0.1", stub_port):
+            async with run_server(daemon, "127.0.0.1", daemon_port):
+                for _ in range(50):
+                    if saw_synthetic >= 1:
+                        break
+                    await asyncio.sleep(0.02)
+        return saw_synthetic
+
+    # (a) default 0.7/0.9 — 0.885 trips HIGH.
+    a = await _scenario(used=58000, cap=65536, theta_hi=0.7, theta_crit=0.9,
+                        expect_synth=True)
+    assert a == 1, f"default-threshold scenario: expected 1 synth, got {a}"
+
+    # (b) non-default 0.5/0.7 — occ=0.6 trips ONLY if probe honors the
+    # plumbed threshold (audit M1 fix).  Pre-fix (hardcoded 0.7) would
+    # NOT synth here.
+    b = await _scenario(used=39000, cap=65536, theta_hi=0.5, theta_crit=0.7,
+                        expect_synth=True)
+    assert b == 1, (
+        f"non-default-threshold scenario: expected 1 synth at occ=0.595 "
+        f"with theta_hi=0.5, got {b}.  Cold-start probe is hardcoding "
+        f"thresholds (M1 fix regressed)."
     )
 
 
@@ -390,10 +417,72 @@ async def la_event_handler_latency(
         f"p50 {stats['p50_mean']:.2f} ± {stats['p50_std']:.2f} ms; "
         f"p99 {stats['p99_mean']:.2f} ± {stats['p99_std']:.2f} ms"
     )
-    assert stats["p99_mean"] + stats["p99_std"] < 80.0, (
-        f"p99 mean+std = {stats['p99_mean'] + stats['p99_std']:.2f} ms exceeds 80 ms"
+    # Audit round-2 ("audit of tests"): previous floor was p99<80 ms
+    # but actual is ~0.7 ms — a 100× regression would slip through.
+    # Tighten to mean+3σ < 5 ms (covers ~99.7 % of trials under normal
+    # noise; catches a 5–7× regression).  In-process loopback FastAPI
+    # over an asyncio.Queue: even a cold first run should land well
+    # under 5 ms.  If a future GIL/loop change pushes us > 5 ms, the
+    # docstring claim is also broken and we want this to fail.
+    p50_envelope = stats["p50_mean"] + 3.0 * stats["p50_std"]
+    p99_envelope = stats["p99_mean"] + 3.0 * stats["p99_std"]
+    assert p50_envelope < 5.0, (
+        f"p50 mean+3σ = {p50_envelope:.2f} ms exceeds 5 ms "
+        f"(p50_mean={stats['p50_mean']:.2f}, p50_std={stats['p50_std']:.2f})"
+    )
+    assert p99_envelope < 5.0, (
+        f"p99 mean+3σ = {p99_envelope:.2f} ms exceeds 5 ms "
+        f"(p99_mean={stats['p99_mean']:.2f}, p99_std={stats['p99_std']:.2f})"
     )
     return stats
+
+
+async def la_firer_retry_and_payload() -> None:
+    """[A11] BLOCKER A3 (test-audit): firer retries on 500 + payload
+    includes both ``ts`` (wall) and ``ts_monotonic``.
+
+    Drive AginferWebhookFirer directly with a stub that returns 500
+    twice then 200.  Assert the capturer ultimately recorded the
+    payload AND that the body has both time fields (audit M3 fix).
+    """
+    sys.path.insert(0, "/scratch/yuzhou/projects/sglang/python")
+    from sglang.srt.managers.aginfer_webhook import AginferWebhookFirer
+
+    capturer = make_stub_webhook_capturer(fail_first_n=2)
+    cap_port = _free_port()
+    async with run_server(capturer, "127.0.0.1", cap_port):
+        firer = AginferWebhookFirer(
+            notify_url=f"http://127.0.0.1:{cap_port}",  # bare URL: tests B1 too
+            heartbeat_s=5.0,
+            theta_hi=0.7,
+            theta_crit=0.9,
+        )
+        try:
+            firer.maybe_fire(used_tokens=58000, cap_tokens=65536)  # ~0.885 -> CRITICAL
+            # The firer's background thread will retry 0.1 + 0.4 s = 0.5 s.
+            # Plus some slack.
+            for _ in range(50):  # up to 5 s
+                if capturer.state.captured:
+                    break
+                await asyncio.sleep(0.1)
+        finally:
+            firer.close()
+
+    assert capturer.state.captured, (
+        "retry-on-500 BROKEN: capturer never received the body after 2 "
+        "stub-failures.  Check the firer's retry loop in "
+        "aginfer_webhook.py:_send."
+    )
+    assert capturer.state.fail_count == 2, capturer.state.fail_count
+    body = capturer.state.captured[0]
+    # Audit A1 (M3 ts_monotonic pin):
+    assert "ts" in body and isinstance(body["ts"], (int, float)), body.keys()
+    assert "ts_monotonic" in body and isinstance(body["ts_monotonic"], (int, float)), (
+        f"M3 fix is unpinned: payload missing ts_monotonic; got keys {sorted(body)}"
+    )
+    # Verify the firer's classification of 0.885 with default
+    # theta_hi=0.7 / theta_crit=0.9 is HIGH (0.7 <= 0.885 < 0.9).
+    assert body["state"] == "HIGH", body["state"]
 
 
 def la_firer_url_append() -> None:
@@ -428,9 +517,24 @@ def la_firer_url_append() -> None:
 
 async def la_no_periodic_timer_in_source() -> None:
     """[A9] Contract: NO `time.sleep`, `asyncio.sleep`, or
-    `loop.call_later` in the daemon's event/router/proxy modules
-    (event-driven only).  The watermark *heartbeat* lives on sglang
-    side; daemon receives events purely reactively.
+    `loop.call_later` / `loop.call_at` in the daemon's event-router
+    / proxy / event-bus modules (event-driven only).  The watermark
+    *heartbeat* lives on sglang side; daemon receives events purely
+    reactively.
+
+    Audit round-2 ("audit of tests"): the previous version's
+    docstring claimed sleep/timing primitives were forbidden, but
+    the actual ``forbidden`` tuple only included ``call_later`` and
+    ``call_at`` — so a regression introducing ``asyncio.sleep(0.1)``
+    polling in the worker would have been invisible.  We now forbid:
+
+      - .sleep           (asyncio.sleep / time.sleep / loop.sleep)
+      - .call_later      (delayed callback)
+      - .call_at         (absolute-time callback)
+      - .perf_counter    (proxy for "running a timer-driven loop")
+
+    Anywhere these appear in the daemon's event-driven hot path is a
+    contract violation.
     """
     import ast
     import inspect
@@ -439,20 +543,28 @@ async def la_no_periodic_timer_in_source() -> None:
     from daemon.events import EventBus
 
     sources = [
-        inspect.getsource(event_router),
-        inspect.getsource(proxy),
-        inspect.getsource(EventBus),
+        ("daemon/event_router.py", inspect.getsource(event_router)),
+        ("daemon/proxy.py", inspect.getsource(proxy)),
+        ("daemon/events.py", inspect.getsource(EventBus)),
     ]
-    forbidden = ("call_later", "call_at")
-    for src in sources:
+    forbidden = ("sleep", "call_later", "call_at", "perf_counter")
+    for name, src in sources:
         tree = ast.parse(src)
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in forbidden:
-                # `loop.call_later` etc. are timing primitives.
                 raise AssertionError(
-                    f"periodic-timer primitive `.{node.attr}` found in "
-                    f"daemon source -- event-driven contract forbids it"
+                    f"polling/timer primitive `.{node.attr}` found in "
+                    f"{name} -- event-driven contract forbids it"
                 )
+            # Defend against `from asyncio import sleep` + `sleep(...)`
+            # bypass.
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in forbidden:
+                    raise AssertionError(
+                        f"polling/timer primitive `{node.func.id}(...)` "
+                        f"found in {name} -- event-driven contract "
+                        f"forbids it (covers `from asyncio import sleep`)"
+                    )
 
 
 # ================================================================ Layer B
@@ -550,7 +662,9 @@ async def lb_watermark_transitions_and_heartbeat() -> Dict[str, Any]:
         kinds = [c.get("kind") for c in capturer.state.captured]
         states = [c.get("state") for c in capturer.state.captured]
         # We expect to see at least ONE memory_pressure (OK -> HIGH/CRITICAL)
-        # and some still_high heartbeats while the plateau held.
+        # and >=2 still_high heartbeats (plateau hold is ~6 s with
+        # heartbeat_s=2.0 -> expect ~2-3; round-tests audit A7 tightens
+        # this from the original >=1 floor).
         print(
             f"    captured {len(kinds)} webhooks; kinds={kinds[:10]}{'...' if len(kinds) > 10 else ''}"
         )
@@ -627,6 +741,10 @@ async def main() -> None:
     print("[A10] BLOCKER B1 fix: AginferWebhookFirer appends "
           "/aginfer/event when user passes a bare base URL ✓")
 
+    await la_firer_retry_and_payload()
+    print("[A11] BLOCKER A3 + A1 fixes: firer retries 2× on 500 + "
+          "payload carries `ts_monotonic` (audit-round-1 M3) ✓")
+
     # ---- Layer B: sglang side, full launch (gated) ----
     if os.environ.get("AGINFER_T5_FULL") == "1":
         print()
@@ -636,10 +754,15 @@ async def main() -> None:
         assert "memory_pressure" in kinds, (
             f"never saw OK->HIGH transition; kinds={kinds!r}"
         )
-        # During the plateau hold (>=6 s with heartbeat 2 s) we should
-        # see at least 2 still_high heartbeats.
+        # During the plateau hold (~6 s with heartbeat 2 s) we expect
+        # 2-3 still_high heartbeats.  Round-tests audit A7: tightened
+        # from >=1 to >=2 so a heartbeat-throttle regression that
+        # fires exactly once would be caught.
         n_still = kinds.count("still_high")
-        assert n_still >= 1, f"never saw plateau heartbeat; kinds={kinds!r}"
+        assert n_still >= 2, (
+            f"plateau hold ~6 s @ heartbeat_s=2 expected >=2 still_high; "
+            f"got {n_still}; kinds={kinds!r}"
+        )
         print(f"[B] PASS: {len(kinds)} webhooks, "
               f"{kinds.count('memory_pressure')} memory_pressure, "
               f"{n_still} still_high heartbeats")
