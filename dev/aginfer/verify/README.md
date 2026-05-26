@@ -65,7 +65,7 @@ Each task lives in its own folder `tN/` with:
 | 3 | T3 | session_id passthrough into tree nodes | [`t3/`](t3/) | **passed** (2026-05-26, audit round-5 done, 14 verify steps + 3-section regression probe) |
 | **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6/`](t6/) | **passed** (2026-05-26, audit round-1 done, 10 verify steps in ~60 ms) |
 | 5 | T4 | daemon HTTP proxy + paper §4 event emission | [`t4/`](t4/) | **passed** (2026-05-26, audit round-1 done, 12 verify steps + 5-run latency, ~370 LoC) |
-| 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | pending |
+| 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | **passed** (2026-05-26, Layer A 9 steps + Layer B real-GPU watermark test) |
 | 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | pending |
 | 8 | T8 | admission_controller + watermark sensitivity | [`t8/`](t8/) | pending |
 | 9 | T9 | Run K + K-a + J ablation (J validates §9 deployment claim w/o HiCache) | [`t9/`](t9/) | pending |

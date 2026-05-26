@@ -455,6 +455,26 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        # aginfer T5: outbound webhook to daemon's /aginfer/event.  No-op
+        # when --aginfer-notify-url is unset.
+        self.aginfer_webhook = None
+        if getattr(server_args, "aginfer_notify_url", None):
+            from sglang.srt.managers.aginfer_webhook import AginferWebhookFirer
+
+            self.aginfer_webhook = AginferWebhookFirer(
+                notify_url=server_args.aginfer_notify_url,
+                heartbeat_s=getattr(server_args, "aginfer_heartbeat_s", 5.0),
+                theta_hi=getattr(server_args, "aginfer_theta_hi", 0.7),
+                theta_crit=getattr(server_args, "aginfer_theta_crit", 0.9),
+            )
+            logger.info(
+                "aginfer webhook armed: url=%s heartbeat_s=%.1f theta_hi=%.2f theta_crit=%.2f",
+                server_args.aginfer_notify_url,
+                self.aginfer_webhook.heartbeat_s,
+                self.aginfer_webhook.theta_hi,
+                self.aginfer_webhook.theta_crit,
+            )
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -1536,6 +1556,21 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            # aginfer T5: fire webhook on watermark transition / heartbeat.
+            if self.aginfer_webhook is not None:
+                try:
+                    pool = self.token_to_kv_pool_allocator
+                    used = (
+                        pool.size_full - pool.available_size()
+                        if pool is not None
+                        else 0
+                    )
+                    cap = pool.size_full if pool is not None else 0
+                    self.aginfer_webhook.maybe_fire(used, cap)
+                except Exception:
+                    logger.exception("aginfer webhook check raised")
+
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -1590,6 +1625,20 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            # aginfer T5: fire webhook on watermark transition / heartbeat.
+            if self.aginfer_webhook is not None:
+                try:
+                    pool = self.token_to_kv_pool_allocator
+                    used = (
+                        pool.size_full - pool.available_size()
+                        if pool is not None
+                        else 0
+                    )
+                    cap = pool.size_full if pool is not None else 0
+                    self.aginfer_webhook.maybe_fire(used, cap)
+                except Exception:
+                    logger.exception("aginfer webhook check raised")
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()

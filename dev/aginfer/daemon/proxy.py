@@ -146,11 +146,16 @@ def create_app(
     event_bus: Optional[EventBus] = None,
     program_tracker: Optional[ProgramTracker] = None,
     http_client: Optional[httpx.AsyncClient] = None,
+    enable_event_router: bool = True,
 ) -> FastAPI:
     """Build the daemon's FastAPI app.
 
     Dependency-injectable so the verify can pass in a stub sglang URL
     and a recording event_bus.  Defaults create fresh singletons.
+
+    ``enable_event_router=True`` (default) mounts the T5
+    ``POST /aginfer/event`` endpoint + spawns the event_worker.
+    Set False for proxy-only tests.
     """
     app = FastAPI(title="aginfer-daemon", version="0.1")
     app.state.sglang_base_url = sglang_base_url.rstrip("/")
@@ -160,6 +165,22 @@ def create_app(
     # event loop running the FastAPI app.  Tests may pass one in.
     app.state.http_client = http_client
     app.state.owns_http_client = http_client is None
+    app.state.event_router = None
+    app.state.enable_event_router = enable_event_router
+
+    # Attach the event router's routes at create-time (routes must be
+    # registered before app start).  The worker task itself is spawned
+    # on startup so it ties to the running event loop.
+    if enable_event_router:
+        from .event_router import EventRouter, attach_event_routes
+
+        router = EventRouter(
+            bus=app.state.event_bus,
+            sglang_base_url=app.state.sglang_base_url,
+            http_client=None,  # router lazily creates its own on start()
+        )
+        attach_event_routes(app, router)
+        app.state.event_router = router
 
     @app.on_event("startup")
     async def _startup() -> None:
@@ -170,9 +191,15 @@ def create_app(
             app.state.http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0)
             )
+        if app.state.event_router is not None:
+            await app.state.event_router.start()
+            await app.state.event_router.cold_start_probe()
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        if app.state.event_router is not None:
+            await app.state.event_router.stop()
+            app.state.event_router = None
         if app.state.owns_http_client and app.state.http_client is not None:
             await app.state.http_client.aclose()
 
