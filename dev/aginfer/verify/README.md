@@ -66,9 +66,9 @@ Each task lives in its own folder `tN/` with:
 | **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6/`](t6/) | **passed** (2026-05-26, audit round-1 done, 10 verify steps in ~60 ms) |
 | 5 | T4 | daemon HTTP proxy + paper §4 event emission | [`t4/`](t4/) | **passed** (2026-05-26, audit round-1 done, 12 verify steps + 5-run latency, ~370 LoC) |
 | 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | **passed** (2026-05-26, audit round-1 done; Layer A 10 steps + Layer B real-GPU watermark test) |
-| 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | **passed** (2026-05-26, 10 verify steps, ~390 LoC daemon code; build 3.2 ms / decide 1.4 ms @ 1k units) |
-| 8 | T8 | admission_controller + watermark sensitivity | [`t8/`](t8/) | **passed (v1, pre-audit)** (2026-05-26, 11 verify steps, ~280 LoC; handler 4.2 ms @ 32 programs) |
-| 9 | T9 | Run K + K-a + J ablation (J validates §9 deployment claim w/o HiCache) | [`t9/`](t9/) | pending |
+| 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | **passed** (2026-05-26, 13 verify steps + 22 bisect probes across 5 audit rounds; ~510 LoC daemon code; build 2.7 ms / decide 1.4 ms @ 1k units) |
+| 8 | T8 | admission_controller (event-driven pause/resume) | [`t8/`](t8/) | **passed** (2026-05-26, 12 verify steps + 5 bisect probes across 2 audit rounds; ~315 LoC daemon code; single-pause 4 ms @ 32 programs) |
+| 9 | T9 | Run K + K-a + J ablation | [`t9/`](t9/) | **K full: 30/32 trials, mean 1559 s FAILS <716 s target (1.76× Run H'); K-a running; J pending** (2026-05-26) |
 | 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies + daemon-controlled L3 (DISK) tier via Mooncake (paper §3 4-tier completion) | [`t10/`](t10/) | pending |
 
 Per-task `tN/results/` directories hold raw outputs (logs, JSON, harbor
