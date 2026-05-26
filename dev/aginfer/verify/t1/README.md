@@ -54,7 +54,8 @@ Mechanism (no harbor needed). `verify/t1_state_endpoint.py`:
 ## REPRODUCING
 
 End-to-end repro, copy-paste from a clean shell.  Picks GPU 4 by
-default; pick any free GPU and edit `CUDA_VISIBLE_DEVICES`.
+default; pick any free GPU (check `nvidia-smi` — typical convention
+is GPU 5 or 6) and edit `CUDA_VISIBLE_DEVICES`.
 
 ```bash
 # 1. Activate the preinstalled env.
@@ -64,6 +65,7 @@ conda activate agsched
 # 2. Launch sglang.  Qwen3-0.6B + flashinfer is enough for T1
 #    (trtllm_mha default would bypass the radix entirely).
 cd /scratch/yuzhou/projects/sglang/dev/aginfer
+lsof -i:30001 && { echo "port 30001 already in use"; exit 1; }
 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
   python -m sglang.launch_server \
     --model-path Qwen/Qwen3-0.6B \
@@ -73,8 +75,10 @@ SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
     --trust-remote-code \
     --attention-backend flashinfer \
   > logs/sglang_t1.log 2>&1 &
+SGLANG_PID=$!
 
-# Wait for "Uvicorn running on http://127.0.0.1:30001" in the log.
+# Wait for the listener.
+until grep -q "Uvicorn running on http://127.0.0.1:30001" logs/sglang_t1.log; do sleep 3; done
 
 # 3. Run the verify.
 AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
@@ -83,7 +87,7 @@ AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
 # expected last line: "=== T1 PASSED ==="
 
 # 4. Tear down sglang.
-pkill -f "launch_server.*30001"
+kill "$SGLANG_PID"
 ```
 
 ## RESULTS

@@ -80,14 +80,40 @@ def units_without(state: Dict[str, Any], program_id: str) -> List[Dict[str, Any]
 def main() -> None:
     print("=== T3 verify: session_id passthrough ===")
 
+    # Launch-config preflight: step [9] needs chunked-prefill-size small
+    # enough to actually trigger the chunked path on Qwen3-0.6B with a
+    # ~1k-token prompt.  If the launcher forgot the flag, step [9]
+    # degrades to "long generation only" (round-2 fake-chunked
+    # regression).  Hard-fail with a clear pointer to the launch line
+    # instead of silently passing.
+    info = requests.get(f"{BASE}/get_server_info", timeout=10)
+    info.raise_for_status()
+    info_json = info.json()
+    chunked_size = (
+        info_json.get("chunked_prefill_size")
+        or info_json.get("server_args", {}).get("chunked_prefill_size")
+    )
+    assert chunked_size is not None, (
+        f"could not read chunked_prefill_size from /get_server_info: "
+        f"{list(info_json.keys())}"
+    )
+    assert chunked_size <= 64, (
+        f"sglang launched with chunked_prefill_size={chunked_size}; "
+        f"verify step [9] needs <=64 to actually exercise the chunked "
+        f"path.  Relaunch with `--chunked-prefill-size 32`."
+    )
+
     # Flush so any residue tag from prior runs of regression_probe or
     # earlier verify invocations doesn't poison our wire-format
     # invariants (step [2] checks that no node has implausibly many
-    # tags). /flush_cache may not exist on all builds; ignore if so.
-    try:
-        requests.post(f"{BASE}/flush_cache", timeout=10).raise_for_status()
-    except Exception:
-        pass
+    # tags).  If /flush_cache is unavailable, the residue could mask a
+    # real regression -- so we hard-fail rather than swallow.
+    flush = requests.post(f"{BASE}/flush_cache", timeout=10)
+    assert flush.status_code in (200, 204), (
+        f"/flush_cache returned {flush.status_code}; without flush, "
+        f"residue tags from prior runs poison step [2]'s wire-format "
+        f"invariants.  Relaunch sglang fresh or expose /flush_cache."
+    )
 
     SHARED_SYS = (
         "You are a helpful assistant. Here is a long system prompt: "
@@ -362,22 +388,39 @@ def main() -> None:
     # ---- [11] Session multi-turn: program_id survives Session.create_req ----
     # sglang's session API constructs a fresh Req via
     # ``Session.create_req``; round-3 audit caught a silent program_id
-    # drop on that path (same shape as the EPD bug from round 2).  Test
-    # it end-to-end by sending a chat with ``session_params={"id": ...}``
-    # set + a program_id, then asserting the tag lands.  Without the
-    # round-3 fix the tag would be silently dropped at create_req.
-    print("\n[11] Session multi-turn: program_id forwarded via Session.create_req")
-    SESSION_PROMPT = "Multi-turn session probe: tell me about prime 19."
-    SESSION_PID = "prog-SESSION"
+    # drop on that path.  CRITICAL: the OpenAI chat handler does NOT
+    # forward session_params (audit-round-4 caught the previous
+    # version of this step using /v1/chat/completions, which goes
+    # through the non-session path that already plumbed program_id --
+    # so the step was passing trivially regardless of the
+    # Session.create_req fix).  Use sglang's native /generate
+    # endpoint (which DOES propagate session_params) + the
+    # /open_session bootstrap so the second turn actually hits
+    # Session.create_req.
+    print("\n[11] Session multi-turn via /generate: program_id forwarded via Session.create_req")
+    open_r = requests.post(f"{BASE}/open_session", json={"capacity_of_str_len": 1024}, timeout=30)
+    open_r.raise_for_status()
+    session_id = open_r.text.strip().strip('"')
+    assert session_id, f"open_session returned empty: {open_r.text!r}"
+    # Seed (no program_id) so the session is populated.
     requests.post(
-        f"{BASE}/v1/chat/completions",
+        f"{BASE}/generate",
         json={
-            "model": MODEL,
-            "messages": [{"role": "user", "content": SESSION_PROMPT}],
-            "max_tokens": 4,
-            "temperature": 0.0,
+            "text": "session seed for verify step [11]",
+            "sampling_params": {"max_new_tokens": 4, "temperature": 0.0},
+            "session_params": {"id": session_id},
+        },
+        timeout=60,
+    ).raise_for_status()
+    # Tagged multi-turn; hits Session.create_req on the scheduler side.
+    SESSION_PID = "prog-SESSION-VERIFY-11"
+    requests.post(
+        f"{BASE}/generate",
+        json={
+            "text": "session second turn tagged with prog-SESSION-VERIFY-11",
+            "sampling_params": {"max_new_tokens": 4, "temperature": 0.0},
+            "session_params": {"id": session_id},
             "program_id": SESSION_PID,
-            "session_params": {"id": "t3-session-probe"},
         },
         timeout=60,
     ).raise_for_status()
@@ -386,7 +429,9 @@ def main() -> None:
     print(f"    session-tagged units: {len(sess_units)}")
     assert sess_units, (
         f"session-multi-turn request lost the tag -- Session.create_req "
-        f"is silently dropping program_id (same shape as the EPD bug)"
+        f"is silently dropping program_id.  Note: this MUST use /generate "
+        f"(not /v1/chat/completions, which drops session_params client-"
+        f"side).  Round-4 audit caught the previous fake version."
     )
 
     # ---- [12] Recursion DoS: deeply-nested list program_id must not crash ----

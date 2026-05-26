@@ -87,13 +87,21 @@ Mechanism. `verify/t2_migrate_endpoint.py`:
 
 ## REPRODUCING
 
-Same setup as T1 (no special launch flags); 21 in-suite steps:
+Same setup as T1 (no special launch flags); 21 in-suite steps.
+`CUDA_VISIBLE_DEVICES=4` is a default — pick any free GPU per
+`nvidia-smi` (the MEMORY-notes default convention is GPU 5 or 6 free,
+but check before you launch).  Capture the launch PID for a precise
+tear-down (`pkill -f` would also catch unrelated processes that
+happen to match the pattern).
 
 ```bash
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
 conda activate agsched
 
 cd /scratch/yuzhou/projects/sglang/dev/aginfer
+# Abort early if port 30001 is already bound.
+lsof -i:30001 && { echo "port 30001 already in use"; exit 1; }
+
 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
   python -m sglang.launch_server \
     --model-path Qwen/Qwen3-0.6B \
@@ -103,15 +111,17 @@ SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
     --trust-remote-code \
     --attention-backend flashinfer \
   > logs/sglang_t2.log 2>&1 &
+SGLANG_PID=$!
 
-# Wait for "Uvicorn running on http://127.0.0.1:30001".
+# Wait for the listener to come up:
+until grep -q "Uvicorn running on http://127.0.0.1:30001" logs/sglang_t2.log; do sleep 3; done
 
 AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
 AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
   python verify/t2/verify.py
 # expected last line: "=== T2 PASSED (depth-audit + round-3) ==="
 
-pkill -f "launch_server.*30001"
+kill "$SGLANG_PID"
 ```
 
 ## RESULTS

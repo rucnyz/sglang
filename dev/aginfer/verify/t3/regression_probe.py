@@ -155,8 +155,62 @@ def probe_recursion_dos() -> str:
     return "PASS"
 
 
+def assert_fix_state_restored() -> None:
+    """Defensive: catch the case where the bisect demo's revert was
+    forgotten in code.  The README documents how to revert each fix
+    for the demo; if a maintainer forgets to restore, the probe
+    would still silently pass for some pre-fix configs.  Introspect
+    the production code state explicitly.
+    """
+    import inspect
+
+    from sglang.srt.managers.schedule_batch import _PROGRAM_ID_MAX_RECURSION
+    from sglang.srt.session.session_controller import SessionController
+
+    assert _PROGRAM_ID_MAX_RECURSION == 8, (
+        f"_PROGRAM_ID_MAX_RECURSION={_PROGRAM_ID_MAX_RECURSION} "
+        f"(expected 8). The bisect demo's revert was forgotten -- "
+        f"restore the cap in schedule_batch.py before re-running."
+    )
+    # The Session class is defined in session_controller; create_req is
+    # a method.  Source must include the program_id forward.
+    Session = None
+    for _name, _obj in inspect.getmembers(
+        SessionController.__module__
+        if hasattr(SessionController, "__module__")
+        else None
+    ):
+        pass
+    from sglang.srt.session import session_controller as _sc_mod
+
+    Session = getattr(_sc_mod, "Session", None)
+    assert Session is not None, "Could not import Session class"
+    src = inspect.getsource(Session.create_req)
+    # Match the line ONLY if uncommented (commented-out reverts still
+    # leave the text in inspect.getsource output).
+    import re
+    pattern = re.compile(
+        r"^[ \t]*program_id\s*=\s*req\.program_id",
+        re.MULTILINE,
+    )
+    assert pattern.search(src), (
+        "Session.create_req source does NOT have an uncommented "
+        "`program_id=req.program_id` line.  The bisect demo's revert "
+        "was forgotten -- restore the line in session_controller.py "
+        "before re-running."
+    )
+
+
 def main() -> int:
     print("=== T3 round-3 regression probe ===")
+    print()
+    print("[fix-state] probing production code for restored fixes ...")
+    try:
+        assert_fix_state_restored()
+        print("    PASS  both round-3 fixes are present in source")
+    except AssertionError as exc:
+        print(f"    FAIL  {exc}")
+        return 2
     print()
 
     results: List[tuple[str, str]] = []

@@ -688,7 +688,7 @@ class Req(ReqDllmMixin):
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
-        program_id: Any = None,
+        program_id: Optional[Any] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,

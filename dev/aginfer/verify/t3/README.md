@@ -55,6 +55,27 @@ documentation:
 7. **HBM ↔ DRAM tier transition** — `_evict_to_host` keeps the same Python node object; `session_ids` survives the tier flip automatically. No verify pinned for this (requires HiCache); T9 / T10 will exercise.
 8. **Speculative-decoding draft model** — draft-model KV is managed by its own pool, NOT by `UnifiedRadixCache`. Draft-model nodes are not tagged. v1 limitation; T9 will exercise if speculative is enabled and document the gap.
 
+### `program_id` distribution semantics for list inputs
+
+There are two list-shaped paths and they MEAN different things — the
+daemon should know which it's invoking:
+
+1. **Single request + list `program_id`** (sanitizer-collapse path):
+   `program_id=["a", "b"]` on a single-completion (`n=1`) request
+   collapses to `"a"` (first non-empty after sanitization).  Verify
+   step [10] guards this.
+2. **Batched / parallel-sample + list `program_id`** (per-item slicing
+   path): `program_id=["a", "b"]` on a request with `n=2` (or a
+   batched `text=[...]` of length 2) dispatches `"a"` to the first
+   item and `"b"` to the second via `GenerateReqInput.__getitem__`.
+   Each completion gets its own tag.  Out-of-range index falls back
+   to broadcasting the whole list, which the sanitizer then collapses
+   to first.
+
+If the daemon emits a list, it's signalling per-item.  If it emits a
+scalar, it's broadcasting.  The wire format does NOT differentiate
+"intended-list" from "intended-broadcast"; the daemon must pick.
+
 ### Reserved sentinel namespace
 
 The daemon (T6/T7) is free to define internal program_id sentinels
@@ -118,15 +139,22 @@ T3 has TWO scripts and an EXTRA launch flag.  Step [9] in
 chunked-path test degrades to "long generation only" (still passes,
 but no longer pins the chunked branch).
 
+`CUDA_VISIBLE_DEVICES=4` is a default — pick any free GPU per
+`nvidia-smi` (typical convention is GPU 5 or 6 free).  Capture launch
+PID so the tear-down is precise.
+
 ```bash
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
 conda activate agsched
 
 # openai package is required for the OpenAI-client extra_body test
-# (step [3] of verify.py).  Default agsched env should already have it.
-python -c "import openai" || pip install openai
+# (step [3] of verify.py).  Force-use the conda-env python so a stray
+# system python on $PATH doesn't install to the wrong site-packages.
+"$CONDA_PREFIX/bin/python" -c "import openai" \
+  || "$CONDA_PREFIX/bin/pip" install openai
 
 cd /scratch/yuzhou/projects/sglang/dev/aginfer
+lsof -i:30001 && { echo "port 30001 already in use"; exit 1; }
 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
   python -m sglang.launch_server \
     --model-path Qwen/Qwen3-0.6B \
@@ -137,16 +165,23 @@ SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
     --attention-backend flashinfer \
     --chunked-prefill-size 32 \
   > logs/sglang_t3.log 2>&1 &
+SGLANG_PID=$!
 
-# Wait for "Uvicorn running on http://127.0.0.1:30001".
+# Wait for the listener.
+until grep -q "Uvicorn running on http://127.0.0.1:30001" logs/sglang_t3.log; do sleep 3; done
 
-# Main 13-step verify (production-shape end-to-end coverage).
+# Main 13-step verify (production-shape end-to-end coverage).  The
+# verify itself preflights /get_server_info and refuses to run if
+# chunked_prefill_size > 64 (catches a launch that forgot the flag,
+# the round-4 audit's regression-class for fake-chunked).
 AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
 AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
   python verify/t3/verify.py
 # expected last line: "=== T3 PASSED (post-audit round 3) ==="
 
 # Bisect regression probe (round-3 audit BLOCKERs):
+#   [fix-state] introspect production code, fail loudly if the bisect
+#               revert was forgotten
 #   [A] Session.create_req forwards program_id
 #   [B] sanitizer recursion cap
 # This is the "first prove the bug exists, then prove the fix works"
@@ -158,7 +193,7 @@ AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
 # expected last lines: "PASS  Session.create_req forwards program_id"
 #                      "PASS  sanitizer recursion cap"
 
-pkill -f "launch_server.*30001"
+kill "$SGLANG_PID"
 ```
 
 To re-run the pre-fix demo for either BLOCKER:
