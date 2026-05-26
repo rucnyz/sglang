@@ -205,6 +205,7 @@ def step_build_paper_state_smoke() -> None:
         state_json,
         event=Event(kind=EventKind.SESSION_ARRIVAL, session="prog-NEW"),
         tracker=tracker,
+        unknown_tier_log=set(),
     )
     assert s.decision_set == ["u-shared-platform"], s.decision_set
 
@@ -213,6 +214,7 @@ def step_build_paper_state_smoke() -> None:
         state_json,
         event=Event(kind=EventKind.TOOL_CALL_START, session="prog-0"),
         tracker=tracker,
+        unknown_tier_log=set(),
     )
     assert s.decision_set == ["u-tail-0"], s.decision_set
 
@@ -221,6 +223,7 @@ def step_build_paper_state_smoke() -> None:
         state_json,
         event=Event(kind=EventKind.TOOL_CALL_END, session="prog-0"),
         tracker=tracker,
+        unknown_tier_log=set(),
     )
     assert s.decision_set == ["u-tail-0"], s.decision_set
 
@@ -229,6 +232,7 @@ def step_build_paper_state_smoke() -> None:
         state_json,
         event=Event(kind=EventKind.SUB_DISPATCH_BLOCKING, session="prog-1"),
         tracker=tracker,
+        unknown_tier_log=set(),
     )
     assert set(s.decision_set) == {"u-tail-1", "u-shared-platform"}, s.decision_set
 
@@ -237,6 +241,7 @@ def step_build_paper_state_smoke() -> None:
         state_json,
         event=Event(kind=EventKind.SUB_DISPATCH_ASYNC, session="prog-1"),
         tracker=tracker,
+        unknown_tier_log=set(),
     )
     assert s.decision_set == ["u-shared-platform"], s.decision_set
 
@@ -245,6 +250,7 @@ def step_build_paper_state_smoke() -> None:
         state_json,
         event=Event(kind=EventKind.LLM_PREFILL, session="prog-0"),
         tracker=tracker,
+        unknown_tier_log=set(),
     )
     assert s.decision_set == [], s.decision_set
 
@@ -254,6 +260,7 @@ def step_build_paper_state_smoke() -> None:
         event=Event(kind=EventKind.TOOL_CALL_START, session="prog-2"),
         tracker=tracker,
         lambda_acting=0.2,
+        unknown_tier_log=set(),
     )
     tail2 = s.units["u-tail-2"]
     # λ for prog-2's tail must come from ACTING floor (0.2), not from
@@ -330,6 +337,7 @@ def step_top_k_bounded() -> None:
             payload={"state": "HIGH", "occ": 0.95},
         ),
         tracker=tracker,
+        unknown_tier_log=set(),
     )
     assert len(s.decision_set) == _kvs._DEFAULT_MEMORY_PRESSURE_TOPK, (
         f"top-k bound violated: {len(s.decision_set)} != "
@@ -555,6 +563,7 @@ async def step_decide_latency_at_1k_units() -> dict:
             state_json,
             event=Event(kind=EventKind.MEMORY_PRESSURE),
             tracker=tracker,
+            unknown_tier_log=set(),
         )
         # Build cost.
         t0 = time.perf_counter()
@@ -562,6 +571,7 @@ async def step_decide_latency_at_1k_units() -> dict:
             state_json,
             event=Event(kind=EventKind.MEMORY_PRESSURE),
             tracker=tracker,
+            unknown_tier_log=set(),
         )
         build_ms = (time.perf_counter() - t0) * 1000
         # Decide cost.
@@ -634,6 +644,7 @@ async def step_lambda_acting_sweep() -> None:
             ),
             tracker=tracker,
             lambda_acting=lam,
+            unknown_tier_log=set(),
         )
         a = policy.decide(s)
         actions_per_lam[lam] = list(a.assignments)

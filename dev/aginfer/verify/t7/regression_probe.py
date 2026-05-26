@@ -135,6 +135,7 @@ def probe_b1_unknown_tier_unsafe_default() -> None:
             state,
             event=Event(kind=EventKind.MEMORY_PRESSURE),
             tracker=ProgramTracker(),
+            unknown_tier_log=set(),
         )
         return "u-zstd" not in s.units
 
@@ -193,6 +194,7 @@ def probe_b1_unknown_tier_unsafe_default() -> None:
                 state,
                 event=Event(kind=EventKind.MEMORY_PRESSURE),
                 tracker=ProgramTracker(),
+                unknown_tier_log=set(),
             )
         except Exception:
             # FIX case never raises — skip-None gracefully drops the unit.
@@ -277,12 +279,18 @@ def probe_b2_per_rank_aggregation() -> None:
     }
 
     def _check() -> bool:
-        s = build_paper_state(
-            per_rank_state,
-            event=Event(kind=EventKind.MEMORY_PRESSURE),
-            tracker=ProgramTracker(),
-        )
-        # FIX: per_rank flattened; both units visible (prefixed with r0/, r1/).
+        try:
+            s = build_paper_state(
+                per_rank_state,
+                event=Event(kind=EventKind.MEMORY_PRESSURE),
+                tracker=ProgramTracker(),
+                unknown_tier_log=set(),
+            )
+        except Exception:
+            # Audit round-3.5 cleanup: build_paper_state now fails
+            # loud on malformed state (per_rank not flattened →
+            # missing top-level tier_usage / units).  Treat as fail.
+            return False
         return len(s.units) >= 2 and len(s.decision_set) >= 1
 
     post_fix_passed = _check()
@@ -351,6 +359,7 @@ def probe_m1_top_k_content_pin() -> None:
             state,
             event=Event(kind=EventKind.MEMORY_PRESSURE),
             tracker=ProgramTracker(),
+            unknown_tier_log=set(),
         )
         return all(h in s.decision_set for h in sentinels)
 
@@ -1060,6 +1069,7 @@ def probe_r2_m1_paused_gets_acting_floor() -> None:
             event=Event(kind=EventKind.MEMORY_PRESSURE),
             tracker=tracker,
             lambda_acting=0.2,
+            unknown_tier_log=set(),
         )
         u = s.units["u-paused-tail"]
         # FIX: PAUSED → ACTING-floor.  λ exactly 0.2.
@@ -1141,6 +1151,7 @@ def probe_r2_n1_units_for_session_set_semantics() -> None:
             state_json,
             event=Event(kind=EventKind.TOOL_CALL_START, session="prog-X"),
             tracker=tracker,
+            unknown_tier_log=set(),
         )
         return "u-dup-holder" in s.decision_set
 
@@ -1275,6 +1286,7 @@ def probe_r3_vacuous3_per_rank_empty_units() -> None:
             per_rank_state,
             event=Event(kind=EventKind.MEMORY_PRESSURE),
             tracker=ProgramTracker(),
+            unknown_tier_log=set(),
         )
         return len(s.units) >= 1
 
@@ -1308,23 +1320,27 @@ def probe_r3_vacuous3_per_rank_empty_units() -> None:
 # ---------------------------------------------------------------- R3 DEPTH-3
 
 
-def probe_r3_depth3_malformed_state_smoke() -> None:
-    """R3 DEPTH-3: malformed unit fields (`n_tokens=None`,
-    `n_bytes=None`, `tier=""`) must NOT crash `build_paper_state`.
+async def probe_r3_depth3_malformed_state_smoke() -> None:
+    """R3 DEPTH-3: malformed unit fields (e.g. `n_tokens=None`,
+    `tier=""`) must NOT crash the event_worker.
 
-    Production defaults via `int(x or 0)` and skip-on-empty-tier
-    (empty string → unknown → unit skipped).
+    Audit round-3.5: the production contract is now FAIL-LOUD —
+    ``build_paper_state`` raises on a malformed field (rather than
+    silently coercing via ``int(x or 0)``).  The ``handle()`` method
+    catches the exception, logs the full traceback, bows out, and
+    the event_worker keeps draining.  This probe pins the worker-
+    level survival contract: a memory_pressure event with malformed
+    units is followed by a clean event, and BOTH are processed
+    (handler_failures stays 0; events_handled == 2).
 
-    PRE-FIX: monkey-patch `int(...)` indirectly is hard; instead use
-    a "bug" where the input is corrupted but the function is asked
-    to process it AS-IS without defaults.  We model the regression
-    by feeding a unit where `int(None)` would happen if defaults
-    were removed.  Actual test: confirms the stock code SURVIVES;
-    pre-fix is "would have crashed without defaults".
+    PRE-FIX (simulated): remove the try/except around
+    build_paper_state in handle(); the exception propagates to
+    event_worker which DOES catch it but increments handler_failures.
+    POST-FIX: handle() catches → handler_failures stays 0.
     """
-    name = "R3-DEPTH-3 (malformed unit fields survive build_paper_state)"
+    name = "R3-DEPTH-3 (malformed unit field doesn't break the worker)"
 
-    state_json = {
+    bad_state = {
         "tier_usage": {
             "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
             "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
@@ -1332,27 +1348,9 @@ def probe_r3_depth3_malformed_state_smoke() -> None:
         },
         "units": [
             {
-                "hash": "u-bad-tokens",
+                "hash": "u-bad",
                 "tier": "HBM",
-                "n_tokens": None,
-                "n_bytes": None,
-                "last_access_time": None,
-                "hit_count": None,
-                "session_ids": [],
-            },
-            {
-                "hash": "u-empty-tier",
-                "tier": "",  # empty → unknown → skipped
-                "n_tokens": 100,
-                "n_bytes": 200_000,
-                "last_access_time": 1,
-                "hit_count": 1,
-                "session_ids": [],
-            },
-            {
-                "hash": "u-ok",
-                "tier": "HBM",
-                "n_tokens": 100,
+                "n_tokens": None,  # malformed
                 "n_bytes": 200_000,
                 "last_access_time": 1,
                 "hit_count": 1,
@@ -1361,57 +1359,93 @@ def probe_r3_depth3_malformed_state_smoke() -> None:
         ],
         "time_counter": 100,
     }
+    good_state = {
+        "tier_usage": {
+            "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+        },
+        "units": [],
+        "time_counter": 101,
+    }
+    state_holder = {"state": bad_state}
+    stub_app = FastAPI()
 
-    def _check() -> bool:
+    @stub_app.get("/aginfer/state")
+    async def _s() -> Any:
+        return state_holder["state"]
+
+    @stub_app.post("/aginfer/migrate")
+    async def _m(raw: Request) -> Any:
+        await raw.body()
+        return {"applied": 0, "applied_hashes": [], "skipped": []}
+
+    async def _run(strip_handle_guard: bool) -> tuple[int, int]:
+        # Monkey-patch BEFORE attach so the bound method that
+        # attach_kv_scheduler captures is the bug version.
+        saved = KvScheduler.handle
+        if strip_handle_guard:
+            async def _bug_handle(self, event, r):
+                state_json = await r.fetch_state()
+                sched_state = kvs_mod.build_paper_state(
+                    state_json,
+                    event=event,
+                    tracker=self.tracker,
+                    lambda_acting=self.lambda_acting,
+                    unknown_tier_log=self._unknown_tier_log,
+                )
+                self.last_decision_set_size = len(sched_state.decision_set)
+                if not sched_state.decision_set:
+                    return
+                action = self.policy.decide(sched_state)
+                self.decisions += 1
+                self.last_action = action
+                if action.assignments:
+                    await self._dispatch_migrate(action.assignments)
+            KvScheduler.handle = _bug_handle  # type: ignore[assignment]
+
+        port = _free_port()
+        url = f"http://127.0.0.1:{port}"
+        tracker = ProgramTracker()
+        bus = EventBus()
+        router = EventRouter(bus=bus, sglang_base_url=url)
+        sched = KvScheduler(tracker=tracker, sglang_base_url=url)
+        attach_kv_scheduler(router, sched)
+        await router.start()
+
         try:
-            s = kvs_mod.build_paper_state(
-                state_json,
-                event=Event(kind=EventKind.MEMORY_PRESSURE),
-                tracker=ProgramTracker(),
-                unknown_tier_log=set(),
-            )
-        except Exception:
-            return False
-        # u-ok survives; u-empty-tier was skipped (unknown tier);
-        # u-bad-tokens is included with n_tokens=0/n_bytes=0 defaults.
-        return (
-            "u-ok" in s.units
-            and "u-empty-tier" not in s.units
-            and "u-bad-tokens" in s.units
-            and s.units["u-bad-tokens"].n_tokens == 0
-            and s.units["u-bad-tokens"].n_bytes == 0
-        )
+            async with run_server(stub_app, "127.0.0.1", port):
+                # First event sees malformed state.
+                state_holder["state"] = bad_state
+                await router.bus.emit(
+                    Event(
+                        kind=EventKind.MEMORY_PRESSURE,
+                        payload={"state": "HIGH", "occ": 0.95},
+                    )
+                )
+                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+                state_holder["state"] = good_state
+                await router.bus.emit(
+                    Event(
+                        kind=EventKind.MEMORY_PRESSURE,
+                        payload={"state": "OK", "occ": 0.05},
+                    )
+                )
+                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+                await router.stop()
+                await sched.aclose()
+        finally:
+            KvScheduler.handle = saved  # type: ignore[assignment]
+        return router.handler_failures, router.events_handled
 
-    post_fix_passed = _check()
-
-    # PRE-FIX: monkey-patch build_paper_state to strip the `or 0`
-    # defaults, so `int(None)` propagates.
-    saved = kvs_mod.build_paper_state
-
-    def _bug_build(state_json_in, **kw):
-        # We can't easily strip the defaults from build_paper_state
-        # without rewriting it.  Instead, simulate the regression by
-        # pre-converting None → raise so the unit can't be parsed.
-        bad_state = dict(state_json_in)
-        bad_units = []
-        for u in bad_state.get("units", []) or []:
-            u2 = dict(u)
-            # If a None field is present, simulate the "no defaults"
-            # regression by replacing None with a malformed string
-            # that int() can't parse, forcing the parse to throw.
-            for field in ("n_tokens", "n_bytes", "last_access_time", "hit_count"):
-                if u2.get(field) is None:
-                    u2[field] = "BAD_NOT_INT"
-            bad_units.append(u2)
-        bad_state["units"] = bad_units
-        return saved(bad_state, **kw)
-
-    kvs_mod.build_paper_state = _bug_build
-    try:
-        pre_fix_passed = _check()
-    finally:
-        kvs_mod.build_paper_state = saved
-
+    failures_post, handled_post = await _run(strip_handle_guard=False)
+    failures_pre, handled_pre = await _run(strip_handle_guard=True)
+    # Contract: handler_failures == 0 AND both events handled.
+    # PRE-FIX (no try/except in handle): event_worker catches the
+    # malformed-state exception → handler_failures bumps to 1.
+    # POST-FIX: handle()'s try/except catches → handler_failures 0.
+    post_fix_passed = (failures_post == 0 and handled_post == 2)
+    pre_fix_passed = (failures_pre == 0 and handled_pre == 2)
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
 
@@ -1556,6 +1590,74 @@ async def probe_r3_depth4_null_fetch_state() -> None:
         pre_fix_passed = (pre_failures == 0)
     finally:
         KvScheduler.handle = saved_handle
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
+# ---------------------------------------------------------------- R3.5 tier-missing
+
+
+def probe_r35_tier_field_missing() -> None:
+    """R3.5: a state unit MISSING the ``tier`` field is the same
+    regression class B1 was designed to catch (silent HBM
+    misclassification of non-HBM units), but B1 only pinned the
+    "unknown label" case.  Round-3.5 audit caught that line 285
+    ``raw.get("tier", "HBM")`` defaults missing-tier to HBM too —
+    skipping B1's defense entirely.
+
+    PRE-FIX: missing tier → silent HBM, unit appears in s.units.
+    POST-FIX: missing tier → empty string → _tier_from_string returns
+    None → skip + log (same path as unknown labels).
+    """
+    name = "R3.5 (missing tier field is not silently HBM)"
+    state_json = {
+        "tier_usage": {
+            "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+        },
+        "units": [
+            {
+                "hash": "u-tierless",
+                # NOTE: deliberately NO "tier" key
+                "n_tokens": 100,
+                "n_bytes": 200_000,
+                "last_access_time": 0,
+                "hit_count": 0,
+                "session_ids": [],
+            }
+        ],
+        "time_counter": 100,
+    }
+
+    def _check() -> bool:
+        s = kvs_mod.build_paper_state(
+            state_json,
+            event=Event(kind=EventKind.MEMORY_PRESSURE),
+            tracker=ProgramTracker(),
+            unknown_tier_log=set(),
+        )
+        # FIX: missing tier → unit dropped (treated like unknown label).
+        return "u-tierless" not in s.units
+
+    post_fix_passed = _check()
+
+    # PRE-FIX: monkey-patch build_paper_state to keep the "HBM" default.
+    saved = kvs_mod.build_paper_state
+
+    def _bug_build(state_json_in, **kw):
+        sj = dict(state_json_in)
+        sj["units"] = [
+            {**u, "tier": u.get("tier", "HBM")}
+            for u in sj.get("units", [])
+        ]
+        return saved(sj, **kw)
+
+    kvs_mod.build_paper_state = _bug_build
+    try:
+        pre_fix_passed = _check()
+    finally:
+        kvs_mod.build_paper_state = saved
 
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
@@ -1749,6 +1851,7 @@ def probe_r3_depth1_n_bytes_from_state_directly() -> None:
             state_json,
             event=Event(kind=EventKind.MEMORY_PRESSURE),
             tracker=ProgramTracker(),
+            unknown_tier_log=set(),
         )
         u = s.units["u-precision"]
         return u.n_bytes == 999_999
@@ -1858,7 +1961,7 @@ def probe_r2_n2_unknown_tier_log_scope() -> None:
     saved = kvs_mod.build_paper_state
 
     def _bug_build(
-        state_json, *, event, tracker, lambda_acting=0.2, now_counter=None,
+        state_json, *, event, tracker, lambda_acting=0.2,
         unknown_tier_log=None,
     ):
         # Force the module-global behavior: ignore the per-instance
@@ -1868,7 +1971,6 @@ def probe_r2_n2_unknown_tier_log_scope() -> None:
             event=event,
             tracker=tracker,
             lambda_acting=lambda_acting,
-            now_counter=now_counter,
             unknown_tier_log=shared_global,
         )
 
@@ -1954,9 +2056,10 @@ def main() -> None:
     probe_r3_depth1_n_bytes_from_state_directly()
     probe_r3_vacuous2_malformed_env_var()
     probe_r3_vacuous3_per_rank_empty_units()
-    probe_r3_depth3_malformed_state_smoke()
+    asyncio.run(probe_r3_depth3_malformed_state_smoke())
     asyncio.run(probe_r3_depth4_null_fetch_state())
     asyncio.run(probe_r3_depth5_no_caching_contract())
+    probe_r35_tier_field_missing()
     print()
     print("=== T7 regression_probe PASSED ===")
 

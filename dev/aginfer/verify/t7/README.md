@@ -94,8 +94,28 @@ Mechanism. `verify/t7_policy.py`:
 | λ_ACTING miscalibrated (audit #15, simulator-grounded) | Run `baselines.compare` with λ_ACTING ∈ {1/30, 1/5, 1/1, 2/1} on the seed-20260523 fixture; record `reward / total_runtime / hit%` for each | reward must stay ≥ LRU's reward (≈ Run F'-band) in all four settings; if it falls below LRU at the extremes, ACTING signal is over-trusted — clamp λ_ACTING ∈ [1/30, 1/1] in production | simulator runs report 4 numbers; compare against LRU baseline 42.7 |
 ## RESULTS
 
-**PASSED** — all 13 verify steps + (9 round-1 + 4 round-2 + 6 round-3)
-bisect demos in regression_probe.py, ~15 s on the agsched env.
+**PASSED** — all 13 verify steps + (9 round-1 + 4 round-2 + 6 round-3 +
+1 round-3.5) bisect demos in regression_probe.py, ~15 s on the
+agsched env.
+
+### Audit round-3.5: dead-defensive-code cleanup
+
+After round-3 the user asked "are there more meaningless fallbacks?"
+A scan turned up one real B1-class bug AND a pile of dead null-defense
+that was preventing fail-loud diagnosis.  Per user direction
+**"raise > silent failure"**, all fallbacks were removed:
+
+| ID | Finding | Fix |
+|---|---|---|
+| **R3.5-1** | `raw.get("tier", "HBM")` defaulted MISSING tier → HBM (B1's silent-mis-classification bug, just for a different trigger) | `raw.get("tier", "")` → empty string flows into `_tier_from_string` → returns None → unit skipped + logged (same path as unknown labels). |
+| **R3.5-2** | `.get(x, {}) or {}` / `.get(x, []) or []` / `.get(x, 0) or 0` defensive null-guards on fields sglang always emits with proper types | Direct `state_json["tier_usage"]` / `raw["n_tokens"]` etc.  Missing field → KeyError → propagates to handle()'s try/except → log + bow out. |
+| **R3.5-3** | `unknown_tier_log: Optional[set] = None` had `if not None:` branch that silently skipped logging when unset | Made required positional kwarg.  All callers pass an explicit set (KvScheduler instance attr in production, `set()` in tests). |
+| **R3.5-4** | `now_counter` parameter had multi-tier fallback (arg → state field → max(last_access)+1) | Removed; trust `state["time_counter"]` (sglang emits it). |
+| **R3.5-5** | `float(lambda_acting)` redundant cast in `KvScheduler.__init__` (already float-typed) | Dropped. |
+| **R3.5-6** | `_flatten_per_rank`'s `isinstance(rank, dict): continue` and similar guards on sglang-emitted containers | Removed; trust shape. |
+
+Net effect on `daemon/kv_scheduler.py`: **-13 LoC** (code is shorter
++ failure modes are now visible in logs).
 
 ### Audit round-3 findings + bisect-style fixes
 

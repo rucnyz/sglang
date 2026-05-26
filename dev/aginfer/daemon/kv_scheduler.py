@@ -161,9 +161,9 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
       * time_counter: max across ranks (clocks may differ).
     Single-rank shape (no ``per_rank``) is returned unchanged.
     """
-    per_rank = state_json.get("per_rank")
-    if not isinstance(per_rank, list) or not per_rank:
+    if "per_rank" not in state_json:
         return state_json
+    per_rank = state_json["per_rank"]
     agg_tu: Dict[str, Dict[str, int]] = {
         "HBM": {"used_bytes": 0, "cap_bytes": 0},
         "DRAM": {"used_bytes": 0, "cap_bytes": 0},
@@ -172,20 +172,14 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
     agg_units: List[Dict[str, Any]] = []
     seen_hashes: set = set()
     agg_time = 0
-    for r_idx, rank in enumerate(per_rank):
-        if not isinstance(rank, dict):
-            continue
-        rank_tu = rank.get("tier_usage", {}) or {}
+    for rank in per_rank:
+        rank_tu = rank["tier_usage"]
         for label in agg_tu:
-            sub = rank_tu.get(label, {}) or {}
-            agg_tu[label]["used_bytes"] += int(sub.get("used_bytes", 0) or 0)
-            agg_tu[label]["cap_bytes"] += int(sub.get("cap_bytes", 0) or 0)
-        for u in rank.get("units", []) or []:
-            if not isinstance(u, dict):
-                continue
-            uhash = str(u.get("hash", ""))
-            if not uhash:
-                continue
+            sub = rank_tu[label]
+            agg_tu[label]["used_bytes"] += int(sub["used_bytes"])
+            agg_tu[label]["cap_bytes"] += int(sub["cap_bytes"])
+        for u in rank["units"]:
+            uhash = str(u["hash"])
             if uhash in seen_hashes:
                 # Replicated-prefix case: same logical unit on multiple
                 # ranks.  Broadcast migrate is correct; dedupe here so
@@ -194,7 +188,7 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             seen_hashes.add(uhash)
             agg_units.append(dict(u))
-        agg_time = max(agg_time, int(rank.get("time_counter", 0) or 0))
+        agg_time = max(agg_time, int(rank["time_counter"]))
     return {
         "tier_usage": agg_tu,
         "units": agg_units,
@@ -206,13 +200,9 @@ def _log_unknown_tier_once(label: str, seen: set) -> None:
     """Log each unknown tier label exactly once to avoid log spam on
     repeated state fetches.
 
-    Audit round-2 R2-N2: ``seen`` is now passed in by the caller
-    (lives on the KvScheduler instance) rather than a module-global.
-    Round-1 used a module-global ``_logged_unknown_tiers`` set; if any
-    test triggered the warn log, the SAME label was suppressed for
-    every subsequent test in the same process, which surprised ops
-    debugging multi-fixture runs.  Instance-scoped also means a
-    daemon restart resets the suppression naturally."""
+    Audit round-2 R2-N2: ``seen`` is per-instance (lives on the
+    KvScheduler) rather than module-global, so cross-test/restart
+    state doesn't leak."""
     if label in seen:
         return
     seen.add(label)
@@ -228,72 +218,69 @@ def build_paper_state(
     *,
     event: Event,
     tracker: ProgramTracker,
+    unknown_tier_log: set,
     lambda_acting: float = _DEFAULT_LAMBDA_ACTING,
-    now_counter: Optional[int] = None,
-    unknown_tier_log: Optional[set] = None,
 ) -> SchedulerState:
     """Convert sglang ``/aginfer/state`` JSON → ``SchedulerState``.
 
     paper §3's reduced state: per-unit (tier, age, p_hat, λ), per-tier
-    usage, and the event's decision_set.  ``λ`` for ACTING programs
-    is the calibrated floor; for REASONING / PAUSED programs we keep
+    usage, and the event's decision_set.  ``λ`` for ACTING/PAUSED
+    programs is the calibrated floor; for REASONING programs we keep
     the inline scorer's ``hits/age`` proxy so two scoring paths agree.
 
-    ``now_counter`` is the sglang "time counter" — an integer access
-    tick.  Pass it explicitly so verify tests are deterministic; in
-    production, pull from the state JSON itself (sglang emits
-    ``state.time_counter``) or default to max-last-access + 1.
+    Audit round-3.5: removed dead null-defense (``or {}`` / ``or []``
+    / ``or 0`` patterns) on fields sglang's dump_aginfer_state always
+    emits with proper types.  A missing/null field is now a contract
+    violation — handle()'s try/except logs the full traceback so ops
+    see exactly which field broke.  Also removed the
+    ``raw.get("tier", "HBM")`` default, which was a B1-class bug
+    (missing tier → silent HBM misclassification).
+
+    sglang's emission contract:
+      * tier_usage: dict with HBM / DRAM / DISK sub-dicts
+        (each has used_bytes + cap_bytes, both int)
+      * units: list of dicts; each has hash, tier, n_tokens, n_bytes,
+        last_access_time, hit_count, session_ids
+      * time_counter: int
     """
     # Audit round-1 B2: multi-rank sglang (TP × DP > 1) emits
-    # ``{"per_rank": [{"tier_usage": ..., "units": ..., ...}, ...]}``.
-    # Detect this shape and aggregate (sum tier usage, concat units) so
-    # the daemon makes one global decision rather than ignoring the
-    # entire payload.
+    # ``{"per_rank": [...]}``; aggregate into a single global view.
     state_json = _flatten_per_rank(state_json)
 
     tier_usage = TierUsage(capacity_bytes={}, used_bytes={})
-    raw_tu = state_json.get("tier_usage", {}) or {}
+    raw_tu = state_json["tier_usage"]
     for label, tier in (("HBM", Tier.HBM), ("DRAM", Tier.DRAM), ("DISK", Tier.DISK)):
-        sub = raw_tu.get(label, {}) or {}
-        tier_usage.capacity_bytes[tier] = int(sub.get("cap_bytes", 0) or 0)
-        tier_usage.used_bytes[tier] = int(sub.get("used_bytes", 0) or 0)
+        sub = raw_tu[label]
+        tier_usage.capacity_bytes[tier] = int(sub["cap_bytes"])
+        tier_usage.used_bytes[tier] = int(sub["used_bytes"])
     # bw_free defaults: use the full per-pair BW from costs config.
     # Production T8 / measurement layer can plumb live bw_free in here.
     tier_usage.bw_free = dict(default_costs().bw)
 
-    # Resolve time counter for age calculations.  Prefer explicit arg,
-    # then state's own value, then "max last_access_time + 1".
-    units_raw = state_json.get("units", []) or []
-    if now_counter is None:
-        now_counter = int(state_json.get("time_counter", 0) or 0)
-    if now_counter == 0 and units_raw:
-        now_counter = max(
-            int(u.get("last_access_time", 0) or 0) for u in units_raw
-        ) + 1
+    units_raw = state_json["units"]
+    now_counter = int(state_json["time_counter"])
 
     units: Dict[str, ReuseUnit] = {}
     # Owner program → its ACTING-floor λ (cached per call).
     program_lambda: Dict[str, float] = {}
     for raw in units_raw:
-        uhash = str(raw.get("hash", ""))
+        uhash = str(raw["hash"])
         if not uhash:
             continue
-        n_tokens = int(raw.get("n_tokens", 0) or 0)
-        # sglang's dump_aginfer_state emits n_bytes per unit directly,
-        # so trust it (no env-driven byte-per-token derivation).
-        n_bytes = int(raw.get("n_bytes", 0) or 0)
-        raw_tier_label = str(raw.get("tier", "HBM"))
+        n_tokens = int(raw["n_tokens"])
+        n_bytes = int(raw["n_bytes"])
+        # Audit round-3.5: tier MUST be present.  Empty / missing /
+        # unrecognised → unit is skipped + logged (same path).
+        # Previously ``raw.get("tier", "HBM")`` silently misclassified
+        # tier-less units as HBM (B1-class bug).
+        raw_tier_label = str(raw.get("tier", ""))
         tier = _tier_from_string(raw_tier_label)
         if tier is None:
-            # Audit round-1 B1: unknown tier label → skip the unit.
-            # Was: silent fallback to HBM, which let unknown-tier units
-            # pollute HBM eviction decisions.
-            if unknown_tier_log is not None:
-                _log_unknown_tier_once(raw_tier_label, unknown_tier_log)
+            _log_unknown_tier_once(raw_tier_label or "<missing>", unknown_tier_log)
             continue
-        last_access = int(raw.get("last_access_time", 0) or 0)
-        hits = int(raw.get("hit_count", 0) or 0)
-        age = max(1, int(now_counter) - last_access)
+        last_access = int(raw["last_access_time"])
+        hits = int(raw["hit_count"])
+        age = max(1, now_counter - last_access)
         # baseline λ + p_hat from inline scorer (hits/age proxy).
         p_hat = min(1.0, hits / age) if age > 0 else 0.0
         lam = max(1e-3, hits / age) if age > 0 else 1e-3
@@ -304,7 +291,7 @@ def build_paper_state(
         # tick frequency".  Paper §7 lambda is unit-centric, not
         # program-centric; this OR is the right reduction for
         # multi-holder units.
-        session_ids = raw.get("session_ids", []) or []
+        session_ids = raw["session_ids"]
         any_acting = False
         for sid in session_ids:
             if sid not in program_lambda:
@@ -505,7 +492,7 @@ class KvScheduler:
         self._client = http_client
         self._owns_client = http_client is None
         self.policy = policy or OursGreedyPolicy(default_costs())
-        self.lambda_acting = float(lambda_acting)
+        self.lambda_acting = lambda_acting
         # Telemetry for tests.
         self.decisions: int = 0
         self.migrate_calls: int = 0
