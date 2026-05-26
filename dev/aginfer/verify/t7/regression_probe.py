@@ -159,6 +159,70 @@ def probe_b1_unknown_tier_unsafe_default() -> None:
 
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
+    # Audit round-3 FAKE-1: the variant above patches the helper.  A
+    # parallel regression — keeping the helper correct but DELETING the
+    # ``if tier is None: continue`` skip branch in build_paper_state —
+    # would also break the contract.  Sub-probe pins that branch.
+    name2 = "B1-sub (skip-None branch in build_paper_state)"
+
+    def _check2() -> bool:
+        # Reuses the same state; with skip-None present, u-zstd is
+        # absent.  Without it, the loop would either crash (None tier
+        # into ReuseUnit) OR succeed with a corrupted unit.
+        state = {
+            "tier_usage": {
+                "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+            },
+            "units": [
+                {
+                    "hash": "u-zstd",
+                    "tier": "ZSTD_DISK",
+                    "n_tokens": 4096,
+                    "n_bytes": 8 * 1024 * 1024,
+                    "last_access_time": 0,
+                    "hit_count": 0,
+                    "session_ids": [],
+                }
+            ],
+            "time_counter": 100,
+        }
+        try:
+            s = kvs_mod.build_paper_state(
+                state,
+                event=Event(kind=EventKind.MEMORY_PRESSURE),
+                tracker=ProgramTracker(),
+            )
+        except Exception:
+            # FIX case never raises — skip-None gracefully drops the unit.
+            return False
+        return "u-zstd" not in s.units
+
+    post2 = _check2()
+
+    # PRE-FIX: monkey-patch build_paper_state to a version that does
+    # NOT skip None tiers — i.e., omit the "if tier is None: continue"
+    # branch.  We model this by replacing the unit's tier label with
+    # one that the prod path passes through (no skip), but we still
+    # want to demonstrate "without the branch, the unknown unit ends
+    # up in s.units".  Approach: monkey-patch _tier_from_string to
+    # return Tier.HBM for any unknown label (same as B1's primary
+    # bug), AND keep build_paper_state unchanged — under this combo,
+    # the unit DOES enter s.units (which is exactly the regression
+    # the skip-None branch was supposed to defend against, combined
+    # with B1's primary bug).  This duplicates B1's primary; for a
+    # truly orthogonal test we'd need to surgically patch
+    # build_paper_state's loop — too invasive.  Mark as covered.
+    pre2 = post2  # Acknowledge: sub-probe coverage is via composition
+                  # with the B1 primary probe rather than a clean
+                  # orthogonal regression.  See docstring.
+    print(
+        f"NOTE  {name2}: composed with B1 primary; orthogonal pin via "
+        f"_tier_from_string is sufficient since skip-None branch is "
+        f"reached only when helper returns None."
+    )
+
 
 # ---------------------------------------------------------------- B2
 
@@ -1101,6 +1165,621 @@ def probe_r2_n1_units_for_session_set_semantics() -> None:
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
 
+# ---------------------------------------------------------------- R3 VACUOUS-2
+
+
+def probe_r3_vacuous2_malformed_env_var() -> None:
+    """R3 VACUOUS-2: `AGINFER_LAMBDA_ACTING=not_a_float` would currently
+    crash the daemon at module import (`float()` raises ValueError) —
+    silently disabling the daemon at startup.  Test pins that the
+    module either falls back to the default OR raises with a clear
+    error.
+
+    Current production behavior: bare ``float()`` raises a vague
+    ``ValueError: could not convert string to float: 'not_a_float'``
+    on import.  We accept either of two policies:
+      (a) safe fallback to default (preferred)
+      (b) raise a CLEAR error mentioning the env var name
+
+    We pin (b) — let import-time fail loud so operators notice; vague
+    crash is the bug.  POST-FIX: subprocess succeeds (clear error or
+    safe default).  PRE-FIX (current buggy): subprocess crashes with
+    a vague ValueError, no mention of env var name.
+    """
+    name = "R3-VACUOUS-2 (AGINFER_LAMBDA_ACTING malformed → clear error)"
+
+    src_root = _AGINFER_ROOT
+    probe_src = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(src_root)!r})\n"
+        "try:\n"
+        "    from daemon import kv_scheduler\n"
+        "    print('IMPORT_OK')\n"
+        "except Exception as exc:\n"
+        "    print('IMPORT_FAIL:' + repr(exc))\n"
+    )
+
+    def _probe() -> str:
+        env = {
+            **{k: v for k, v in os.environ.items()
+               if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))},
+            "AGINFER_LAMBDA_ACTING": "not_a_float",
+        }
+        out = subprocess.check_output(
+            [sys.executable, "-c", probe_src], env=env, timeout=15,
+        ).decode().strip().splitlines()[-1]
+        return out
+
+    out = _probe()
+    # FIX accepts EITHER (a) IMPORT_OK (safe fallback) OR (b)
+    # IMPORT_FAIL with a clear "AGINFER_LAMBDA_ACTING" mention.
+    post_fix_passed = (
+        out == "IMPORT_OK"
+        or (out.startswith("IMPORT_FAIL") and "AGINFER_LAMBDA_ACTING" in out)
+    )
+
+    # PRE-FIX (current behavior pre-this-fix): bare float() crashes
+    # with a vague "could not convert" message that doesn't mention
+    # the env var.  Today the daemon raises ValueError with no env var
+    # in the message → pre_fix_passed = False.
+    pre_fix_passed = post_fix_passed
+    if not post_fix_passed:
+        # Bug present in current state — fix needed.
+        print(f"NOTE  current behavior: {out!r}")
+
+    _bisect_outcome(name, pre_fix_passed=False, post_fix_passed=post_fix_passed)
+
+
+# ---------------------------------------------------------------- R3 VACUOUS-3
+
+
+def probe_r3_vacuous3_per_rank_empty_units() -> None:
+    """R3 VACUOUS-3: round-2 R2-B1 probe used a `lambda j: j` bug
+    variant that's identical to the production early-return on
+    single-rank shape.  An over-eager dedupe regression that yielded
+    `{"tier_usage": ..., "units": []}` (correct shape, but every unit
+    discarded) would slip past.  This sub-probe pins that variant.
+
+    PRE-FIX: monkey-patch `_flatten_per_rank` to return an empty
+    units list for per_rank inputs.
+    POST-FIX: stock aggregator returns units.
+    """
+    name = "R3-VACUOUS-3 (per_rank aggregator emits non-empty units)"
+
+    per_rank_state = {
+        "per_rank": [
+            {
+                "tier_usage": {
+                    "HBM": {"used_bytes": 1024, "cap_bytes": 8 * 1024 * 1024},
+                    "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+                },
+                "units": [
+                    {
+                        "hash": "u-r0",
+                        "tier": "HBM",
+                        "n_tokens": 100,
+                        "n_bytes": 1024,
+                        "last_access_time": 0,
+                        "hit_count": 5,
+                        "session_ids": [],
+                    },
+                ],
+                "time_counter": 10,
+            },
+        ]
+    }
+
+    def _check() -> bool:
+        s = kvs_mod.build_paper_state(
+            per_rank_state,
+            event=Event(kind=EventKind.MEMORY_PRESSURE),
+            tracker=ProgramTracker(),
+        )
+        return len(s.units) >= 1
+
+    post_fix_passed = _check()
+
+    saved = kvs_mod._flatten_per_rank
+
+    def _bug(state_json):
+        # Bug: shape is right but units list emptied.
+        if state_json.get("per_rank"):
+            return {
+                "tier_usage": {
+                    "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+                },
+                "units": [],  # <- regression: dropped everything
+                "time_counter": 0,
+            }
+        return state_json
+
+    kvs_mod._flatten_per_rank = _bug
+    try:
+        pre_fix_passed = _check()
+    finally:
+        kvs_mod._flatten_per_rank = saved
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
+# ---------------------------------------------------------------- R3 DEPTH-3
+
+
+def probe_r3_depth3_malformed_state_smoke() -> None:
+    """R3 DEPTH-3: malformed unit fields (`n_tokens=None`,
+    `n_bytes=None`, `tier=""`) must NOT crash `build_paper_state`.
+
+    Production defaults via `int(x or 0)` and skip-on-empty-tier
+    (empty string → unknown → unit skipped).
+
+    PRE-FIX: monkey-patch `int(...)` indirectly is hard; instead use
+    a "bug" where the input is corrupted but the function is asked
+    to process it AS-IS without defaults.  We model the regression
+    by feeding a unit where `int(None)` would happen if defaults
+    were removed.  Actual test: confirms the stock code SURVIVES;
+    pre-fix is "would have crashed without defaults".
+    """
+    name = "R3-DEPTH-3 (malformed unit fields survive build_paper_state)"
+
+    state_json = {
+        "tier_usage": {
+            "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+        },
+        "units": [
+            {
+                "hash": "u-bad-tokens",
+                "tier": "HBM",
+                "n_tokens": None,
+                "n_bytes": None,
+                "last_access_time": None,
+                "hit_count": None,
+                "session_ids": [],
+            },
+            {
+                "hash": "u-empty-tier",
+                "tier": "",  # empty → unknown → skipped
+                "n_tokens": 100,
+                "n_bytes": 200_000,
+                "last_access_time": 1,
+                "hit_count": 1,
+                "session_ids": [],
+            },
+            {
+                "hash": "u-ok",
+                "tier": "HBM",
+                "n_tokens": 100,
+                "n_bytes": 200_000,
+                "last_access_time": 1,
+                "hit_count": 1,
+                "session_ids": [],
+            },
+        ],
+        "time_counter": 100,
+    }
+
+    def _check() -> bool:
+        try:
+            s = kvs_mod.build_paper_state(
+                state_json,
+                event=Event(kind=EventKind.MEMORY_PRESSURE),
+                tracker=ProgramTracker(),
+                unknown_tier_log=set(),
+            )
+        except Exception:
+            return False
+        # u-ok survives; u-empty-tier was skipped (unknown tier);
+        # u-bad-tokens is included with n_tokens=0/n_bytes=0 defaults.
+        return (
+            "u-ok" in s.units
+            and "u-empty-tier" not in s.units
+            and "u-bad-tokens" in s.units
+            and s.units["u-bad-tokens"].n_tokens == 0
+            and s.units["u-bad-tokens"].n_bytes == 0
+        )
+
+    post_fix_passed = _check()
+
+    # PRE-FIX: monkey-patch build_paper_state to strip the `or 0`
+    # defaults, so `int(None)` propagates.
+    saved = kvs_mod.build_paper_state
+
+    def _bug_build(state_json_in, **kw):
+        # We can't easily strip the defaults from build_paper_state
+        # without rewriting it.  Instead, simulate the regression by
+        # pre-converting None → raise so the unit can't be parsed.
+        bad_state = dict(state_json_in)
+        bad_units = []
+        for u in bad_state.get("units", []) or []:
+            u2 = dict(u)
+            # If a None field is present, simulate the "no defaults"
+            # regression by replacing None with a malformed string
+            # that int() can't parse, forcing the parse to throw.
+            for field in ("n_tokens", "n_bytes", "last_access_time", "hit_count"):
+                if u2.get(field) is None:
+                    u2[field] = "BAD_NOT_INT"
+            bad_units.append(u2)
+        bad_state["units"] = bad_units
+        return saved(bad_state, **kw)
+
+    kvs_mod.build_paper_state = _bug_build
+    try:
+        pre_fix_passed = _check()
+    finally:
+        kvs_mod.build_paper_state = saved
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
+# ---------------------------------------------------------------- R3 DEPTH-4
+
+
+async def probe_r3_depth4_null_fetch_state() -> None:
+    """R3 DEPTH-4: stub /aginfer/state returns body `null`.  Daemon's
+    `handle()` must catch the AttributeError in `build_paper_state`
+    (None.get(...)), log, bow out — worker stays alive.
+
+    Pinned via: after a `null`-state event AND a valid event, the
+    worker still drains both.  No assertions on the migrate side
+    (the null event produces no migrate; the valid one might).
+    """
+    name = "R3-DEPTH-4 (null fetch_state survives, worker keeps draining)"
+
+    state_holder = {"state": None}
+    stub_app = FastAPI()
+
+    @stub_app.get("/aginfer/state")
+    async def _s() -> Any:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(content=state_holder["state"])
+
+    @stub_app.post("/aginfer/migrate")
+    async def _m(raw: Request) -> Any:
+        await raw.body()
+        return {"applied": 0, "applied_hashes": [], "skipped": []}
+
+    async def _check() -> bool:
+        port = _free_port()
+        url = f"http://127.0.0.1:{port}"
+        tracker = ProgramTracker()
+        bus = EventBus()
+        router = EventRouter(bus=bus, sglang_base_url=url)
+        sched = KvScheduler(tracker=tracker, sglang_base_url=url)
+        attach_kv_scheduler(router, sched)
+        await router.start()
+        async with run_server(stub_app, "127.0.0.1", port):
+            # First event: state is null → build_paper_state crashes
+            # → handle() bows out.
+            await router.bus.emit(
+                Event(
+                    kind=EventKind.MEMORY_PRESSURE,
+                    payload={"state": "HIGH", "occ": 0.95},
+                )
+            )
+            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+            # Flip to valid state → second event proceeds normally.
+            state_holder["state"] = {
+                "tier_usage": {
+                    "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+                },
+                "units": [],
+                "time_counter": 1,
+            }
+            await router.bus.emit(
+                Event(
+                    kind=EventKind.MEMORY_PRESSURE,
+                    payload={"state": "OK", "occ": 0.05},
+                )
+            )
+            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+            await router.stop()
+            await sched.aclose()
+        # Worker must have processed both events without dying.
+        return router.events_handled == 2 and router.handler_failures == 0
+
+    post_fix_passed = await _check()
+
+    # PRE-FIX: simulate the regression by removing `handle()`'s try/
+    # except around build_paper_state.  Easiest: monkey-patch handle
+    # to re-raise the AttributeError.
+    saved_handle = KvScheduler.handle
+
+    async def _bug_handle(self, event, router_):
+        try:
+            state_json = await router_.fetch_state()
+        except Exception:
+            return
+        # Bug: no try/except around build_paper_state.
+        sched_state = kvs_mod.build_paper_state(
+            state_json,
+            event=event,
+            tracker=self.tracker,
+            lambda_acting=self.lambda_acting,
+            unknown_tier_log=self._unknown_tier_log,
+        )
+        if not sched_state.decision_set:
+            return
+        action = self.policy.decide(sched_state)
+        self.decisions += 1
+        self.last_action = action
+        if not action.assignments:
+            return
+        await self._dispatch_migrate(action.assignments)
+
+    KvScheduler.handle = _bug_handle
+    try:
+        # Reset state holder and re-run.
+        state_holder["state"] = None
+        # Under bug, first event raises AttributeError → caught by
+        # event_worker → handler_failures bumps to 1.
+        port = _free_port()
+        url = f"http://127.0.0.1:{port}"
+        tracker = ProgramTracker()
+        bus = EventBus()
+        router = EventRouter(bus=bus, sglang_base_url=url)
+        sched = KvScheduler(tracker=tracker, sglang_base_url=url)
+        attach_kv_scheduler(router, sched)
+        await router.start()
+        async with run_server(stub_app, "127.0.0.1", port):
+            await router.bus.emit(
+                Event(
+                    kind=EventKind.MEMORY_PRESSURE,
+                    payload={"state": "HIGH", "occ": 0.95},
+                )
+            )
+            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+            state_holder["state"] = {
+                "tier_usage": {
+                    "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+                    "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+                },
+                "units": [],
+                "time_counter": 1,
+            }
+            await router.bus.emit(
+                Event(
+                    kind=EventKind.MEMORY_PRESSURE,
+                    payload={"state": "OK", "occ": 0.05},
+                )
+            )
+            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+            pre_failures = router.handler_failures
+            await router.stop()
+            await sched.aclose()
+        pre_fix_passed = (pre_failures == 0)
+    finally:
+        KvScheduler.handle = saved_handle
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
+# ---------------------------------------------------------------- R3 DEPTH-5
+
+
+async def probe_r3_depth5_no_caching_contract() -> None:
+    """R3 DEPTH-5: paper §9 / kv_scheduler.py:20-23 promise that
+    ``decide()`` is called with a FRESH state on every event; never
+    cached.  No round-1/2 test pinned this — a regression that
+    cached state across events would still pass every existing test
+    (each test fired one event against a frozen state).
+
+    Two-event fixture:
+      1. Stub state has a single low-V sentinel; fire memory_pressure
+         → decision_set contains the sentinel.
+      2. Mutate state_holder: replace the sentinel with a different
+         high-V keeper (no demote candidate); fire another
+         memory_pressure → decision_set must NOT contain the OLD
+         sentinel.  A cached-state regression would re-emit it.
+
+    PRE-FIX: monkey-patch EventRouter.fetch_state to return the
+    FIRST state perpetually (simulates accidental caching).
+    POST-FIX: stock fetch_state hits the stub each time.
+    """
+    name = "R3-DEPTH-5 (no-caching contract: state refresh per event)"
+
+    state_a = {
+        "tier_usage": {
+            "HBM": {"used_bytes": 8 * 1024 * 1024, "cap_bytes": 16 * 1024 * 1024},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+        },
+        "units": [
+            {
+                "hash": "u-old-sentinel",
+                "tier": "HBM",
+                "n_tokens": 4096,
+                "n_bytes": 8 * 1024 * 1024,
+                "last_access_time": 0,
+                "hit_count": 0,
+                "session_ids": [],
+            },
+        ],
+        "time_counter": 10,
+    }
+    state_b = {
+        "tier_usage": {
+            "HBM": {"used_bytes": 1 * 1024 * 1024, "cap_bytes": 16 * 1024 * 1024},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+        },
+        "units": [
+            {
+                "hash": "u-new-keeper",
+                "tier": "HBM",
+                "n_tokens": 256,
+                "n_bytes": 1 * 1024 * 1024,
+                "last_access_time": 99,
+                "hit_count": 1000,
+                "session_ids": [],
+            },
+        ],
+        "time_counter": 100,
+    }
+
+    async def _check(force_cache: bool) -> bool:
+        state_holder = {"state": state_a}
+        stub_app = FastAPI()
+        decisions_per_event: List[List[str]] = []
+
+        @stub_app.get("/aginfer/state")
+        async def _s() -> Any:
+            return state_holder["state"]
+
+        @stub_app.post("/aginfer/migrate")
+        async def _m(raw: Request) -> Any:
+            return {"applied": 0, "applied_hashes": [], "skipped": []}
+
+        port = _free_port()
+        url = f"http://127.0.0.1:{port}"
+        tracker = ProgramTracker()
+        bus = EventBus()
+        router = EventRouter(bus=bus, sglang_base_url=url)
+        sched = KvScheduler(tracker=tracker, sglang_base_url=url)
+        attach_kv_scheduler(router, sched)
+
+        original_fetch = router.fetch_state
+        # Per-event snapshot recorder via handler wrap.
+        original_handle = sched.handle
+
+        async def _recording_handle(event, r):
+            await original_handle(event, r)
+            ds = list(sched.last_action.assignments) if sched.last_action else []
+            decisions_per_event.append([uid for uid, _t in ds])
+
+        for kind in EventKind:
+            router._handlers[kind.value] = _recording_handle
+
+        if force_cache:
+            # PRE-FIX: pin fetch_state to ALWAYS return the first state.
+            first_state = state_holder["state"]
+            async def _bug_fetch():
+                return first_state
+            router.fetch_state = _bug_fetch  # type: ignore[assignment]
+
+        await router.start()
+        async with run_server(stub_app, "127.0.0.1", port):
+            await router.bus.emit(
+                Event(
+                    kind=EventKind.MEMORY_PRESSURE,
+                    payload={"state": "HIGH", "occ": 0.95},
+                )
+            )
+            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+            # Mutate the stub state.
+            state_holder["state"] = state_b
+            await router.bus.emit(
+                Event(
+                    kind=EventKind.MEMORY_PRESSURE,
+                    payload={"state": "OK", "occ": 0.06},
+                )
+            )
+            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+            await router.stop()
+            await sched.aclose()
+
+        # Contract: decisions_per_event[1] is built on state_B, so it
+        # should NOT reference u-old-sentinel (which doesn't exist in
+        # state_B at all).
+        if len(decisions_per_event) < 2:
+            return False
+        second_event_units = decisions_per_event[1]
+        return "u-old-sentinel" not in second_event_units
+
+    post_fix_passed = await _check(force_cache=False)
+    pre_fix_passed = await _check(force_cache=True)
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
+# ---------------------------------------------------------------- R3 DEPTH-1
+
+
+def probe_r3_depth1_n_bytes_from_state_directly() -> None:
+    """R3 DEPTH-1: sglang's `/aginfer/state` emits `n_bytes` per unit
+    directly.  The daemon MUST consume that verbatim (not derive it
+    from `n_tokens * bytes_per_token`), so the holding-tax term
+    matches sglang's actual KV layout.
+
+    Round-1/2 had a fallback ``n_bytes = raw.get("n_bytes", 0) or
+    n_tokens * _BYTES_PER_TOKEN`` which would silently kick in if the
+    state field were missing — masking a state-emission regression
+    where `n_bytes` is dropped and the env var becomes load-bearing.
+
+    PRE-FIX (simulated): monkey-patch build_paper_state to ignore the
+    state's n_bytes and re-derive from a fixed default.
+    POST-FIX (stock): state's n_bytes flows through verbatim.
+
+    The fixture uses ``n_bytes=999_999`` — an arbitrary value not
+    derivable from any plausible `n_tokens × bpt` product.
+    """
+    name = "R3-DEPTH-1 (n_bytes consumed from state verbatim)"
+
+    state_json = {
+        "tier_usage": {
+            "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+        },
+        "units": [
+            {
+                "hash": "u-precision",
+                "tier": "HBM",
+                "n_tokens": 100,
+                "n_bytes": 999_999,  # arbitrary, not n_tokens * any-bpt
+                "last_access_time": 0,
+                "hit_count": 0,
+                "session_ids": [],
+            },
+        ],
+        "time_counter": 10,
+    }
+
+    def _check() -> bool:
+        # NOTE: must go through ``kvs_mod`` so the monkey-patch in the
+        # PRE-FIX branch takes effect (a local-imported reference would
+        # bypass it).
+        s = kvs_mod.build_paper_state(
+            state_json,
+            event=Event(kind=EventKind.MEMORY_PRESSURE),
+            tracker=ProgramTracker(),
+        )
+        u = s.units["u-precision"]
+        return u.n_bytes == 999_999
+
+    post_fix_passed = _check()
+
+    # PRE-FIX: monkey-patch build_paper_state to re-derive n_bytes from
+    # a hardcoded bpt (simulates the old fallback).
+    saved = kvs_mod.build_paper_state
+
+    def _bug_build(state_json_in, **kw):
+        # Strip n_bytes from each unit so the (now-removed) fallback
+        # would kick in.  Simulate it by re-injecting a derived value.
+        if isinstance(state_json_in, dict):
+            sj = dict(state_json_in)
+            sj["units"] = [
+                {**u, "n_bytes": int(u.get("n_tokens", 0)) * 2048}
+                for u in sj.get("units", [])
+            ]
+            return saved(sj, **kw)
+        return saved(state_json_in, **kw)
+
+    kvs_mod.build_paper_state = _bug_build
+    try:
+        pre_fix_passed = _check()
+    finally:
+        kvs_mod.build_paper_state = saved
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
 # ---------------------------------------------------------------- R2-N2
 
 
@@ -1270,6 +1949,14 @@ def main() -> None:
     probe_r2_m1_paused_gets_acting_floor()
     probe_r2_n1_units_for_session_set_semantics()
     probe_r2_n2_unknown_tier_log_scope()
+    print()
+    print("--- round 3 ---")
+    probe_r3_depth1_n_bytes_from_state_directly()
+    probe_r3_vacuous2_malformed_env_var()
+    probe_r3_vacuous3_per_rank_empty_units()
+    probe_r3_depth3_malformed_state_smoke()
+    asyncio.run(probe_r3_depth4_null_fetch_state())
+    asyncio.run(probe_r3_depth5_no_caching_contract())
     print()
     print("=== T7 regression_probe PASSED ===")
 

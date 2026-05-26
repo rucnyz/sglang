@@ -784,6 +784,15 @@ async def step_all_event_kinds_registered() -> None:
           ``scheduler.last_decision_set_size`` is non-zero
           (handler was actually invoked).
     """
+    # Audit round-3 VACUOUS-1: previous version compared bound-method
+    # identity (``handler == scheduler.handle``), which is fragile —
+    # a future ``functools.partial`` wrapper would fail equality but
+    # routing would be functionally correct (and vice versa, a
+    # wrapper that intercepts but still calls handle would pass
+    # equality while breaking behavior).  Replace with FUNCTIONAL
+    # pin: fire one event of EACH kind in turn and assert
+    # ``last_decision_set_size`` was actually touched by
+    # ``scheduler.handle`` (the sentinel-overwrite check).
     state_holder = {"state": make_synthetic_state(n_programs=2)}
     stub_app, _migrate_calls = build_stub_sglang(lambda: state_holder["state"])
     stub_port = _free_port()
@@ -791,31 +800,27 @@ async def step_all_event_kinds_registered() -> None:
     tracker = ProgramTracker()
     tracker.observe_arrival("prog-0")
     tracker.observe_arrival("prog-1")
+    SENTINEL = -42
     async with run_server(stub_app, "127.0.0.1", stub_port):
         async with boot_router(stub_url, tracker) as (router, scheduler):
-            # (a) static registry check.  Bound methods on the same
-            # instance compare equal with `==` (each lookup builds a
-            # fresh bound-method object so `is` would fail).
             for kind in EventKind:
-                handler = router._handlers.get(kind.value)
-                assert handler == scheduler.handle, (
-                    f"EventKind.{kind.name} not routed to kv_scheduler; "
-                    f"got {handler!r} (expected scheduler.handle)"
+                scheduler.last_decision_set_size = SENTINEL
+                await router.bus.emit(
+                    Event(
+                        kind=kind,
+                        session="prog-0",
+                        payload={"state": "HIGH", "occ": 0.95},
+                    )
                 )
-            # (b) end-to-end PRESSURE_RESOLVED fire.
-            scheduler.last_decision_set_size = -1  # sentinel
-            await router.bus.emit(
-                Event(
-                    kind=EventKind.PRESSURE_RESOLVED,
-                    payload={"state": "OK", "prev_state": "HIGH", "occ": 0.3},
+                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+                # If routing landed on _noop_handler instead of
+                # scheduler.handle, the sentinel would still be -42
+                # (noop doesn't touch this field).
+                assert scheduler.last_decision_set_size != SENTINEL, (
+                    f"EventKind.{kind.name} was NOT routed to "
+                    f"scheduler.handle; sentinel stayed {SENTINEL} "
+                    f"(handler probably fell back to _noop_handler)."
                 )
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-    # Sentinel was overwritten → handler ran.
-    assert scheduler.last_decision_set_size != -1, (
-        "PRESSURE_RESOLVED was NOT routed to the kv_scheduler handler; "
-        "router fell back to _noop_handler (M3 regression)."
-    )
 
 
 async def step_migrate_5xx_does_not_crash() -> None:
@@ -902,8 +907,7 @@ def step_env_var_binding() -> None:
         "from daemon import kv_scheduler as k; "
         "print(json.dumps({"
         "'topk': k._DEFAULT_MEMORY_PRESSURE_TOPK, "
-        "'lam':  k._DEFAULT_LAMBDA_ACTING, "
-        "'bpt':  k._BYTES_PER_TOKEN}))"
+        "'lam':  k._DEFAULT_LAMBDA_ACTING}))"
     )
     out = subprocess.check_output(
         [sys.executable, "-c", probe],
@@ -912,7 +916,6 @@ def step_env_var_binding() -> None:
                if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))},
             "AGINFER_MEMORY_PRESSURE_TOPK": "7",
             "AGINFER_LAMBDA_ACTING": "0.42",
-            "AGINFER_BYTES_PER_TOKEN": "1024",
         },
         timeout=15,
     ).decode().strip().splitlines()[-1]
@@ -924,10 +927,6 @@ def step_env_var_binding() -> None:
     assert abs(parsed["lam"] - 0.42) < 1e-9, (
         f"AGINFER_LAMBDA_ACTING -> _DEFAULT_LAMBDA_ACTING binding broken: "
         f"got {parsed['lam']}"
-    )
-    assert parsed["bpt"] == 1024, (
-        f"AGINFER_BYTES_PER_TOKEN -> _BYTES_PER_TOKEN binding broken: "
-        f"got {parsed['bpt']}"
     )
 
 

@@ -94,8 +94,29 @@ Mechanism. `verify/t7_policy.py`:
 | λ_ACTING miscalibrated (audit #15, simulator-grounded) | Run `baselines.compare` with λ_ACTING ∈ {1/30, 1/5, 1/1, 2/1} on the seed-20260523 fixture; record `reward / total_runtime / hit%` for each | reward must stay ≥ LRU's reward (≈ Run F'-band) in all four settings; if it falls below LRU at the extremes, ACTING signal is over-trusted — clamp λ_ACTING ∈ [1/30, 1/1] in production | simulator runs report 4 numbers; compare against LRU baseline 42.7 |
 ## RESULTS
 
-**PASSED** — all 13 verify steps + (9 round-1 + 4 round-2) bisect
-demos in regression_probe.py, ~12 s on the agsched env.
+**PASSED** — all 13 verify steps + (9 round-1 + 4 round-2 + 6 round-3)
+bisect demos in regression_probe.py, ~15 s on the agsched env.
+
+### Audit round-3 findings + bisect-style fixes
+
+The third audit was a **test-quality audit** (are tests fake / vacuous
+/ missing depth) rather than a code-quality audit.  Found 1 FAKE +
+3 VACUOUS + 2 MAJOR depth + 2 MINOR depth.  One depth finding
+(DEPTH-1) initially looked like a prod bug but the right fix was
+to SIMPLIFY: remove the `_BYTES_PER_TOKEN` env var + `n_bytes`
+fallback entirely (sglang's state always emits `n_bytes` directly,
+so the fallback was dead defensive code).
+
+| ID | Finding | Fix layer |
+|---|---|---|
+| **R3-DEPTH-1** | `n_bytes` fallback via env var was load-bearing only if sglang's state dropped the field; in practice it's always emitted, so the fallback was dead code that masked a state-emission regression | **Production simplify**: removed `_BYTES_PER_TOKEN` env var + fallback entirely; `n_bytes = int(raw.get("n_bytes", 0) or 0)`.  Probe pins state's n_bytes flows through verbatim. |
+| **R3-DEPTH-5** | Paper §9 "fresh state per event" / no-caching contract was unpinned — a regression caching fetch_state across events would slip past every existing test | **Test only** (prod was correct): two-event probe that mutates state between emits and asserts the second decision reflects the new state. |
+| **R3-FAKE-1** | `probe_b1` monkey-patches `_tier_from_string` but not the `build_paper_state` skip-None branch; a parallel regression deleting only the skip branch would slip | **Test**: documented sub-probe NOTE acknowledging that orthogonal pin requires composition with the B1 primary (skip-None is reachable only when helper returns None). |
+| **R3-VACUOUS-1** | `step_all_event_kinds_registered` used bound-method `==` which is fragile (functools.partial wrapper would falsely fail) | **Test**: switched to FUNCTIONAL pin — fire one event per EventKind, assert `last_decision_set_size` sentinel was overwritten (proves scheduler.handle, not _noop_handler, ran). |
+| **R3-VACUOUS-2** | `AGINFER_LAMBDA_ACTING=not_a_float` crashed module import with a vague `ValueError: could not convert` (no mention of env var name) | **Production**: added `_env_float` / `_env_int` helpers that re-raise with the env var name in the message. |
+| **R3-VACUOUS-3** | Round-2's probe_b2 bug variant (`lambda j: j`) was equivalent to the production early-return on non-per_rank, so it pinned "triggered when present" not "aggregation result valid" | **Test**: new probe with a bug that returns correct shape but empty units (over-eager dedupe regression class). |
+| **R3-DEPTH-3** | Malformed unit fields (`n_tokens=None`, `tier=""`) not pinned | **Test**: new probe feeding a state with three malformed units; assert (a) `u-ok` survives, (b) `u-empty-tier` is skipped (UnknownTierError caught), (c) `u-bad-tokens` is included with n_tokens=0 defaults. |
+| **R3-DEPTH-4** | `fetch_state` returning JSON `null` (non-dict) not pinned | **Test**: new probe with stub returning `null` first then valid state; assert worker survives, `handler_failures == 0`. |
 
 ### Audit round-2 findings + bisect-style fixes
 

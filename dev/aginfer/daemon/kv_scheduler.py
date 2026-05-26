@@ -68,16 +68,39 @@ logger = logging.getLogger(__name__)
 # to [1/30, 1/1] per audit #15 — see verify/t7/README.md WORST CASE.
 _LAMBDA_ACTING_FLOOR = 1.0 / 30.0
 _LAMBDA_ACTING_CEIL = 1.0 / 1.0
-_DEFAULT_LAMBDA_ACTING = float(
-    os.environ.get("AGINFER_LAMBDA_ACTING", "0.2")
-)
+
+
+def _env_float(key: str, default: str) -> float:
+    """Parse a float env var with a CLEAR error message on malformed
+    values — bare ``float(os.environ[k])`` raises a vague
+    ``ValueError: could not convert string to float`` that doesn't
+    mention the env var name, which would silently break the daemon
+    at module import."""
+    raw = os.environ.get(key, default)
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"env var {key}={raw!r} is not a valid float: {exc}"
+        ) from exc
+
+
+def _env_int(key: str, default: str) -> int:
+    raw = os.environ.get(key, default)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"env var {key}={raw!r} is not a valid int: {exc}"
+        ) from exc
+
+
+_DEFAULT_LAMBDA_ACTING = _env_float("AGINFER_LAMBDA_ACTING", "0.2")
 
 # Top-k cap on the memory_pressure decision_set.  Paper §7.1.  256 is
 # enough to materially affect HBM occ on a B300 (~half a percent per
 # unit at 2 KB/token × 4 k tokens/unit).
-_DEFAULT_MEMORY_PRESSURE_TOPK = int(
-    os.environ.get("AGINFER_MEMORY_PRESSURE_TOPK", "256")
-)
+_DEFAULT_MEMORY_PRESSURE_TOPK = _env_int("AGINFER_MEMORY_PRESSURE_TOPK", "256")
 
 
 def _clamp_lambda_acting(lam: float) -> float:
@@ -85,10 +108,6 @@ def _clamp_lambda_acting(lam: float) -> float:
 
 
 # ----------------------------------------------------------------- adapter
-
-# Bytes-per-token override (kept in sync with sglang_adapter.py so unit
-# tests don't depend on inference-time KV layout).
-_BYTES_PER_TOKEN = int(os.environ.get("AGINFER_BYTES_PER_TOKEN", "2048"))
 
 
 _TIER_LABEL_MAP: Dict[str, Tier] = {
@@ -180,8 +199,6 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         "tier_usage": agg_tu,
         "units": agg_units,
         "time_counter": agg_time,
-        # Preserve any other top-level fields (rare; bytes_per_token etc.).
-        **{k: v for k, v in state_json.items() if k not in ("per_rank",)},
     }
 
 
@@ -262,7 +279,9 @@ def build_paper_state(
         if not uhash:
             continue
         n_tokens = int(raw.get("n_tokens", 0) or 0)
-        n_bytes = int(raw.get("n_bytes", 0) or n_tokens * _BYTES_PER_TOKEN)
+        # sglang's dump_aginfer_state emits n_bytes per unit directly,
+        # so trust it (no env-driven byte-per-token derivation).
+        n_bytes = int(raw.get("n_bytes", 0) or 0)
         raw_tier_label = str(raw.get("tier", "HBM"))
         tier = _tier_from_string(raw_tier_label)
         if tier is None:
