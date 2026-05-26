@@ -110,6 +110,67 @@ Mechanism. `verify/t3_session_passthrough.py`:
    shared-prefix node's session_ids has all 32.
 ```
 
+## REPRODUCING
+
+T3 has TWO scripts and an EXTRA launch flag.  Step [9] in
+`verify.py` exercises the chunked-prefill path; without
+`--chunked-prefill-size 32` the request stays in one chunk and the
+chunked-path test degrades to "long generation only" (still passes,
+but no longer pins the chunked branch).
+
+```bash
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
+conda activate agsched
+
+# openai package is required for the OpenAI-client extra_body test
+# (step [3] of verify.py).  Default agsched env should already have it.
+python -c "import openai" || pip install openai
+
+cd /scratch/yuzhou/projects/sglang/dev/aginfer
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
+  python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B \
+    --host 127.0.0.1 --port 30001 \
+    --tp 1 --mem-fraction-static 0.15 \
+    --max-total-tokens 65536 \
+    --trust-remote-code \
+    --attention-backend flashinfer \
+    --chunked-prefill-size 32 \
+  > logs/sglang_t3.log 2>&1 &
+
+# Wait for "Uvicorn running on http://127.0.0.1:30001".
+
+# Main 13-step verify (production-shape end-to-end coverage).
+AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
+AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
+  python verify/t3/verify.py
+# expected last line: "=== T3 PASSED (post-audit round 3) ==="
+
+# Bisect regression probe (round-3 audit BLOCKERs):
+#   [A] Session.create_req forwards program_id
+#   [B] sanitizer recursion cap
+# This is the "first prove the bug exists, then prove the fix works"
+# demo.  Pre-fix logs (in verify/t3/results/*PREFIX*.log) show both
+# FAIL; post-fix logs show both PASS.
+AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
+AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
+  python verify/t3/regression_probe.py
+# expected last lines: "PASS  Session.create_req forwards program_id"
+#                      "PASS  sanitizer recursion cap"
+
+pkill -f "launch_server.*30001"
+```
+
+To re-run the pre-fix demo for either BLOCKER:
+* BLOCKER A: in `python/sglang/srt/session/session_controller.py`,
+  comment out the ``program_id=req.program_id`` line in the Req
+  constructor (~line 243), restart sglang, re-run probe — probe [A]
+  must FAIL.  Restore + restart + re-run, probe [A] must PASS.
+* BLOCKER B: in `python/sglang/srt/managers/schedule_batch.py`, set
+  ``_PROGRAM_ID_MAX_RECURSION = 999_999``, restart, re-run probe —
+  probe [B] must FAIL.  Restore to 8 + restart + re-run, probe [B]
+  must PASS.
+
 ## RESULTS
 
 **PASSED** — all 13 steps (post audit round-3) on Qwen3-0.6B +

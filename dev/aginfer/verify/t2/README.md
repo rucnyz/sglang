@@ -85,6 +85,35 @@ Mechanism. `verify/t2_migrate_endpoint.py`:
 7. Latency micro-bench: 100 batches of 100 actions each, measure throughput.
 ```
 
+## REPRODUCING
+
+Same setup as T1 (no special launch flags); 21 in-suite steps:
+
+```bash
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
+conda activate agsched
+
+cd /scratch/yuzhou/projects/sglang/dev/aginfer
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
+  python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B \
+    --host 127.0.0.1 --port 30001 \
+    --tp 1 --mem-fraction-static 0.15 \
+    --max-total-tokens 65536 \
+    --trust-remote-code \
+    --attention-backend flashinfer \
+  > logs/sglang_t2.log 2>&1 &
+
+# Wait for "Uvicorn running on http://127.0.0.1:30001".
+
+AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
+AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
+  python verify/t2/verify.py
+# expected last line: "=== T2 PASSED (depth-audit + round-3) ==="
+
+pkill -f "launch_server.*30001"
+```
+
 ## RESULTS
 
 **PASSED** (depth-audit edition, 2026-05-26).  All 16 in-suite steps pass on

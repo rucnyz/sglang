@@ -51,6 +51,41 @@ Mechanism (no harbor needed). `verify/t1_state_endpoint.py`:
    of `/aginfer/state` over 20 calls, report p50/p99.
 ```
 
+## REPRODUCING
+
+End-to-end repro, copy-paste from a clean shell.  Picks GPU 4 by
+default; pick any free GPU and edit `CUDA_VISIBLE_DEVICES`.
+
+```bash
+# 1. Activate the preinstalled env.
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
+conda activate agsched
+
+# 2. Launch sglang.  Qwen3-0.6B + flashinfer is enough for T1
+#    (trtllm_mha default would bypass the radix entirely).
+cd /scratch/yuzhou/projects/sglang/dev/aginfer
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=4 \
+  python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-0.6B \
+    --host 127.0.0.1 --port 30001 \
+    --tp 1 --mem-fraction-static 0.15 \
+    --max-total-tokens 65536 \
+    --trust-remote-code \
+    --attention-backend flashinfer \
+  > logs/sglang_t1.log 2>&1 &
+
+# Wait for "Uvicorn running on http://127.0.0.1:30001" in the log.
+
+# 3. Run the verify.
+AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
+AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
+  python verify/t1/verify.py
+# expected last line: "=== T1 PASSED ==="
+
+# 4. Tear down sglang.
+pkill -f "launch_server.*30001"
+```
+
 ## RESULTS
 
 **PASSED** — happy path + worst-case forced injection, on Qwen3-0.6B + `--attention-backend flashinfer` (trtllm_mha auto-picks page_size=1 and bypasses sglang radix insertion; flashinfer + UnifiedRadixCache does insert).

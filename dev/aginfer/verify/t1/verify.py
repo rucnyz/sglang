@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 import requests
 
 import os
-BASE = os.environ.get("AGINFER_VERIFY_BASE", "http://127.0.0.1:30000")
+BASE = os.environ.get("AGINFER_VERIFY_BASE", "http://127.0.0.1:30001")
 MODEL = os.environ.get("AGINFER_VERIFY_MODEL", "deepseek-ai/DeepSeek-V4-Flash")
 
 
