@@ -128,64 +128,104 @@ Two SWAP POINTS the new estimator must touch (both compute
   inline evictions disagree with daemon migrations → conflict rate
   > 1 % violation.
 
-### Design discipline: WORKLOAD-AGNOSTIC ESTIMATOR
+### Final T11 design (2026-05-26): program-alive rule + residual estimator
 
-⚠️ **Reformulation rejected (2026-05-26, user direction).**  Earlier
-this section proposed a "T11x — session-aware p_hat" that hard-
-coded `p_hat = 1.0 for REASONING/ACTING units, decay τ=88s for
-idle, fall back to hits/age for orphans`.  That was overfitting to
-terminus-2.  Paper §7's V_u is a general framework; T11 must
-deliver a general estimator.
+After two rounds of reformulation (T11x rejected for hard-coding
+terminus-2 constants; then over-corrected to "no rules at all"),
+the principled design that survived is:
 
-**The rule:** the p_hat estimator MUST be workload-agnostic.  It
-learns from observed reuse intervals.  It does not encode "if
-terminus-2 then 1.0".  Session-state and benchmark-shape are
-treated as **features** the estimator can use, not as rules.
+**Core rule (workload-class-general, not benchmark-specific):**
 
-**Validation discipline:** on terminus-2 (deterministic monotonic
-extension) a correctly-fit estimator SHOULD converge to ~1.0 for
-trunk units in active sessions.  If it does not, the estimator is
-buggy — fix the estimator, do not hard-code the answer.  On RAG /
-code-completion / branching workloads the same estimator must
-adapt to different reuse curves without code change.
+```
+p_hat(u | holder p) = 1.0               if p is alive
+                    = ε  /  empirical    if p has ended
+```
 
-**Original T11 plan is therefore reinstated** (T11a → T11b → T11c):
+Why this is general, not benchmark-specific:
+* The anchor is **ProgramTracker.is_alive(p)** — a queryable
+  predicate that exists in T6, has no magic constants
+  (no τ=88s, no 14s threshold).
+* For **any monotonic-extension workload** (multi-turn agents,
+  long conversations, MCTS branch exploration) an alive holder
+  will reuse the prefix on its next step.
+* For **stateless / single-shot workloads** (one-off completion,
+  RAG) each request is a short-lived program; while in flight it
+  reuses its prefix, when done it dies — same rule.
+* The rule does NOT bake in terminus-2's specific timing
+  (88s p99 inter-turn), nor any "if dataset == X" branch.
 
-1. **T11a — Trace harvest** (workload-agnostic instrumentation).
-   5 hooks in sglang (see notes/trace_hooks.md).  Log (unit_hash,
-   ts, kind, holder_state, scope, depth, branching_factor, hits,
-   age) — features that any estimator might want.  Harvest on
-   Run K full + a second workload if available.
+**System-prompt high value emerges from aggregation, not a
+special rule:** with K alive holders each contributing
+p_hat=1.0, the unit's aggregated V_u accumulates across holders
+(via T8's shared-aware aggregation, currently equal-split,
+ideally Shapley).  Trunk units have 1 alive holder.  System-
+prompt shared head has ~32 alive holders → naturally rises to
+the top of the heap with no special-casing.
 
-2. **T11b — Empirical estimator** (no workload assumption).  Try
-   in order:
-   * b1 — Histogram + Bayesian smoothing on inter-access intervals.
-     Conditioned on (UnitType, Scope, holder_state_bucket).  Beta
-     prior so cold-start ≠ 0.
-   * b2 — Per-(program-cluster) prior.  Cluster programs by
-     early-life features only (turns/sec, branching factor, prefix
-     reuse rate at age=30s).  No benchmark label is allowed as a
-     feature — cluster discovery only.
-   * b3 — Hawkes / Pareto fit on per-unit-type intensity.  See
-     notes/literature_survey.md — this was the lit-recommended
-     starting point and remains a valid path.
-   Pick whichever has lowest log-loss on held-out trace.
+**Why this addresses the K-full 1.76× slowdown:** trunk units in
+active sessions are exactly where `hits/age` fails — young units
+(low age) with few hits (~0.05) get evicted, then must be
+refetched the next turn.  The rule promotes them to p_hat=1.0
+(20× upward correction), matching the order of magnitude of the
+observed regression.
 
-3. **T11c — Integration + re-eval.**  Plug winner into both swap
-   points (sglang_adapter.py:69/71 and kv_scheduler.py:309/310).
-   Re-run K.  Target ≤ Run H' 885s; ideally ≤ Run G 666s.
+**Why p_hat = 1.0 is now theoretically defensible:**
+*conditional* on the queryable predicate "program alive AND
+issuing more tokens", monotonic-extension means next-step reuse
+is structurally certain.  The earlier "no probability truly = 1"
+objection applied to *unconditional* p_hat; conditioning on
+alive-program makes 1.0 exact within the 1-step horizon of
+paper §7.
 
-### What the workload_characterisation data IS for
+### Revised sub-task plan
 
-`notes/workload_characterisation.md` keeps its findings, but its
-role changes:
-* **Sanity check** for T11b — on terminus-2 traces the fitted
-  estimator should predict ~1.0 for active-session trunk units
-  (deterministic ground truth).
-* **Coverage check** — confirms our trace harvest captures the
-  multi-turn structure (200 turns × 32 trials = ~6400 turn events
-  per Run K, plenty of data).
-* **NOT** a basis for hard-coded rules in the estimator code.
+**T11a — Implement the program-alive rule (PRIMARY).**
+
+Touch points (see notes/phat_inventory.md):
+* Daemon side: `daemon/kv_scheduler.py:build_paper_state`
+  (lines 309–310) — easy, ProgramTracker is in-process.
+* Inline side: `baselines/sglang_adapter.py:_node_to_unit`
+  (lines 69, 71) — needs sglang to receive ProgramTracker liveness
+  snapshots from daemon (NOT polling — push on state changes:
+  pause/resume/observe_arrival/program_end).
+
+State machinery already exists from T6.  The new wire is just
+"daemon → sglang: here's the current set of alive program IDs",
+event-driven.
+
+Re-run K full with this rule.  Targets:
+* T11a mean ≤ Run H' 885s → primary regression eliminated, ship.
+* T11a mean ≤ Run G 666s → also beats ThunderAgent, paper-strong.
+* T11a mean > 1000s → rule isn't enough, escalate to T11b.
+
+**T11b — Empirical residual p_hat (cold path; only if T11a
+under-delivers OR for orphan-unit valuation refinement).**
+
+For units whose holders have all ended, what's the chance a
+*future* program reattaches?  This affects the priority of dead-
+program units only — strictly cold-path, not on the hot eviction
+heap.  Approaches (b1 histogram / b2 cluster-prior /
+b3 Hawkes-Pareto fit) remain valid; pick by held-out log-loss on
+trace data.  Same workload-agnostic discipline: behavioural
+features only, no benchmark labels.
+
+**T11c — Integration + ablation.**
+
+After T11a (and optionally T11b), re-run K full + a second
+workload if available, to confirm the rule generalises beyond
+terminus-2.
+
+### Role of harvested traces
+
+`notes/trace_hooks.md`'s instrumentation is still worth doing,
+but its purpose is **validation**, not estimator construction:
+* Verify on terminus-2 traces that alive-program trunk units do
+  hit ~100% of the time within the next ACTING step.  If not,
+  the rule has a flaw worth understanding.
+* Provide training data for T11b's residual estimator (post-
+  program-end reuse patterns).
+* Coverage check: 200 turns × 32 trials per Run K ≈ 6400 turn
+  events, plenty of data.
 
 ## OPEN QUESTIONS (track here, update as we learn)
 
