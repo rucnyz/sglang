@@ -556,8 +556,14 @@ def main() -> None:
         f"scheduler crashed."
     )
     health = requests.get(f"{BASE}/health", timeout=10)
-    assert health.status_code in (200, 503), (
-        f"server unresponsive after recursion bomb: {health.status_code}"
+    # Audit round-3: previously accepted 200 OR 503.  A 503 means the
+    # scheduler DID crash (or its degraded-health gate tripped), which
+    # is the exact failure we're trying to prevent.  Tighten to 200
+    # only — if the bomb takes sglang out, we want this assertion to
+    # fail loudly, not pass with a "stayed up" message.
+    assert health.status_code == 200, (
+        f"server unhealthy after recursion bomb: {health.status_code} "
+        f"(recursion cap did not protect the scheduler)"
     )
     state = fetch_state()
     assert not units_with(state, "should-be-buried-too-deep"), (

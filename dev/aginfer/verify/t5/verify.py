@@ -458,7 +458,7 @@ async def la_firer_retry_and_payload() -> None:
             theta_crit=0.9,
         )
         try:
-            firer.maybe_fire(used_tokens=58000, cap_tokens=65536)  # ~0.885 -> CRITICAL
+            firer.maybe_fire(used_tokens=58000, cap_tokens=65536)  # ~0.885 -> HIGH (< 0.9 crit)
             # The firer's background thread will retry 0.1 + 0.4 s = 0.5 s.
             # Plus some slack.
             for _ in range(50):  # up to 5 s
@@ -539,13 +539,17 @@ async def la_no_periodic_timer_in_source() -> None:
     import ast
     import inspect
 
-    from daemon import event_router, proxy
-    from daemon.events import EventBus
+    from daemon import event_router, events as events_mod, proxy
 
+    # Audit round-3: previously scanned `inspect.getsource(EventBus)`
+    # which only returns the class body — a module-level `import time;
+    # _LAST_FIRE = time.time()` in daemon/events.py would slip past the
+    # AST scan entirely.  Scan the WHOLE module for each daemon source
+    # so module-level state can't bypass the contract.
     sources = [
         ("daemon/event_router.py", inspect.getsource(event_router)),
         ("daemon/proxy.py", inspect.getsource(proxy)),
-        ("daemon/events.py", inspect.getsource(EventBus)),
+        ("daemon/events.py", inspect.getsource(events_mod)),
     ]
     forbidden = ("sleep", "call_later", "call_at", "perf_counter")
     for name, src in sources:

@@ -52,6 +52,9 @@ def make_stub_sglang(
     """
     app = FastAPI()
     app.state.received: List[Dict[str, Any]] = []
+    # Audit round-3 (N2): record received headers so a test can pin
+    # that the daemon forwards Authorization / traceparent / etc.
+    app.state.received_headers: List[Dict[str, str]] = []
 
     @app.get("/health")
     async def _h() -> Any:
@@ -61,6 +64,7 @@ def make_stub_sglang(
     async def _chat(raw: Request) -> Any:
         body = await raw.json()
         app.state.received.append(body)
+        app.state.received_headers.append(dict(raw.headers))
 
         if fail_with is not None:
             # Allow returning a non-JSON body (e.g. an HTML 5xx error
@@ -189,7 +193,14 @@ async def step_nonstream_response_passthrough(daemon_url: str, stub_app) -> None
 
 
 async def step_streaming_chunks(daemon_url: str) -> None:
-    """[2] Streaming pass-through: chunks arrive in order; terminator present."""
+    """[2] Streaming pass-through: chunks arrive in order; terminator present.
+
+    Audit round-3: previously asserted only ``len(chunks_seen) >= 2``,
+    but the stub emits 3 data chunks + ``[DONE]`` = 4 frames.  A
+    regression server-side that buffered chunks and emitted them as
+    one combined frame (still 1 data + DONE = 2) would pass.  Tighten
+    to: exact frame count + exact ordering of the data deltas.
+    """
     body = {
         "model": "stub",
         "messages": [{"role": "user", "content": "stream test"}],
@@ -204,8 +215,73 @@ async def step_streaming_chunks(daemon_url: str) -> None:
                 if line.startswith("data: "):
                     chunks_seen.append(line[6:])
     assert "[DONE]" in chunks_seen[-1], chunks_seen[-1]
-    # At least 3 chunks (default stub uses ["hello", " ", "world"] via chunks override).
-    assert len(chunks_seen) >= 2, len(chunks_seen)
+    # 3 data frames (hello / space / world) + 1 [DONE] = 4.  A buffer-
+    # then-flush regression would coalesce the 3 deltas into 1 and trip
+    # this length check.
+    assert len(chunks_seen) == 4, (
+        f"expected 4 SSE frames (3 data + DONE), got {len(chunks_seen)}: "
+        f"{chunks_seen}"
+    )
+    # Decode the 3 data frames and assert their delta.content values in
+    # order match the stub's configured chunks.  A regression that
+    # reordered frames or dropped one would trip here.
+    deltas = [
+        json.loads(frame)["choices"][0]["delta"]["content"]
+        for frame in chunks_seen[:3]
+    ]
+    assert deltas == ["hello", " ", "world"], (
+        f"streamed deltas out of order or mutated: {deltas!r}"
+    )
+
+
+async def step_header_forwarding(stub_app, daemon_url: str) -> None:
+    """[2b] N2 pin: the proxy forwards Authorization / traceparent /
+    x-request-id (the `_FORWARD_HEADERS` allowlist) verbatim to sglang.
+
+    A regression that empties ``_FORWARD_HEADERS`` (or filters them
+    all out before the upstream request) would silently break OpenAI
+    auth in prod.  The stub records ``raw.headers`` on every chat
+    completion; we send a unique sentinel for each header and assert
+    it appears in the stub's last-received headers dict.
+    """
+    sentinel_auth = "Bearer test-token-aginfer-N2-pin"
+    sentinel_trace = "00-deadbeefcafebabe1122334455667788-0000000000000001-01"
+    sentinel_req = "aginfer-N2-req-id-7777"
+    body = {
+        "model": "stub",
+        "messages": [{"role": "user", "content": "header probe"}],
+        "program_id": "prog-N2-HEADERS",
+    }
+    n_before = len(stub_app.state.received_headers)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{daemon_url}/v1/chat/completions",
+            json=body,
+            headers={
+                "Authorization": sentinel_auth,
+                "traceparent": sentinel_trace,
+                "x-request-id": sentinel_req,
+            },
+        )
+    assert r.status_code == 200, r.text
+    assert len(stub_app.state.received_headers) == n_before + 1, (
+        f"stub did not record the upstream request; before={n_before}, "
+        f"after={len(stub_app.state.received_headers)}"
+    )
+    upstream_headers = stub_app.state.received_headers[-1]
+    # Lowercase keys per ASGI convention.
+    assert upstream_headers.get("authorization") == sentinel_auth, (
+        f"Authorization header was NOT forwarded: "
+        f"got={upstream_headers.get('authorization')!r}"
+    )
+    assert upstream_headers.get("traceparent") == sentinel_trace, (
+        f"traceparent header was NOT forwarded: "
+        f"got={upstream_headers.get('traceparent')!r}"
+    )
+    assert upstream_headers.get("x-request-id") == sentinel_req, (
+        f"x-request-id header was NOT forwarded: "
+        f"got={upstream_headers.get('x-request-id')!r}"
+    )
 
 
 async def step_event_sequence_two_turns(daemon_url: str, bus: EventBus) -> None:
@@ -492,6 +568,227 @@ async def step_unary_non_request_error_recovers() -> None:
             daemon.state.http_client.post = original_post
 
 
+def _make_midstream_break_stub() -> FastAPI:
+    """A stub that sends SSE headers + ONE valid chunk, then raises.
+
+    Used by step_streaming_midstream_break ([10b], audit round-3 M1)
+    to drive the proxy's ``_stream()`` generator into its
+    ``except Exception`` branch.  This is the only way to exercise
+    the in-band SSE-error-frame path that paper §9 promises for
+    graceful stream-end signalling.
+    """
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def _chat(raw: Request) -> Any:  # noqa: ANN001
+        await raw.body()
+
+        async def _gen():
+            yield (
+                b"data: " +
+                json.dumps(
+                    {"choices": [{"delta": {"content": "hello"}, "index": 0}]}
+                ).encode()
+                + b"\n\n"
+            )
+            await asyncio.sleep(0)
+            raise RuntimeError("simulated mid-stream upstream break")
+
+        return StreamingResponse(_gen(), media_type="text/event-stream")
+
+    return app
+
+
+async def step_streaming_midstream_break() -> None:
+    """[10b] Audit round-3 M1: the streaming generator's
+    ``try/except Exception`` around ``aiter_bytes()`` must emit an
+    in-band SSE error frame + ``[DONE]`` if the upstream breaks mid
+    stream (after 200 + SSE headers have already been committed).
+
+    A regression that (a) drops the in-band error frame, (b) drops
+    the ``[DONE]`` terminator, or (c) lets the exception propagate
+    (starving Starlette of the terminator and producing a silent
+    truncation) would trip this assertion.  Paper §9 promises
+    graceful stream-end signalling, so this is a published-claim pin.
+
+    Also asserts the tracker recovers via the generator's ``finally``
+    block — see step_streaming_client_disconnect ([10c]) for the
+    pure-client-disconnect angle.
+    """
+    stub = _make_midstream_break_stub()
+    stub_p = _free_port()
+    bus_ = EventBus()
+    tracker_ = ProgramTracker()
+    daemon = create_app(
+        sglang_base_url=f"http://127.0.0.1:{stub_p}",
+        event_bus=bus_,
+        program_tracker=tracker_,
+        enable_event_router=False,
+    )
+    daemon_p = _free_port()
+    PID = "prog-MIDSTREAM-BREAK"
+    async with run_server(stub, "127.0.0.1", stub_p):
+        async with run_server(daemon, "127.0.0.1", daemon_p):
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"http://127.0.0.1:{daemon_p}/v1/chat/completions",
+                    json={
+                        "model": "stub",
+                        "messages": [{"role": "user", "content": "midstream"}],
+                        "stream": True,
+                        "program_id": PID,
+                    },
+                ) as r:
+                    # Daemon must have committed 200 + SSE headers
+                    # BEFORE the stub raised (otherwise we'd see 502;
+                    # but the connect-failure branch is covered by [10]).
+                    assert r.status_code == 200, (
+                        f"midstream-break expected 200 (already committed), "
+                        f"got {r.status_code}"
+                    )
+                    data_lines: list[str] = []
+                    async for line in r.aiter_lines():
+                        if line.startswith("data: "):
+                            data_lines.append(line[6:])
+    # Expect: one happy chunk, one error frame, one [DONE].
+    assert len(data_lines) == 3, (
+        f"expected 3 data frames (hello / error / DONE), got "
+        f"{len(data_lines)}: {data_lines}"
+    )
+    happy = json.loads(data_lines[0])
+    assert happy["choices"][0]["delta"]["content"] == "hello", happy
+    err_frame = data_lines[1]
+    assert "error" in err_frame and "upstream sglang error" in err_frame, (
+        f"missing in-band error frame: {err_frame!r}"
+    )
+    assert data_lines[2] == "[DONE]", (
+        f"missing [DONE] terminator: got {data_lines[2]!r}"
+    )
+    # Tracker recovered via the generator's finally → _emit_completion.
+    assert tracker_.state(PID) != State.REASONING, tracker_.state(PID)
+
+
+async def step_streaming_connect_non_request_error_recovers() -> None:
+    """[10d] Audit round-3 N1: the stream-connect path has a broader
+    ``except Exception`` after the narrow ``except httpx.RequestError``.
+    The unary equivalent is [11b]; this is the stream-side symmetric.
+
+    Force the broader branch by monkey-patching the daemon's
+    ``http_client.stream`` so that entering its async context raises
+    a non-RequestError.  Expected: proxy returns 502 + tracker
+    recovers.  A regression narrowing the catch would re-raise and
+    Starlette would return 500 (and tracker would stay REASONING).
+    """
+    bus = EventBus()
+    tracker = ProgramTracker()
+    daemon = create_app(
+        sglang_base_url="http://127.0.0.1:1",  # unused; patched
+        event_bus=bus,
+        program_tracker=tracker,
+        enable_event_router=False,
+    )
+    daemon_p = _free_port()
+    PID = "prog-STREAM-WEIRD-EXCEPTION"
+    async with run_server(daemon, "127.0.0.1", daemon_p):
+        class _StubError(Exception):
+            pass
+
+        original_stream = daemon.state.http_client.stream
+
+        def _bad_stream(*a, **kw):
+            class _Ctx:
+                async def __aenter__(self):
+                    raise _StubError("simulated stream connect failure")
+                async def __aexit__(self, et, ev, tb):
+                    return False
+            return _Ctx()
+
+        daemon.state.http_client.stream = _bad_stream
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(
+                    f"http://127.0.0.1:{daemon_p}/v1/chat/completions",
+                    json={
+                        "model": "stub",
+                        "messages": [{"role": "user", "content": "weird stream"}],
+                        "stream": True,
+                        "program_id": PID,
+                    },
+                )
+            assert r.status_code == 502, (
+                f"stream-connect non-RequestError should 502, got {r.status_code}"
+            )
+            assert tracker.state(PID) != State.REASONING, tracker.state(PID)
+        finally:
+            daemon.state.http_client.stream = original_stream
+
+
+async def step_streaming_client_disconnect() -> None:
+    """[10c] Audit round-3 N5: when the client drops the connection
+    mid-stream, the proxy's ``_stream()`` generator's ``finally``
+    block must still run ``_emit_completion()`` so the tracker
+    doesn't leak REASONING state.
+
+    Open the stream, read one chunk, then abruptly close the client.
+    Starlette closes the generator (GeneratorExit / cancellation),
+    triggering ``finally``.  A regression that moves
+    ``_emit_completion`` out of ``finally`` (or into a happy-path-only
+    branch) would leave the tracker stuck in REASONING.
+    """
+    # Re-use the stub from step [2]: 3 short chunks + [DONE].  We
+    # disconnect after reading the first one.
+    stub = make_stub_sglang(
+        chunks=["hello", " ", "world"],
+        response_text="ignored",
+    )
+    stub_p = _free_port()
+    bus_ = EventBus()
+    tracker_ = ProgramTracker()
+    daemon = create_app(
+        sglang_base_url=f"http://127.0.0.1:{stub_p}",
+        event_bus=bus_,
+        program_tracker=tracker_,
+        enable_event_router=False,
+    )
+    daemon_p = _free_port()
+    PID = "prog-CLIENT-DISCONNECT"
+    async with run_server(stub, "127.0.0.1", stub_p):
+        async with run_server(daemon, "127.0.0.1", daemon_p):
+            client = httpx.AsyncClient(timeout=10.0)
+            stream_ctx = client.stream(
+                "POST",
+                f"http://127.0.0.1:{daemon_p}/v1/chat/completions",
+                json={
+                    "model": "stub",
+                    "messages": [{"role": "user", "content": "disco"}],
+                    "stream": True,
+                    "program_id": PID,
+                },
+            )
+            r = await stream_ctx.__aenter__()
+            assert r.status_code == 200, r.status_code
+            # Read at least one data frame, then bail out.
+            saw_one = False
+            async for line in r.aiter_lines():
+                if line.startswith("data: "):
+                    saw_one = True
+                    break
+            assert saw_one, "no data frames before client disconnect"
+            # Forcefully drop the stream + client.
+            await client.aclose()
+            # Daemon side: Starlette cancels the generator; finally runs
+            # _emit_completion.  Give the loop a tick to settle.
+            for _ in range(50):
+                if tracker_.state(PID) != State.REASONING:
+                    break
+                await asyncio.sleep(0.01)
+    assert tracker_.state(PID) != State.REASONING, (
+        f"client disconnect did NOT trigger _emit_completion; "
+        f"tracker still in {tracker_.state(PID)} for {PID}"
+    )
+
+
 async def step_stream_field_is_strict_bool() -> None:
     """[11] MINOR (round-1 audit): ``"stream": "false"`` (string,
     truthy) must NOT trigger the streaming branch.  Only ``True`` does.
@@ -734,6 +1031,10 @@ async def main() -> None:
             await step_streaming_chunks(daemon_url)
             print("[2] streaming chunks pass-through; terminator preserved ✓")
 
+            await step_header_forwarding(stub_app, daemon_url)
+            print("[2b] audit round-3 N2 fix: Authorization / traceparent "
+                  "/ x-request-id forwarded to upstream sglang ✓")
+
             await step_event_sequence_two_turns(daemon_url, bus)
             print("[3] event sequence: arrival emits SESSION_ARRIVAL + "
                   "LLM_PREFILL + TOOL_CALL_START; second turn emits "
@@ -772,6 +1073,18 @@ async def main() -> None:
     await step_streaming_connect_error()
     print("[10] BLOCKER 2 fix: streaming with dead upstream -> real "
           "502, not 200 with in-band error frame ✓")
+
+    await step_streaming_midstream_break()
+    print("[10b] audit round-3 M1 fix: mid-stream upstream break -> "
+          "in-band SSE error frame + [DONE]; tracker recovers ✓")
+
+    await step_streaming_client_disconnect()
+    print("[10c] audit round-3 N5 fix: client disconnect mid-stream -> "
+          "generator finally runs _emit_completion; tracker recovers ✓")
+
+    await step_streaming_connect_non_request_error_recovers()
+    print("[10d] audit round-3 N1 fix: stream-connect path catches "
+          "non-RequestError exceptions; 502 + tracker recovers ✓")
 
     await step_unary_non_request_error_recovers()
     print("[11a] round-1 MAJOR fix: unary path catches non-RequestError "

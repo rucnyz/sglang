@@ -98,8 +98,28 @@ Daemon code lives at `dev/aginfer/daemon/proxy.py` (~270 LoC),
 
 ## RESULTS
 
-**PASSED** — all 13 steps (post audit round-1 + audit-of-tests round-2)
-including a 5-run multi-trial latency benchmark.
+**PASSED** — all 16 steps (post audit round-1 + audit-of-tests
+round-2 + audit round-3 stream-robustness expansion) including a
+5-run multi-trial latency benchmark.
+
+### Audit round-3 additions (stream / header robustness)
+
+* [2] step_streaming_chunks (N3): tightened from ``len >= 2`` to
+  ``== 4`` (3 data deltas + DONE) + per-frame ordering assertion.
+  Catches a buffer-then-flush regression that collapses chunks.
+* [2b] step_header_forwarding (N2): new step pinning that
+  ``Authorization`` / ``traceparent`` / ``x-request-id`` survive the
+  proxy hop.  Stub records ``raw.headers``; sentinel values asserted.
+* [10b] step_streaming_midstream_break (M1): new step — stub commits
+  200 + SSE then raises mid-stream; proxy must emit in-band SSE
+  error frame + ``[DONE]`` and recover tracker via ``finally``.
+* [10c] step_streaming_client_disconnect (N5): new step — client
+  drops connection after 1 chunk; assert generator ``finally`` runs
+  ``_emit_completion`` and tracker exits REASONING.
+* [10d] step_streaming_connect_non_request_error_recovers (N1):
+  new step — monkey-patches ``http_client.stream`` to raise a
+  non-RequestError on ``__aenter__``; assert 502 + tracker recovers
+  (symmetric to unary's [11a]).
 
 * date: 2026-05-26
 * daemon code: ~370 LoC across `daemon/proxy.py` + `daemon/events.py`
