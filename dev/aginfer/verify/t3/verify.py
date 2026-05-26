@@ -80,28 +80,49 @@ def units_without(state: Dict[str, Any], program_id: str) -> List[Dict[str, Any]
 def main() -> None:
     print("=== T3 verify: session_id passthrough ===")
 
-    # Launch-config preflight: step [9] needs chunked-prefill-size small
-    # enough to actually trigger the chunked path on Qwen3-0.6B with a
-    # ~1k-token prompt.  If the launcher forgot the flag, step [9]
-    # degrades to "long generation only" (round-2 fake-chunked
-    # regression).  Hard-fail with a clear pointer to the launch line
-    # instead of silently passing.
+    # Launch-config preflight: catches "launch line forgot the flag"
+    # silently passing the chunked test (round-2 fake-chunked regression).
     info = requests.get(f"{BASE}/get_server_info", timeout=10)
     info.raise_for_status()
     info_json = info.json()
-    chunked_size = (
-        info_json.get("chunked_prefill_size")
-        or info_json.get("server_args", {}).get("chunked_prefill_size")
-    )
+    server_args = info_json.get("server_args", {}) if isinstance(info_json, dict) else {}
+
+    # chunked_prefill_size: step [9] needs <=64 to actually trigger chunked.
+    chunked_size = info_json.get("chunked_prefill_size")
+    if chunked_size is None:
+        chunked_size = server_args.get("chunked_prefill_size")
     assert chunked_size is not None, (
-        f"could not read chunked_prefill_size from /get_server_info: "
-        f"{list(info_json.keys())}"
+        f"could not read chunked_prefill_size from /get_server_info; "
+        f"top-level keys: {sorted(info_json)[:10]}; "
+        f"server_args keys: {sorted(server_args)[:10] if server_args else 'absent'}. "
+        f"sglang's /get_server_info schema may have changed."
     )
     assert chunked_size <= 64, (
         f"sglang launched with chunked_prefill_size={chunked_size}; "
         f"verify step [9] needs <=64 to actually exercise the chunked "
         f"path.  Relaunch with `--chunked-prefill-size 32`."
     )
+
+    # UnifiedRadixCache preflight (audit round-5 MINOR 6): without
+    # SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 the tree_cache is a different
+    # class and /aginfer/state schema diverges; step [1] would then fail
+    # with a confusing "no A-only tail nodes" instead of pointing at the
+    # config.  Two checks: (a) /aginfer/state returns the expected schema
+    # keys, (b) env or server_args flag if exposed.
+    try:
+        state_probe = requests.get(f"{BASE}/aginfer/state", timeout=10).json()
+    except Exception as exc:
+        raise AssertionError(
+            f"/aginfer/state preflight failed: {exc}. sglang likely launched "
+            f"without SGLANG_ENABLE_UNIFIED_RADIX_TREE=1, or the radix cache "
+            f"isn't UnifiedRadixCache."
+        )
+    for k in ("units", "tier_usage", "page_size", "bytes_per_token"):
+        assert k in state_probe, (
+            f"/aginfer/state missing key {k!r}; schema mismatch suggests "
+            f"sglang was not launched with SGLANG_ENABLE_UNIFIED_RADIX_TREE=1. "
+            f"Got keys: {sorted(state_probe)}"
+        )
 
     # Flush so any residue tag from prior runs of regression_probe or
     # earlier verify invocations doesn't poison our wire-format
@@ -400,8 +421,20 @@ def main() -> None:
     print("\n[11] Session multi-turn via /generate: program_id forwarded via Session.create_req")
     open_r = requests.post(f"{BASE}/open_session", json={"capacity_of_str_len": 1024}, timeout=30)
     open_r.raise_for_status()
-    session_id = open_r.text.strip().strip('"')
-    assert session_id, f"open_session returned empty: {open_r.text!r}"
+    # /open_session may return a JSON string or (future-proof) a dict.
+    # Same forward-compat parsing as regression_probe.py.
+    session_id = None
+    try:
+        _parsed = open_r.json()
+        if isinstance(_parsed, str):
+            session_id = _parsed
+        elif isinstance(_parsed, dict):
+            session_id = _parsed.get("session_id") or _parsed.get("id")
+    except Exception:
+        session_id = open_r.text.strip().strip('"')
+    assert session_id and isinstance(session_id, str), (
+        f"open_session response unparsable: {open_r.text!r}"
+    )
     # Seed (no program_id) so the session is populated.
     requests.post(
         f"{BASE}/generate",
@@ -459,23 +492,26 @@ def main() -> None:
         headers={"Content-Type": "application/json"},
         timeout=60,
     )
-    assert bomb_resp.status_code in (200, 400), (
-        f"5xx on deeply-nested program_id: {bomb_resp.status_code} -- "
-        f"scheduler likely crashed (recursion cap missing)"
+    # CRITICAL (audit round-5 BLOCKER): require status==200 so the
+    # sanitizer was actually exercised.  Accepting 400 silently would
+    # make the test a no-op if a future Python / FastAPI tightens JSON
+    # parse recursion limits below depth=20.
+    assert bomb_resp.status_code == 200, (
+        f"server returned {bomb_resp.status_code} on depth-{depth} bomb "
+        f"(expected 200).  The request did NOT reach the sanitizer -- "
+        f"either JSON parser rejected earlier (lower the depth) OR the "
+        f"scheduler crashed."
     )
     health = requests.get(f"{BASE}/health", timeout=10)
     assert health.status_code in (200, 503), (
         f"server unresponsive after recursion bomb: {health.status_code}"
     )
-    if bomb_resp.status_code == 200:
-        state = fetch_state()
-        assert not units_with(state, "should-be-buried-too-deep"), (
-            "deep nested list bypassed the recursion cap -- the buried "
-            "string reached session_ids"
-        )
-        print("    server stayed up; tag correctly dropped (depth cap hit)")
-    else:
-        print("    server rejected the request at HTTP layer (also acceptable)")
+    state = fetch_state()
+    assert not units_with(state, "should-be-buried-too-deep"), (
+        "deep nested list bypassed the recursion cap -- the buried "
+        "string reached session_ids"
+    )
+    print(f"    server stayed up; depth-{depth} -> tag dropped (cap hit) ✓")
 
     # ---- [13] Pydantic regression: model_config.extra must NOT be 'allow' ----
     # Round-3 NIT: the negative ``extra_body`` test in step [3] depends
@@ -497,6 +533,26 @@ def main() -> None:
         f"the program_id wire path before enabling this."
     )
     print(f"    model_config.extra = {extra!r} (not 'allow') ✓")
+
+    # ---- [14] Direct sanitizer test: str()-raising object must not crash ----
+    # The sanitizer wraps the str() coercion in try/except.  We can't
+    # ship a Python object through HTTP JSON, so we test the helper
+    # directly by import.  Round-5 audit NIT 8.
+    print("\n[14] sanitizer str()-raising object falls back to None")
+    from sglang.srt.managers.schedule_batch import _sanitize_program_id
+
+    class _Bomb:
+        def __str__(self):
+            raise RuntimeError("bomb")
+
+    out = _sanitize_program_id(_Bomb())
+    assert out is None, f"str()-raising object should sanitize to None, got {out!r}"
+    # Cycle in a list must terminate via depth cap, not RecursionError.
+    cyc: list = []
+    cyc.append(cyc)
+    out = _sanitize_program_id(cyc)
+    assert out is None, f"cycle list should sanitize to None, got {out!r}"
+    print("    bomb-__str__ + cyclic-list both -> None ✓")
 
     print("\n=== T3 PASSED (post-audit round 3) ===")
 

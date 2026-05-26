@@ -56,11 +56,21 @@ def probe_session_forward() -> str:
 
     open_r = requests.post(f"{BASE}/open_session", json={"capacity_of_str_len": 1024}, timeout=30)
     open_r.raise_for_status()
-    raw = open_r.text.strip()
-    # body is a JSON string literal: "abc-def-..."
-    session_id = raw.strip('"')
-    if not session_id:
-        return f"FAIL: open_session returned empty: {open_r.text!r}"
+    # /open_session currently returns a bare JSON string ("abc-def-..."),
+    # but the response shape is not contractually fixed.  Try the JSON
+    # parse first; accept dicts {"session_id": ...} or {"id": ...} for
+    # forward-compat.  Fall back to text.strip('"') only if json fails.
+    session_id = None
+    try:
+        parsed = open_r.json()
+        if isinstance(parsed, str):
+            session_id = parsed
+        elif isinstance(parsed, dict):
+            session_id = parsed.get("session_id") or parsed.get("id")
+    except Exception:
+        session_id = open_r.text.strip().strip('"')
+    if not session_id or not isinstance(session_id, str):
+        return f"FAIL: open_session response unparsable: {open_r.text!r}"
 
     seed = {
         "text": "session seed prompt: tell me about prime 19.",
@@ -136,6 +146,19 @@ def probe_recursion_dos() -> str:
         return f"FAIL: request raised {type(exc).__name__}: {exc!s}"
     if r.status_code >= 500:
         return f"FAIL: server returned {r.status_code} (scheduler crash?)"
+    # CRITICAL (round-5 audit BLOCKER): if the HTTP layer 400s on the
+    # depth=20 payload, the request never reaches our sanitizer and the
+    # cap is untested.  Future Python / FastAPI may tighten JSON parse
+    # recursion limits; the test would silently become a no-op.  Require
+    # status==200 so the sanitizer was actually exercised, OR escalate
+    # with a clear "json parser rejected -- pick smaller depth" hint.
+    if r.status_code != 200:
+        return (
+            f"FAIL: server returned {r.status_code} on depth-{depth} bomb; "
+            f"the request never reached the sanitizer (JSON parser rejected "
+            f"earlier).  The recursion cap is UNTESTED.  Tighten depth "
+            f"(or split into two depths, one that lands at 200) and re-run."
+        )
     # Sanity: server still healthy after the bomb
     try:
         hh = requests.get(f"{BASE}/health", timeout=10)
@@ -143,61 +166,113 @@ def probe_recursion_dos() -> str:
         return f"FAIL: /health raised {type(exc).__name__}: {exc!s}"
     if hh.status_code >= 500:
         return f"FAIL: /health returned {hh.status_code} after recursion bomb"
-    # If the request was accepted, the cap means the buried tag should
-    # NOT be in any node's session_ids.
-    if r.status_code == 200:
-        try:
-            state = fetch_state()
-            if units_with(state, "deeply-buried"):
-                return "FAIL: deeply-buried tag bypassed the cap"
-        except requests.exceptions.RequestException as exc:
-            return f"FAIL: /aginfer/state after bomb raised {exc!s}"
+    try:
+        state = fetch_state()
+    except requests.exceptions.RequestException as exc:
+        return f"FAIL: /aginfer/state after bomb raised {exc!s}"
+    if units_with(state, "deeply-buried"):
+        return "FAIL: deeply-buried tag bypassed the cap"
     return "PASS"
 
 
+def _uncommented_lines(src: str) -> str:
+    """Drop comments (full-line ``#`` lines AND trailing ``# ...``).
+
+    Returned text is multi-line.  We don't actually parse Python; the
+    goal is to make sure a commented-out fix does NOT match a
+    "fix present" regex.  Also collapses ``a =\\n    b`` into ``a = b``
+    so a line-broken fix still counts as restored.
+    """
+    import re
+
+    out_lines = []
+    for line in src.splitlines():
+        # Strip trailing comment.
+        if "#" in line:
+            line = line[: line.index("#")]
+        # Skip lines that are now empty (was a full-line comment).
+        if line.strip():
+            out_lines.append(line)
+    joined = "\n".join(out_lines)
+    # Collapse line-continuations: ``foo = \n    bar`` -> ``foo = bar``.
+    # Black-style multi-arg breaks become single-line.
+    joined = re.sub(r"\n[ \t]+", " ", joined)
+    return joined
+
+
 def assert_fix_state_restored() -> None:
-    """Defensive: catch the case where the bisect demo's revert was
-    forgotten in code.  The README documents how to revert each fix
-    for the demo; if a maintainer forgets to restore, the probe
-    would still silently pass for some pre-fix configs.  Introspect
-    the production code state explicitly.
+    """Defensive: catch the case where any production-side fix was
+    accidentally reverted (the bisect demo documents how to revert
+    each one; this guards against "revert + forgot to restore").
+
+    Introspects three production-code lines:
+      * ``_PROGRAM_ID_MAX_RECURSION`` constant (round-3 BLOCKER 2)
+      * ``Session.create_req`` source contains ``program_id=req.program_id``
+        (round-3 BLOCKER 1)
+      * ``encode_receiver.create_req`` source contains
+        ``program_id=recv_req.program_id`` (round-2 BLOCKER -- round-5
+        audit found this fix had no self-check)
+
+    Regex matches operate on a comment-stripped + line-continuation-
+    flattened view so commented-out reverts AND autoformatter line
+    breaks are both handled correctly.
     """
     import inspect
+    import re
 
     from sglang.srt.managers.schedule_batch import _PROGRAM_ID_MAX_RECURSION
-    from sglang.srt.session.session_controller import SessionController
 
     assert _PROGRAM_ID_MAX_RECURSION == 8, (
         f"_PROGRAM_ID_MAX_RECURSION={_PROGRAM_ID_MAX_RECURSION} "
         f"(expected 8). The bisect demo's revert was forgotten -- "
         f"restore the cap in schedule_batch.py before re-running."
     )
-    # The Session class is defined in session_controller; create_req is
-    # a method.  Source must include the program_id forward.
-    Session = None
-    for _name, _obj in inspect.getmembers(
-        SessionController.__module__
-        if hasattr(SessionController, "__module__")
-        else None
-    ):
-        pass
+
     from sglang.srt.session import session_controller as _sc_mod
 
     Session = getattr(_sc_mod, "Session", None)
     assert Session is not None, "Could not import Session class"
-    src = inspect.getsource(Session.create_req)
-    # Match the line ONLY if uncommented (commented-out reverts still
-    # leave the text in inspect.getsource output).
-    import re
-    pattern = re.compile(
-        r"^[ \t]*program_id\s*=\s*req\.program_id",
-        re.MULTILINE,
-    )
-    assert pattern.search(src), (
-        "Session.create_req source does NOT have an uncommented "
+    src = _uncommented_lines(inspect.getsource(Session.create_req))
+    assert re.search(r"\bprogram_id\s*=\s*req\.program_id\b", src), (
+        "Session.create_req source does NOT contain an uncommented "
         "`program_id=req.program_id` line.  The bisect demo's revert "
         "was forgotten -- restore the line in session_controller.py "
         "before re-running."
+    )
+
+    # EPD-disagg path -- round-5 audit BLOCKER 2 (the fix had no
+    # self-check until now).  The class name is sglang-version-dependent
+    # (currently MMReceiverBase); iterate every class in the module and
+    # find the one with a ``create_req(self, recv_req: ...)`` method.
+    from sglang.srt.disaggregation import encode_receiver as _enc_mod
+
+    epd_create_req = None
+    for _name, _obj in inspect.getmembers(_enc_mod, inspect.isclass):
+        if _obj.__module__ != _enc_mod.__name__:
+            continue  # imported, not defined here
+        cr = getattr(_obj, "create_req", None)
+        if cr is None or not callable(cr):
+            continue
+        try:
+            sig = inspect.signature(cr)
+        except (ValueError, TypeError):
+            continue
+        if "recv_req" in sig.parameters:
+            epd_create_req = cr
+            break
+    assert epd_create_req is not None, (
+        "Could not locate create_req(self, recv_req: ...) in "
+        "sglang.srt.disaggregation.encode_receiver -- class layout "
+        "changed; update assert_fix_state_restored."
+    )
+    epd_src = _uncommented_lines(inspect.getsource(epd_create_req))
+    assert re.search(
+        r"\bprogram_id\s*=\s*recv_req\.program_id\b", epd_src
+    ), (
+        "encode_receiver.<create_req> source does NOT contain an "
+        "uncommented `program_id=recv_req.program_id` line.  EPD-"
+        "disagg tag would silently drop; restore the line in "
+        "disaggregation/encode_receiver.py before re-running."
     )
 
 
