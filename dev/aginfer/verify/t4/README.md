@@ -37,7 +37,8 @@
 
 ## HOW WE VERIFY
 
-Mechanism. `verify/t4_proxy.py`:
+Mechanism. `verify/t4/verify.py` (in-process FastAPI stub-sglang +
+real daemon; no GPU; ~10 s total runtime):
 
 ```
 1. Launch sglang on :30000 and daemon on :9100, pointing at sglang.
@@ -76,12 +77,66 @@ Mechanism. `verify/t4_proxy.py`:
 | Resume races request | `program_tracker.pause("p")`, send request for "p", immediately `program_tracker.resume("p")` | request unblocks within 100 ms of resume; no double-emission of `tool_call_end` | event log inspection |
 | 50 concurrent requests, all same program | Issue 50 requests with same `program_id` | program_tracker observes 50 arrivals; events emitted in order; no race condition causes lost state transition | event log invariants |
 
+## REPRODUCING
+
+T4 is in-process: a FastAPI stub sglang + the real daemon both run
+inside the verify's asyncio loop, talking over loopback HTTP.  No
+GPU, no real sglang launch.
+
+```bash
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
+conda activate agsched
+
+cd /scratch/yuzhou/projects/sglang/dev/aginfer
+python verify/t4/verify.py
+# expected last line: "=== T4 PASSED ==="
+```
+
+Daemon code lives at `dev/aginfer/daemon/proxy.py` (~270 LoC),
+`dev/aginfer/daemon/events.py` (~100 LoC); T6 dep:
+`dev/aginfer/daemon/program_tracker.py`.
+
 ## RESULTS
-* date: _pending_
-* daemon sha:
-* response equivalence: _pending_
-* latency overhead p50 / p99: _pending_
-* streaming chunk parity: _pending_
-* event emission sequence correct: _pending_
-* pause back-pressure works: _pending_
-* raw log: `verify/results/t4_<datetime>.log`
+
+**PASSED** — all 12 steps (post audit round-1) including a 5-run
+multi-trial latency benchmark.
+
+* date: 2026-05-26
+* daemon code: ~370 LoC across `daemon/proxy.py` + `daemon/events.py`
+  (T6 reused unchanged).
+* response equivalence: ✓ unary JSON pass-through verbatim;
+  non-JSON / non-200 bodies (e.g. text/html error pages) preserved
+  with original content-type (round-1 BLOCKER 1 fix; pinned by step
+  [9]).
+* event emission sequence: ✓ first-arrival emits SESSION_ARRIVAL +
+  LLM_PREFILL + TOOL_CALL_START; subsequent arrival after ACTING
+  emits TOOL_CALL_END (BEFORE) + LLM_PREFILL + TOOL_CALL_START.
+* streaming chunk parity: ✓ SSE chunks pass through; original
+  content-type preserved; `[DONE]` terminator survives.  Dead
+  upstream returns a real 502 *before* committing 200 + SSE
+  headers (round-1 BLOCKER 2 fix; pinned by step [10]).
+* pause back-pressure: ✓ request blocks on pause; resumes < 1 s.
+* `stream` is strict bool: ✓ string `"false"` does NOT trigger
+  streaming branch (round-1 MINOR fix; pinned by step [11]).
+* malformed `program_id`: ✓ 8 shapes (None / "" / "   " / 42 /
+  dict / list / "x"\*10k / `[None, "deep"]`) all forward cleanly.
+* upstream dead (unary): ✓ 502; tracker recovers (not stuck in
+  REASONING).
+
+### Latency (multi-run, per memory:feedback-latency-multi-run)
+
+5 independent trials × 50 requests/trial = 250 samples per side
+(direct stub vs proxy).  In-process loopback, no GPU work.
+
+| metric                | direct       | proxy        | overhead         |
+|---|---|---|---|
+| **p50** (mean ± std)  | 1.18 ± 0.02 ms | 2.68 ± 0.04 ms | **+1.49 ± 0.02 ms** |
+| **p99** (mean ± std)  | 1.31 ± 0.09 ms | 3.25 ± 0.55 ms | **+1.94 ± 0.47 ms** |
+
+Both well inside the design budget (<2 ms p50 / <5 ms p99 added
+latency).  The verify assertion uses (mean + 1·std) so a single
+noisy trial doesn't flake the suite.
+
+* raw logs (relative to this directory):
+  * `results/<YYYYMMDD_HHMMSS>_run4_audit.log` — current state
+    (post round-1 audit, 12 steps + 5-run latency)

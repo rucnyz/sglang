@@ -1,0 +1,100 @@
+"""Paper §4 event types emitted by the aginfer daemon.
+
+The daemon's proxy (T4) emits 6 of the 8 paper §4 event kinds during
+the request lifecycle.  sglang pushes the remaining 2
+(``memory_pressure`` / ``pressure_resolved``) via a webhook (T5).
+All events land on a single ``asyncio.Queue`` and are processed by
+the event_worker (T7 / T8) serially with an action_lock.
+"""
+from __future__ import annotations
+
+import asyncio
+import enum
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+
+class EventKind(str, enum.Enum):
+    """The eight paper §4 event kinds.
+
+    Six are emitted by the proxy (T4): SESSION_ARRIVAL, LLM_PREFILL,
+    TOOL_CALL_START, TOOL_CALL_END, SUB_DISPATCH_BLOCKING,
+    SUB_DISPATCH_ASYNC.
+
+    Two are pushed by sglang via webhook (T5): MEMORY_PRESSURE,
+    PRESSURE_RESOLVED.
+    """
+
+    # ---- proxy-emitted (T4) ----
+    SESSION_ARRIVAL = "session_arrival"
+    LLM_PREFILL = "llm_prefill"
+    TOOL_CALL_START = "tool_call_start"
+    TOOL_CALL_END = "tool_call_end"
+    SUB_DISPATCH_BLOCKING = "sub_dispatch_blocking"
+    SUB_DISPATCH_ASYNC = "sub_dispatch_async"
+    # ---- sglang webhook (T5) ----
+    MEMORY_PRESSURE = "memory_pressure"
+    PRESSURE_RESOLVED = "pressure_resolved"
+
+
+@dataclass(frozen=True, slots=True)
+class Event:
+    """A single paper §4 event.
+
+    ``session`` is the program_id (paper §3 maps "session" → "program"
+    in our terminology).  ``payload`` carries event-specific data
+    (e.g. ``child_session_id`` for sub_dispatch events; ``state`` for
+    memory_pressure).
+    """
+
+    kind: EventKind
+    session: Optional[str] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+
+
+class EventBus:
+    """Thin wrapper around ``asyncio.Queue`` that the proxy calls into.
+
+    Lives as a singleton on the daemon's FastAPI app state.  v1 has
+    no flow control / backpressure; events are queued unconditionally.
+    The event_worker (T7 / T8) drains the queue.
+
+    Verification (T4 verify) replaces the bus with a recording stub
+    that captures every ``put`` call for invariant checks.
+    """
+
+    def __init__(self) -> None:
+        self._q: asyncio.Queue[Event] = asyncio.Queue()
+        self._known_programs: set[str] = set()
+
+    @property
+    def queue(self) -> asyncio.Queue[Event]:
+        return self._q
+
+    def mark_known(self, pid: str) -> bool:
+        """Idempotent: returns True iff ``pid`` was newly added.
+
+        Used by the proxy to decide whether to emit ``SESSION_ARRIVAL``
+        (only on the FIRST request from a program).
+        """
+        if pid in self._known_programs:
+            return False
+        self._known_programs.add(pid)
+        return True
+
+    def forget(self, pid: str) -> None:
+        """Used by the event_worker once the program is fully done
+        (paper §9 program lifecycle); v1 doesn't call this yet."""
+        self._known_programs.discard(pid)
+
+    def known_size(self) -> int:
+        return len(self._known_programs)
+
+    async def emit(self, event: Event) -> None:
+        """Best-effort: never blocks the proxy on a full queue.
+
+        v1 queue is unbounded so this is just ``put_nowait``.  If a
+        future maintainer adds bounding, this should fall back to
+        drop-event-with-warning rather than block the proxy step.
+        """
+        self._q.put_nowait(event)
