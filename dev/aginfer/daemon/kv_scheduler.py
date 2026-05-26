@@ -129,8 +129,16 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
     Aggregation rule:
       * tier_usage: sum used_bytes and cap_bytes across ranks (HBM is
         per-rank; total HBM is the sum).
-      * units: concatenate, prefixing each ``hash`` with ``rN/`` so
-        migrate dispatch can route back to the right rank.
+      * units: concatenate verbatim — **no hash prefix**.  Audit
+        round-2 R2-B1: previous version prefixed with ``rN/`` so the
+        daemon could "route back" to the right rank, but sglang's
+        ``POST /aginfer/migrate`` does an EXACT ``hash_to_node.get(h)``
+        lookup; a prefix landed every action in ``skipped`` and the
+        daemon never knew (200 + empty ``applied_hashes``).  sglang's
+        hashes are globally unique (hex SHA256 or ``node-<id>``); if
+        two ranks emit the SAME hash it's the same logical unit
+        (replicated prefix) and we dedupe via ``seen_hashes`` —
+        broadcasting one migrate to both ranks is the correct action.
       * time_counter: max across ranks (clocks may differ).
     Single-rank shape (no ``per_rank``) is returned unchanged.
     """
@@ -143,6 +151,7 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         "DISK": {"used_bytes": 0, "cap_bytes": 0},
     }
     agg_units: List[Dict[str, Any]] = []
+    seen_hashes: set = set()
     agg_time = 0
     for r_idx, rank in enumerate(per_rank):
         if not isinstance(rank, dict):
@@ -155,11 +164,17 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         for u in rank.get("units", []) or []:
             if not isinstance(u, dict):
                 continue
-            u2 = dict(u)
-            uhash = str(u2.get("hash", ""))
-            if uhash and not uhash.startswith(f"r{r_idx}/"):
-                u2["hash"] = f"r{r_idx}/{uhash}"
-            agg_units.append(u2)
+            uhash = str(u.get("hash", ""))
+            if not uhash:
+                continue
+            if uhash in seen_hashes:
+                # Replicated-prefix case: same logical unit on multiple
+                # ranks.  Broadcast migrate is correct; dedupe here so
+                # the policy doesn't see two ReuseUnits competing for
+                # the same hash.
+                continue
+            seen_hashes.add(uhash)
+            agg_units.append(dict(u))
         agg_time = max(agg_time, int(rank.get("time_counter", 0) or 0))
     return {
         "tier_usage": agg_tu,
@@ -170,16 +185,20 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-_logged_unknown_tiers: set = set()
-
-
-def _log_unknown_tier_once(label: str) -> None:
+def _log_unknown_tier_once(label: str, seen: set) -> None:
     """Log each unknown tier label exactly once to avoid log spam on
-    repeated state fetches.  Per-process state is fine here — a
-    daemon restart will re-log."""
-    if label in _logged_unknown_tiers:
+    repeated state fetches.
+
+    Audit round-2 R2-N2: ``seen`` is now passed in by the caller
+    (lives on the KvScheduler instance) rather than a module-global.
+    Round-1 used a module-global ``_logged_unknown_tiers`` set; if any
+    test triggered the warn log, the SAME label was suppressed for
+    every subsequent test in the same process, which surprised ops
+    debugging multi-fixture runs.  Instance-scoped also means a
+    daemon restart resets the suppression naturally."""
+    if label in seen:
         return
-    _logged_unknown_tiers.add(label)
+    seen.add(label)
     logger.warning(
         "kv_scheduler: unknown tier label %r in /aginfer/state; "
         "unit skipped.  Add to daemon/kv_scheduler.py _TIER_LABEL_MAP.",
@@ -194,6 +213,7 @@ def build_paper_state(
     tracker: ProgramTracker,
     lambda_acting: float = _DEFAULT_LAMBDA_ACTING,
     now_counter: Optional[int] = None,
+    unknown_tier_log: Optional[set] = None,
 ) -> SchedulerState:
     """Convert sglang ``/aginfer/state`` JSON → ``SchedulerState``.
 
@@ -249,7 +269,8 @@ def build_paper_state(
             # Audit round-1 B1: unknown tier label → skip the unit.
             # Was: silent fallback to HBM, which let unknown-tier units
             # pollute HBM eviction decisions.
-            _log_unknown_tier_once(raw_tier_label)
+            if unknown_tier_log is not None:
+                _log_unknown_tier_once(raw_tier_label, unknown_tier_log)
             continue
         last_access = int(raw.get("last_access_time", 0) or 0)
         hits = int(raw.get("hit_count", 0) or 0)
@@ -269,9 +290,18 @@ def build_paper_state(
         for sid in session_ids:
             if sid not in program_lambda:
                 st = tracker.state(sid)
+                # Audit round-2 R2-M1: PAUSED programs are STILL
+                # mid-tool-call (admission_controller pinned them).
+                # Paper §7's "expected reuse interval ~ tool duration"
+                # applies to them too.  Round-1 only fired the floor
+                # for ACTING; PAUSED fell back to hits/age — the
+                # OPPOSITE of paper intent (a high-hit prefix would
+                # get high λ and be KEPT on HBM during the tool call,
+                # which is exactly what admission gating is trying
+                # to free up).
                 program_lambda[sid] = (
                     _clamp_lambda_acting(lambda_acting)
-                    if st == State.ACTING
+                    if st in (State.ACTING, State.PAUSED)
                     else 0.0
                 )
             if program_lambda[sid] > 0:
@@ -320,10 +350,13 @@ def _units_for_session(
     """
     if session is None:
         return []
-    return [
-        uid for uid, u in units.items()
-        if u.holders == [session] or set(u.holders) == {session}
-    ]
+    # Audit round-2 R2-N1: previously had ``u.holders == [session] or
+    # set(u.holders) == {session}``.  The set form already covered
+    # everything (incl. duplicate-holder lists like ``[s, s]``); the
+    # list form was redundant.  Use set semantics exclusively — it's
+    # the paper meaning (a unit has a SET of holders).
+    target = {session}
+    return [uid for uid, u in units.items() if set(u.holders) == target]
 
 
 def _shared_prefix_units(units: Dict[str, ReuseUnit]) -> List[str]:
@@ -459,6 +492,9 @@ class KvScheduler:
         self.migrate_calls: int = 0
         self.last_action: Optional[Action] = None
         self.last_decision_set_size: int = 0
+        # Audit round-2 R2-N2: per-instance unknown-tier log set so
+        # cross-test / cross-restart state doesn't leak.
+        self._unknown_tier_log: set = set()
 
     async def ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -492,6 +528,7 @@ class KvScheduler:
                 event=event,
                 tracker=self.tracker,
                 lambda_acting=self.lambda_acting,
+                unknown_tier_log=self._unknown_tier_log,
             )
         except Exception:  # noqa: BLE001
             logger.exception("kv_scheduler: build_paper_state raised; skip")

@@ -94,8 +94,29 @@ Mechanism. `verify/t7_policy.py`:
 | λ_ACTING miscalibrated (audit #15, simulator-grounded) | Run `baselines.compare` with λ_ACTING ∈ {1/30, 1/5, 1/1, 2/1} on the seed-20260523 fixture; record `reward / total_runtime / hit%` for each | reward must stay ≥ LRU's reward (≈ Run F'-band) in all four settings; if it falls below LRU at the extremes, ACTING signal is over-trusted — clamp λ_ACTING ∈ [1/30, 1/1] in production | simulator runs report 4 numbers; compare against LRU baseline 42.7 |
 ## RESULTS
 
-**PASSED** — all 13 verify steps + 9-finding regression_probe bisect
-demos, ~10 s on the agsched env.
+**PASSED** — all 13 verify steps + (9 round-1 + 4 round-2) bisect
+demos in regression_probe.py, ~12 s on the agsched env.
+
+### Audit round-2 findings + bisect-style fixes
+
+The second-pass audit on the round-1 code found 1 BLOCKER + 2 MAJORs
++ 3 MINORs + 2 NITs.  Notably, the BLOCKER (R2-B1) was a **fix-
+introduced bug** in round-1 itself: the per_rank hash prefix would
+never resolve on sglang's side and migrations would silently no-op.
+All fixes follow the same protocol (probe re-injects regression →
+new assertion FAILS → fix applied → assertion PASSES); raw logs in
+`results/<...>_r2*.log`.
+
+| ID | Finding | Fix layer |
+|---|---|---|
+| **R2-B1** | Round-1's `_flatten_per_rank` prefixed hashes with `rN/`; sglang's exact-hash lookup would miss every action → 200 OK with empty `applied_hashes`, daemon never knows | **Production**: drop the prefix (sglang hashes are globally unique); dedupe via `seen_hashes` set; broadcast migrate handles replicated prefixes. New probe round-trips through a stub that mimics sglang's exact-hash lookup. |
+| **R2-M1** | ACTING-floor λ only fired for `State.ACTING`; PAUSED programs (admission_controller pinned mid-tool-call) fell back to `hits/age` proxy — exact opposite of paper §7 intent | **Production**: `if st in (State.ACTING, State.PAUSED)` |
+| **R2-M2** | Round-1's `probe_n3` was a tautology: subprocess literally read a renamed env key without importing `kv_scheduler` at all | **Test**: rewritten to lay down a shadow copy of `daemon/` + `baselines/` with the env var key sed-replaced; subprocess imports the shadow; observes that the OLD env var no longer drives the constant. |
+| **R2-N1** | `_units_for_session` had a redundant `holders == [s] or set(holders) == {s}` — set form was already correct, but a future revert to list-only would silently miss duplicate-holder edge cases | **Production**: use set semantics exclusively (paper meaning). Probe demonstrates list-only would miss `["s","s"]`. |
+| **R2-N2** | `_logged_unknown_tiers` was a module-global set → test #1 triggering the warn suppressed it for all subsequent tests in the same process | **Production**: moved to `KvScheduler._unknown_tier_log` instance attribute; `build_paper_state` takes optional `unknown_tier_log` param. Daemon restart naturally resets. |
+| **R2-N3** | `regression_probe.py`'s `run_server` lacked the startup-failure guard `verify.py` has → silent vacuous passes if uvicorn fails to bind | **Test**: mirror `verify.py:73`'s `raise RuntimeError`. |
+| **R2-X1** | `probe_n4` built its own fixture rather than calling `step_idempotent_repeat_event` (stand-in drift risk) | **Doc only**: explicit STAND-IN docstring; refactor would require invasive surgery on verify module. |
+| **R2-X2** | `probe_m2` had `endswith("u-tail-2")` in one path and `== "u-tail-2"` in another | **Test**: aligned to `==` (no `rN/` prefix after R2-B1 fix). |
 
 ### Audit round-1 findings + bisect-style fixes
 
@@ -163,11 +184,22 @@ Assertion: `mean + 3σ < 5 ms` for both stages.  Current envelopes
 ≈ 3.9 ms / 1.5 ms.
 
 * raw logs (relative to this directory):
-  * `results/20260526_PREFIX_audit1_baseline.log` — pre-audit
-    baseline (10 steps; loose floors per audit round-1)
-  * `results/<YYYYMMDD_HHMMSS>_run3_audit1.log` — post-audit
+  * `results/20260526_PREFIX_audit1_baseline.log` — pre-round-1
+    baseline (10 steps; loose floors)
+  * `results/<YYYYMMDD_HHMMSS>_run3_audit1.log` — post round-1
     (13 steps; tightened floors + B1/B2 prod fixes)
-  * `results/<YYYYMMDD_HHMMSS>_regression_probe.log` — bisect-style
-    pre-fix-FAIL / post-fix-PASS demos for B1, B2, M1+N7, M2, M3,
-    N1, N2, N3, N4 (9 findings; N5 / N6 are mechanical and don't
-    need a bisect)
+  * `results/<YYYYMMDD_HHMMSS>_run4_r2.log` — post round-2
+    (13 steps; B1/B2 fix corrected to drop hash prefix; PAUSED in
+    ACTING-floor; set-only `_units_for_session`; instance log set)
+  * `results/<YYYYMMDD_HHMMSS>_r2b1_PRE_fix.log` — R2-B1 pre-fix
+    demonstrating `applied_hashes` empty (multi-rank routes broken)
+  * `results/<YYYYMMDD_HHMMSS>_r2b1_POST_fix.log` — R2-B1 post-fix
+  * `results/<YYYYMMDD_HHMMSS>_r2m1_PRE_fix2.log` — R2-M1 pre-fix
+    (PAUSED λ ≠ 0.2)
+  * `results/<YYYYMMDD_HHMMSS>_r2m1_POST_fix.log` — R2-M1 post-fix
+  * `results/<YYYYMMDD_HHMMSS>_r2n2_POST_fix.log` — R2-N2 final state
+    (all probes pass)
+  * `results/<YYYYMMDD_HHMMSS>_regression_probe.log` — round-1 only
+    (9 bisect demos)
+  * `results/<YYYYMMDD_HHMMSS>_regression_probe_r2.log` — round-1
+    + round-2 (13 bisect demos)
