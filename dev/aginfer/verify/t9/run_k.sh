@@ -242,13 +242,29 @@ fi
 echo "[run_k:$VARIANT]   ✓ daemon: kv_scheduler=$DAEMON_KV admission_controller=$DAEMON_ADMISSION"
 
 # ---- 5. harbor run ----
-echo "[run_k:$VARIANT] starting harbor (32 trials, swebenchpro/terminus-2)..."
 HARBOR_RESULTS="$RESULTS_DIR/harbor_jobs"
 mkdir -p "$HARBOR_RESULTS"
 
 # litellm runs on the HOST (not in docker as I first thought), so its
 # OPENAI_API_KEY check reads from THIS shell's env, not from --ae.
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
+# Harbor flag map (harbor run --help):
+#   -n / --n-concurrent : how many trials run in parallel (default 4)
+#   -l / --n-tasks      : TOTAL trial cap (NOT what -n does)
+#   -k / --n-attempts   : retries per trial (default 1)
+#
+# Swebenchpro dataset has 32 tasks.  We want all 32, fully parallel:
+#   N_TASKS=32, N_CONCURRENT=32, N_ATTEMPTS=1.
+#
+# Smoke override: SMOKE_N_TASKS=2 SMOKE_N_CONCURRENT=2 SMOKE_MAX_TURNS=20
+# → pipeline-validation run in ~25 min wall.
+HARBOR_N_TASKS="${SMOKE_N_TASKS:-32}"
+HARBOR_N_CONCURRENT="${SMOKE_N_CONCURRENT:-32}"
+HARBOR_MAX_TURNS="${SMOKE_MAX_TURNS:-200}"
+HARBOR_ATTEMPTS="${SMOKE_ATTEMPTS:-1}"
+
+echo "[run_k:$VARIANT] starting harbor (n_tasks=${HARBOR_N_TASKS}, concurrent=${HARBOR_N_CONCURRENT}, max_turns=${HARBOR_MAX_TURNS}, swebenchpro/terminus-2)..."
+
 (cd /scratch/yuzhou/projects/harbor && \
     harbor run \
         -p datasets/swebenchpro \
@@ -256,10 +272,12 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
         -m openai/deepseek-ai/DeepSeek-V4-Flash \
         --ak api_base=http://172.17.0.1:9100/v1 \
         --ak api_key="${OPENAI_API_KEY}" \
-        --ak max_turns=200 \
+        --ak max_turns="${HARBOR_MAX_TURNS}" \
         --ak temperature=0.0 \
         --ak seed=42 \
-        -n 32 \
+        -l "${HARBOR_N_TASKS}" \
+        -n "${HARBOR_N_CONCURRENT}" \
+        -k "${HARBOR_ATTEMPTS}" \
         --jobs-dir "$HARBOR_RESULTS" \
     >"$HARBOR_LOG" 2>&1) || HARBOR_EXIT=$?
 

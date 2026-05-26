@@ -58,8 +58,14 @@ Per cycle wall: ~50 min.  Six cycles: ~5 h.
   identical KV cache state).
 * **sglang seed**: `--random-seed 42` on sglang launch (covers
   any internal scheduling randomness).
-* **Instance set**: `harbor -n 32` picks the first 32 swebenchpro
-  task directories alphabetically — deterministic.
+* **Instance set**: `harbor -l 32 -n 32 -k 1` — runs all 32
+  swebenchpro task directories (alphabetical, deterministic),
+  fully parallel, 1 attempt each.  **Beware**: harbor `-n` is
+  `--n-concurrent` (parallelism), NOT total trial count; `-l` is
+  `--n-tasks` (total cap); `-k` is `--n-attempts` (retries).  The
+  earlier K runs used `-n 32` only and ran the same 32 because
+  the dataset happens to have exactly 32 tasks.  We now pin all
+  three to remove ambiguity.
 * **Task cap**: `--ak max_turns=200` (unchanged from K full).
 * **Hardware**: GPUs 4, 7 (B300 SXM6).  TP=2 EP=2.
 * **HiCache**: enabled, `--hicache-ratio 1.5`, write-through-
