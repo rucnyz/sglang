@@ -2233,6 +2233,14 @@ class UnifiedRadixCache(BasePrefixCache):
         applied = 0
         applied_hashes: list[str] = []
         skipped: list[dict] = []
+        # Tracks nodes we've already mutated in this batch.  Without this,
+        # a duplicate hash in `actions` would re-enter the DROP / DRAM code
+        # with a stale view of the node (cd.value is left dangling because
+        # FullComponent.evict_component DEFERS the ``cd.value = None`` to a
+        # later trigger -- see _cascade_evict line ~1114).  The second pass
+        # would then crash inside _remove_leaf_from_parent (assert v == node
+        # after a no-op pop) or double-free the device buffer.
+        acted_node_ids: set[int] = set()
         components = self._components_tuple
         base = BASE_COMPONENT_TYPE
         new_tracker = lambda: {ct: 0 for ct in self.tree_components}
@@ -2243,6 +2251,12 @@ class UnifiedRadixCache(BasePrefixCache):
             node = hash_to_node.get(h)
             if node is None:
                 skipped.append({"hash": h, "reason": "not_in_tree"})
+                continue
+            if node.id in acted_node_ids:
+                # Defensive: duplicate (or aliasing) action against the same
+                # node would crash on the stale cd.value pointer. See comment
+                # at acted_node_ids initialisation.
+                skipped.append({"hash": h, "reason": "already_acted_this_batch"})
                 continue
             cd = node.component_data[base]
             has_device = cd.value is not None and len(cd.value) > 0
@@ -2270,6 +2284,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 applied += 1
                 applied_hashes.append(h)
+                acted_node_ids.add(node.id)
             elif target == "DRAM":
                 if has_device and has_host:
                     tracker = new_tracker()
@@ -2280,6 +2295,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     self._update_evictable_leaf_sets(node)
                     applied += 1
                     applied_hashes.append(h)
+                    acted_node_ids.add(node.id)
                 elif has_host:
                     skipped.append({"hash": h, "reason": "already_on_dram"})
                 elif has_device:

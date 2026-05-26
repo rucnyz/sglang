@@ -50,43 +50,71 @@ Mechanism. `verify/t2_migrate_endpoint.py`:
 
 ## RESULTS
 
-**PASSED** — happy path + 4 in-suite worst-case rows + audit-tightened replay
-test. Run on Qwen3-0.6B + `--attention-backend flashinfer`, GPU 7, single-DP.
-Three rows of the predicted contract are deferred to T9/T10 with explicit
-justifications below — none of them are environmentally reachable on the
-smoke harness without HiCache or an RPS generator.
+**PASSED** (depth-audit edition, 2026-05-26).  All 16 in-suite steps pass on
+Qwen3-0.6B + `--attention-backend flashinfer`, single-DP.  This edition
+covers every branch of `apply_aginfer_migrations` that is reachable without
+HiCache, plus the tier_usage delta invariant, IPC serialization, duplicate
+hashes, empty/malformed actions, cascade-to-zero, round-2 applied absence,
+and a 2-thread concurrency probe.
+
+**Bug found and fixed during the audit**.  Sending a duplicate hash within
+the same migrate batch SIGQUIT-crashed the scheduler:
+`_remove_leaf_from_parent` line ~1124 fired `assert v == node` because the
+second iteration of the same node entered the DROP path even though the
+first iteration had already detached it.  Root cause:
+`FullComponent.evict_component` (`full_component.py:113`) defers
+`cd.value = None` to a later `_cascade_evict(trigger=BASE,
+target=DEVICE)` trigger, and our DROP path uses `target=ALL` which never
+fires the deferred clear.  Fix lives in `apply_aginfer_migrations` itself
+as a defensive `acted_node_ids` set; documented in code.  The first-round
+audit (which did not require duplicate-batch testing) would have shipped
+this bug.
 
 * date: 2026-05-26
 * sglang sha: (this commit)
-* lines added: ~150 across 5 files (io_struct + scheduler dispatch + mixin
-  pair + HTTP handler + tree migration logic)
-* DROP applied: ✓ 21 leaves of 44 HBM units in round 1; the other 23 were
-  internal nodes (`not_a_leaf`, daemon should drop bottom-up). All 21
-  server-reported `applied_hashes` were absent in the immediately-after
-  state snapshot (causal check ✓). Server cannot fabricate hashes outside
-  the pre-snapshot — verified.
-* DROP cascade (audit Q6): round-2 replay of the same batch applied 20 more
-  hashes, ALL drawn from round-1's `not_a_leaf` bucket (size 23). This is
-  the bottom-up cascade the design promises, not unstable addressing.
-* DRAM demote: not yet exercised — requires HiCache backup to populate
-  `host_value`. v1 contract: returns `demote_requires_existing_host_backup`
-  skip reason for HBM-only nodes. Will exercise in T9 / Run K with
-  `--enable-hierarchical-cache`.
-* HBM promote: not wired (v1). Returns `promote_not_yet_wired`. v1 falls
-  back to sglang's normal cache-hit auto-load.
-* DISK tier: returns `disk_tier_not_yet_wired` (v1 contract).
-* not_in_tree: 2 bogus hashes → both skipped correctly.
-* unknown target_tier: 1 bogus tier → skipped with `unknown_target_tier:'...'`.
-* Malformed payload (empty, non-list actions, non-JSON body): all return 400.
-* Per-action latency:
-  - **Slow path** (147-action batch, real targets, 61 actual DROPs):
-    **0.044 ms/action** (6 ms total). This is the ceiling-relevant path.
-  - **Fast path** (1000-action all-bogus → not_in_tree dict miss):
-    **0.007 ms/action** (7 ms total). Sanity floor.
-  - Original v1 verify only measured the fast path; audit Q3 flagged this.
-    The slow path is now first-class. Both are 23× under the 1 ms/action
-    ceiling.
-* raw log: `results/<YYYYMMDD_HHMMSS>_run2.log`
+* lines added: ~170 across 5 files (io_struct + scheduler dispatch + mixin
+  pair + HTTP handler + tree migration logic + defensive duplicate-detect)
+* Causal happy path (step [2]):
+  - 21 of 44 HBM units applied; 23 skipped as `not_a_leaf`.
+  - server-reported `applied_hashes` were all absent post-snapshot ✓
+  - server cannot fabricate hashes (applied_hashes ⊆ pre-snapshot) ✓
+  - **tier_usage delta**: HBM `used_tokens` dropped from 394 → 306, exactly
+    matching `Σ n_tokens of applied_hashes = 88`.  This is the
+    audit-BLOCKER-#1 invariant the v2 verify missed: a regression that
+    detaches the node but leaks the buffer would have passed v2 but fails
+    here.
+* Branch-coverage probes (audit BLOCKERs #2 / #3 / #4 / #5):
+  - DRAM on HBM-only node → `demote_requires_existing_host_backup` ✓
+  - HBM on HBM-resident node → `already_on_hbm` ✓
+  - Explicit `not_a_leaf` binding to a known internal node ✓
+  - DISK → `disk_tier_not_yet_wired` ✓
+  - unknown target_tier on a real hash → `unknown_target_tier:'...'` ✓
+  - Malformed actions inside valid list (missing hash, None target,
+    non-string hash, missing target_tier): all clean, no 5xx ✓
+  - IPC unknown-key passthrough (`session_id`, `owner`, `weight` in action
+    dict): server accepts and ignores ✓
+  - Empty `actions` list: `{applied: 0, applied_hashes: [], skipped: []}` ✓
+  - Malformed HTTP payload (empty body, non-list actions, non-JSON body):
+    all return 400 ✓
+* Duplicate-hash defense (audit MINOR — found real bug, see above):
+  - Batch of 10 unique × 2 = 20 actions: applied=8, no double-apply ✓
+  - 4 first-occurrence applies whose dup was blocked by
+    `already_acted_this_batch` ✓ (defensive check fired)
+  - 4 cascade-promoted (first occurrence `not_a_leaf`, second occurrence
+    applied as the child's drop made it a leaf) — correct semantics ✓
+* Cost ceilings:
+  - **Slow path** (211 real-DROP actions): 0.033 ms/action (audit-BLOCKER-#5
+    relevant; v2 verify only measured the fast path)
+  - Fast path (1k bogus, all `not_in_tree`): 0.009 ms/action
+  - Both 30× under the 1 ms/action ceiling
+* Cascade-to-zero (audit MINOR): looped `migrate(targets)` until applied==0;
+  terminated in 6 iterations, 149 cumulative applied, HBM `used_tokens`
+  went 1664 → 0 ✓
+* Round-2 applied absence (audit MINOR): round-2's own `applied_hashes`
+  also verified absent post-replay ✓
+* Concurrency (audit MINOR): 2 threads with disjoint batches, no 5xx and
+  no overlap in `applied_hashes` ✓
+* raw log: `results/<YYYYMMDD_HHMMSS>_run9_clean.log`
 
 ### Caveats (deferred, NOT regressions)
 

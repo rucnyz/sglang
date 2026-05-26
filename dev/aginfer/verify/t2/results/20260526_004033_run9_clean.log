@@ -1,0 +1,39 @@
+=== T2 verify: POST /aginfer/migrate (depth-audit) ===
+
+[1] populate tree
+    units: 45, HBM used_tokens: 396, DROP targets: 45
+[2] POST migrate; check applied_hashes + tier_usage delta
+    applied=22, dur=5.9ms (0.131 ms/action)
+    skip reasons: ['not_a_leaf']
+    HBM tokens: 396 -> 306 (delta 90, expected >= 90)
+    causal checks (count, absence, anti-fabrication, tier_usage delta) ✓
+
+[3] warm fresh nodes for branch probes
+[4] DRAM on HBM-only: applied=0, skip=[{'hash': 'node-50', 'reason': 'demote_requires_existing_host_backup'}]
+[5] HBM on HBM-resident: applied=0, skip=[{'hash': 'node-53', 'reason': 'already_on_hbm'}]
+[6] explicit not_a_leaf: applied=0, skip=[{'hash': 'node-10', 'reason': 'not_a_leaf'}]
+
+[7] duplicate hashes in same batch
+    sent 20 actions (10 unique hashes, each twice), applied=8, unique applied=8
+    skipped reason counts: {'not_a_leaf': 8, 'already_acted_this_batch': 4}
+    first-applied + dup-blocked: 4 / 4 (defensive check fired); cascade-promoted: 4
+    no double-apply ✓; defensive already_acted_this_batch fired ✓
+
+[8] malformed action shapes (must not 5xx)
+    4 malformed shapes handled cleanly
+[9] empty list: {'applied': 0, 'applied_hashes': [], 'skipped': []}
+[10] IPC unknown keys: applied=0, skipped=[{'hash': 'node-50', 'reason': 'not_a_leaf'}]
+
+[11] COST: slow-path real-DROP batch
+    180 actions, 7 ms total (0.037 ms/action), applied=95
+[12] COST: 1k all-bogus fast path
+    10 ms (0.010 ms/action), applied=0
+[13] malformed HTTP payload returns 400
+[14] cascade: loop migrate(targets) until applied == 0
+    terminated in 6 iterations, cumulative applied=117; HBM 1395 -> 0 (1395 freed); leftover-with-data: 0
+[15] round-2 applied_hashes must be absent post-replay
+    round-2 applied=15, all absent ✓
+[16] concurrency: 2 threads, disjoint batches
+    thread A: applied=11/33, thread B: applied=31/33
+
+=== T2 PASSED (depth-audit) ===

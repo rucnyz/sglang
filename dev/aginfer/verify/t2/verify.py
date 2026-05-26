@@ -1,8 +1,13 @@
-"""T2 verify: POST /aginfer/migrate.
+"""T2 verify: POST /aginfer/migrate (depth-audit edition).
 
 Runs against the same minimal sglang as T1 (Qwen3-0.6B, UnifiedRadixCache,
 flashinfer attention -- trtllm_mha auto-picks page_size=1 and bypasses radix
 insert).  Asserts the contract documented in dev/aginfer/verify/t2/README.md.
+
+This version covers all branches of apply_aginfer_migrations that are
+reachable without HiCache, plus the tier_usage delta invariant, IPC
+serialization, duplicate hashes, empty lists, malformed action shapes,
+cascade-to-zero, round-2 applied absence, and a 2-thread concurrency probe.
 
 Usage:
     # assumes sglang is already up at http://127.0.0.1:30001
@@ -11,8 +16,8 @@ Usage:
 from __future__ import annotations
 
 import os
-import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
 import requests
@@ -40,7 +45,7 @@ def fetch_state() -> Dict[str, Any]:
     return r.json()
 
 
-def migrate(actions: List[Dict[str, str]]) -> Dict[str, Any]:
+def migrate(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
     r = requests.post(
         f"{BASE}/aginfer/migrate",
         json={"actions": actions},
@@ -50,149 +55,299 @@ def migrate(actions: List[Dict[str, str]]) -> Dict[str, Any]:
     return r.json()
 
 
-def warm_distinct_leaves(n: int) -> None:
-    """Insert n distinct top-level prefixes so we get n addressable leaves.
+def hbm_used(state: Dict[str, Any]) -> int:
+    return int(state["tier_usage"]["HBM"]["used_tokens"])
 
-    Uses single-token user prompts -- short enough that decode finishes quickly,
-    distinct enough that no two share a prefix beyond the chat template.
-    """
+
+def warm_distinct_leaves(n: int, salt: str = "") -> None:
     for i in range(n):
-        chat(f"distinct-prompt-{i}: short answer please about prime {i}")
+        chat(f"{salt}distinct-prompt-{i}: short answer please about prime {i}")
 
 
 def main() -> None:
-    print("=== T2 verify: POST /aginfer/migrate ===")
+    print("=== T2 verify: POST /aginfer/migrate (depth-audit) ===")
 
-    # ---- HAPPY PATH: DROP a known leaf and verify it's gone ----
-    print("\n[1] populate tree, capture a DROP target")
-    warm_distinct_leaves(20)
-    state_before = fetch_state()
-    units_before = state_before["units"]
-    print(f"    units before: {len(units_before)}")
-    if not units_before:
-        print("    no units; cannot exercise migrate. did sglang actually insert?")
-        return
+    # ---------- HAPPY PATH + CAUSAL INVARIANTS ----------
+    print("\n[1] populate tree")
+    warm_distinct_leaves(20, salt="round1-")
+    state0 = fetch_state()
+    n_tokens_by_hash = {u["hash"]: u["n_tokens"] for u in state0["units"]}
+    hbm0 = hbm_used(state0)
+    targets = [
+        {"hash": u["hash"], "target_tier": "DROP"}
+        for u in state0["units"]
+        if u["tier"] == "HBM" and u["n_tokens"] > 0
+    ]
+    print(f"    units: {len(state0['units'])}, HBM used_tokens: {hbm0}, DROP targets: {len(targets)}")
 
-    # We DROP every HBM unit with n_tokens > 0 that exists right now.  Because
-    # we filtered transient (hash_value-less) nodes out of /aginfer/state, every
-    # hash in this list IS stably addressable.  not_a_leaf is still possible
-    # (internal nodes with kids) -- the daemon's job is bottom-up drop.
-    hbm = [u for u in units_before if u["tier"] == "HBM" and u["n_tokens"] > 0]
-    print(f"    HBM units to attempt drop: {len(hbm)}")
-    target_hashes_before = {u["hash"] for u in hbm}
-    targets = [{"hash": u["hash"], "target_tier": "DROP"} for u in hbm]
-
-    print("[2] POST /aginfer/migrate with DROP for the targets")
+    print("[2] POST migrate; check applied_hashes + tier_usage delta")
     t0 = time.perf_counter()
     resp = migrate(targets)
     dur_ms = (time.perf_counter() - t0) * 1000
-    print(f"    applied: {resp['applied']}  skipped: {len(resp['skipped'])}")
-    print(f"    latency: {dur_ms:.1f} ms total ({dur_ms/max(1,len(targets)):.2f} ms/action)")
-    skipped_reasons = {s["reason"] for s in resp["skipped"]}
-    print(f"    skipped reasons: {skipped_reasons}")
-    assert resp["applied"] > 0, (
-        f"no actions applied; reasons: {skipped_reasons}"
-    )
-    # Every action must be accounted for (applied + skipped == sent).
-    assert resp["applied"] + len(resp["skipped"]) == len(targets)
-
-    print("[3] re-fetch state, verify EXACTLY the applied_hashes are gone")
-    state_after = fetch_state()
-    after_hashes = {u["hash"] for u in state_after["units"]}
     applied_hashes = set(resp.get("applied_hashes", []))
-    # Sanity: server-reported applied_hashes must match `applied` count.
-    assert len(applied_hashes) == resp["applied"], (
-        f"server inconsistency: applied={resp['applied']} but "
-        f"len(applied_hashes)={len(applied_hashes)}"
-    )
-    # Causal invariant (audit Q2): each hash the server claims it applied
-    # must be ABSENT from a snapshot taken immediately after.  No slack.
-    still_present = applied_hashes & after_hashes
-    assert not still_present, (
-        f"{len(still_present)} of {len(applied_hashes)} server-applied DROPs "
-        f"did not actually evict the node: {sorted(list(still_present))[:5]}"
-    )
-    # And the applied_hashes must have BEEN in the snapshot just before
-    # we issued the migrate (rules out the server lying with random
-    # hashes it pulled from thin air).
-    pre_present_applied = applied_hashes & target_hashes_before
-    assert pre_present_applied == applied_hashes, (
-        f"{len(applied_hashes - target_hashes_before)} applied_hashes were "
-        f"not in the pre-migrate snapshot; server fabricated them"
-    )
-    print(f"    all {len(applied_hashes)} applied hashes removed (causal check ✓)")
+    print(f"    applied={resp['applied']}, dur={dur_ms:.1f}ms ({dur_ms/max(1,len(targets)):.3f} ms/action)")
+    print(f"    skip reasons: {sorted({s['reason'] for s in resp['skipped']})}")
 
-    # ---- WORST CASE 1: hash-not-found ----
-    print("\n[4] WORST CASE: hash-not-found")
-    bogus = migrate(
-        [
-            {"hash": "definitely-not-in-tree-aaaaaaaa", "target_tier": "DROP"},
-            {"hash": "also-not-real-bbbbbbbb", "target_tier": "DROP"},
-        ]
-    )
-    print(f"    {bogus}")
-    assert bogus["applied"] == 0, "phantom hashes must NOT be applied"
-    assert len(bogus["skipped"]) == 2, "every action must be reported"
-    reasons = {s["reason"] for s in bogus["skipped"]}
-    assert reasons == {"not_in_tree"}, f"wrong reason set: {reasons}"
+    # (A) server-reported count == len(applied_hashes)
+    assert len(applied_hashes) == resp["applied"]
+    # (B) ALL skips in round 1 must be exactly 'not_a_leaf' (every target was a
+    #     pre-snapshot HBM unit, so 'no_data' / 'not_in_tree' would be a bug).
+    skip_reasons = {s["reason"] for s in resp["skipped"]}
+    assert skip_reasons <= {"not_a_leaf"}, f"unexpected round-1 skip reasons: {skip_reasons}"
 
-    # ---- WORST CASE 2: unsupported target tier ----
-    print("\n[5] WORST CASE: unknown target_tier")
-    # Pick any live hash so the lookup succeeds and we hit the tier dispatch.
-    state_live = fetch_state()
-    if state_live["units"]:
-        h = state_live["units"][0]["hash"]
-        bad = migrate([{"hash": h, "target_tier": "DOESNOTEXIST"}])
-        print(f"    {bad}")
-        assert bad["applied"] == 0
-        assert len(bad["skipped"]) == 1
-        r = bad["skipped"][0]["reason"]
-        assert "unknown_target_tier" in r, f"wrong reason: {r}"
+    state1 = fetch_state()
+    after_hashes = {u["hash"] for u in state1["units"]}
+    # (C) applied_hashes absent in post-snapshot
+    leaked = applied_hashes & after_hashes
+    assert not leaked, f"{len(leaked)} applied DROPs still in tree: {sorted(leaked)[:5]}"
+    # (D) applied_hashes were in pre-snapshot (server didn't fabricate)
+    fabricated = applied_hashes - set(n_tokens_by_hash.keys())
+    assert not fabricated, f"server fabricated {len(fabricated)} applied_hashes"
+    # (E) tier_usage delta -- the audit BLOCKER #1 invariant.  HBM used_tokens
+    #     must decrease by AT LEAST the sum of dropped n_tokens.  ">=" allows
+    #     cascade through tombstones to free more; "<" would mean the migrate
+    #     reported success without freeing buffers.
+    hbm1 = hbm_used(state1)
+    expected_drop = sum(n_tokens_by_hash[h] for h in applied_hashes)
+    actual_drop = hbm0 - hbm1
+    print(f"    HBM tokens: {hbm0} -> {hbm1} (delta {actual_drop}, expected >= {expected_drop})")
+    assert actual_drop >= expected_drop, (
+        f"HBM used_tokens dropped by only {actual_drop}, expected >= {expected_drop} "
+        f"-- migrate reported applied but did not free buffers"
+    )
+    print("    causal checks (count, absence, anti-fabrication, tier_usage delta) ✓")
+
+    # ---------- BRANCH PROBES (reachable without HiCache) ----------
+    print("\n[3] warm fresh nodes for branch probes")
+    warm_distinct_leaves(8, salt="probe-")
+    state_probe = fetch_state()
+    fresh = [u for u in state_probe["units"] if u["tier"] == "HBM" and u["n_tokens"] > 0]
+    assert fresh, "no fresh HBM units; branch probes cannot run"
+
+    # DRAM probe -- HBM-only node => demote_requires_existing_host_backup
+    h_dram = fresh[0]["hash"]
+    r = migrate([{"hash": h_dram, "target_tier": "DRAM"}])
+    print(f"[4] DRAM on HBM-only: applied={r['applied']}, skip={r['skipped']}")
+    assert r["applied"] == 0
+    assert r["skipped"][0]["reason"] == "demote_requires_existing_host_backup", r
+
+    # HBM probe -- HBM-resident node => already_on_hbm
+    h_hbm = fresh[1]["hash"] if len(fresh) > 1 else fresh[0]["hash"]
+    r = migrate([{"hash": h_hbm, "target_tier": "HBM"}])
+    print(f"[5] HBM on HBM-resident: applied={r['applied']}, skip={r['skipped']}")
+    assert r["applied"] == 0
+    assert r["skipped"][0]["reason"] == "already_on_hbm", r
+
+    # Explicit not_a_leaf binding (audit BLOCKER #4).  Pick a leftover internal
+    # node from round 1 that's still in the tree.
+    leftover_internal = next(
+        (s["hash"] for s in resp["skipped"]
+         if s["reason"] == "not_a_leaf" and s["hash"] in {u["hash"] for u in state_probe["units"]}),
+        None,
+    )
+    if leftover_internal is not None:
+        r = migrate([{"hash": leftover_internal, "target_tier": "DROP"}])
+        print(f"[6] explicit not_a_leaf: applied={r['applied']}, skip={r['skipped']}")
+        # It may have become a leaf via cascade in the meantime; either reason
+        # is acceptable but the bug would be a 5xx or a different string.
+        assert r["applied"] in (0, 1)
+        if r["skipped"]:
+            assert r["skipped"][0]["reason"] in {"not_a_leaf", "no_data"}, r
     else:
-        print("    no live units; skipping (would be a no-op)")
+        print("[6] no leftover internal node to probe explicitly; skipped")
 
-    # ---- WORST CASE 3: DISK tier reported as not_yet_wired (v1 contract) ----
-    print("\n[6] DISK tier returns not_yet_wired (v1 contract)")
-    state_live = fetch_state()
-    if state_live["units"]:
-        h = state_live["units"][0]["hash"]
-        disk = migrate([{"hash": h, "target_tier": "DISK"}])
-        print(f"    {disk}")
-        assert disk["applied"] == 0
-        assert disk["skipped"][0]["reason"] == "disk_tier_not_yet_wired"
+    # Duplicate hashes in same batch (audit MINOR).  Bug case: server applies
+    # the same hash twice (double-detach via _remove_leaf_from_parent).  We
+    # don't pre-identify a leaf -- if any hash in the batch is droppable, we
+    # send each twice and assert it never appears more than once in
+    # applied_hashes.
+    print("\n[7] duplicate hashes in same batch")
+    warm_distinct_leaves(8, salt="dup-")
+    state_dup = fetch_state()
+    # Diagnostic: any duplicate hashes in /aginfer/state itself?
+    all_hashes = [u["hash"] for u in state_dup["units"]]
+    from collections import Counter
+    h_counter = Counter(all_hashes)
+    state_dups = {h: c for h, c in h_counter.items() if c > 1}
+    if state_dups:
+        print(f"    WARN: /aginfer/state has {len(state_dups)} duplicate hashes (first 3): "
+              f"{dict(list(state_dups.items())[:3])}")
+    dup_inputs = [
+        u["hash"] for u in state_dup["units"]
+        if u["tier"] == "HBM" and u["n_tokens"] > 0
+    ]
+    # Deduplicate input list before sending duplicates (otherwise we count
+    # /aginfer/state's intrinsic duplicates against our defensive check).
+    dup_inputs = list(dict.fromkeys(dup_inputs))[:10]
+    dup_batch = (
+        [{"hash": h, "target_tier": "DROP"} for h in dup_inputs]
+        + [{"hash": h, "target_tier": "DROP"} for h in dup_inputs]
+    )
+    r = migrate(dup_batch)
+    applied_set = set(r.get("applied_hashes", []))
+    print(
+        f"    sent {len(dup_batch)} actions ({len(dup_inputs)} unique hashes, "
+        f"each twice), applied={r['applied']}, unique applied={len(applied_set)}"
+    )
+    # (a) no double-apply
+    assert len(applied_set) == r["applied"], (
+        f"double-apply detected: count={r['applied']}, unique={len(applied_set)}"
+    )
+    # (b) total accountability
+    assert r["applied"] + len(r["skipped"]) == len(dup_batch)
+    # (c) every skip reason is in the legal set
+    skip_reasons = {s["reason"] for s in r["skipped"]}
+    assert skip_reasons <= {
+        "not_a_leaf", "no_data", "not_in_tree", "already_acted_this_batch"
+    }, skip_reasons
+    from collections import Counter
+    reason_count = Counter(s["reason"] for s in r["skipped"])
+    print(f"    skipped reason counts: {dict(reason_count)}")
+    # (d) No hash applied more than once -- this is the real
+    #     "no double-apply / no double-free" invariant.  applied_hashes
+    #     is a list; if a hash appears twice the server applied it twice.
+    applied_counter = Counter(r.get("applied_hashes", []))
+    multi_applied = {h: c for h, c in applied_counter.items() if c > 1}
+    assert not multi_applied, f"hash applied multiple times: {multi_applied}"
+    # (e) The defensive check MUST have fired at least once if any first-
+    #     occurrence got applied (its second occurrence would otherwise have
+    #     crashed _remove_leaf_from_parent).  Detect this via: for each pair
+    #     (idx_i, idx_{i+10}), if idx_i applied then idx_{i+10} must be
+    #     blocked by already_acted_this_batch.  Cascade-promotion (idx_i
+    #     skipped as not_a_leaf, idx_{i+10} applied) is a separate legitimate
+    #     outcome and does NOT exercise the defensive check.
+    n_unique = len(dup_inputs)
+    applied_hashes_list = r.get("applied_hashes", [])
+    # We need to know WHICH occurrence index applied for each hash; the
+    # server returns applied_hashes in action order, so we walk the batch.
+    skipped_by_hash_in_order: dict[str, list[str]] = {}
+    for s in r["skipped"]:
+        skipped_by_hash_in_order.setdefault(s["hash"], []).append(s["reason"])
+    must_block_first_applied = 0
+    actual_block_first_applied = 0
+    cascade_promoted = 0
+    for i, h in enumerate(dup_inputs):
+        # Position i is the first occurrence; position i+n_unique is dup.
+        # Look at which occurrence applied for h (or neither, both skipped).
+        # applied_hashes preserves apply order; we can search by index.
+        if applied_hashes_list.count(h) == 0:
+            # neither occurrence applied; both should be not_a_leaf (or similar)
+            continue
+        # exactly one occurrence applied (asserted above by multi_applied check)
+        # Which occurrence? Server order is action-index order, so the applied
+        # one is whichever came first in (i, i+n_unique).  Inspect the skipped
+        # reasons for h: if `already_acted_this_batch` is present, the FIRST
+        # occurrence (idx=i) applied and the dup got blocked.  If the only
+        # other reason is `not_a_leaf`, the FIRST was skipped and SECOND
+        # applied (cascade promotion).
+        reasons = skipped_by_hash_in_order.get(h, [])
+        if "already_acted_this_batch" in reasons:
+            must_block_first_applied += 1
+            actual_block_first_applied += 1
+        elif "not_a_leaf" in reasons:
+            cascade_promoted += 1
+        else:
+            # h applied with no recorded skip for the other occurrence; this
+            # would mean only one action targeted h, which contradicts our
+            # constructed batch -- assert.
+            raise AssertionError(
+                f"hash {h} applied but neither dup-occurrence is in skipped; "
+                f"batch construction is wrong"
+            )
+    print(
+        f"    first-applied + dup-blocked: {actual_block_first_applied} / "
+        f"{must_block_first_applied} (defensive check fired); "
+        f"cascade-promoted: {cascade_promoted}"
+    )
+    assert must_block_first_applied == actual_block_first_applied
+    # Final invariant: AT LEAST ONE first-applied path was actually exercised
+    # (otherwise the defensive check is untested by this run).
+    assert actual_block_first_applied > 0, (
+        "no first-applied -> dup-blocked pair in this run; defensive check "
+        "wasn't exercised. retry with a different prompt set."
+    )
+    print(f"    no double-apply ✓; defensive already_acted_this_batch fired ✓")
 
-    # ---- COST: 1000-action slow-path batch (real DROPs, not bogus) ----
-    # Audit Q3: the original 1000-bogus measurement only times the not_in_tree
-    # fast path.  Re-warm and time a real-DROP batch end-to-end.
-    print("\n[7] COST: slow-path real-DROP batch")
-    warm_distinct_leaves(60)
+    # ---------- MALFORMED ACTION SHAPES ----------
+    # For tier-dispatch errors to surface, we need a REAL hash (otherwise the
+    # lookup misses first and we always see not_in_tree).
+    print("\n[8] malformed action shapes (must not 5xx)")
+    chat("malformed-test-prompt: short answer please")
+    state_mal = fetch_state()
+    h_real = next(
+        (u["hash"] for u in state_mal["units"]
+         if u["tier"] == "HBM" and u["n_tokens"] > 0),
+        None,
+    )
+    assert h_real is not None
+    # (a) missing 'hash' -> hash_to_node.get(None) -> None -> not_in_tree
+    r = migrate([{"target_tier": "DROP"}])
+    assert r["applied"] == 0 and r["skipped"][0]["reason"] == "not_in_tree", r
+    # (b) target_tier=None on a REAL hash -> (None or '').upper() == '' -> unknown
+    r = migrate([{"hash": h_real, "target_tier": None}])
+    assert r["applied"] == 0
+    assert "unknown_target_tier" in r["skipped"][0]["reason"], r
+    # (c) non-string hash -> lookup miss -> not_in_tree
+    r = migrate([{"hash": 42, "target_tier": "DROP"}])
+    assert r["applied"] == 0 and r["skipped"][0]["reason"] == "not_in_tree", r
+    # (d) missing target_tier on a REAL hash -> '' upper -> unknown
+    r = migrate([{"hash": h_real}])
+    assert r["applied"] == 0
+    assert "unknown_target_tier" in r["skipped"][0]["reason"], r
+    print("    4 malformed shapes handled cleanly")
+
+    # ---------- EMPTY ACTIONS ----------
+    r = migrate([])
+    print(f"[9] empty list: {r}")
+    assert r == {"applied": 0, "applied_hashes": [], "skipped": []}
+
+    # ---------- IPC SERIALIZATION (extra unknown key) ----------
+    # A future version of the protocol may add fields to the action dict.
+    # The server must accept and ignore extras -- catches the case where
+    # MigrateAginferReq.actions becomes a structured dataclass that rejects
+    # unknown keys.
+    chat("ipc-test-prompt: short answer please")
+    state_ipc = fetch_state()
+    h_ipc = next(
+        (u["hash"] for u in state_ipc["units"] if u["tier"] == "HBM" and u["n_tokens"] > 0),
+        None,
+    )
+    assert h_ipc is not None
+    r = migrate([{
+        "hash": h_ipc,
+        "target_tier": "DROP",
+        "session_id": "future-field",
+        "owner": "depth-audit",
+        "weight": 0.5,
+    }])
+    print(f"[10] IPC unknown keys: applied={r['applied']}, skipped={r['skipped']}")
+    assert "applied" in r and "applied_hashes" in r and "skipped" in r
+    # Action should have applied (the node was a fresh HBM leaf).
+    assert r["applied"] == 1 or (r["skipped"] and r["skipped"][0]["reason"] in {"not_a_leaf", "no_data"})
+
+    # ---------- COST: slow-path 1k+ real-DROPs ----------
+    print("\n[11] COST: slow-path real-DROP batch")
+    warm_distinct_leaves(60, salt="cost-")
     state_warm = fetch_state()
     real_targets = [
         {"hash": u["hash"], "target_tier": "DROP"}
         for u in state_warm["units"]
         if u["tier"] == "HBM" and u["n_tokens"] > 0
     ]
-    print(f"    real-DROP batch size: {len(real_targets)}")
     if real_targets:
         t0 = time.perf_counter()
         big = migrate(real_targets)
         dur_ms = (time.perf_counter() - t0) * 1000
         per_action_ms = dur_ms / max(1, len(real_targets))
         print(
-            f"    {dur_ms:.0f} ms total ({per_action_ms:.3f} ms/action), "
-            f"applied={big['applied']} skipped={len(big['skipped'])}"
+            f"    {len(real_targets)} actions, {dur_ms:.0f} ms total "
+            f"({per_action_ms:.3f} ms/action), applied={big['applied']}"
         )
-        # Slow-path ceiling: < 1 ms/action amortised (= the README claim).
-        assert per_action_ms < 1.0, (
-            f"slow-path per-action {per_action_ms:.2f} ms exceeds the 1 ms ceiling"
-        )
-        assert big["applied"] > 0, (
-            f"slow-path batch did 0 real DROPs (reasons: "
-            f"{ {s['reason'] for s in big['skipped']} })"
-        )
+        assert per_action_ms < 1.0, f"slow-path {per_action_ms:.2f} ms exceeds 1 ms ceiling"
+        assert big["applied"] > 0
 
-    # ---- COST: 1000-action all-bogus fast path ----
-    print("\n[8] COST: 1k-action fast path (all not_in_tree, sanity)")
+    # ---------- COST: 1k fast-path ----------
+    print("[12] COST: 1k all-bogus fast path")
     big_batch = [
         {"hash": f"bogus-{i}-aaaaaaaaaaaaaaaa", "target_tier": "DROP"}
         for i in range(1000)
@@ -200,74 +355,91 @@ def main() -> None:
     t0 = time.perf_counter()
     big = migrate(big_batch)
     dur_ms = (time.perf_counter() - t0) * 1000
-    per_action_ms = dur_ms / 1000
-    print(
-        f"    {dur_ms:.0f} ms total ({per_action_ms:.3f} ms/action), "
-        f"applied={big['applied']} skipped={len(big['skipped'])}"
-    )
-    assert per_action_ms < 1.0
-    assert big["applied"] == 0
-    assert len(big["skipped"]) == 1000
+    print(f"    {dur_ms:.0f} ms ({dur_ms/1000:.3f} ms/action), applied={big['applied']}")
+    assert dur_ms / 1000 < 1.0
+    assert big["applied"] == 0 and len(big["skipped"]) == 1000
 
-    # ---- WORST CASE 4: malformed payload ----
-    print("\n[9] WORST CASE: malformed payload returns 400")
-    r = requests.post(f"{BASE}/aginfer/migrate", json={}, timeout=10)
-    assert r.status_code == 400, f"got {r.status_code}"
-    r = requests.post(
-        f"{BASE}/aginfer/migrate", json={"actions": "not a list"}, timeout=10
-    )
-    assert r.status_code == 400
-    r = requests.post(
+    # ---------- MALFORMED HTTP PAYLOAD ----------
+    print("[13] malformed HTTP payload returns 400")
+    for body in [{}, {"actions": "not a list"}]:
+        rr = requests.post(f"{BASE}/aginfer/migrate", json=body, timeout=10)
+        assert rr.status_code == 400, f"{body} -> {rr.status_code}"
+    rr = requests.post(
         f"{BASE}/aginfer/migrate",
         data="not json",
         headers={"Content-Type": "application/json"},
         timeout=10,
     )
-    assert r.status_code == 400
+    assert rr.status_code == 400
 
-    # ---- IDEMPOTENT REPLAY: causal, allows cascade ----
-    # The auditor flagged "21 applied on replay" as suspicious.  Actual cause:
-    # round 1 drops leaves whose parents were skipped as `not_a_leaf`; once
-    # the children are gone the parents BECOME leaves and become droppable.
-    # That's the daemon "drop bottom-up" semantics, not a bug.  The strict
-    # invariants are:
-    #   (a) round-1 applied_hashes are STILL absent after replay.
-    #   (b) round-2 applied_hashes ⊆ round-1 `not_a_leaf` skip bucket
-    #       (replay must not "discover" hashes outside the original request).
-    #   (c) round-2 reasons for any new skip are sane.
-    # We still ran the unrelated probes (steps [4]-[9]) in between, but
-    # those were either bogus hashes or no-op tier dispatches and cannot
-    # mutate the tree.
-    print("\n[10] IDEMPOTENT REPLAY: cascade-aware causal check")
-    not_a_leaf_round1 = {
-        s["hash"] for s in resp["skipped"] if s["reason"] == "not_a_leaf"
-    }
-    again = migrate(targets)
-    again_applied = set(again.get("applied_hashes", []))
-    again_reasons = {s["reason"] for s in again["skipped"]}
+    # ---------- CASCADE TO ZERO ----------
+    print("[14] cascade: loop migrate(targets) until applied == 0")
+    warm_distinct_leaves(15, salt="cascade-")
+    state_c = fetch_state()
+    pre_hbm = hbm_used(state_c)
+    cascade_targets = [{"hash": u["hash"], "target_tier": "DROP"} for u in state_c["units"]]
+    iters = 0
+    cumulative = 0
+    max_iters = 20  # tree depth bound for these prompts is much less
+    while True:
+        iters += 1
+        rr = migrate(cascade_targets)
+        cumulative += rr["applied"]
+        if rr["applied"] == 0:
+            break
+        assert iters < max_iters, f"cascade did not terminate in {max_iters} iterations"
+    state_pc = fetch_state()
+    post_hbm = hbm_used(state_pc)
+    leftover_with_data = [
+        u for u in state_pc["units"]
+        if u["hash"] in {a["hash"] for a in cascade_targets} and u["n_tokens"] > 0
+    ]
     print(
-        f"    round-2 applied={again['applied']} (came from round-1 "
-        f"not_a_leaf bucket of size {len(not_a_leaf_round1)}); "
-        f"skipped reasons: {again_reasons}"
+        f"    terminated in {iters} iterations, cumulative applied={cumulative}; "
+        f"HBM {pre_hbm} -> {post_hbm} ({pre_hbm-post_hbm} freed); "
+        f"leftover-with-data: {len(leftover_with_data)}"
     )
-    # (a) Round-1 applied still gone.
-    state_replay = fetch_state()
-    replay_present = applied_hashes & {u["hash"] for u in state_replay["units"]}
-    assert not replay_present, (
-        f"replay state lost {len(replay_present)} originally-dropped hashes!"
-    )
-    # (b) Round-2 applied ⊆ round-1 not_a_leaf.
-    outside_orig = again_applied - not_a_leaf_round1
-    assert not outside_orig, (
-        f"replay applied {len(outside_orig)} hashes that were NOT in the "
-        f"original not_a_leaf bucket: {sorted(list(outside_orig))[:5]}"
-    )
-    # (c) Sane reasons.
-    assert again_reasons <= {"not_in_tree", "no_data", "not_a_leaf"}, (
-        f"unexpected replay reasons: {again_reasons}"
+    assert not leftover_with_data, (
+        f"cascade left {len(leftover_with_data)} target nodes with non-zero data"
     )
 
-    print("\n=== T2 PASSED ===")
+    # ---------- ROUND-2 APPLIED ABSENCE ----------
+    print("[15] round-2 applied_hashes must be absent post-replay")
+    warm_distinct_leaves(15, salt="r2-")
+    state_r2 = fetch_state()
+    r2_targets = [{"hash": u["hash"], "target_tier": "DROP"} for u in state_r2["units"]]
+    _ = migrate(r2_targets)
+    r2 = migrate(r2_targets)  # second pass: cascade picks up newly-leafed parents
+    r2_applied = set(r2.get("applied_hashes", []))
+    state_r2_after = fetch_state()
+    leak = r2_applied & {u["hash"] for u in state_r2_after["units"]}
+    assert not leak, f"{len(leak)} round-2 applied_hashes still in tree"
+    print(f"    round-2 applied={len(r2_applied)}, all absent ✓")
+
+    # ---------- CONCURRENCY (audit MINOR) ----------
+    print("[16] concurrency: 2 threads, disjoint batches")
+    warm_distinct_leaves(30, salt="conc-")
+    state_c2 = fetch_state()
+    units = [u for u in state_c2["units"] if u["tier"] == "HBM" and u["n_tokens"] > 0]
+    batch_a = [{"hash": u["hash"], "target_tier": "DROP"} for u in units[::2]]
+    batch_b = [{"hash": u["hash"], "target_tier": "DROP"} for u in units[1::2]]
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fa = ex.submit(migrate, batch_a)
+        fb = ex.submit(migrate, batch_b)
+        ra, rb = fa.result(), fb.result()
+    print(
+        f"    thread A: applied={ra['applied']}/{len(batch_a)}, "
+        f"thread B: applied={rb['applied']}/{len(batch_b)}"
+    )
+    assert "applied_hashes" in ra and "applied_hashes" in rb, "concurrent calls 5xx'd"
+    overlap = set(ra["applied_hashes"]) & set(rb["applied_hashes"])
+    assert not overlap, f"concurrent applies overlapped on disjoint inputs: {overlap}"
+    # At least one of the two should have applied something (assuming the
+    # batches contained any leaves at all).
+    if batch_a or batch_b:
+        assert ra["applied"] + rb["applied"] >= 1
+
+    print("\n=== T2 PASSED (depth-audit) ===")
 
 
 if __name__ == "__main__":
