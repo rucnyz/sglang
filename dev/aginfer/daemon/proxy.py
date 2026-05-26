@@ -267,17 +267,14 @@ def create_app(
 
         async def _emit_completion() -> None:
             """Run after the request completes (stream end / unary /
-            failure).  Best-effort: never raises."""
+            failure).  bus.emit is put_nowait on an unbounded queue
+            and tracker.observe_completion is a dict op — neither can
+            raise under v1's contract, so we let exceptions propagate
+            (handle()'s try/except catches if they ever do)."""
             if pid is None:
                 return
-            try:
-                await bus.emit(Event(EventKind.TOOL_CALL_START, session=pid))
-            except Exception:  # noqa: BLE001 -- defensive
-                logger.warning("event_bus.emit raised; swallowing", exc_info=True)
-            try:
-                tracker.observe_completion(pid)
-            except Exception:  # noqa: BLE001
-                logger.warning("tracker.observe_completion raised", exc_info=True)
+            await bus.emit(Event(EventKind.TOOL_CALL_START, session=pid))
+            tracker.observe_completion(pid)
 
         if not is_stream:
             try:

@@ -157,9 +157,8 @@ class AginferWebhookFirer:
                 kind = "still_high"
 
         if kind is None:
-            # No transition, no heartbeat due.  Update state in case
-            # cur differs from last (it shouldn't, but defensive).
-            self._last_state = cur
+            # No transition, no heartbeat due.  derive_kind returned
+            # None ⇒ cur == prev, so _last_state already equals cur.
             return None
 
         payload = WebhookPayload(

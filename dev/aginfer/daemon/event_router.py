@@ -126,9 +126,9 @@ class EventRouter:
         except Exception as exc:  # noqa: BLE001
             logger.warning("cold_start_probe: /aginfer/state failed: %s", exc)
             return
-        tier_usage = state.get("tier_usage", {}).get("HBM", {})
-        used = tier_usage.get("used_bytes", 0)
-        cap = tier_usage.get("cap_bytes", 0)
+        hbm = state["tier_usage"]["HBM"]
+        used = hbm["used_bytes"]
+        cap = hbm["cap_bytes"]
         if cap > 0 and (used / cap) > self.theta_hi:
             occ = used / cap
             state_label = "HIGH" if occ < self.theta_crit else "CRITICAL"

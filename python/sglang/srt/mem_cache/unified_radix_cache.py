@@ -2541,6 +2541,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     "used_bytes": dram_used * bytes_per_token,
                     "cap_bytes": dram_cap,
                 },
+                # DISK placeholder — Mooncake/SSD spill is not yet wired
+                # (see migrate handler's "disk_tier_not_yet_wired" branch).
+                # Emit a stable zero so the daemon can do `state["tier_usage"]
+                # ["DISK"]` without a fallback; once Mooncake lands, populate
+                # used_bytes / cap_bytes with the host-pool's disk metrics.
+                "DISK": {"used_bytes": 0, "cap_bytes": 0},
             },
             "units": units,
             "page_size": page_size,
@@ -2659,7 +2665,9 @@ class UnifiedRadixCache(BasePrefixCache):
         out += str(dram_used * bytes_per_token).encode("ascii")
         out += b',"cap_bytes":'
         out += str(dram_cap).encode("ascii")
-        out += b'}},"units":['
+        # DISK placeholder — Mooncake/SSD spill not yet wired; emit zero so
+        # the daemon can read state["tier_usage"]["DISK"] without a fallback.
+        out += b'},"DISK":{"used_bytes":0,"cap_bytes":0}},"units":['
         out += units_buf
         out += b'],"page_size":'
         out += str(page_size).encode("ascii")

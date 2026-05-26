@@ -269,21 +269,23 @@ def build_paper_state(
             continue
         n_tokens = int(raw["n_tokens"])
         n_bytes = int(raw["n_bytes"])
-        # Audit round-3.5: tier MUST be present.  Empty / missing /
-        # unrecognised → unit is skipped + logged (same path).
-        # Previously ``raw.get("tier", "HBM")`` silently misclassified
-        # tier-less units as HBM (B1-class bug).
-        raw_tier_label = str(raw.get("tier", ""))
+        # sglang's emit code hardcodes "tier" as a non-optional field
+        # (`tier_lit` in the bytes-path / explicit dict key in the dict-
+        # path).  Direct access — KeyError is sglang misbehaving.
+        raw_tier_label = str(raw["tier"])
         tier = _tier_from_string(raw_tier_label)
         if tier is None:
-            _log_unknown_tier_once(raw_tier_label or "<missing>", unknown_tier_log)
+            # Unrecognised label — skip + log once (forward-compat with
+            # future tier labels we haven't taught the daemon about).
+            _log_unknown_tier_once(raw_tier_label, unknown_tier_log)
             continue
         last_access = int(raw["last_access_time"])
         hits = int(raw["hit_count"])
         age = max(1, now_counter - last_access)
         # baseline λ + p_hat from inline scorer (hits/age proxy).
-        p_hat = min(1.0, hits / age) if age > 0 else 0.0
-        lam = max(1e-3, hits / age) if age > 0 else 1e-3
+        # `age` is `max(1, ...)` above, so it's always >= 1.
+        p_hat = min(1.0, hits / age)
+        lam = max(1e-3, hits / age)
         # If ANY holder of this unit is in ACTING state, clamp λ to the
         # ACTING floor.  A unit on the platform/tool_def prefix may
         # have many holders; one ACTING holder is enough to indicate
@@ -314,7 +316,7 @@ def build_paper_state(
                 any_acting = True
         if any_acting:
             lam = program_lambda[
-                next(sid for sid in session_ids if program_lambda.get(sid, 0) > 0)
+                next(sid for sid in session_ids if program_lambda[sid] > 0)
             ]
         units[uhash] = ReuseUnit(
             id=uhash,
