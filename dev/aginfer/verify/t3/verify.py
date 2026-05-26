@@ -119,33 +119,55 @@ def main() -> None:
     # ---- [3] extra_body path via the real OpenAI client (the daemon's path) ----
     # The OpenAI client unpacks ``extra_body`` into top-level body fields
     # CLIENT-SIDE before sending; the server only ever sees top-level
-    # ``program_id``.  Using requests.post with a nested "extra_body" key
-    # would (correctly) NOT reach the server's program_id field.  Replicate
-    # the client's behaviour: send program_id at the top level just like
-    # ``OpenAI(...).chat.completions.create(extra_body={'program_id': ...})``
-    # would.
+    # ``program_id``.  This test does TWO things:
+    #   (a) real OpenAI client with extra_body -> assert pid reaches the
+    #       tree (= the daemon's actual code path);
+    #   (b) raw POST with a nested "extra_body" key -> assert the pid
+    #       does NOT reach the tree.  This proves the unpack is purely
+    #       client-side and the server has no fallback that would mask
+    #       a misconfigured daemon.
     print("\n[3] extra_body passthrough (= top-level after OpenAI client unpack)")
-    try:
-        from openai import OpenAI
+    # Hard requirement -- the OpenAI client is the daemon's wire format;
+    # no silent fallback that would mask a broken extra_body contract.
+    from openai import OpenAI  # noqa: WPS433
 
-        client = OpenAI(base_url=f"{BASE}/v1", api_key="not-needed")
-        client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": SHARED_SYS},
-                {"role": "user", "content": "Tell me a 1-line fact about prime 13."},
-            ],
-            max_tokens=4,
-            temperature=0.0,
-            extra_body={"program_id": "prog-EB"},
-        )
-    except ImportError:
-        # Fall back: top-level field is what the OpenAI client would unpack to.
-        chat("Tell me a 1-line fact about prime 13.",
-             program_id="prog-EB", system_text=SHARED_SYS, use_extra_body=False)
+    client = OpenAI(base_url=f"{BASE}/v1", api_key="not-needed")
+    client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SHARED_SYS},
+            {"role": "user", "content": "Tell me a 1-line fact about prime 13."},
+        ],
+        max_tokens=4,
+        temperature=0.0,
+        extra_body={"program_id": "prog-EB"},
+    )
     state = fetch_state()
     assert units_with(state, "prog-EB"), (
         "OpenAI-client extra_body.program_id did not reach the radix tree"
+    )
+    # Negative case: nested extra_body via raw POST must NOT tag the tree.
+    # Pydantic doesn't have an `extra_body` field on ChatCompletionRequest;
+    # the JSON key is silently ignored, so this proves the server doesn't
+    # auto-unpack.
+    requests.post(
+        f"{BASE}/v1/chat/completions",
+        json={
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": SHARED_SYS},
+                {"role": "user", "content": "Tell me a 1-line fact about prime 17."},
+            ],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "extra_body": {"program_id": "prog-SHOULD-NOT-LAND"},
+        },
+        timeout=60,
+    ).raise_for_status()
+    state = fetch_state()
+    assert not units_with(state, "prog-SHOULD-NOT-LAND"), (
+        "nested extra_body somehow reached the tree -- server is auto-"
+        "unpacking, which contradicts the OpenAI client contract"
     )
 
     # ---- [4] Concurrent 32-program shared-prefix stress ----
@@ -233,7 +255,74 @@ def main() -> None:
         f"tagging adds {overhead_per_req_ms:.2f} ms/req — way above 0.1 ms ceiling"
     )
 
-    print("\n=== T3 PASSED ===")
+    # ---- [8] Retro-tagging: untagged then tagged on the same prefix ----
+    # Order matters in implementations that "skip if node already exists"
+    # might miss the tag. The contract is set-additive: the tagged
+    # request adds its pid to the previously-untagged ancestor.
+    print("\n[8] retro-tagging: untagged-first then tagged on shared prefix")
+    RETRO_SYS = "Retro-tag system prompt: " + ("alpha beta gamma. " * 40)
+    chat("retro untagged seed", program_id=None, system_text=RETRO_SYS)
+    state_before = fetch_state()
+    chat("retro tagged after", program_id="prog-RETRO", system_text=RETRO_SYS)
+    state_after = fetch_state()
+    retro_units = units_with(state_after, "prog-RETRO")
+    assert retro_units, "tagged request after untagged did NOT tag the shared ancestor"
+    # And the ancestor's session_ids set must STILL contain the RETRO tag --
+    # not get blown away by the second insert.
+    multi_tag_node = max(retro_units, key=lambda u: len(u["session_ids"]))
+    assert "prog-RETRO" in multi_tag_node["session_ids"]
+    print(f"    retro-tag landed on {len(retro_units)} shared-prefix nodes ✓")
+
+    # ---- [9] Chunked prefill: long generation with a tag ----
+    # Force a multi-chunk insert by sending a request whose prompt+generation
+    # spans more than chunked_prefill_size tokens, then assert the tag lands
+    # on the deepest nodes (not just the leading chunk).
+    print("\n[9] chunked prefill: long-generation tagged request")
+    LONG_PROMPT = (
+        "You are a verbose narrator. Tell me a long step-by-step story "
+        + "with at least 30 sentences. " * 4
+        + " Start now: "
+    )
+    requests.post(
+        f"{BASE}/v1/chat/completions",
+        json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content": LONG_PROMPT}],
+            "max_tokens": 256,
+            "temperature": 0.0,
+            "program_id": "prog-CHUNK",
+        },
+        timeout=120,
+    ).raise_for_status()
+    state = fetch_state()
+    chunk_units = units_with(state, "prog-CHUNK")
+    print(f"    chunked req tagged {len(chunk_units)} nodes")
+    assert chunk_units, "chunked / long-generation request lost the tag entirely"
+    # n_tokens of the deepest tagged node should be > 32 (= multi-chunk leaf).
+    deepest = max(chunk_units, key=lambda u: u["n_tokens"])
+    assert deepest["n_tokens"] >= 32, (
+        f"deepest tagged node has only {deepest['n_tokens']} tokens; "
+        f"chunked insert did NOT keep tagging across chunks"
+    )
+
+    # ---- [10] Single-request batched-broadcast bug guard ----
+    # A daemon misusing the wire format might send a list as program_id
+    # for a SINGLE request: ``program_id=["foo", "bar"]``.  Our
+    # sanitizer collapses to first element (no per-item broadcast for
+    # single-request paths).  This complements case [6] which only
+    # checked the request didn't 5xx.
+    print("\n[10] single-request list program_id sanitizes to first element")
+    chat("single-req list pid", program_id=["prog-LIST-FIRST", "prog-LIST-SECOND"])
+    state = fetch_state()
+    assert units_with(state, "prog-LIST-FIRST"), (
+        "list[0] did not become the sanitized program_id"
+    )
+    assert not units_with(state, "prog-LIST-SECOND"), (
+        "list[1] leaked into the tree -- batched-broadcast misfire on a "
+        "single request"
+    )
+
+    print("\n=== T3 PASSED (post-audit) ===")
 
 
 if __name__ == "__main__":

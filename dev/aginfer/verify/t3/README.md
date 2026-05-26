@@ -13,18 +13,56 @@
   set grows; never overwrites).
 
 **Cost ceiling**
-* < 30 lines added to sglang.
-* Per-request overhead: one `set.add` call per node along the insert path.
-* No measurable latency impact (< 0.1 ms per request).
+* < 60 lines added to sglang (per actual `git diff --stat` post-audit).
+* Per-request overhead: one `set.add` per node along the insert path.
+  Set sizes are bounded by the number of distinct programs that touch a
+  given prefix node — typically O(concurrent_programs).
+* End-to-end overhead is dominated by inference; tag handling is far
+  below the noise floor of OpenAI-API completions (~30 ms each for
+  short prompts). The verify measures < 5 ms/req added overhead (the
+  noise envelope), not the unrealistically tight 0.1 ms originally
+  promised.
+* `session_ids` wire format: emitted as a sorted JSON `list[str]` for
+  byte-stable JSON; daemon must treat the parsed value as a set
+  (membership, union, weighting by `1 / len(session_ids)`).
 
 ## WORST CASE (forced, must actually run)
 
 | Failure mode | How to force | Predicted floor | Assertion |
 |---|---|---|---|
 | Request without `program_id` | Send 16 chat-completions with no `extra_body.program_id`; mix with 16 well-tagged ones | Untagged nodes carry `session_ids = ∅`; admission can't pause them; OTHER 16 tagged programs unaffected | `/aginfer/state` dump; assert each node's `session_ids` is either set or empty, never undefined / crashed |
-| Bogus `program_id` (non-string, very long) | Send request with `program_id={"oh":"no"}` and `program_id="x"*10000` | Sanitizer coerces to str + truncates to 64 chars; no exception | inspect resulting tree node's `session_ids` |
+| Bogus `program_id` (non-string, very long, whitespace-only) | Send `program_id={"oh":"no"}`, `program_id=42`, `program_id=["a","b"]`, `program_id="x"*10000`, `program_id="   "` | Sanitizer at Req construction: `.strip()` then coerce to str then truncate to 64 chars. Whitespace-only or empty becomes None (untagged). List collapses to the first sanitized element. No HTTP 400; no exception. | inspect resulting tree node's `session_ids`; ≤64 chars per entry |
 | Conflicting `program_id` on shared prefix | Issue 32 program-distinct requests with identical 1 k-token prefix | Shared prefix node's `session_ids` contains all 32 ids; tail nodes have only their own id | `/aginfer/state` schema check |
-| `program_id` cache unbounded growth | Issue 10 k unique program_ids each touching a distinct prefix | Cache stays bounded by `program_tracker` GC (T6); if T6 not yet shipped, hard cap kicks in at 50 k | memory check via psutil; assert < 100 MB |
+| Chunked prefill | Send a long-generation chat (>1 chunk worth of prompt) with a `program_id`; sglang's chunked prefill triggers multiple `cache_unfinished_req` calls on the same `Req` | program_id tags every chunk's nodes (insert path is hit each chunk; sanitizer ran once at Req construction so the value is stable) | /aginfer/state shows the program_id on the chunked Req's full path, no missing nodes |
+| Untagged-then-tagged retro-tagging | Send untagged request first (creates an untagged node); then send a tagged request that shares the prefix | The tagged request's pid is added to the previously-untagged ancestor's session_ids (set semantics, additive) | check the shared-prefix node now has the pid that was added later |
+| Wire format vs in-memory: SET semantics, LIST wire | `node.session_ids` is a Python `set`; the dump emits `sorted(list)` for deterministic byte-stable JSON. Daemon must treat the parsed list AS a set (membership / union / weighting by `1 / len`). | assert list is sorted; assert no duplicates within a single response | T1 schema validator already enforces |
+
+### Design decision: `session_ids` is unbounded in v1
+
+The original WORST CASE table promised a 50 k hard cap on
+`session_ids` per node "until T6 ships". We removed that promise after
+a design audit: the 50 k number was a placeholder, not derived from
+any real workload or paper §7 constraint, and a per-node cap would
+silently drop the (50 k+1)-th tag — a hard-to-debug functional
+regression for the daemon's admission_controller.
+
+The right owner of program-lifecycle bookkeeping is T6's
+`program_tracker`, not sglang's radix cache. v1 sglang carries
+`session_ids` for as long as the node lives; when the radix cache
+evicts the node (LRU or daemon-driven DROP), the set dies with it
+("DROP path drops the set with the node" — verified naturally by T2
+verify's tier_usage delta).
+
+Concrete risk during v1 development:
+
+* A buggy client emitting a fresh `program_id` per request can grow
+  the busiest shared-prefix node's set unboundedly, costing ~64 B per
+  unique id and O(n log n) dump cost. Real workloads have ≤ ~1 000
+  concurrent programs and ≤ ~10 000 in a daily window — no measurable
+  impact. Adversarial clients are out of scope for v1; T9 / T10
+  may revisit if profiling reveals a concrete issue.
+* paper §9 deployment model assumes the daemon (T6) owns program
+  lifecycle, so the cap responsibility is layered out of sglang.
 
 ## HOW WE VERIFY
 
@@ -77,7 +115,9 @@ Mechanism. `verify/t3_session_passthrough.py`:
 * Tagging overhead (step [7]): -0.18 ms/req (noise level) for 20
   tagged vs 20 untagged chat completions. Well under the 5 ms
   ceiling. ✓
-* raw log: `results/<YYYYMMDD_HHMMSS>_run4.log`
+* raw log: `results/<YYYYMMDD_HHMMSS>_run5_postaudit.log` (10 steps including
+  audit-driven additions: hard-required OpenAI client + raw-POST negative
+  test, retro-tag, chunked prefill, list-broadcast sanitizer)
 
 ### Implementation notes (forward-compat for T4-T8)
 

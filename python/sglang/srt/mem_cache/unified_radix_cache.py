@@ -593,7 +593,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_insert:
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
-                program_id=getattr(req, "program_id", None),
+                program_id=req.program_id,
             )
 
             # components prepare insert data + return effective cache_len
@@ -662,7 +662,7 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
-            program_id=getattr(req, "program_id", None),
+            program_id=req.program_id,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:

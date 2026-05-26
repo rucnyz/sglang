@@ -605,12 +605,27 @@ class ReqLogprob:
 def _sanitize_program_id(pid: Any) -> Optional[str]:
     """Best-effort coercion of an aginfer program_id to a stable short string.
 
-    Worst-case row in verify/t3/README.md: bogus shapes (dict, int, very long
-    str) must NOT raise.  Coerce to str, truncate to 64 chars, return None
-    for the empty / None case so untagged requests stay None.
+    Worst-case rows in verify/t3/README.md: bogus shapes (dict, int, very
+    long str, list, whitespace-only) must NOT raise.  Pipeline:
+
+      * ``None`` / empty after strip → ``None`` (untagged path).
+      * list / tuple → recurse into the first element; one Req has one
+        program_id, never a multi-program tag.  (The batched
+        ``GenerateReqInput`` path uses ``__getitem__`` to split a
+        per-request list BEFORE reaching this point; if a single-request
+        path still gets a list, take element [0].)
+      * everything else → ``str(...)``, ``.strip()``, truncate to 64 chars.
+
+    Truncation can silently collide two distinct ids that share the
+    first 64 chars; documented in t3/README.md.  v1 callers either keep
+    ids ≤ 64 chars or accept the collision.
     """
     if pid is None:
         return None
+    if isinstance(pid, (list, tuple)):
+        if not pid:
+            return None
+        return _sanitize_program_id(pid[0])
     if not isinstance(pid, str):
         try:
             pid = str(pid)
