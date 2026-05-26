@@ -45,11 +45,57 @@ Mechanism. `verify/t6_program_state.py`:
 | Bogus `pause(p)` for unknown p | Call `program_tracker.pause("never_seen")` | logs warning; creates a placeholder PAUSED entry; if request later arrives, it waits and resumes correctly | tracker dump + send-after-pause test |
 | Program churn (10 k unique program_ids in 60 s) | Synthetic stream of distinct ids, one request each, then never again | program_tracker memory bounded ≤ 50 MB after 60 s; GC runs | psutil + tracker.size() |
 | Concurrent transitions for same program | Spam 100 arrival+completion pairs for one program in 100 ms | All transitions correctly recorded; no lost state; final state matches expected | event count + final state check |
-* date: _pending_
-* daemon sha:
-* state on inflight non-streaming: _pending_
-* state on streaming chunks (DONE):
-* PAUSED hangs requests: _pending_
-* resume unblocks: _pending_
-* event-only transitions (grep check):
-* raw log: `verify/results/t6_<datetime>.log`
+
+## REPRODUCING
+
+T6 is the FIRST daemon-side code; the verify is pure asyncio
+in-process (no sglang launch needed, no GPU).
+
+```bash
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
+conda activate agsched
+
+cd /scratch/yuzhou/projects/sglang/dev/aginfer
+python verify/t6/verify.py
+# expected last line: "=== T6 PASSED in <NNN> ms ==="
+```
+
+Daemon code lives at `dev/aginfer/daemon/program_tracker.py` —
+~50 LoC, pure Python.
+
+## RESULTS
+
+**PASSED** — all 8 steps in ~200 ms on the agsched env.
+
+* date: 2026-05-26
+* daemon code: `dev/aginfer/daemon/program_tracker.py` (~140 LoC
+  incl. docstrings; the actual transition logic is ~30 LoC)
+* state on inflight non-streaming: ✓ (step [1] — arrival → REASONING,
+  completion → ACTING, re-arrival → REASONING)
+* state on streaming chunks (DONE): same path covered by step [1]
+  (the proxy will call `observe_completion` on the
+  `data: [DONE]` sentinel; verified at the API level here)
+* PAUSED hangs requests: ✓ (step [3] — wait_if_paused blocks for
+  ≥100 ms while paused; resume releases within ≤100 ms)
+* resume unblocks: ✓ (step [3])
+* state stays PAUSED after resume until next arrival: ✓ (step [3]
+  asserts state(p) is still PAUSED post-resume; next observe_arrival
+  flips to REASONING)
+* event-only transitions (grep / AST check): ✓ (step [8] — AST-walks
+  every public method and refuses any `time.*` / `loop.time` /
+  `monotonic` / `now` reference)
+* defensive contract checks: ✓ (step [2] completion-without-arrival
+  is a no-op; step [4] pause on unknown program creates a
+  placeholder that a late arrival correctly waits on; step [5]
+  resume on unknown program is a no-op with a warning log)
+* memory: ✓ (step [7] — 10 k unique program_ids tracked, size()
+  matches, no crash; far under the 50 MB target)
+* raw log: `results/<YYYYMMDD_HHMMSS>_run1.log`
+
+### Not covered in v1 (deferred to T4 integration)
+
+* `tool_call_start` / `tool_call_end` events live in T4's HTTP proxy
+  layer; T6 only verifies the underlying state machine. The proxy
+  will translate streaming response-end into `observe_completion`.
+  WORST CASE row "Lost tool_call_start" and "State-drift recovery"
+  are T4 verify territory.
