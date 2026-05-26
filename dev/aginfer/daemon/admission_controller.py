@@ -348,4 +348,9 @@ def attach_admission_controller(
             await _prior(evt, r)
             await _adm.handle(evt, r)
 
-        router.set_handler(kind, _composite)
+        # Audit T8 round-2 R2-M2 sentinel: mark this handler as a
+        # wrapped composite so `EventRouter.set_handler` refuses to
+        # overwrite it without an explicit force=True.  Symmetric to
+        # the round-1 B2 ordering guard.
+        _composite._aginfer_wrap = True  # type: ignore[attr-defined]
+        router.set_handler(kind, _composite, force=True)

@@ -188,13 +188,21 @@ def step_shared_aware_aggregation() -> None:
     """[1] prog_score divides each unit's V_u by |holders|; shared
     platform doesn't double-count.
 
-    Audit round-1 M1: previously only pinned ranking (prog-3 lowest).
-    A regression to "sum raw V_u, ignore holders" would produce the
-    SAME ranking since tail hit_count dominates.  Now we NUMERICALLY
-    pin the per-program score: each program's value must equal
-    its own tail's V_u + (shared platform V_u / 4).
+    Audit round-2 R2-M1: round-1's numerical pin imported
+    `_value_at_current_tier` and used it to compute the "expected"
+    value, then asserted the production code (which calls the same
+    function) matched — a tautology.  A regression in
+    `_value_at_current_tier` (e.g., reverting the B1 holding-tax
+    restore) would produce matching expected+actual → test still
+    passes.
+
+    Now we hand-derive the expected V_u from paper §7's atomic
+    primitives (`reload_cost` + `holding_unit_cost` direct calls)
+    so a regression in the AGGREGATED function `_value_at_current_tier`
+    diverges from the hand-derived expected.
     """
     from baselines.costs import default_costs as _dc
+    from baselines.ours_greedy import reload_cost, holding_unit_cost
 
     state_json = make_pressure_state(n_programs=4)
     tracker = ProgramTracker()
@@ -211,23 +219,40 @@ def step_shared_aware_aggregation() -> None:
     assert sorted_pids[0] == "prog-3", (
         f"expected prog-3 (lowest hit_count) to score lowest; sorted={sorted_pids}"
     )
-    # Numerical pin: prog-i's score is V_tail-i + V_shared / 4.
-    # Use the SAME _value_at_current_tier (post-B1 fix) for the
-    # expected values so we test the aggregation, not the formula.
-    from daemon.admission_controller import _value_at_current_tier
+
+    # Hand-derive paper §7 V_u — independent of `_value_at_current_tier`
+    # so a regression there (e.g., dropping the holding term) shows up
+    # as a mismatch instead of being self-consistent.
     costs = _dc()
+    pi_u = 1.0e-4
+
+    def _paper_v_u(u) -> float:
+        # V_u(tier) = p_hat * (R(DROP) - R(tier)) - h * b_u / lambda
+        save_prefill = u.p_hat * (
+            reload_cost(u, Tier.DROP, costs, pi_u)
+            - reload_cost(u, u.tier, costs, pi_u)
+        )
+        used = s.tier_usage.used_bytes.get(u.tier, 0)
+        cap = s.tier_usage.capacity_bytes.get(u.tier, 0)
+        h = holding_unit_cost(u.tier, used, cap, costs)
+        hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
+        return save_prefill - h * u.n_bytes * hold_time
+
     shared = s.units["u-shared-platform"]
-    v_shared = _value_at_current_tier(shared, s, costs, 1.0e-4)
+    v_shared = _paper_v_u(shared)
     expected_shared_per_holder = v_shared / 4
+
     for i in range(4):
         tail = s.units[f"u-tail-{i}"]
-        v_tail = _value_at_current_tier(tail, s, costs, 1.0e-4)
+        v_tail = _paper_v_u(tail)
         expected = v_tail + expected_shared_per_holder
         actual = scores[f"prog-{i}"]
         assert abs(actual - expected) < 1e-9, (
             f"prog-{i}: shared-aware aggregation off: got {actual}, "
             f"expected {expected} (= V_tail {v_tail} + V_shared/4 "
-            f"{expected_shared_per_holder})"
+            f"{expected_shared_per_holder}).  Note: expected is hand-"
+            f"derived from paper §7 primitives, NOT via "
+            f"_value_at_current_tier (which is the function under test)."
         )
 
 

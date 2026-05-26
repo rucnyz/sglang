@@ -79,7 +79,36 @@ class EventRouter:
 
     # ---- registration ----
 
-    def set_handler(self, kind: EventKind, fn: HandlerFn) -> None:
+    def set_handler(
+        self, kind: EventKind, fn: HandlerFn, *, force: bool = False
+    ) -> None:
+        """Register a handler for ``kind``.
+
+        Audit T8 round-2 R2-M2: a future subsystem (T10 GC, T9
+        observer) registering after T8's admission would SILENTLY
+        replace the admission composite — admission stops firing,
+        no log.  This is symmetric to the round-1 B2 ordering bug
+        (which only caught the "before" direction).
+
+        Now: if the existing handler is a wrapped composite
+        (attribute ``_aginfer_wrap`` set by
+        ``attach_admission_controller``), refuse the overwrite
+        unless ``force=True``.  Pass ``force=True`` for legitimate
+        test re-attach.
+        """
+        prev = self._handlers.get(kind.value)
+        if (
+            prev is not None
+            and getattr(prev, "_aginfer_wrap", False)
+            and not force
+        ):
+            raise RuntimeError(
+                f"set_handler({kind.name}): refusing to overwrite a "
+                f"wrapped composite handler.  Pass force=True if you "
+                f"intend to bypass admission_controller's wrap, OR "
+                f"call attach_<your_layer> BEFORE "
+                f"attach_admission_controller (which must be last)."
+            )
         self._handlers[kind.value] = fn
 
     # ---- lifecycle ----

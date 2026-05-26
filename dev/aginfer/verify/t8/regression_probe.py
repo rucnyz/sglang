@@ -349,15 +349,221 @@ async def probe_n4_drain_resumes_per_event() -> None:
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
 
+# ---------------------------------------------------------------- R2-M1
+
+
+def probe_r2_m1_step1_catches_holding_tax_revert() -> None:
+    """R2-M1: round-1 verify step [1]'s numerical assertion was a
+    tautology (computed expected via the same function the
+    production code calls).  The round-2 rewrite hand-derives V_u
+    from paper §7 primitives (`reload_cost` + `holding_unit_cost`
+    directly), so a regression in `_value_at_current_tier` is
+    catchable.
+
+    This probe verifies the NEW step [1] catches a B1-style revert
+    (drop holding tax).  Pre-fix uses the round-1 tautology (re-
+    importing _value_at_current_tier); post-fix uses the round-2
+    hand-derived assertion.
+    """
+    name = "R2-M1 (verify step [1] catches holding-tax revert, not tautological)"
+
+    from baselines.costs import default_costs
+    from baselines.ours_greedy import reload_cost, holding_unit_cost
+    from daemon.kv_scheduler import build_paper_state as _bps
+
+    # The state from `make_pressure_state(n_programs=4)` equivalent:
+    state = {
+        "tier_usage": {
+            "HBM": {"used_bytes": 35_651_584, "cap_bytes": 33_554_432},
+            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
+            "DISK": {"used_bytes": 0, "cap_bytes": 0},
+        },
+        "units": [
+            {
+                "hash": "u-shared",
+                "tier": "HBM",
+                "n_tokens": 1024,
+                "n_bytes": 2097152,
+                "last_access_time": 100,
+                "hit_count": 200,
+                "session_ids": [f"prog-{i}" for i in range(4)],
+            },
+            *[
+                {
+                    "hash": f"u-tail-{i}",
+                    "tier": "HBM",
+                    "n_tokens": 4096,
+                    "n_bytes": 8388608,
+                    "last_access_time": 100 - i,
+                    "hit_count": (4 - i) * 8,
+                    "session_ids": [f"prog-{i}"],
+                }
+                for i in range(4)
+            ],
+        ],
+        "time_counter": 200,
+    }
+    s_built = _bps(
+        state,
+        event=Event(kind=EventKind.MEMORY_PRESSURE),
+        tracker=ProgramTracker(),
+        unknown_tier_log=set(),
+    )
+
+    def _paper_v_u(u) -> float:
+        save = u.p_hat * (
+            reload_cost(u, Tier.DROP, default_costs(), 1.0e-4)
+            - reload_cost(u, u.tier, default_costs(), 1.0e-4)
+        )
+        used = s_built.tier_usage.used_bytes.get(u.tier, 0)
+        cap = s_built.tier_usage.capacity_bytes.get(u.tier, 0)
+        h = holding_unit_cost(u.tier, used, cap, default_costs())
+        hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
+        return save - h * u.n_bytes * hold_time
+
+    def _check_with_step1_logic(use_paper_primitives: bool) -> bool:
+        """Replay verify step [1]'s assertion.
+
+        ``use_paper_primitives=True``: round-2 hand-derived (the FIX).
+        ``use_paper_primitives=False``: round-1 tautology (used the
+        function under test to compute expected).
+        """
+        scores = shared_aware_prog_scores(s_built)
+        v_shared = (
+            _paper_v_u(s_built.units["u-shared"])
+            if use_paper_primitives
+            else adm_mod._value_at_current_tier(
+                s_built.units["u-shared"], s_built, default_costs(), 1.0e-4
+            )
+        )
+        per_holder = v_shared / 4
+        for i in range(4):
+            tail = s_built.units[f"u-tail-{i}"]
+            v_tail = (
+                _paper_v_u(tail)
+                if use_paper_primitives
+                else adm_mod._value_at_current_tier(
+                    tail, s_built, default_costs(), 1.0e-4
+                )
+            )
+            expected = v_tail + per_holder
+            actual = scores[f"prog-{i}"]
+            if abs(actual - expected) >= 1e-9:
+                return False  # assertion would fail
+        return True  # assertion passes
+
+    # Simulate a B1-revert: `_value_at_current_tier` drops the holding
+    # term (only saved_prefill).
+    saved = adm_mod._value_at_current_tier
+
+    def _bug_value(u, state, costs, pi_u):
+        return u.p_hat * (
+            reload_cost(u, Tier.DROP, costs, pi_u)
+            - reload_cost(u, u.tier, costs, pi_u)
+        )
+
+    adm_mod._value_at_current_tier = _bug_value
+    try:
+        # The contract: "does the verify step CATCH the B1 revert?"
+        # = "does the assertion FAIL under the bug?"
+        # Pre-fix (tautology): assertion passes under bug → does NOT
+        # catch → pre_fix_passed = False.
+        pre_fix_passed = not _check_with_step1_logic(use_paper_primitives=False)
+        # Post-fix (paper primitives): assertion fails under bug →
+        # DOES catch → post_fix_passed = True.
+        post_fix_passed = not _check_with_step1_logic(use_paper_primitives=True)
+    finally:
+        adm_mod._value_at_current_tier = saved
+
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
+# ---------------------------------------------------------------- R2-M2
+
+
+def probe_r2_m2_composite_overwrite_refused() -> None:
+    """R2-M2: after `attach_admission_controller`, any future
+    `router.set_handler(MEMORY_PRESSURE/PRESSURE_RESOLVED, X)` (e.g.,
+    by a future T9/T10 subsystem registering its own handler) would
+    silently REPLACE the admission composite — admission stops
+    firing, no log.  Symmetric to round-1 B2 (which only guarded
+    the "before" direction).
+
+    POST-FIX: `set_handler` raises `RuntimeError` on overwrite of a
+    wrapped composite unless `force=True`.
+    PRE-FIX: silent overwrite.
+
+    Probe: attach kv_scheduler + admission, then attempt to overwrite
+    MEMORY_PRESSURE with a fresh stub handler.  Post-fix raises;
+    pre-fix succeeds and admission's composite is gone.
+    """
+    name = "R2-M2 (set_handler refuses overwrite of wrapped composite)"
+
+    def _check_post() -> bool:
+        bus = EventBus()
+        router = EventRouter(bus=bus, sglang_base_url="http://x")
+        tracker = ProgramTracker()
+        sched = KvScheduler(tracker=tracker, sglang_base_url="http://x")
+        attach_kv_scheduler(router, sched)
+        admission = AdmissionController(
+            tracker=tracker, theta_hi=0.8, theta_lo=0.6
+        )
+        attach_admission_controller(router, admission)
+
+        async def _new_handler(evt, r):
+            pass
+
+        try:
+            router.set_handler(EventKind.MEMORY_PRESSURE, _new_handler)
+        except RuntimeError:
+            return True  # raised loudly — fix is in place
+        return False  # silently overwrote — bug
+
+    def _check_pre() -> bool:
+        # Simulate pre-fix by reproducing the OLD set_handler inline
+        # (no overwrite-guard).  The assertion is the SAME as POST.
+        bus = EventBus()
+        router = EventRouter(bus=bus, sglang_base_url="http://x")
+        tracker = ProgramTracker()
+        sched = KvScheduler(tracker=tracker, sglang_base_url="http://x")
+        attach_kv_scheduler(router, sched)
+        admission = AdmissionController(
+            tracker=tracker, theta_hi=0.8, theta_lo=0.6
+        )
+        attach_admission_controller(router, admission)
+
+        async def _new_handler(evt, r):
+            pass
+
+        # Bypass the guard: simulate the OLD behavior by direct dict
+        # mutation, demonstrating that without the guard the composite
+        # disappears silently.
+        raised = False
+        try:
+            router._handlers[EventKind.MEMORY_PRESSURE.value] = _new_handler
+        except Exception:
+            raised = True
+        return raised  # pre-fix: no raise → False; assertion fails
+
+    post_fix_passed = _check_post()
+    pre_fix_passed = _check_pre()
+    _bisect_outcome(name, pre_fix_passed, post_fix_passed)
+
+
 # ---------------------------------------------------------------- main
 
 
 def main() -> None:
-    print("=== T8 regression_probe: audit round-1 bisect demos ===")
+    print("=== T8 regression_probe: audit round-1 + round-2 bisect demos ===")
     print()
+    print("--- round 1 ---")
     probe_b1_holding_tax_restored()
     probe_b2_composition_order_safety()
     asyncio.run(probe_n4_drain_resumes_per_event())
+    print()
+    print("--- round 2 ---")
+    probe_r2_m1_step1_catches_holding_tax_revert()
+    probe_r2_m2_composite_overwrite_refused()
     print()
     print("=== T8 regression_probe PASSED ===")
 
