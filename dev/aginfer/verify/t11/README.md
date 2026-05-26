@@ -128,40 +128,64 @@ Two SWAP POINTS the new estimator must touch (both compute
   inline evictions disagree with daemon migrations → conflict rate
   > 1 % violation.
 
-### Revised T11 plan (incorporating subagent findings)
+### Design discipline: WORKLOAD-AGNOSTIC ESTIMATOR
 
-The original T11 plan (T11a → T11b histogram/bucket/Hawkes →
-T11c) is **partially superseded** by finding A.  Revised order:
+⚠️ **Reformulation rejected (2026-05-26, user direction).**  Earlier
+this section proposed a "T11x — session-aware p_hat" that hard-
+coded `p_hat = 1.0 for REASONING/ACTING units, decay τ=88s for
+idle, fall back to hits/age for orphans`.  That was overfitting to
+terminus-2.  Paper §7's V_u is a general framework; T11 must
+deliver a general estimator.
 
-**T11x — session-aware p_hat (NEW, do first; ~1 day)**
-The workload data says reuse is deterministic given session
-liveness.  Implement:
-* For units with holders in REASONING / ACTING session → p_hat = 1.0
-* For units with all holders idle ≥ inter-turn-p90 (14 s) → p_hat
-  decays via exponential with τ = inter-turn-p99 (88 s)
-* For shared-platform (≥2 holders) → p_hat = 1.0 always
-* For units with NO holders → fall back to hits/age proxy
+**The rule:** the p_hat estimator MUST be workload-agnostic.  It
+learns from observed reuse intervals.  It does not encode "if
+terminus-2 then 1.0".  Session-state and benchmark-shape are
+treated as **features** the estimator can use, not as rules.
 
-Daemon side already has ProgramTracker.state(pid) (T6).  Inline
-side has no daemon state — needs sglang to expose session liveness
-via a callback.  Most natural place: pipe daemon's tracker state
-into sglang via a periodic state sync (NOT polling — sync on
-state change events: pause / resume / observe_arrival).
+**Validation discipline:** on terminus-2 (deterministic monotonic
+extension) a correctly-fit estimator SHOULD converge to ~1.0 for
+trunk units in active sessions.  If it does not, the estimator is
+buggy — fix the estimator, do not hard-code the answer.  On RAG /
+code-completion / branching workloads the same estimator must
+adapt to different reuse curves without code change.
 
-**T11a, T11b, T11c — keep as originally planned**, but use them
-to **measure**, not to construct the primary estimator.  Order:
-1. T11a — harvest traces (still needed for T11x validation)
-2. T11x — implement session-aware p_hat
-3. Re-run K full with T11x
-4. If T11x ≈ Run H' but not better → workload IS deterministic, T11x
-   is correct, gain is "no regression", paper claim is conservative
-5. If T11x **< Run H'** → great, ship it
-6. T11b/c (Hawkes etc.) only if T11x doesn't beat baseline
+**Original T11 plan is therefore reinstated** (T11a → T11b → T11c):
 
-This deviates from the literature recommendation (lit said start
-with Hawkes), but the **workload-specific evidence is stronger** —
-when data says "deterministic", you don't need a probabilistic
-model.
+1. **T11a — Trace harvest** (workload-agnostic instrumentation).
+   5 hooks in sglang (see notes/trace_hooks.md).  Log (unit_hash,
+   ts, kind, holder_state, scope, depth, branching_factor, hits,
+   age) — features that any estimator might want.  Harvest on
+   Run K full + a second workload if available.
+
+2. **T11b — Empirical estimator** (no workload assumption).  Try
+   in order:
+   * b1 — Histogram + Bayesian smoothing on inter-access intervals.
+     Conditioned on (UnitType, Scope, holder_state_bucket).  Beta
+     prior so cold-start ≠ 0.
+   * b2 — Per-(program-cluster) prior.  Cluster programs by
+     early-life features only (turns/sec, branching factor, prefix
+     reuse rate at age=30s).  No benchmark label is allowed as a
+     feature — cluster discovery only.
+   * b3 — Hawkes / Pareto fit on per-unit-type intensity.  See
+     notes/literature_survey.md — this was the lit-recommended
+     starting point and remains a valid path.
+   Pick whichever has lowest log-loss on held-out trace.
+
+3. **T11c — Integration + re-eval.**  Plug winner into both swap
+   points (sglang_adapter.py:69/71 and kv_scheduler.py:309/310).
+   Re-run K.  Target ≤ Run H' 885s; ideally ≤ Run G 666s.
+
+### What the workload_characterisation data IS for
+
+`notes/workload_characterisation.md` keeps its findings, but its
+role changes:
+* **Sanity check** for T11b — on terminus-2 traces the fitted
+  estimator should predict ~1.0 for active-session trunk units
+  (deterministic ground truth).
+* **Coverage check** — confirms our trace harvest captures the
+  multi-turn structure (200 turns × 32 trials = ~6400 turn events
+  per Run K, plenty of data).
+* **NOT** a basis for hard-coded rules in the estimator code.
 
 ## OPEN QUESTIONS (track here, update as we learn)
 
