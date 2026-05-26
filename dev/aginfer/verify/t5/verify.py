@@ -396,6 +396,36 @@ async def la_event_handler_latency(
     return stats
 
 
+def la_firer_url_append() -> None:
+    """[A10] BLOCKER B1 (round-1 audit): firer appends /aginfer/event
+    if user passes a bare base URL.
+
+    Pure unit test on AginferWebhookFirer.__init__ — no actual HTTP
+    needed.  Verifies the firer normalises both shapes to the same
+    final notify URL.
+    """
+    # The import here avoids needing the sglang source on path during
+    # other Layer A tests.
+    sys.path.insert(0, "/scratch/yuzhou/projects/sglang/python")
+    from sglang.srt.managers.aginfer_webhook import AginferWebhookFirer
+
+    cases = [
+        ("http://daemon:8765", "http://daemon:8765/aginfer/event"),
+        ("http://daemon:8765/", "http://daemon:8765/aginfer/event"),
+        ("http://daemon:8765/aginfer/event", "http://daemon:8765/aginfer/event"),
+        ("http://daemon:8765/aginfer/event/", "http://daemon:8765/aginfer/event"),
+    ]
+    for inp, want in cases:
+        f = AginferWebhookFirer(notify_url=inp)
+        try:
+            assert f.notify_url == want, (
+                f"firer URL mismatch: notify_url={inp!r} -> "
+                f"firer.notify_url={f.notify_url!r}, expected {want!r}"
+            )
+        finally:
+            f.close()
+
+
 async def la_no_periodic_timer_in_source() -> None:
     """[A9] Contract: NO `time.sleep`, `asyncio.sleep`, or
     `loop.call_later` in the daemon's event/router/proxy modules
@@ -592,6 +622,10 @@ async def main() -> None:
     await la_no_periodic_timer_in_source()
     print("[A9] contract: no `call_later` / `call_at` in daemon "
           "event-router source (event-driven only) ✓")
+
+    la_firer_url_append()
+    print("[A10] BLOCKER B1 fix: AginferWebhookFirer appends "
+          "/aginfer/event when user passes a bare base URL ✓")
 
     # ---- Layer B: sglang side, full launch (gated) ----
     if os.environ.get("AGINFER_T5_FULL") == "1":

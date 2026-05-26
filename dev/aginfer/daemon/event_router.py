@@ -52,11 +52,20 @@ class EventRouter:
         bus: EventBus,
         sglang_base_url: str,
         http_client: Optional[httpx.AsyncClient] = None,
+        theta_hi: float = 0.7,
+        theta_crit: float = 0.9,
     ) -> None:
         self.bus = bus
         self.sglang_base_url = sglang_base_url.rstrip("/")
         self._client = http_client
         self._owns_client = http_client is None
+        # Watermark thresholds used by cold_start_probe ONLY (the
+        # real-time detector lives on sglang side).  Should match
+        # the sglang launch's --aginfer-theta-hi / --aginfer-theta-crit
+        # to avoid the cold-start synth firing on a different
+        # threshold than steady-state webhooks.  Audit-round-1 M1.
+        self.theta_hi = float(theta_hi)
+        self.theta_crit = float(theta_crit)
         # Per-kind handler.  Defaults to noop; T7 / T8 override.
         self._handlers: dict[str, HandlerFn] = {}
         # Serialise handler execution.  paper §9: "no two handlers
@@ -91,8 +100,12 @@ class EventRouter:
             self._worker_task.cancel()
             try:
                 await self._worker_task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:  # noqa: BLE001
+                # Audit-round-1 M4: don't silently swallow real bugs at
+                # shutdown.  Log + continue (we're shutting down anyway).
+                logger.exception("event_worker raised during shutdown")
             self._worker_task = None
         if self._owns_client and self._client is not None:
             await self._client.aclose()
@@ -103,8 +116,10 @@ class EventRouter:
         synthesise a local ``memory_pressure`` event so the daemon
         doesn't sit oblivious to pre-existing pressure.
 
-        v1: theta_hi is hardcoded to 0.7 here (matches sglang default
-        --aginfer-theta-hi); a future PR can plumb it through.
+        Uses ``self.theta_hi`` / ``self.theta_crit`` — set these to
+        match the sglang launch flags so cold-start synth and steady-
+        state webhooks agree on the watermark thresholds.  Audit-round-1
+        M1.
         """
         try:
             state = await self.fetch_state()
@@ -114,10 +129,13 @@ class EventRouter:
         tier_usage = state.get("tier_usage", {}).get("HBM", {})
         used = tier_usage.get("used_bytes", 0)
         cap = tier_usage.get("cap_bytes", 0)
-        if cap > 0 and (used / cap) > 0.7:
+        if cap > 0 and (used / cap) > self.theta_hi:
+            occ = used / cap
+            state_label = "HIGH" if occ < self.theta_crit else "CRITICAL"
             logger.info(
-                "cold_start_probe: HBM occ %.2f > 0.7; synthesising memory_pressure",
-                used / cap,
+                "cold_start_probe: HBM occ %.3f > theta_hi %.3f; "
+                "synthesising memory_pressure (state=%s)",
+                occ, self.theta_hi, state_label,
             )
             await self.bus.emit(
                 Event(
@@ -125,9 +143,9 @@ class EventRouter:
                     session=None,
                     payload={
                         "kind": "memory_pressure",
-                        "state": "HIGH" if used / cap < 0.9 else "CRITICAL",
+                        "state": state_label,
                         "prev_state": "OK",
-                        "occ": used / cap,
+                        "occ": occ,
                         "used_bytes": int(used),
                         "cap_bytes": int(cap),
                         "synthetic": True,
@@ -157,6 +175,9 @@ class EventRouter:
                     await handler(event, self)
                 self.events_handled += 1
             except asyncio.CancelledError:
+                # Pair the get() with task_done() so a future
+                # ``queue.join()`` doesn't hang on a cancel-time event.
+                self.bus.queue.task_done()
                 raise
             except Exception:  # noqa: BLE001
                 self.handler_failures += 1
@@ -164,6 +185,14 @@ class EventRouter:
                     "aginfer event handler for %s raised; queue continues",
                     event.kind.value,
                 )
+            finally:
+                # Audit-round-1 M5: pair get() with task_done() so
+                # ``bus.queue.join()`` works.
+                try:
+                    self.bus.queue.task_done()
+                except ValueError:
+                    # Already called (cancel path above).  Tolerate.
+                    pass
 
 
 async def _noop_handler(event: Event, router: "EventRouter") -> None:

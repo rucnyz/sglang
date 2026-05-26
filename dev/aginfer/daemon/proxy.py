@@ -147,6 +147,8 @@ def create_app(
     program_tracker: Optional[ProgramTracker] = None,
     http_client: Optional[httpx.AsyncClient] = None,
     enable_event_router: bool = True,
+    theta_hi: float = 0.7,
+    theta_crit: float = 0.9,
 ) -> FastAPI:
     """Build the daemon's FastAPI app.
 
@@ -178,6 +180,8 @@ def create_app(
             bus=app.state.event_bus,
             sglang_base_url=app.state.sglang_base_url,
             http_client=None,  # router lazily creates its own on start()
+            theta_hi=theta_hi,
+            theta_crit=theta_crit,
         )
         attach_event_routes(app, router)
         app.state.event_router = router

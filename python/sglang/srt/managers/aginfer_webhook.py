@@ -51,7 +51,13 @@ class WebhookPayload:
     occ: float
     used_tokens: int
     cap_tokens: int
+    # Two time bases (round-1 audit M3): wall clock for human/log
+    # correlation, monotonic for arithmetic on inter-fire intervals.
+    # Downstream consumers (T7/T8 admission) should use ts_monotonic
+    # when computing "time since last fire" — wall clock can step
+    # backward on NTP adjustment.
     ts: float
+    ts_monotonic: float
 
 
 def classify(occ: float, theta_hi: float, theta_crit: float) -> WatermarkState:
@@ -90,6 +96,13 @@ class AginferWebhookFirer:
     background thread, so the scheduler step never awaits.
     """
 
+    # Path the firer appends to a base URL.  README contract:
+    # ``POST <notify_url>/aginfer/event``.  Audit-round-1 caught the
+    # firer was posting to ``notify_url`` verbatim, so a user passing
+    # the documented base URL (``--aginfer-notify-url=http://daemon:8765``)
+    # would silently 404 every webhook.
+    _EVENT_PATH = "/aginfer/event"
+
     def __init__(
         self,
         *,
@@ -98,7 +111,13 @@ class AginferWebhookFirer:
         theta_hi: float = 0.7,
         theta_crit: float = 0.9,
     ) -> None:
-        self.notify_url = notify_url
+        # Append the event path if the user passed a bare base URL.
+        # Tolerate trailing slashes and either form ("base/" or
+        # "base/aginfer/event") so the launch CLI is forgiving.
+        url = notify_url.rstrip("/")
+        if not url.endswith(self._EVENT_PATH):
+            url = url + self._EVENT_PATH
+        self.notify_url = url
         self.heartbeat_s = float(heartbeat_s)
         self.theta_hi = float(theta_hi)
         self.theta_crit = float(theta_crit)
@@ -151,6 +170,7 @@ class AginferWebhookFirer:
             used_tokens=int(used_tokens),
             cap_tokens=int(cap_tokens),
             ts=time.time(),
+            ts_monotonic=now,
         )
         self._last_state = cur
         self._last_fire_ts = now
@@ -164,10 +184,23 @@ class AginferWebhookFirer:
         return kind
 
     def close(self) -> None:
-        """Stop the background loop on scheduler shutdown."""
-        if self._loop is not None:
+        """Stop the background loop + close the httpx client on scheduler
+        shutdown.  Audit-round-1 BLOCKER 2: without this, every scheduler
+        restart leaked the daemon thread + open httpx connections."""
+        loop = self._loop
+        client = self._client
+        if loop is not None and client is not None:
             try:
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                fut = asyncio.run_coroutine_threadsafe(
+                    client.aclose(), loop
+                )
+                fut.result(timeout=2.0)
+            except Exception:
+                logger.warning("aginfer client.aclose() failed", exc_info=True)
+        self._client = None
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
             except Exception:
                 pass
         if self._thread is not None:
@@ -204,6 +237,7 @@ class AginferWebhookFirer:
             "used_tokens": payload.used_tokens,
             "cap_tokens": payload.cap_tokens,
             "ts": payload.ts,
+            "ts_monotonic": payload.ts_monotonic,
         }
         backoff = 0.1
         for attempt in range(3):
@@ -220,9 +254,12 @@ class AginferWebhookFirer:
                     "aginfer webhook %s raised (attempt %d/3): %s",
                     payload.kind, attempt + 1, exc,
                 )
-            await asyncio.sleep(backoff)
-            backoff *= 4
+            # Round-1 audit M2: skip sleep after the last attempt (we're
+            # about to give up anyway).
+            if attempt < 2:
+                await asyncio.sleep(backoff)
+                backoff *= 4
         logger.warning(
-            "aginfer webhook %s gave up after 3 attempts (last backoff %.1fs)",
-            payload.kind, backoff,
+            "aginfer webhook %s gave up after 3 attempts",
+            payload.kind,
         )

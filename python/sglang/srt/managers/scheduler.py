@@ -3927,3 +3927,12 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            # aginfer T5: tear down the webhook firer's background asyncio
+            # loop + httpx client.  Without this, the daemon thread + open
+            # connections leak across scheduler restarts (audit-round-1
+            # BLOCKER 2).
+            if getattr(scheduler, "aginfer_webhook", None) is not None:
+                try:
+                    scheduler.aginfer_webhook.close()
+                except Exception:
+                    logger.exception("aginfer_webhook.close() failed")

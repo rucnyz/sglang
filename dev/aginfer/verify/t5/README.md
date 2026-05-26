@@ -43,7 +43,7 @@
 
 ## HOW WE VERIFY
 
-Mechanism. `verify/t5_event_router.py`:
+Mechanism. `verify/t5/verify.py` (two layers: A pure-asyncio, B real-sglang gated by `AGINFER_T5_FULL=1`):
 
 ```
 1. sglang side
@@ -88,11 +88,11 @@ Mechanism. `verify/t5_event_router.py`:
 
 | Failure mode | How to force | Predicted floor | Assertion |
 |---|---|---|---|
-| Webhook receiver completely down | Launch sglang with `--aginfer-notify-url=http://127.0.0.1:1` (port closed); run full harbor swebenchpro -n 32 | per-trial mean ≤ Run F' × 1.10 = 960 s (degrades to inline scorer only, the safety net) | log-grep `failed` count + harbor result |
+| Webhook receiver completely down *(deferred to T9 Run K)* | Launch sglang with `--aginfer-notify-url=http://127.0.0.1:1` (port closed); run full harbor swebenchpro -n 32 | per-trial mean ≤ Run F' × 1.10 = 960 s (degrades to inline scorer only, the safety net) | log-grep `failed` count + harbor result |
 | Daemon receives event but handler raises | Patch handler to raise on every 5th event; run 100 events | other 4/5 succeed; bad event logged + counted; queue does not stall | event log count |
 | Burst of 1000 events in 100 ms | fastapi `/aginfer/event` slammed with 1000 concurrent POSTs | All eventually processed serially; no dropped; total drain time < 5 s | metric: events_handled == 1000 |
 | Webhook for transition that never occurs (idle workload) | Boot sglang + daemon, send no traffic for 60 s | Daemon CPU < 1 %; no events fire | psutil sample |
-| Daemon process killed mid-handler | `kill -9` daemon while handler running; restart | On restart, sees current sglang state via 1× fetch; any in-flight migrate either committed or dropped (no half-state). Run K trial-in-flight may error; subsequent trials proceed | docker container survival + harbor stats |
+| Daemon process killed mid-handler *(deferred to T10 integration)* | `kill -9` daemon while handler running; restart | On restart, sees current sglang state via 1× fetch; any in-flight migrate either committed or dropped (no half-state). Run K trial-in-flight may error; subsequent trials proceed | docker container survival + harbor stats |
 ## REPRODUCING
 
 T5 has two layers.  Layer A is pure asyncio (no sglang, no GPU);
@@ -119,8 +119,53 @@ daemon-bound POSTs for assertion.
 
 ## RESULTS
 
-**PASSED** — Layer A (9 steps) + Layer B (full sglang webhook path on
-a real GPU) both clean.
+**PASSED** — Layer A (10 steps post-audit) + Layer B (full sglang
+webhook path on a real GPU) both clean.
+
+### Audit round-1 findings + resolution
+
+Found 2 BLOCKER + 7 MINOR + 5 NIT.  Real fixes:
+
+* **BLOCKER B1** — Firer was POSTing to `notify_url` verbatim; user
+  passing the documented base URL (`--aginfer-notify-url=http://daemon:8765`)
+  would silently 404 every webhook.  Fixed: `AginferWebhookFirer.__init__`
+  now appends `/aginfer/event` to bare base URLs.  Pinned by step [A10].
+* **BLOCKER B2** — `close()` was never called → daemon thread + httpx
+  client leaked per scheduler subprocess.  Fixed: `run_scheduler_process`
+  finally-block now calls `scheduler.aginfer_webhook.close()`, and
+  `close()` itself `aclose()`s the httpx client on the background loop
+  before stopping it.
+* **MINOR M1** — Cold-start probe hardcoded `0.7` / `0.9` instead of
+  honoring sglang's `--aginfer-theta-hi` / `--aginfer-theta-crit`.
+  Fixed: `EventRouter` constructor takes `theta_hi` / `theta_crit`
+  parameters; `create_app` plumbs them through.
+* **MINOR M2** — Retry loop slept 1.6 s AFTER the third (final) failure
+  for no reason.  Fixed: skip sleep when `attempt == 2`.
+* **MINOR M3** — Payload `ts` used wall clock; detector `last_fire_ts`
+  used monotonic.  Mixing the two confuses downstream drift / latency
+  calculations.  Fixed: payload now carries BOTH `ts` (wall) and
+  `ts_monotonic`.  T7 / T8 should use `ts_monotonic` for inter-fire
+  arithmetic.
+* **MINOR M4** — `EventRouter.stop()` swallowed non-cancel exceptions.
+  Fixed: now logs them.
+* **MINOR M5** — Worker never called `queue.task_done()`; a future
+  `queue.join()` would hang.  Fixed: paired in a `finally`.
+* **NIT N1** — README HOW WE VERIFY referred to a legacy path
+  (`verify/t5_event_router.py`); actual is `verify/t5/verify.py`.
+  Fixed.
+* **NIT N2** — WORST CASE table rows that are deferred to T9 / T10
+  ("Webhook receiver completely down", "Daemon process killed
+  mid-handler") now carry an explicit `*(deferred to ...)*` marker.
+
+Documented (not coded around) for v1:
+* **MINOR M6** — Idempotency claim is true for v1's noop handler but
+  T7 / T8 implementers must enforce idempotency for their real
+  handlers.  Documented in the not-covered-in-v1 section.
+* **MINOR M7** — In TP/PP, each Scheduler subprocess constructs its
+  own firer; daemon will receive N×events per transition.  Noop
+  handler is fine; T7 / T8 must dedup.  Documented.
+* **NITs N3 / N4 / N5** — async-around-sync emit, deprecated
+  `@app.on_event`, probe-not-retried.  Cosmetic; no behaviour change.
 
 * date: 2026-05-26
 * sglang code added:
