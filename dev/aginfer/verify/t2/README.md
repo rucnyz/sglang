@@ -126,7 +126,7 @@ kill "$SGLANG_PID"
 
 ## RESULTS
 
-**PASSED** (depth-audit edition, 2026-05-26).  All 16 in-suite steps pass on
+**PASSED** (audit round-3 edition, 2026-05-26).  All 21 in-suite steps pass on
 Qwen3-0.6B + `--attention-backend flashinfer`, single-DP.  This edition
 covers every branch of `apply_aginfer_migrations` that is reachable without
 HiCache, plus the tier_usage delta invariant, IPC serialization, duplicate
@@ -212,7 +212,15 @@ this bug.
 * **Memory / GC soak** (step [21]): 1000 small migrate calls; p50=2.75ms,
   p99=4.24ms; late-window median 1.55× early-window — well under the
   3× slow-leak threshold. Server still responsive after the burst.
-* raw log: `results/<YYYYMMDD_HHMMSS>_run10_round3.log`
+* raw logs (relative to this directory):
+  * `results/20260525_234929_run1.log` — initial T2 passing run (audit round 1)
+  * `results/20260526_001806_run3_depth.log` — depth-audit FAILURE (shows the
+    duplicate-batch SIGQUIT, kept as bug-discovery evidence)
+  * `results/20260526_004033_run9_clean.log` — post-depth-audit passing run
+  * `results/20260526_004940_run10_round3.log` — round-3 audit (production
+    realism + adversarial) passing run, 21 steps
+  * `results/20260526_012629_run11_bytes_schema.log` — final passing run on
+    the bytes-schema rewrite (current implementation)
 
 ### Caveats (deferred, NOT regressions)
 

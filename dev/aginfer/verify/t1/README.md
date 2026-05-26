@@ -128,8 +128,17 @@ kill "$SGLANG_PID"
 * delta vs ceiling: **10× under** at the stress regime (48 ms vs 836 ms bound); 5× tail-latency improvement under concurrent stress.
 * root cause discovered: Gen-2 cyclic-GC fired every ~50 dumps because each dump allocated 10k Python dicts + lists, and the sweep over the live radix tree + KV-pool descriptors took 300-500 ms. Fix: direct-to-bytearray JSON in `dump_aginfer_state_bytes`, no per-node dict allocation. Walk itself is only ~14 ms at 4300 nodes.
 * raw logs (relative to this directory):
-  * `results/20260525_224238_baseline.log` (before opt)
-  * `results/20260525_232021_optimized.log` (after opt)
+  * `results/20260525_224238_baseline.log` (before perf opt)
+  * `results/20260525_232021_optimized.log` (after 10× perf opt)
   * `results/20260525_232149_optimized_run2.log`
   * `results/20260525_232258_optimized_run3.log`
   * `results/optimization_notes.md` (writeup of the 10× p99 improvement)
+  * **Note**: a subsequent bytes-schema rewrite (2026-05-26) changed
+    the `/aginfer/state` contract to expose `bytes_per_token`,
+    per-unit `n_bytes`, and tier_usage in `used_bytes` / `cap_bytes`
+    instead of tokens.  The optimized-path logs above are from BEFORE
+    that schema rewrite; their numeric values for `used_tokens` /
+    `cap_tokens` no longer match the live schema, but the latency /
+    GC / concurrent-walker measurements remain valid.  Re-run
+    `verify/t1/verify.py` (which targets the post-rewrite schema)
+    to see fresh numbers on the current implementation.

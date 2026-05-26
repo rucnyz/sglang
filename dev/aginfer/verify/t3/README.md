@@ -208,8 +208,9 @@ To re-run the pre-fix demo for either BLOCKER:
 
 ## RESULTS
 
-**PASSED** — all 13 steps (post audit round-3) on Qwen3-0.6B +
-`--attention-backend flashinfer --chunked-prefill-size 32`.
+**PASSED** — all 14 verify steps + 3-section regression probe (post
+audit round-5) on Qwen3-0.6B + `--attention-backend flashinfer
+--chunked-prefill-size 32`.
 
 * date: 2026-05-26
 * sglang sha: (this commit)
@@ -256,10 +257,22 @@ To re-run the pre-fix demo for either BLOCKER:
   it does not.
 * Pydantic regression (step [13]): `ChatCompletionRequest.model_config.extra`
   must NOT be `"allow"`; introspection check guards the contract.
-* raw log: `results/<YYYYMMDD_HHMMSS>_run9_audit3_clean.log` (full 13
-  steps); regression-probe logs `PREFIX_demo_v4.log` (both FAIL with
-  fixes reverted) and `POSTFIX_demo.log` (both PASS with fixes
-  restored) — the bisect proves the fix actually fixes.
+* raw logs (relative to this directory):
+  * `results/20260526_023126_run5_postaudit.log` — round-1+2 fixes,
+    10 steps passing
+  * `results/20260526_025258_run6_audit2.log` — round-2 audit fixes
+    (depth-audit complete)
+  * `results/20260526_031612_PREFIX_demo_v4.log` — **bisect PRE-fix**
+    (round-3 BLOCKERs reverted, probe FAILs both)
+  * `results/20260526_031737_POSTFIX_demo.log` — **bisect POST-fix**
+    (fixes restored, probe PASSes both)
+  * `results/20260526_031841_run9_audit3_clean.log` — round-3 audit
+    fixes, 13 steps passing
+  * `results/20260526_034309_run10_audit4.log` — round-4 audit fixes
+    (step [11] rewritten to use /generate, preflight added)
+  * `results/20260526_035348_run11_audit5.log` — round-5 audit fixes
+    (recursion-must-reach-sanitizer + EPD self-check), 14 steps + 3
+    probe sections all passing — **current state**
 
 ### Implementation notes (forward-compat for T4-T8)
 
