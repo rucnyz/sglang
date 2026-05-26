@@ -67,6 +67,102 @@ Re-run T9 Run K full; targets:
 * If T11 mean < 885 s → empirical estimator beats LRU.  Paper-worthy.
 * If T11 mean < Run G 666 s → empirical estimator beats TA.  Strong.
 
+## SUBAGENT BACKGROUND (collected 2026-05-26, see notes/)
+
+Four parallel subagents collected the prerequisite info.  Detailed
+write-ups in `notes/literature_survey.md`,
+`notes/trace_hooks.md`, `notes/phat_inventory.md`,
+`notes/workload_characterisation.md`.
+
+### Critical synthesis (cross-cutting takeaways)
+
+**A. Workload is essentially DETERMINISTIC, not probabilistic
+   (workload_characterisation):**
+* Constant 200 turns per trial (hard `max_turns` cap; all trials hit it).
+* **Per-turn prefix is monotonic extension** — every turn N's message
+  list == turn (N-1)'s list + one `[assistant, user]` pair.  Byte-
+  identical across 199/199 boundaries in sampled trials.  No
+  summarisation, no truncation.
+* First **~750 tokens shared across all trials** (system prompt +
+  JSON protocol spec).  Diverges into per-task PR description after.
+* Inter-turn timing: p50=1.1s, p90=14s, p99=88s, max=223s.
+  44 % sub-second, 87 % under 10s.
+
+**Implication for T11**: next-turn KV reuse is essentially CERTAIN
+while session is active.  The right `p_hat` for trunk units in an
+active session is **~1.0**, not a Hawkes-fit value.  Stale sessions
+(no turn for ≥30s suspected) decay toward 0.  The current `hits/age`
+proxy systematically **undervalues NEW units** (low age + low hits
+→ tiny p_hat) — but if they're in an active session, they're
+*guaranteed* to be reused next turn.  **This is the bug.**
+
+**B. Literature (literature_survey):**
+* No prior LLM KV system uses probabilistic per-block reuse modeling —
+  T11 is new ground.
+* Classical: LIRS / LRU-K encode reuse-distance, are the strongest
+  *adaptive* baselines.  ARC / SLRU / TinyLFU insufficient for
+  long-horizon prefix reuse.
+* Learned: Belady-imitation (Glider-style GBDT) is the theoretical
+  ceiling.  LeCaR / MAB skip (their ceiling = max(LRU,LFU)).
+* Temporal point processes (Hawkes self-exciting) are the
+  theoretically grounded choice if we go probabilistic — but per
+  (A), this workload may not need probabilistic at all.
+
+**C. Trace hooks (trace_hooks):**
+Minimum 5 instrumentation points in sglang to reconstruct full
+reuse pattern (file:line, expected ~1.2 µs total per request):
+* `unified_radix_cache.py:849` — CACHE_HIT (prefix match)
+* `unified_radix_cache.py:1019` — INSERT_OVERLAP
+* `unified_radix_cache.py:1340` — EVICT_DEVICE_LEAF (lifetime end)
+* `unified_cache_components/full_component.py:206` — LOCK_ACQUIRE
+* `unified_radix_cache.py:1623` — BACKUP_STORAGE (L3 transition)
+
+**D. p_hat swap points (phat_inventory):**
+Two SWAP POINTS the new estimator must touch (both compute
+`p_hat = min(1.0, hits/age)` and `lambda = max(1e-3, hits/age)`):
+* SWAP 1 — `baselines/sglang_adapter.py:_node_to_unit` lines 69, 71
+  (inline scorer; sglang hot path; no daemon state available here)
+* SWAP 2 — `daemon/kv_scheduler.py:build_paper_state` lines 309, 310
+  (daemon side; full ProgramTracker state available)
+* These two MUST stay consistent (within an age-counter epoch) or
+  inline evictions disagree with daemon migrations → conflict rate
+  > 1 % violation.
+
+### Revised T11 plan (incorporating subagent findings)
+
+The original T11 plan (T11a → T11b histogram/bucket/Hawkes →
+T11c) is **partially superseded** by finding A.  Revised order:
+
+**T11x — session-aware p_hat (NEW, do first; ~1 day)**
+The workload data says reuse is deterministic given session
+liveness.  Implement:
+* For units with holders in REASONING / ACTING session → p_hat = 1.0
+* For units with all holders idle ≥ inter-turn-p90 (14 s) → p_hat
+  decays via exponential with τ = inter-turn-p99 (88 s)
+* For shared-platform (≥2 holders) → p_hat = 1.0 always
+* For units with NO holders → fall back to hits/age proxy
+
+Daemon side already has ProgramTracker.state(pid) (T6).  Inline
+side has no daemon state — needs sglang to expose session liveness
+via a callback.  Most natural place: pipe daemon's tracker state
+into sglang via a periodic state sync (NOT polling — sync on
+state change events: pause / resume / observe_arrival).
+
+**T11a, T11b, T11c — keep as originally planned**, but use them
+to **measure**, not to construct the primary estimator.  Order:
+1. T11a — harvest traces (still needed for T11x validation)
+2. T11x — implement session-aware p_hat
+3. Re-run K full with T11x
+4. If T11x ≈ Run H' but not better → workload IS deterministic, T11x
+   is correct, gain is "no regression", paper claim is conservative
+5. If T11x **< Run H'** → great, ship it
+6. T11b/c (Hawkes etc.) only if T11x doesn't beat baseline
+
+This deviates from the literature recommendation (lit said start
+with Hawkes), but the **workload-specific evidence is stronger** —
+when data says "deterministic", you don't need a probabilistic
+model.
+
 ## OPEN QUESTIONS (track here, update as we learn)
 
 1. **Is `hits/age` actually wrong, or just slightly off?**
