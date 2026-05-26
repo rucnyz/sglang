@@ -117,13 +117,52 @@ do but framework works; > 873 = architectural fault; < 600 = paper
 worthy.
 
 ## RESULTS
+
+**Status (2026-05-26):** K full RAN; K-a IN PROGRESS; J PENDING.
+
+### K full — kv_scheduler ON + admission ON + HiCache ON
+* date: 2026-05-26 14:16-15:08 (~52 min wall)
+* **30 / 32 successful** (✓ ≥ 28)
+* per-trial mean: **1559 s** (✗ vs < 716 s target; 1.76× Run H' 885 s)
+* per-trial std: 678 s
+* per-trial p50/p90/p99: 1500 / 2511 / 3120 s
+* per-trial max: 3120 s
+* sum: 49 900 s (13.9 h)
+* sglang crashes: 0 (✓)
+* Daemon observed 5177 chat completions + 11 748 `/aginfer/state` fetches.
+* Verdict: K full FAILED the mean target — the daemon added overhead instead of reducing it. K-a and J ablations needed to attribute.
+* Full table: [`results/RUN_K_FULL_SUMMARY.md`](results/RUN_K_FULL_SUMMARY.md)
+* raw harbor JSON: `results/run_K_full/harbor_jobs/2026-05-26__14-16-56/`
+
+### K-a — kv_scheduler ON + admission OFF + HiCache ON
+* date: 2026-05-26 (running, ~50 min wall expected)
+* status: _pending_
+* purpose: isolates admission contribution.  If K-a mean ≈ Run H' (885 s), admission added ~675 s/trial of overhead.
+
+### J — kv_scheduler ON + admission ON + HiCache OFF
 * date: _pending_
-* K (full, HiCache ON, 3 layers): mean / std / p99 / successful: _pending_
-* K-a (HiCache ON, admission OFF): _pending_
-* J (HiCache OFF, 3 layers): _pending_
-* Acceptance criteria met:
-  - K.mean < 716 AND K.successful >= 28: _pending_
-  - J.mean < 885 (§9 deployment claim): _pending_
-  - K-a.mean ≤ 885 ± 30 (T7 calibration): _pending_
-* Stretch met: _pending_
-* raw logs: `verify/results/t9_*/`
+* status: pending
+* purpose: paper §9 deployment claim (daemon works without HiCache).
+
+### Pre-run debugging notes (problems caught en route to a real Run K)
+
+Seven retries of `bash verify/t9/run_k.sh full` before harbor saw real traffic.
+Each retry caught a different orchestration / config bug — none of them
+in T1–T8 unit tests, all visible only in production:
+
+| retry | failure | cause | fix |
+|---|---|---|---|
+| 1 | HALT at startup invariant | `SGLANG_KV_POLICY_MODULE` not exported in run_k.sh | export it |
+| 2 | HALT at startup invariant | grep matched STALE `sglang_v4flash.log` from retry-1 (race with launch script's rotate_log) | rotate the log ourselves before launch |
+| 3 | sglang CUDA OOM | retry-1 sglang scheduler subprocess (`sglang::schedul`, name truncated by Linux at 15 chars) was not in pkill pattern → leaked 232 GB GPU memory | pkill `-f sglang` (substring match) + drain-zombies loop |
+| 3.5 | (same as 3) | the zombie process (defunct, PPID=1) held GPU memory until init reaped it; nvidia-smi reported 237 MB but PyTorch saw 232 GB in-use | wait for state==Z entries to clear; also pre-flight `nvidia-smi memory.used > 1024 MiB → HALT` |
+| 4 | 32 InternalServerError in 3.5 min | harbor's `litellm` refused to send (no `OPENAI_API_KEY`) — daemon never saw any HTTP request | added `--ak api_key=dummy` |
+| 5 | same as 4 | `litellm` runs on the HOST not in docker; `--ak` only sets agent-config, not env | also passed `--ae OPENAI_API_KEY=dummy` |
+| 6 | same as 4/5 | `--ae` passes env to docker container, but `litellm` runs in the harness shell | `export OPENAI_API_KEY=dummy` in run_k.sh before invoking harbor |
+| 7 | (success) | — | — |
+
+Take-away: T1–T8 verify suites all pass in synthetic-state in-process tests.
+The 5 round-1+ audits, 22 bisect probes, 5 cleanup rounds caught a lot
+— **but real-world deployment glue (env vars, process trees, log
+rotation races, zombie reaping, litellm credentials) is its own bug
+class that smoke testing only exposes when you fire the real stack.**

@@ -62,20 +62,56 @@ SGLANG_PID=""
 DAEMON_PID=""
 
 # ---- cleanup ----
+# Killing the top-level launch script's pid does NOT reap sglang's
+# scheduler subprocess (TP shards, ray workers) — they keep holding
+# GPU memory and the NEXT Run K hits CUDA OOM.  Match by command
+# pattern to catch the full tree.
 cleanup() {
     set +e
     echo "[run_k:$VARIANT] cleanup..."
+    # SIGTERM by pid first (clean shutdown if it honors it).
     [[ -n "${DAEMON_PID:-}" ]] && kill "$DAEMON_PID" 2>/dev/null
     [[ -n "${SGLANG_PID:-}" ]] && kill "$SGLANG_PID" 2>/dev/null
     [[ -n "${MOONCAKE_PID:-}" ]] && kill "$MOONCAKE_PID" 2>/dev/null
     sleep 3
-    [[ -n "${DAEMON_PID:-}" ]] && kill -9 "$DAEMON_PID" 2>/dev/null
-    [[ -n "${SGLANG_PID:-}" ]] && kill -9 "$SGLANG_PID" 2>/dev/null
-    [[ -n "${MOONCAKE_PID:-}" ]] && kill -9 "$MOONCAKE_PID" 2>/dev/null
+    # Force-kill the full process trees.  Match by cmdline substring
+    # since Linux truncates comm to 15 chars (sglang::scheduler →
+    # sglang::schedul) — a pkill on the full name silently misses.
+    pkill -9 -f "daemon.main" 2>/dev/null
+    pkill -9 -f "sglang" 2>/dev/null      # catches launch_server, srt, schedul, detoken, tp
+    pkill -9 -f "mooncake_master" 2>/dev/null
+    sleep 2
+    # Drain any remaining zombies (PPID=1, state=Z) — the kernel
+    # reclaims the GPU buffer only after init reaps them, so without
+    # the wait the next Run K may hit phantom-OOM.  Up to 10 s.
+    for _ in $(seq 1 10); do
+        if ! ps -eo state,comm 2>/dev/null | awk '$1=="Z" && $2~/^sglang/' | grep -q .; then
+            break
+        fi
+        sleep 1
+    done
     # Harbor docker leftovers.
     docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'instance_|swebenchpro' | xargs -r docker kill 2>/dev/null
 }
 trap cleanup EXIT INT TERM
+
+# ---- pre-flight: confirm our GPUs are actually free ----
+# nvidia-smi reports `pid, used_memory` even for zombie processes; a
+# launch into a "0 MB free" GPU just OOMs after model load.  Use the
+# per-GPU `memory.used` view from nvidia-smi which (post-zombie-reap)
+# accurately reflects actually-claimable VRAM.
+echo "[run_k:$VARIANT] pre-flight GPU check on $AGINFER_GPUS..."
+IFS=',' read -ra _GPU_LIST <<< "$AGINFER_GPUS"
+for gpu in "${_GPU_LIST[@]}"; do
+    used_mb=$(nvidia-smi -i "$gpu" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')
+    if (( used_mb > 1024 )); then
+        echo "[run_k:$VARIANT] HALT — GPU $gpu has $used_mb MiB used (need < 1024 MiB)" >&2
+        echo "[run_k:$VARIANT] check zombies: ps -eo state,pid,comm | awk '\$1==\"Z\"'" >&2
+        echo "[run_k:$VARIANT] or other users' jobs on this GPU." >&2
+        exit 1
+    fi
+    echo "[run_k:$VARIANT]   GPU $gpu: $used_mb MiB used (OK)"
+done
 
 # ---- 1. mooncake_master (skip for J) ----
 if [[ -n "$HICACHE_FLAG" ]]; then
@@ -92,6 +128,19 @@ fi
 
 # ---- 2. sglang ----
 echo "[run_k:$VARIANT] starting sglang (TP=$SGLANG_TP, GPUs=$AGINFER_GPUS, HiCache=${HICACHE_FLAG:-OFF})..."
+# T9 README §"For ALL variants": ours_greedy_score scorer is the
+# load-bearing inline path; without it, the floor argument breaks.
+# Export here (NOT in env.sh) so the env stays local to Run K.
+export SGLANG_KV_POLICY_MODULE="baselines.sglang_adapter:ours_greedy_score"
+
+# Pre-rotate the launch-script's internal log so our grep-wait doesn't
+# race the launch-script's own rotate_log and match stale content.
+# (Bug observed on the second run after a halt: orchestrator's grep
+# saw the prior run's "Uvicorn running" line before the launch script
+# had a chance to wipe the log.)
+SGLANG_LOG_REAL="$AGINFER_LOGS/sglang_v4flash.log"
+[[ -e "$SGLANG_LOG_REAL" ]] && mv "$SGLANG_LOG_REAL" "${SGLANG_LOG_REAL}.run_k_prev"
+
 if [[ -n "$HICACHE_FLAG" ]]; then
     bash "$AGINFER_DIR/scripts/launch_sglang_v4flash.sh" >"$SGLANG_LOG" 2>&1 &
 else
@@ -100,7 +149,6 @@ fi
 SGLANG_PID=$!
 
 # Wait for sglang Uvicorn listener.
-SGLANG_LOG_REAL="$AGINFER_LOGS/sglang_v4flash.log"  # The launch scripts log here.
 echo "[run_k:$VARIANT] waiting for sglang Uvicorn on :30000 (up to 600 s)..."
 for i in $(seq 1 300); do
     if grep -q "Uvicorn running on http" "$SGLANG_LOG_REAL" 2>/dev/null; then
@@ -185,12 +233,16 @@ echo "[run_k:$VARIANT] starting harbor (32 trials, swebenchpro/terminus-2)..."
 HARBOR_RESULTS="$RESULTS_DIR/harbor_jobs"
 mkdir -p "$HARBOR_RESULTS"
 
+# litellm runs on the HOST (not in docker as I first thought), so its
+# OPENAI_API_KEY check reads from THIS shell's env, not from --ae.
+export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
 (cd /scratch/yuzhou/projects/harbor && \
     harbor run \
         -p datasets/swebenchpro \
         -a terminus-2 \
         -m openai/deepseek-ai/DeepSeek-V4-Flash \
         --ak api_base=http://172.17.0.1:9100/v1 \
+        --ak api_key="${OPENAI_API_KEY}" \
         --ak max_turns=200 \
         -n 32 \
         --jobs-dir "$HARBOR_RESULTS" \
