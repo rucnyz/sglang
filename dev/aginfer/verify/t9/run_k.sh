@@ -103,8 +103,12 @@ cleanup() {
         fi
         sleep 1
     done
-    # Harbor docker leftovers.
+    # Harbor docker leftovers.  Pipe failure (no match) is fine.
     docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'instance_|swebenchpro' | xargs -r docker kill 2>/dev/null
+    # End cleanup with explicit success so the EXIT trap doesn't
+    # propagate a cosmetic non-zero from the last pipe (docker ps |
+    # grep with no match) into the script's exit code.
+    return 0
 }
 trap cleanup EXIT INT TERM
 
