@@ -16,11 +16,11 @@
 
 set -euo pipefail
 
-VARIANT="${1:?usage: run_k.sh <full|ka|J>}"
+VARIANT="${1:?usage: run_k.sh <full|ka|J|kv_off>}"
 case "$VARIANT" in
-    full|ka|J) ;;
+    full|ka|J|kv_off) ;;
     *)
-        echo "[run_k] invalid variant: $VARIANT (expected: full|ka|J)" >&2
+        echo "[run_k] invalid variant: $VARIANT (expected: full|ka|J|kv_off)" >&2
         exit 2
         ;;
 esac
@@ -45,6 +45,19 @@ case "$VARIANT" in
         HICACHE_FLAG=""  # HiCache OFF
         DAEMON_KV="enabled"
         DAEMON_ADMISSION="enabled"
+        ;;
+    kv_off)
+        # Diagnostic: kv_scheduler OFF + admission OFF + HiCache ON.
+        # Daemon proxies requests + EventRouter no-ops on events; no
+        # migrate POSTs, no pause/resume.  Inline scorer (sglang's
+        # drive_eviction) still uses ours_greedy_score.  Approximates
+        # Run H' + daemon proxy hop.  If kv_off mean ≈ Run H' 885 s,
+        # kv_scheduler is the source of the K-full / K-a slowdown.
+        # If kv_off mean ≈ 1550 s, the inline scorer's V_u (paper §7)
+        # itself is the source — escalate to T11 (empirical p_hat).
+        HICACHE_FLAG="--enable-hierarchical-cache"
+        DAEMON_KV="disabled"
+        DAEMON_ADMISSION="disabled"
         ;;
 esac
 

@@ -68,8 +68,9 @@ Each task lives in its own folder `tN/` with:
 | 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | **passed** (2026-05-26, audit round-1 done; Layer A 10 steps + Layer B real-GPU watermark test) |
 | 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | **passed** (2026-05-26, 13 verify steps + 22 bisect probes across 5 audit rounds; ~510 LoC daemon code; build 2.7 ms / decide 1.4 ms @ 1k units) |
 | 8 | T8 | admission_controller (event-driven pause/resume) | [`t8/`](t8/) | **passed** (2026-05-26, 12 verify steps + 5 bisect probes across 2 audit rounds; ~315 LoC daemon code; single-pause 4 ms @ 32 programs) |
-| 9 | T9 | Run K + K-a + J ablation | [`t9/`](t9/) | **K full: 30/32 trials, mean 1559 s FAILS <716 s target (1.76× Run H'); K-a running; J pending** (2026-05-26) |
+| 9 | T9 | Run K + K-a + J ablation | [`t9/`](t9/) | **K full + K-a: both ~1550 s mean, FAIL <716 s target; admission_controller NOT the cause; kv_off (diagnostic) + J pending** (2026-05-26) |
 | 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies + daemon-controlled L3 (DISK) tier via Mooncake (paper §3 4-tier completion) | [`t10/`](t10/) | pending |
+| **11** | **T11** | **empirical p_hat / scoring (replace paper §7 hits/age proxy)** | [`t11/`](t11/) | **scoped 2026-05-26; T9 K-full+K-a empirical evidence that §7 1-step greedy V_u is wrong for multi-turn agent workloads; T11a trace harvest → T11b estimator → T11c re-run K** |
 
 Per-task `tN/results/` directories hold raw outputs (logs, JSON, harbor
 result dirs, optimization writeups) for that task only — no cross-task
