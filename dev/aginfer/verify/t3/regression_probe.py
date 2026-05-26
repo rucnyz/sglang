@@ -175,29 +175,76 @@ def probe_recursion_dos() -> str:
     return "PASS"
 
 
-def _uncommented_lines(src: str) -> str:
-    """Drop comments (full-line ``#`` lines AND trailing ``# ...``).
+def _function_passes_kwarg(func, kwarg_name: str, expected_value_src: str) -> bool:
+    """AST check: does ``func`` contain a Call whose keyword ``kwarg_name``
+    is set to the expression ``expected_value_src``?
 
-    Returned text is multi-line.  We don't actually parse Python; the
-    goal is to make sure a commented-out fix does NOT match a
-    "fix present" regex.  Also collapses ``a =\\n    b`` into ``a = b``
-    so a line-broken fix still counts as restored.
+    Round-6 audit BLOCKER 1: replaced ``_uncommented_lines`` + regex with
+    real AST parsing because regex-matching the textual source had blind
+    spots — docstrings, string literals containing ``#``, and other
+    non-code occurrences of the fix string would all pass.  AST walks
+    only over real keyword-argument nodes.
     """
-    import re
+    import ast
+    import inspect
+    import textwrap
 
-    out_lines = []
-    for line in src.splitlines():
-        # Strip trailing comment.
-        if "#" in line:
-            line = line[: line.index("#")]
-        # Skip lines that are now empty (was a full-line comment).
-        if line.strip():
-            out_lines.append(line)
-    joined = "\n".join(out_lines)
-    # Collapse line-continuations: ``foo = \n    bar`` -> ``foo = bar``.
-    # Black-style multi-arg breaks become single-line.
-    joined = re.sub(r"\n[ \t]+", " ", joined)
-    return joined
+    try:
+        src = textwrap.dedent(inspect.getsource(func))
+        tree = ast.parse(src)
+    except (OSError, TypeError, SyntaxError):
+        return False
+    expected = expected_value_src.strip()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg != kwarg_name:
+                continue
+            # ast.unparse drops formatting differences but keeps
+            # structural identity; this is exactly what we want.
+            try:
+                got = ast.unparse(kw.value).strip()
+            except Exception:
+                continue
+            if got == expected:
+                return True
+    return False
+
+
+def _assignment_present(func, attr_chain: str) -> bool:
+    """AST check: does ``func`` contain an assignment whose target's text
+    (via ``ast.unparse``) is ``attr_chain``?  Useful for verifying that
+    a self.attribute init line is present.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    try:
+        src = textwrap.dedent(inspect.getsource(func))
+        tree = ast.parse(src)
+    except (OSError, TypeError, SyntaxError):
+        return False
+    target = attr_chain.strip()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            for t in targets:
+                try:
+                    if ast.unparse(t).strip() == target:
+                        return True
+                except Exception:
+                    continue
+        elif isinstance(node, ast.AugAssign):
+            try:
+                if ast.unparse(node.target).strip() == target:
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def assert_fix_state_restored() -> None:
@@ -205,20 +252,27 @@ def assert_fix_state_restored() -> None:
     accidentally reverted (the bisect demo documents how to revert
     each one; this guards against "revert + forgot to restore").
 
-    Introspects three production-code lines:
-      * ``_PROGRAM_ID_MAX_RECURSION`` constant (round-3 BLOCKER 2)
-      * ``Session.create_req`` source contains ``program_id=req.program_id``
-        (round-3 BLOCKER 1)
-      * ``encode_receiver.create_req`` source contains
-        ``program_id=recv_req.program_id`` (round-2 BLOCKER -- round-5
-        audit found this fix had no self-check)
+    Introspects five production-code invariants (round-2/3/5/6 BLOCKERs):
+      1. ``_PROGRAM_ID_MAX_RECURSION == 8`` (round-3 sanitizer cap)
+      2. ``Session.create_req`` calls Req with ``program_id=req.program_id``
+         (round-3 session multi-turn fix)
+      3. ``MMReceiverBase.create_req`` calls Req with
+         ``program_id=recv_req.program_id`` (round-2 EPD-disagg fix)
+      4. ``UnifiedTreeNode.__init__`` assigns ``self.session_ids``
+         (round-6 -- the tagging contract depends on this attribute
+         being initialised; if removed, dump's try/except path silently
+         emits empty lists)
+      5. ``UnifiedRadixCache._split_node`` does
+         ``new_node.session_ids |= child.session_ids`` (round-6 --
+         split-merge inheritance; if removed, internal nodes lose
+         tags after a radix split)
 
-    Regex matches operate on a comment-stripped + line-continuation-
-    flattened view so commented-out reverts AND autoformatter line
-    breaks are both handled correctly.
+    All checks use ``ast.parse`` rather than regex.  Round-6 audit
+    BLOCKER 1: regex over source text false-positives on docstrings /
+    string literals that contain the fix string; AST walking ignores
+    those automatically.
     """
     import inspect
-    import re
 
     from sglang.srt.managers.schedule_batch import _PROGRAM_ID_MAX_RECURSION
 
@@ -228,63 +282,126 @@ def assert_fix_state_restored() -> None:
         f"restore the cap in schedule_batch.py before re-running."
     )
 
+    # 2) Session.create_req
     from sglang.srt.session import session_controller as _sc_mod
 
     Session = getattr(_sc_mod, "Session", None)
     assert Session is not None, "Could not import Session class"
-    src = _uncommented_lines(inspect.getsource(Session.create_req))
-    assert re.search(r"\bprogram_id\s*=\s*req\.program_id\b", src), (
-        "Session.create_req source does NOT contain an uncommented "
-        "`program_id=req.program_id` line.  The bisect demo's revert "
-        "was forgotten -- restore the line in session_controller.py "
-        "before re-running."
+    assert _function_passes_kwarg(
+        Session.create_req, "program_id", "req.program_id"
+    ), (
+        "Session.create_req does NOT pass `program_id=req.program_id` "
+        "as a real keyword argument (AST check).  The bisect demo's "
+        "revert was forgotten -- restore the line in "
+        "session_controller.py before re-running."
     )
 
-    # EPD-disagg path -- round-5 audit BLOCKER 2 (the fix had no
-    # self-check until now).  The class name is sglang-version-dependent
-    # (currently MMReceiverBase); iterate every class in the module and
-    # find the one with a ``create_req(self, recv_req: ...)`` method.
+    # 3) MMReceiverBase.create_req (EPD-disagg path).  Class name is
+    # sglang-version-dependent; pin the most likely one and fall back
+    # to iteration.  Require EXACTLY ONE match so a future stub class
+    # doesn't accidentally shadow the real one (round-6 MINOR 3).
     from sglang.srt.disaggregation import encode_receiver as _enc_mod
 
+    pinned = getattr(_enc_mod, "MMReceiverBase", None)
     epd_create_req = None
-    for _name, _obj in inspect.getmembers(_enc_mod, inspect.isclass):
-        if _obj.__module__ != _enc_mod.__name__:
-            continue  # imported, not defined here
-        cr = getattr(_obj, "create_req", None)
-        if cr is None or not callable(cr):
-            continue
+    if pinned is not None and hasattr(pinned, "create_req"):
         try:
-            sig = inspect.signature(cr)
+            sig = inspect.signature(pinned.create_req)
+            if "recv_req" in sig.parameters:
+                epd_create_req = pinned.create_req
         except (ValueError, TypeError):
-            continue
-        if "recv_req" in sig.parameters:
-            epd_create_req = cr
-            break
-    assert epd_create_req is not None, (
-        "Could not locate create_req(self, recv_req: ...) in "
-        "sglang.srt.disaggregation.encode_receiver -- class layout "
-        "changed; update assert_fix_state_restored."
-    )
-    epd_src = _uncommented_lines(inspect.getsource(epd_create_req))
-    assert re.search(
-        r"\bprogram_id\s*=\s*recv_req\.program_id\b", epd_src
+            pass
+    if epd_create_req is None:
+        matches = []
+        for _name, _obj in inspect.getmembers(_enc_mod, inspect.isclass):
+            if _obj.__module__ != _enc_mod.__name__:
+                continue
+            cr = getattr(_obj, "create_req", None)
+            if cr is None or not callable(cr):
+                continue
+            try:
+                sig = inspect.signature(cr)
+            except (ValueError, TypeError):
+                continue
+            if "recv_req" in sig.parameters:
+                matches.append((_name, cr))
+        assert len(matches) == 1, (
+            f"Expected exactly one create_req(self, recv_req: ...) in "
+            f"sglang.srt.disaggregation.encode_receiver, got "
+            f"{len(matches)}: {[m[0] for m in matches]}.  Class layout "
+            f"changed; pin a class name in assert_fix_state_restored."
+        )
+        epd_create_req = matches[0][1]
+    assert _function_passes_kwarg(
+        epd_create_req, "program_id", "recv_req.program_id"
     ), (
-        "encode_receiver.<create_req> source does NOT contain an "
-        "uncommented `program_id=recv_req.program_id` line.  EPD-"
-        "disagg tag would silently drop; restore the line in "
-        "disaggregation/encode_receiver.py before re-running."
+        "encode_receiver.<create_req> does NOT pass "
+        "`program_id=recv_req.program_id` as a real keyword argument "
+        "(AST check).  EPD-disagg tag would silently drop; restore "
+        "the line in disaggregation/encode_receiver.py before re-running."
+    )
+
+    # 4) UnifiedTreeNode.__init__ initialises session_ids
+    # (round-6 MINOR 6).  Without this, every node defaults to
+    # missing-attr and the dump's try/except silently emits [].
+    from sglang.srt.mem_cache.unified_radix_cache import (
+        UnifiedRadixCache,
+        UnifiedTreeNode,
+    )
+
+    assert _assignment_present(
+        UnifiedTreeNode.__init__, "self.session_ids"
+    ), (
+        "UnifiedTreeNode.__init__ does NOT assign `self.session_ids` "
+        "(AST check).  Every node would start without the attribute "
+        "and the dump path would silently emit empty session_ids.  "
+        "Restore the init line in unified_radix_cache.py."
+    )
+
+    # 5) _split_node does the union-merge of session_ids
+    # (round-6 MINOR 6).  Without this, internal nodes created by
+    # radix splits lose all tags carried by the original (longer-
+    # prefix) child.
+    assert _assignment_present(
+        UnifiedRadixCache._split_node, "new_node.session_ids"
+    ), (
+        "_split_node does NOT assign `new_node.session_ids` "
+        "(AST check).  After a radix split, the new internal node "
+        "would lose every program tag carried by its child.  Restore "
+        "the union-merge line in unified_radix_cache.py."
     )
 
 
 def main() -> int:
-    print("=== T3 round-3 regression probe ===")
+    print("=== T3 regression probe ===")
     print()
+    # MINOR 4 (round 6): HEAD /health first so a "sglang isn't running"
+    # error is the first thing the user sees, not "PASS [fix-state]"
+    # followed by ConnectionError on [A].
+    try:
+        h = requests.get(f"{BASE}/health", timeout=5)
+    except requests.exceptions.RequestException as exc:
+        print(
+            f"FATAL  cannot reach sglang at {BASE}: {type(exc).__name__}: {exc!s}.\n"
+            f"       Launch sglang first; see verify/t3/README.md REPRODUCING."
+        )
+        return 3
+    if h.status_code >= 500:
+        print(f"FATAL  /health returned {h.status_code}; sglang is unhealthy.")
+        return 3
+
     print("[fix-state] probing production code for restored fixes ...")
     try:
         assert_fix_state_restored()
-        print("    PASS  both round-3 fixes are present in source")
+        print("    PASS  all 5 production-code invariants present in source (AST)")
     except AssertionError as exc:
         print(f"    FAIL  {exc}")
+        print(
+            "    note: this checks ON-DISK source.  If you edited the .py\n"
+            "          but did NOT restart sglang, the live behaviour may\n"
+            "          still be correct (probe [A]/[B] would then PASS).\n"
+            "          Always restart sglang after touching production code."
+        )
         return 2
     print()
 

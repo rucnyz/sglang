@@ -175,6 +175,10 @@ def main() -> None:
     #   * no duplicate entries (set semantics in memory, list on wire)
     #   * len(session_ids) per node is reasonable (sanity check for the
     #     daemon's 1/len weighting in admission_controller)
+    # ORDER-DEPENDENCE: the len <= 4 upper bound assumes ONLY steps [1]
+    # have run so far (prog-A + prog-B + at most a couple stragglers).
+    # If step [4]'s 32-program stress runs BEFORE this, the bound fails.
+    # Keep [2] right after [1]; do not reorder.
     print("\n[2] wire-format invariants + no fake tags")
     expected_tags = {"prog-A", "prog-B"}
     for u in state["units"]:
@@ -277,7 +281,18 @@ def main() -> None:
     # contains at least one unit with session_ids = [] (the untagged tail).
     empty_units = [u for u in state["units"] if u["session_ids"] == []]
     print(f"    units with empty session_ids: {len(empty_units)}")
-    assert empty_units, "no untagged units in state — every node got a tag?"
+    # Round-6 audit MINOR 7: previous assert was `empty_units` (truthy),
+    # which would pass even if a regression auto-tagged every node with
+    # a sentinel (e.g. "system") and left only ONE node untagged.
+    # Require >=2 empty-session nodes -- a healthy tree always has the
+    # untagged request's distinct tail plus at least one untagged
+    # ancestor (e.g. a fresh root child the tagged paths don't touch).
+    assert len(empty_units) >= 2, (
+        f"only {len(empty_units)} untagged nodes; a regression that "
+        f"auto-tags every touched node with a sentinel could leave just "
+        f"one untagged leaf and still pass the old `assert empty_units` "
+        f"check.  Expected >=2 in a clean tree."
+    )
     # Schema check: each session_ids is a list of strings.
     for u in state["units"]:
         assert isinstance(u["session_ids"], list)
@@ -466,6 +481,16 @@ def main() -> None:
         f"(not /v1/chat/completions, which drops session_params client-"
         f"side).  Round-4 audit caught the previous fake version."
     )
+    # Round-6 audit MINOR 9: close the session at the end so repeated
+    # verify runs don't accumulate sessions in the controller.
+    try:
+        requests.post(
+            f"{BASE}/close_session",
+            json={"session_id": session_id},
+            timeout=10,
+        )
+    except Exception:
+        pass  # close_session is best-effort; not a hard requirement.
 
     # ---- [12] Recursion DoS: deeply-nested list program_id must not crash ----
     # Round-3 audit caught the sanitizer recursing unbounded into nested
