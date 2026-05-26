@@ -13,7 +13,10 @@
   set grows; never overwrites).
 
 **Cost ceiling**
-* < 60 lines added to sglang (per actual `git diff --stat` post-audit).
+* ~120 lines added to sglang across the wire path (protocol, io_struct,
+  tokenizer_manager, serving_chat/completions, scheduler, schedule_batch,
+  base_prefix_cache, unified_radix_cache, encode_receiver for the EPD
+  disaggregation path).
 * Per-request overhead: one `set.add` per node along the insert path.
   Set sizes are bounded by the number of distinct programs that touch a
   given prefix node — typically O(concurrent_programs).
@@ -31,11 +34,41 @@
 | Failure mode | How to force | Predicted floor | Assertion |
 |---|---|---|---|
 | Request without `program_id` | Send 16 chat-completions with no `extra_body.program_id`; mix with 16 well-tagged ones | Untagged nodes carry `session_ids = ∅`; admission can't pause them; OTHER 16 tagged programs unaffected | `/aginfer/state` dump; assert each node's `session_ids` is either set or empty, never undefined / crashed |
-| Bogus `program_id` (non-string, very long, whitespace-only) | Send `program_id={"oh":"no"}`, `program_id=42`, `program_id=["a","b"]`, `program_id="x"*10000`, `program_id="   "` | Sanitizer at Req construction: `.strip()` then coerce to str then truncate to 64 chars. Whitespace-only or empty becomes None (untagged). List collapses to the first sanitized element. No HTTP 400; no exception. | inspect resulting tree node's `session_ids`; ≤64 chars per entry |
+| Bogus `program_id` (non-string, very long, whitespace-only) | Send `program_id={"oh":"no"}`, `program_id=42`, `program_id=["a","b"]`, `program_id="x"*10000`, `program_id="   "` | Sanitizer at Req construction: `.strip()` then coerce to str then truncate to 64 chars. Whitespace-only or empty becomes None (untagged). List collapses to the first **non-empty** sanitized element (a leading None / "" doesn't silently kill a valid later element). No HTTP 400; no exception. | inspect resulting tree node's `session_ids`; ≤64 chars per entry |
 | Conflicting `program_id` on shared prefix | Issue 32 program-distinct requests with identical 1 k-token prefix | Shared prefix node's `session_ids` contains all 32 ids; tail nodes have only their own id | `/aginfer/state` schema check |
 | Chunked prefill | Send a long-generation chat (>1 chunk worth of prompt) with a `program_id`; sglang's chunked prefill triggers multiple `cache_unfinished_req` calls on the same `Req` | program_id tags every chunk's nodes (insert path is hit each chunk; sanitizer ran once at Req construction so the value is stable) | /aginfer/state shows the program_id on the chunked Req's full path, no missing nodes |
 | Untagged-then-tagged retro-tagging | Send untagged request first (creates an untagged node); then send a tagged request that shares the prefix | The tagged request's pid is added to the previously-untagged ancestor's session_ids (set semantics, additive) | check the shared-prefix node now has the pid that was added later |
 | Wire format vs in-memory: SET semantics, LIST wire | `node.session_ids` is a Python `set`; the dump emits `sorted(list)` for deterministic byte-stable JSON. Daemon must treat the parsed list AS a set (membership / union / weighting by `1 / len`). | assert list is sorted; assert no duplicates within a single response | T1 schema validator already enforces |
+
+### Tagging-path coverage and v1 limitations
+
+The general contract is "every radix-tree node touched by a tagged
+request gets the tag", but the v1 wire-up does NOT cover three
+paths.  These are documented here so T9 / T10 can address each
+when they're exercised:
+
+1. **HiCache `prefetch_from_storage` (`unified_radix_cache._insert_helper_host`)**.
+   When a tagged request triggers a host-side prefetch from
+   Mooncake / disk, the host nodes are created with empty
+   `session_ids`.  The tag is added later, when the matching
+   device-side insert runs (`_insert_helper`).  Between those two
+   events, the daemon's `/aginfer/state` snapshot may show the
+   prefetched host nodes as untagged.  T9 Run K will exercise this;
+   we'll either thread `program_id` through `prefetch_from_storage`
+   then or document the race window's acceptance criterion.
+2. **`StreamingSession.try_cache_*`** (streaming-session API):
+   requests bound to a streaming session route through the
+   `StreamingSession` short-circuit in `cache_finished_req` /
+   `cache_unfinished_req` and never reach `_insert_helper`.
+   v1 simply doesn't tag streaming-session reqs; if T6 / T7 need
+   them tagged, plumb `program_id` into the StreamingSession path
+   separately.
+3. **EPD-disaggregation** (`encode_receiver.create_req`): now FIXED
+   (commit follow-up to T3 audit-round-2).  The `program_id` is
+   forwarded through the EPD path so tagged requests retain their
+   tag when sglang runs in encode-prefill-decode disaggregation
+   mode.  Without the fix, `Req.program_id` would default to None
+   in EPD mode and the tag would die silently.
 
 ### Design decision: `session_ids` is unbounded in v1
 

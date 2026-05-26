@@ -15,6 +15,9 @@ asserts:
 
 Usage:
     # assumes sglang is already up at http://127.0.0.1:30001
+    # IMPORTANT: launch sglang with ``--chunked-prefill-size 32`` so step
+    # [9] actually exercises the chunked path (default size is 8 K,
+    # which a 256-token gen never crosses).
     python dev/aginfer/verify/t3/verify.py
 """
 from __future__ import annotations
@@ -110,10 +113,25 @@ def main() -> None:
     assert b_only, "no B-only tail nodes"
 
     # ---- [2] Per-unit causal: every tagged unit carries the tag ----
-    print("\n[2] no untagged unit has program_id; no extra/fake tags")
+    # Also pins the wire-format invariants the daemon will rely on:
+    #   * session_ids is a JSON list of strings
+    #   * sorted (deterministic byte-stable JSON)
+    #   * no duplicate entries (set semantics in memory, list on wire)
+    #   * len(session_ids) per node is reasonable (sanity check for the
+    #     daemon's 1/len weighting in admission_controller)
+    print("\n[2] wire-format invariants + no fake tags")
     expected_tags = {"prog-A", "prog-B"}
     for u in state["units"]:
-        extra = set(u["session_ids"]) - expected_tags
+        sids = u["session_ids"]
+        assert isinstance(sids, list), f"session_ids must be list: {sids!r}"
+        assert sids == sorted(sids), f"session_ids not sorted: {sids}"
+        assert len(sids) == len(set(sids)), f"session_ids has duplicates: {sids}"
+        # daemon-weighting sanity: per-node count is bounded -- for this
+        # test, no node has touched more than the two expected programs.
+        assert 0 <= len(sids) <= 4, (
+            f"unit {u['hash']} has implausible session_ids count: {len(sids)}"
+        )
+        extra = set(sids) - expected_tags
         assert not extra, f"unit {u['hash']} has unexpected tags: {extra}"
 
     # ---- [3] extra_body path via the real OpenAI client (the daemon's path) ----
@@ -273,22 +291,31 @@ def main() -> None:
     assert "prog-RETRO" in multi_tag_node["session_ids"]
     print(f"    retro-tag landed on {len(retro_units)} shared-prefix nodes ✓")
 
-    # ---- [9] Chunked prefill: long generation with a tag ----
-    # Force a multi-chunk insert by sending a request whose prompt+generation
-    # spans more than chunked_prefill_size tokens, then assert the tag lands
-    # on the deepest nodes (not just the leading chunk).
-    print("\n[9] chunked prefill: long-generation tagged request")
-    LONG_PROMPT = (
-        "You are a verbose narrator. Tell me a long step-by-step story "
-        + "with at least 30 sentences. " * 4
-        + " Start now: "
+    # ---- [9] Chunked prefill: tagged request whose prompt > 1 chunk ----
+    # The request's prompt must EXCEED the server's --chunked-prefill-size
+    # to actually trigger ``cache_unfinished_req(chunked=True)`` and exercise
+    # the tagging path on chunk boundaries.  We probe the server's effective
+    # chunked_prefill_size by sending a prompt that's *definitely* larger
+    # than the smallest practical setting (32 tokens) -- the verify
+    # docstring asks the launcher to use ``--chunked-prefill-size 32``.
+    # If the prompt is shorter than the configured chunk size, this test
+    # degrades to "long generation" (still useful, but doesn't pin the
+    # chunked path).
+    print("\n[9] chunked prefill: prompt > chunked_prefill_size, tagged")
+    # Build a long prompt: each "fact <i>:" segment is ~5 tokens; 200
+    # segments ≈ 1 K tokens, well above the 32 / 64 / 128 the launcher
+    # might use.  At default 8 K we still won't chunk -- README says
+    # "launch with --chunked-prefill-size 32"; we proceed regardless.
+    chunked_prompt = (
+        "Recite the following facts verbatim: "
+        + " ".join(f"fact {i}: prime {i} is interesting." for i in range(200))
     )
     requests.post(
         f"{BASE}/v1/chat/completions",
         json={
             "model": MODEL,
-            "messages": [{"role": "user", "content": LONG_PROMPT}],
-            "max_tokens": 256,
+            "messages": [{"role": "user", "content": chunked_prompt}],
+            "max_tokens": 16,
             "temperature": 0.0,
             "program_id": "prog-CHUNK",
         },
@@ -297,12 +324,13 @@ def main() -> None:
     state = fetch_state()
     chunk_units = units_with(state, "prog-CHUNK")
     print(f"    chunked req tagged {len(chunk_units)} nodes")
-    assert chunk_units, "chunked / long-generation request lost the tag entirely"
-    # n_tokens of the deepest tagged node should be > 32 (= multi-chunk leaf).
-    deepest = max(chunk_units, key=lambda u: u["n_tokens"])
-    assert deepest["n_tokens"] >= 32, (
-        f"deepest tagged node has only {deepest['n_tokens']} tokens; "
-        f"chunked insert did NOT keep tagging across chunks"
+    assert chunk_units, "chunked / long-prompt request lost the tag entirely"
+    # Total tagged tokens in the deepest leaf path must be large -- proves
+    # the tag survived from chunk 0 through to the final insert.
+    total_tokens = sum(u["n_tokens"] for u in chunk_units)
+    print(f"    total tagged tokens: {total_tokens}")
+    assert total_tokens >= 200, (
+        f"only {total_tokens} tokens tagged; tag lost mid-chunked-prefill"
     )
 
     # ---- [10] Single-request batched-broadcast bug guard ----

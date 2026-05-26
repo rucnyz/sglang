@@ -623,9 +623,14 @@ def _sanitize_program_id(pid: Any) -> Optional[str]:
     if pid is None:
         return None
     if isinstance(pid, (list, tuple)):
-        if not pid:
-            return None
-        return _sanitize_program_id(pid[0])
+        # Take the FIRST non-empty element; a leading None / "" / empty
+        # dict / empty list shouldn't silently kill an otherwise valid
+        # later element.  Empty container -> None (untagged).
+        for elem in pid:
+            sanitized = _sanitize_program_id(elem)
+            if sanitized is not None:
+                return sanitized
+        return None
     if not isinstance(pid, str):
         try:
             pid = str(pid)

@@ -1029,6 +1029,11 @@ class MMReceiverBase(ABC):
             disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
             vocab_size=self.scheduler.model_config.vocab_size,
             priority=recv_req.priority,
+            # aginfer §3 state: forward program_id through the EPD path so
+            # tagged requests retain their tag when sglang runs in
+            # encode-prefill-decode disaggregation mode.  Without this the
+            # tag silently dies in EPD mode (Req.program_id defaults to None).
+            program_id=recv_req.program_id,
             metrics_collector=(
                 self.scheduler.metrics_collector
                 if self.scheduler.metrics_reporter.enable_metrics

@@ -368,10 +368,16 @@ class CompletionRequest(BaseModel):
     # aginfer: program-level identity. Every radix-tree node touched by this
     # request adds ``program_id`` to its ``session_ids`` set; daemon reads
     # the result via /aginfer/state.  Pass via top-level field or
-    # ``extra_body={"program_id": "..."}``.  Typed as ``Any`` (rather than
-    # str) so the worst-case "bogus shape" row (dict / int / list / very
-    # long string) is silently sanitized at Req construction instead of
-    # 400'd at the HTTP layer.
+    # ``extra_body={"program_id": "..."}`` (the OpenAI client library
+    # unpacks ``extra_body`` to top-level CLIENT-SIDE; server has no
+    # auto-unpack -- t3/verify step [3] guards this contract).
+    # NOTE: do not add ``model_config = ConfigDict(extra="allow")`` to
+    # this class without re-thinking the program_id story: if extras
+    # land as model attributes, a malicious client could nest extras to
+    # bypass the sanitizer.  Typed as ``Any`` (rather than str) so the
+    # worst-case "bogus shape" row (dict / int / list / very long string)
+    # is silently sanitized at Req construction instead of 400'd at the
+    # HTTP layer.
     program_id: Optional[Any] = None
     # Priority for the request
     priority: Optional[int] = None
@@ -741,10 +747,16 @@ class ChatCompletionRequest(BaseModel):
     # aginfer: program-level identity. Every radix-tree node touched by this
     # request adds ``program_id`` to its ``session_ids`` set; daemon reads
     # the result via /aginfer/state.  Pass via top-level field or
-    # ``extra_body={"program_id": "..."}``.  Typed as ``Any`` (rather than
-    # str) so the worst-case "bogus shape" row (dict / int / list / very
-    # long string) is silently sanitized at Req construction instead of
-    # 400'd at the HTTP layer.
+    # ``extra_body={"program_id": "..."}`` (the OpenAI client library
+    # unpacks ``extra_body`` to top-level CLIENT-SIDE; server has no
+    # auto-unpack -- t3/verify step [3] guards this contract).
+    # NOTE: do not add ``model_config = ConfigDict(extra="allow")`` to
+    # this class without re-thinking the program_id story: if extras
+    # land as model attributes, a malicious client could nest extras to
+    # bypass the sanitizer.  Typed as ``Any`` (rather than str) so the
+    # worst-case "bogus shape" row (dict / int / list / very long string)
+    # is silently sanitized at Req construction instead of 400'd at the
+    # HTTP layer.
     program_id: Optional[Any] = None
     # Priority for the request
     priority: Optional[int] = None
