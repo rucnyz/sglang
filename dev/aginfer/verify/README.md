@@ -67,7 +67,7 @@ Each task lives in its own folder `tN/` with:
 | 5 | T4 | daemon HTTP proxy + paper §4 event emission | [`t4/`](t4/) | **passed** (2026-05-26, audit round-1 done, 12 verify steps + 5-run latency, ~370 LoC) |
 | 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | **passed** (2026-05-26, audit round-1 done; Layer A 10 steps + Layer B real-GPU watermark test) |
 | 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | **passed** (2026-05-26, 10 verify steps, ~390 LoC daemon code; build 3.2 ms / decide 1.4 ms @ 1k units) |
-| 8 | T8 | admission_controller + watermark sensitivity | [`t8/`](t8/) | pending |
+| 8 | T8 | admission_controller + watermark sensitivity | [`t8/`](t8/) | **passed (v1, pre-audit)** (2026-05-26, 11 verify steps, ~280 LoC; handler 4.2 ms @ 32 programs) |
 | 9 | T9 | Run K + K-a + J ablation (J validates §9 deployment claim w/o HiCache) | [`t9/`](t9/) | pending |
 | 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies + daemon-controlled L3 (DISK) tier via Mooncake (paper §3 4-tier completion) | [`t10/`](t10/) | pending |
 

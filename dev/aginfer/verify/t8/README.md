@@ -84,12 +84,47 @@ Mechanism. `verify/t8_admission.py`:
 | pressure_resolved event arrives but no program to resume | All programs active | log "nothing to resume"; no exception | log assertion |
 | Rapid memory_pressure → pressure_resolved oscillation | Inject 10 cycles of (HIGH, OK, HIGH, OK ...) in 1 second | admission's pause/resume decisions stable; doesn't ping-pong; hysteresis prevents flapping (resume only when occ < θ_lo) | event log: at most 1 program paused, at most 1 resumed during oscillation |
 | Run K mini with `θ_hi=0.99` (effectively no admission) | env override | per-trial mean ≤ Run F' × 1.10 (= 960 s); proves admission's contribution is bounded above by gap to no-admission | mini harbor run |
-* date: _pending_
-* daemon sha:
-* prog_score down-weights shared units: _pending_
-* lowest-score paused first: _pending_
-* FIFO resume + hysteresis: _pending_
-* shared-aware passes degenerate test: _pending_
-* anti-timer grep: _pending_
-* tick time @ 32 programs: _pending_
-* raw log: `verify/results/t8_<datetime>.log`
+## RESULTS
+
+**PASSED (v1, pre-audit)** — all 11 verify steps, ~5 s on agsched env.
+
+* date: 2026-05-26
+* daemon code: ~280 LoC `daemon/admission_controller.py` (new);
+  reuses `OursGreedyPolicy` value functions from `baselines/` and
+  `build_paper_state` from T7's `daemon/kv_scheduler.py`.
+* prog_score down-weights shared units: ✓ [1] — each unit's V_u
+  divided by `|holders|` so the platform/tool_def prefix doesn't
+  inflate a single program's score.
+* shared-aware passes degenerate test: ✓ [2] — 32 programs sharing
+  one unit with zero unique tails → identical scores (max-min < 1e-9).
+* lowest-score paused first: ✓ [3] — `prog-3` (lowest hit_count
+  tail) paused under occ=0.95 / theta_hi=0.5.
+* FIFO resume: ✓ [4] — pressure_resolved resumes ONE program at a
+  time in the order they were paused.
+* Hysteresis: ✓ [5] — pressure_resolved with `occ >= theta_lo` does
+  NOT resume (waits for occ to drop further).
+* No-victim-when-all-paused: ✓ [6] — pre-paused state +
+  memory_pressure: `pause_decisions == 0`, no crash.
+* Anti-timer contract (AST grep): ✓ [7] — zero `sleep` /
+  `call_later` / `call_at` / `perf_counter` in source.
+* Max-pauses cap: ✓ [8] — persistent pressure bounded at 16
+  pauses/event (no runaway).
+* Invalid watermark rejection: ✓ [10] — `theta_lo >= theta_hi`
+  raises `ValueError` at construction.
+* Composition with T7: ✓ [11] — on memory_pressure,
+  `kv_scheduler.handle` fires first (migrate POST), then
+  `admission.handle` (pause re-check); both side-effects observable.
+
+### Latency (multi-run, per memory:feedback-latency-multi-run)
+
+5 independent trials at 32 programs (no actual pause; theta_hi=0.99).
+
+| stage | mean ± std | budget |
+|---|---|---|
+| admission `handle()` end-to-end | **4.16 ± 0.15 ms** (mean+3σ 4.60 ms) | < 10 ms |
+
+Assertion uses `mean + 3σ < 10 ms` (current envelope leaves ~2×
+headroom; catches a 2× regression).
+
+* raw logs:
+  * `results/20260526_120256_run1.log` — v1 (pre-audit)
