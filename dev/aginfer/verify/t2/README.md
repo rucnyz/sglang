@@ -19,16 +19,53 @@
 
 | Failure mode | How to force | Predicted floor | Assertion |
 |---|---|---|---|
-| hash-not-found race | Insert a node, capture its hash, internally `_evict_device_leaf` to remove it; immediately POST `/aginfer/migrate` for that hash | response is `{applied: 0, skipped: [{hash: X, reason: not_in_tree}]}`; no exception | parse response, assert structure + counts |
-| unknown target_tier (typo / version skew) | POST migrate with `target_tier="DOESNOTEXIST"` for a live hash | response `{applied: 0, skipped: [{hash: X, reason: unknown_target_tier:'DOESNOTEXIST'}]}`; no exception | parse, assert reason substring |
-| DISK tier in v1 (not wired) | POST migrate with `target_tier="DISK"` for a live hash | response `{applied: 0, skipped: [{hash: X, reason: disk_tier_not_yet_wired}]}` | parse, assert reason |
-| Malformed payload | POST migrate with `{}`, `{"actions": "not a list"}`, or non-JSON body | HTTP 400 on all three; no exception, no partial mutation | requests + status assert |
-| DRAM demote with no host backup (v1 contract) | POST migrate(target=DRAM) for an HBM-only hash (no HiCache backup populated) | response `{applied: 0, skipped: [{hash: X, reason: demote_requires_existing_host_backup}]}` — same safety floor as HiCache-full, the daemon retries idempotently | parse, assert reason |
-| Slow-path 1k batch latency (real DROPs) | warm 60+ distinct leaves, POST migrate(target=DROP) for all of them | per-action amortized < 1 ms; all real targets actually evict | timeit + causal absence check |
-| Idempotent replay | POST migrate(DROP) once for hashes H1..Hn; capture {applied}; immediately POST the same batch again with no traffic in between | second response has `applied == 0`; reasons ⊆ {`not_in_tree`, `no_data`, `not_a_leaf`}; no crash | strict applied==0 assert |
+| hash-not-found race | Insert a node, capture its hash, internally `_evict_device_leaf` to remove it; immediately POST `/aginfer/migrate` for that hash | response is `{applied: 0, skipped: [{hash: X, reason: not_in_tree}]}`; no exception. **Daemon: retryable — drop from retry set, log and move on.** | parse response, assert structure + counts |
+| Node is internal (has children) | POST migrate(DROP) on a node that still has children | `{applied: 0, skipped: [{hash: X, reason: not_a_leaf}]}`. **Daemon: retryable bottom-up — drop the children first, then re-issue for the parent.** | step [6] explicit-binding probe |
+| Node has no data (buffer freed but still in tree) | After a successful DROP on X, send a duplicate DROP for X in a later batch (the in-batch case is caught by `already_acted_this_batch`, see next row); or target a node whose data was cleared by sglang's auto-eviction between snapshot and migrate | `{applied: 0, skipped: [{hash: X, reason: no_data}]}`. **Daemon: retryable, but the same as not_in_tree — the node is functionally gone, drop from retry set.** | parse, assert reason |
+| Same hash twice in one batch | `migrate([{drop X}, {drop X}])` — without the defensive `acted_node_ids` set this SIGQUITs the scheduler at `_remove_leaf_from_parent:1124` (`assert v == node`) | second occurrence skipped as `already_acted_this_batch`. **Daemon: programmer error — investigate the upstream code that emitted the duplicate.** | step [7] (DEFENSIVE check, found a real bug; see RESULTS) |
+| unknown target_tier (typo / version skew) | POST migrate with `target_tier="DOESNOTEXIST"` for a live hash | response `{applied: 0, skipped: [{hash: X, reason: unknown_target_tier:'DOESNOTEXIST'}]}`; no exception. **Daemon: programmer error — daemon should pin to v1's known tier set.** | parse, assert reason substring |
+| DISK tier in v1 (not wired) | POST migrate with `target_tier="DISK"` for a live hash | `{applied: 0, skipped: [{hash: X, reason: disk_tier_not_yet_wired}]}`. **Daemon: not retryable in v1; either pin to HBM/DRAM/DROP or wait for T9.** | parse, assert reason |
+| Malformed payload | POST migrate with `{}`, `{"actions": "not a list"}`, or non-JSON body | HTTP 400 on all three; no exception, no partial mutation. **Daemon: caller bug; do not retry.** | requests + status assert |
+| DRAM demote with no host backup (v1 contract) | POST migrate(target=DRAM) for an HBM-only hash (no HiCache backup populated) | `{applied: 0, skipped: [{hash: X, reason: demote_requires_existing_host_backup}]}`. **Daemon: retryable later (HiCache backup_thread may catch up), or fall back to DROP.** | parse, assert reason |
+| Slow-path 1k batch latency (real DROPs) | warm 60+ distinct leaves, POST migrate(target=DROP) for all of them | per-action amortized < 1 ms; all real targets actually evict | timeit + causal absence check + tier_usage delta |
+| TOCTOU between state and migrate | Fetch `/aginfer/state`, then drive 5-10 prefills before POSTing migrate. The hashes the daemon believed were HBM-resident leaves may now be DRAM-only, internal, or auto-evicted | response remains well-formed, skip reasons all in the legal set above; NO 5xx; the daemon's idempotent retry handles the rest | step [17] |
+| Mixed-tier batch (cross-action interaction) | One batch with [DROP, DRAM, HBM, DROP, ...] interleaved on hashes that share a parent chain | every action accounted for, no double-apply, no 5xx; applied hashes are absent from a follow-up `/aginfer/state` | step [18] |
+| Overlapping concurrent batches | Two threads POST the SAME 20-hash batch | both responses well-formed; `applied_hashes` from the two responses are DISJOINT (each hash applies at most once across both requests); total applied ≤ batch size | step [19] |
+| HTTP DoS via huge hash / huge batch | POST a 10 000-char hash; POST 100 001 actions | both return 400 (caps enforced in `http_server.py`) | step [20] |
+| 1k small migrate calls in tight loop | repeated cheap migrate calls | p99 latency < 100 ms; late-window median < 3 × early-window median (no slow leak) | step [21] |
+| Idempotent replay | POST migrate(DROP) once for hashes H1..Hn; capture {applied}; immediately POST the same batch again with no traffic in between | second response: round-1 applied hashes are still absent; any newly-applied hash must be in the round-1 `not_a_leaf` bucket (cascade promotion is legitimate); no crash | step [10] cascade-aware replay |
 | HiCache backup target tier full (audit #14) — deferred to T9/Run K | Fill DRAM to 100 % via real warmup under `--enable-hierarchical-cache`. Then POST 1k migrate(target=DRAM) actions for HBM-resident hashes | Daemon falls back via `demote_requires_existing_host_backup` until backup_thread catches up; once host is full the response carries the existing HiCache pool's `out_of_capacity` skip reason verbatim. Idempotent re-issue does NOT amplify | requires HiCache; exercised in T9 |
 | Capacity-full promote — deferred to T9 | HBM at 100 %, POST migrate(target=HBM) for a DRAM hash | v1 returns `promote_not_yet_wired`; promote semantics land in T9 when the kv_scheduler decides promotions explicitly | T9 |
 | 1000 actions / batch under 30 RPS load — deferred to T10 | Insert 10 k nodes, drive concurrent traffic at 30 RPS, then POST a single migrate with 1 k random actions | per-action amortized < 2 ms (= 2× ceiling under load); no daemon timeout | T10 (requires RPS generator) |
+
+### `applied_hashes` consumer (audit round-3 MINOR)
+
+The response includes `applied_hashes` so the daemon's retry logic can
+prune its retry set without re-walking `/aginfer/state`.  T5/T7 (kv_scheduler
+event handlers) and T8 (admission_controller) will both consume this:
+when an action is reported applied, the daemon removes it from any
+pending retry queue and from its in-memory paper-§3 state snapshot.  The
+field is small (one hex string per applied hash) and the cost is O(applied)
+both server- and wire-side.  If a future profiling pass shows it dominates,
+add a `with_applied_hashes: bool = True` request flag.
+
+### Daemon retry-set classification
+
+For a fast hand-off into T4/T5, here is the canonical mapping every skip
+reason emitted by `apply_aginfer_migrations` falls into:
+
+* **retryable, idempotent** (re-issue once the tree changes): `not_in_tree`,
+  `no_data`, `not_a_leaf`, `demote_requires_existing_host_backup`,
+  `already_on_dram`, `already_on_hbm`.
+* **defensive / programmer error** (do not retry; investigate upstream):
+  `already_acted_this_batch`, `unknown_target_tier:'...'`,
+  `unsupported_tree_cache:...`.
+* **v1 not-yet-wired** (will become retryable in T9/T10): `promote_not_yet_wired`,
+  `disk_tier_not_yet_wired`.
+
+Daemon's `RETRYABLE_REASONS` set MUST include every string in group 1; the
+group-2 strings are programmer-error sentinels; group-3 is a known
+v1 limitation that the daemon should explicitly skip (not retry forever).
 
 ## HOW WE VERIFY
 
@@ -114,7 +151,29 @@ this bug.
   also verified absent post-replay ✓
 * Concurrency (audit MINOR): 2 threads with disjoint batches, no 5xx and
   no overlap in `applied_hashes` ✓
-* raw log: `results/<YYYYMMDD_HHMMSS>_run9_clean.log`
+
+### Round-3 audit additions (production realism + adversarial)
+
+* **TOCTOU between state and migrate** (step [17]): fetched state, drove
+  8 chats to mutate the tree, then ran migrate. 41/66 applied; only
+  retry-able reasons in the skip set; no 5xx. The daemon's idempotent
+  retry loop is safe even when the tree mutates between snapshot and
+  action.
+* **Mixed-tier batch** (step [18]): 15 actions interleaving DROP/DRAM/HBM
+  on the same subtree. 2 DROPs of leaves applied; DRAM and HBM correctly
+  skipped without HiCache (`demote_requires_existing_host_backup`,
+  `already_on_hbm`); cascade-removed parents did NOT crash subsequent
+  actions in the same batch.
+* **Overlapping concurrent batches** (step [19]): 2 threads sent the
+  SAME 20-hash batch. Thread A applied 8, thread B applied 8, **overlap = 0**.
+  Scheduler ZMQ serialization prevents double-apply across requests.
+* **Adversarial HTTP** (step [20]): hash longer than 1024 chars and batch
+  larger than 100 000 actions both return 400 at the HTTP layer (caps in
+  `http_server.py:692`).
+* **Memory / GC soak** (step [21]): 1000 small migrate calls; p50=2.75ms,
+  p99=4.24ms; late-window median 1.55× early-window — well under the
+  3× slow-leak threshold. Server still responsive after the burst.
+* raw log: `results/<YYYYMMDD_HHMMSS>_run10_round3.log`
 
 ### Caveats (deferred, NOT regressions)
 

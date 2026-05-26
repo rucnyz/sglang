@@ -439,7 +439,165 @@ def main() -> None:
     if batch_a or batch_b:
         assert ra["applied"] + rb["applied"] >= 1
 
-    print("\n=== T2 PASSED (depth-audit) ===")
+    # ===== AUDIT-ROUND-3 ADDITIONS =====
+
+    # [17] TOCTOU: daemon's real flow is state -> decide -> migrate, with
+    # inference traffic flowing the whole time.  We mimic that by issuing
+    # chat calls BETWEEN fetch_state and migrate, so the tree mutates
+    # underneath the hashes we captured.  The server must remain well-formed
+    # (no 5xx) and every skip reason must be in the legal set.
+    print("\n[17] TOCTOU: fetch_state -> chats interleave -> migrate")
+    warm_distinct_leaves(20, salt="toctou-pre-")
+    state_t = fetch_state()
+    targets_t = [
+        {"hash": u["hash"], "target_tier": "DROP"}
+        for u in state_t["units"]
+        if u["tier"] == "HBM" and u["n_tokens"] > 0
+    ]
+    # interleave inference traffic so the tree mutates between snapshot and migrate
+    for j in range(8):
+        chat(f"toctou-interleave-{j}: tell me a fun fact about prime {j}")
+    rt = migrate(targets_t)
+    skip_reasons_t = {s["reason"] for s in rt["skipped"]}
+    print(
+        f"    applied={rt['applied']}/{len(targets_t)}, "
+        f"skip reasons: {skip_reasons_t}"
+    )
+    legal_reasons = {
+        "not_in_tree", "not_a_leaf", "no_data",
+        "already_acted_this_batch",
+        "demote_requires_existing_host_backup", "already_on_dram",
+        "already_on_hbm", "promote_not_yet_wired",
+        "disk_tier_not_yet_wired",
+    }
+    assert skip_reasons_t <= legal_reasons, (
+        f"unexpected reasons after TOCTOU: {skip_reasons_t - legal_reasons}"
+    )
+    assert rt["applied"] + len(rt["skipped"]) == len(targets_t)
+
+    # [18] Mixed-tier batch: cross-action interaction.  All three tier targets
+    # in one batch; some targets share a parent chain so cascade-removed
+    # nodes can become stale entries the next action would normally crash on.
+    print("\n[18] mixed-tier batch")
+    warm_distinct_leaves(20, salt="mixed-")
+    state_m = fetch_state()
+    hbm_m = [
+        u["hash"] for u in state_m["units"]
+        if u["tier"] == "HBM" and u["n_tokens"] > 0
+    ]
+    if len(hbm_m) < 15:
+        print(f"    skip: need >=15 HBM units, got {len(hbm_m)}")
+    else:
+        mixed_batch = []
+        for i, h in enumerate(hbm_m[:15]):
+            tier = ["DROP", "DRAM", "HBM"][i % 3]
+            mixed_batch.append({"hash": h, "target_tier": tier})
+        rm = migrate(mixed_batch)
+        applied_m = set(rm["applied_hashes"])
+        reasons_m = {s["reason"] for s in rm["skipped"]}
+        print(
+            f"    {len(mixed_batch)} mixed actions, applied={rm['applied']}, "
+            f"reasons: {reasons_m}"
+        )
+        assert "applied" in rm and "applied_hashes" in rm
+        assert rm["applied"] + len(rm["skipped"]) == len(mixed_batch)
+        assert reasons_m <= legal_reasons
+        # Without HiCache, DRAM and HBM actions cannot apply (no host backup,
+        # promote not wired).  Every applied hash must therefore be a DROP.
+        drop_hashes = {
+            a["hash"] for a in mixed_batch if a["target_tier"] == "DROP"
+        }
+        non_drop_applied = applied_m - drop_hashes
+        assert not non_drop_applied, (
+            f"applied a non-DROP action without HiCache? {non_drop_applied}"
+        )
+        # All applied DROPs must be absent in fresh snapshot.
+        state_m2 = fetch_state()
+        leaked = applied_m & {u["hash"] for u in state_m2["units"]}
+        assert not leaked, f"mixed-batch DROPs leaked nodes: {leaked}"
+
+    # [19] Overlapping concurrent batches: two threads send the SAME batch.
+    # The scheduler serializes through ZMQ, so the first request applies
+    # what it can; the second sees not_in_tree / no_data for those nodes.
+    # Invariant: no hash is applied by BOTH requests (no double-apply across
+    # requests).
+    print("\n[19] overlapping concurrent batches (same 20 hashes)")
+    warm_distinct_leaves(30, salt="overlap-")
+    state_o = fetch_state()
+    units_o = [
+        u["hash"] for u in state_o["units"]
+        if u["tier"] == "HBM" and u["n_tokens"] > 0
+    ][:20]
+    batch_same = [{"hash": h, "target_tier": "DROP"} for h in units_o]
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fa = ex.submit(migrate, batch_same)
+        fb = ex.submit(migrate, batch_same)
+        ra2, rb2 = fa.result(), fb.result()
+    overlap_applied = set(ra2["applied_hashes"]) & set(rb2["applied_hashes"])
+    total_applied = ra2["applied"] + rb2["applied"]
+    print(
+        f"    thread A applied={ra2['applied']}, thread B applied={rb2['applied']}, "
+        f"overlap={len(overlap_applied)}, total={total_applied}, batch_size={len(units_o)}"
+    )
+    assert not overlap_applied, (
+        f"DOUBLE-APPLY across requests: {overlap_applied}"
+    )
+    # Every hash can apply at most once across both requests
+    assert total_applied <= len(units_o), (
+        f"total applied {total_applied} > batch size {len(units_o)} -- "
+        f"double-apply somewhere"
+    )
+
+    # [20] Adversarial / DoS inputs (HTTP-layer caps).
+    print("\n[20] adversarial inputs: HTTP caps")
+    # (a) hash longer than the 1024-char cap -> 400
+    long_hash = "x" * 10_000
+    rr = requests.post(
+        f"{BASE}/aginfer/migrate",
+        json={"actions": [{"hash": long_hash, "target_tier": "DROP"}]},
+        timeout=30,
+    )
+    assert rr.status_code == 400, f"long hash should 400, got {rr.status_code}"
+    # (b) too many actions (1 above the 100k cap) -> 400
+    over_cap = 100_001
+    huge_batch = [{"hash": f"bogus-{i}", "target_tier": "DROP"} for i in range(over_cap)]
+    rr = requests.post(
+        f"{BASE}/aginfer/migrate",
+        json={"actions": huge_batch},
+        timeout=60,
+    )
+    assert rr.status_code == 400, f"oversize batch should 400, got {rr.status_code}"
+    print(f"    long-hash and {over_cap}-action batch both correctly 400'd")
+
+    # [21] Memory / GC soak: 1k small calls, latency must stay bounded.
+    # If anything per-call leaks O(N), the latency creeps up over time.
+    print("\n[21] soak: 1000 small migrate calls, latency must stay bounded")
+    soak_batch = [{"hash": f"soak-bogus-{i}", "target_tier": "DROP"} for i in range(5)]
+    soak_lat = []
+    for _i in range(1000):
+        _t0 = time.perf_counter()
+        _ = migrate(soak_batch)
+        soak_lat.append((time.perf_counter() - _t0) * 1000)
+    soak_lat.sort()
+    p50, p99 = soak_lat[500], soak_lat[990]
+    # First-quartile vs last-quartile median: drift detector for slow leaks.
+    early = sorted(soak_lat[:250])[125]
+    late = sorted(soak_lat[750:])[125]
+    print(
+        f"    p50={p50:.2f}ms, p99={p99:.2f}ms, early-median={early:.2f}ms, "
+        f"late-median={late:.2f}ms"
+    )
+    assert p99 < 100, f"soak p99 {p99:.0f} ms -- possible memory pressure"
+    # Late should not be more than 3x early (slow leak detector).
+    assert late < max(3.0 * early, early + 5.0), (
+        f"late median {late:.2f} ms vs early {early:.2f} ms -- "
+        f"latency creep suggests a slow leak"
+    )
+    # Server still serving correctly:
+    state_after_soak = fetch_state()
+    assert "units" in state_after_soak
+
+    print("\n=== T2 PASSED (depth-audit + round-3) ===")
 
 
 if __name__ == "__main__":

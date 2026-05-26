@@ -689,6 +689,30 @@ async def aginfer_migrate(raw_request: Request):
         raise HTTPException(
             status_code=400, detail="missing or non-list 'actions' field"
         )
+    # Caps protect the scheduler against adversarial payloads: a 1MB hash
+    # string would consume O(len) on every dict-lookup, and a 1M-action
+    # batch would block the scheduler event loop for seconds.  Real daemon
+    # batches are ~hundreds of actions with hex-SHA256 or "node-N" hashes.
+    AGINFER_MAX_ACTIONS_PER_BATCH = 100_000
+    AGINFER_MAX_HASH_LEN = 1024
+    if len(actions) > AGINFER_MAX_ACTIONS_PER_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"too many actions in one batch ({len(actions)} > "
+                f"{AGINFER_MAX_ACTIONS_PER_BATCH})"
+            ),
+        )
+    for _a in actions:
+        if isinstance(_a, dict):
+            _h = _a.get("hash")
+            if isinstance(_h, str) and len(_h) > AGINFER_MAX_HASH_LEN:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"hash too long ({len(_h)} > {AGINFER_MAX_HASH_LEN})"
+                    ),
+                )
     from sglang.srt.managers.io_struct import MigrateAginferReq
 
     responses = await _global_state.tokenizer_manager.migrate_aginfer(
