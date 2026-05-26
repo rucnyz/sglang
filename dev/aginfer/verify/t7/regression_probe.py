@@ -1598,18 +1598,18 @@ async def probe_r3_depth4_null_fetch_state() -> None:
 
 
 def probe_r35_tier_field_missing() -> None:
-    """R3.5: a state unit MISSING the ``tier`` field is the same
-    regression class B1 was designed to catch (silent HBM
-    misclassification of non-HBM units), but B1 only pinned the
-    "unknown label" case.  Round-3.5 audit caught that line 285
-    ``raw.get("tier", "HBM")`` defaults missing-tier to HBM too —
-    skipping B1's defense entirely.
+    """R3.5: a state unit MISSING the ``tier`` field must NOT be
+    silently misclassified as HBM (the B1-class bug).  Under the
+    post-cleanup contract (commit a7863505f6), missing field →
+    KeyError → build_paper_state raises → handle()'s try/except
+    catches + bows out cleanly.
 
-    PRE-FIX: missing tier → silent HBM, unit appears in s.units.
-    POST-FIX: missing tier → empty string → _tier_from_string returns
-    None → skip + log (same path as unknown labels).
+    PRE-FIX (`raw.get("tier", "HBM")` default): unit silently
+    appears in s.units as HBM-resident — wrong tier classification
+    pollutes top-k regret ranking.
+    POST-FIX (`raw["tier"]` direct access): KeyError raised.
     """
-    name = "R3.5 (missing tier field is not silently HBM)"
+    name = "R3.5 (missing tier field raises, doesn't silent-HBM)"
     state_json = {
         "tier_usage": {
             "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
@@ -1631,18 +1631,26 @@ def probe_r35_tier_field_missing() -> None:
     }
 
     def _check() -> bool:
-        s = kvs_mod.build_paper_state(
-            state_json,
-            event=Event(kind=EventKind.MEMORY_PRESSURE),
-            tracker=ProgramTracker(),
-            unknown_tier_log=set(),
-        )
-        # FIX: missing tier → unit dropped (treated like unknown label).
-        return "u-tierless" not in s.units
+        """Returns True iff build_paper_state RAISES (correct
+        fail-loud behavior) AND the contract violation is visible."""
+        try:
+            kvs_mod.build_paper_state(
+                state_json,
+                event=Event(kind=EventKind.MEMORY_PRESSURE),
+                tracker=ProgramTracker(),
+                unknown_tier_log=set(),
+            )
+        except KeyError as e:
+            return "tier" in str(e)
+        except Exception:
+            return False
+        return False
 
     post_fix_passed = _check()
 
-    # PRE-FIX: monkey-patch build_paper_state to keep the "HBM" default.
+    # PRE-FIX: monkey-patch build_paper_state to use the OLD silent-
+    # HBM-default behavior; assert it does NOT raise (silently
+    # misclassifies the unit).
     saved = kvs_mod.build_paper_state
 
     def _bug_build(state_json_in, **kw):
@@ -1655,7 +1663,7 @@ def probe_r35_tier_field_missing() -> None:
 
     kvs_mod.build_paper_state = _bug_build
     try:
-        pre_fix_passed = _check()
+        pre_fix_passed = _check()  # bug version doesn't raise → False
     finally:
         kvs_mod.build_paper_state = saved
 
