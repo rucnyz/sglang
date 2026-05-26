@@ -131,18 +131,32 @@ scheduler step.
 {
   "page_size": 1,
   "bytes_per_token": 576,
+  "time_counter": int,
   "tier_usage": {
     "HBM":  {"used_bytes": int, "cap_bytes": int},
-    "DRAM": {"used_bytes": int, "cap_bytes": int}
+    "DRAM": {"used_bytes": int, "cap_bytes": int},
+    "DISK": {"used_bytes": int, "cap_bytes": int}
   },
   "units": [
     {"hash": str, "tier": "HBM"|"DRAM",
      "n_tokens": int, "n_bytes": int,
      "last_access_time": int, "hit_count": int,
      "session_ids": list[str]}
-  ]
+  ],
+  "unsupported_tree_cache": "<ClassName>"   // optional; only set when
+                                              // sglang launched with a
+                                              // tree cache that lacks
+                                              // dump_aginfer_state
 }
 ```
+
+DISK is **always present** in `tier_usage` (round-3.5 cleanup); v1
+sglang emits `{used_bytes: 0, cap_bytes: 0}` as a placeholder until
+Mooncake / HiCache L3 is wired (T10).  Daemon reads `tier_usage["DISK"]`
+unconditionally — no `.get()` fallback.
+
+`time_counter` is sglang's monotonic access tick (used for unit-age
+arithmetic).  Always emitted.
 
 Bytes are the paper §7 currency: per-unit value rule divides by
 memory cost in bytes, and tier capacities are inherently byte
@@ -173,23 +187,55 @@ all consume it. Cost is O(applied) per call, dominated by JSON
 serialisation; gate with `with_applied_hashes: bool = True` request
 flag only if a profile shows it dominates.
 
-### Daemon retry-set classification (canonical mapping)
+### Migrate skip-reason taxonomy
 
-The daemon must classify every skip reason into one of three buckets:
+`POST /aginfer/migrate` returns `applied_hashes` + `skipped[{hash, reason}]`.
+Daemon's handling depends on the reason **class**, not the literal
+string.  Only ONE class is "soft" (retryable); everything else is
+either a hard error or a not-yet-wired feature.
 
-* **Retryable / idempotent** (re-issue once the tree changes):
-  `not_in_tree`, `no_data`, `not_a_leaf`,
-  `demote_requires_existing_host_backup`, `already_on_dram`,
-  `already_on_hbm`.
-* **Programmer error** (do not retry; investigate upstream):
-  `already_acted_this_batch`, `unknown_target_tier:'<X>'`,
-  `unsupported_tree_cache:<ClassName>`.
-* **v1 not-yet-wired** (will become retryable in T9/T10):
-  `promote_not_yet_wired`, `disk_tier_not_yet_wired`.
+**Class `race:*` — time-window race, retryable.**
+Daemon read state at `t0`; tree mutated by inline scorer / a concurrent
+request between `t0` and write.  Re-issue on the next event.  All
+reasons here use the `race:` prefix so log grep is trivial.
 
-T5/T7 imports `RETRYABLE_REASONS` from a single canonical place; the
-verify suite double-checks every emitted reason string falls into the
-expected bucket.
+| reason | what raced |
+|---|---|
+| `race:not_in_tree` | unit evicted between read and write |
+| `race:no_data` | `value` and `host_value` both nil at write time |
+| `race:not_a_leaf` | new child appeared under the target node |
+| `race:demote_requires_existing_host_backup` | HiCache backup thread hadn't caught up |
+| `race:already_on_dram` | another demote landed first |
+| `race:already_on_hbm` | unit already promoted |
+
+**Class `error` — daemon bug or deployment misconfig; raise/exit.**
+NOT a bucket to silently retry.  These reasons should be **impossible**
+under a correctly-built daemon + correctly-launched sglang; if any of
+them ever appears in a response, the daemon raises (or `sys.exit(1)`
+at startup, for the deployment-misconfig case).  "Soft warning" is
+explicitly rejected — we want every encounter to surface as a bug to
+fix, not as a stat in a dashboard.
+
+| reason | source |
+|---|---|
+| `already_acted_this_batch` | daemon sent the same hash twice in one batch (must dedupe upfront) |
+| `unknown_target_tier:'<X>'` | daemon emitted a tier string not in `{HBM, DRAM, DISK, DROP}` (must validate upfront) |
+| `unsupported_tree_cache:<ClassName>` | sglang launched with a non-Unified tree cache; aginfer requires `UnifiedRadixCache` |
+
+**Class `deferred` — v1 not-yet-wired, accept silently.**
+Will transition into `race:*` once the underlying feature lands (T10).
+
+| reason | becomes available in |
+|---|---|
+| `promote_not_yet_wired` | T10 (explicit DRAM→HBM promote) |
+| `disk_tier_not_yet_wired` | T10 (Mooncake L3) |
+
+**v1 status (2026-05-26):** the daemon currently observes skip reasons
+but does NOT yet implement a retry loop OR the error-class raises.
+Round-1 framing-only commit lays down the naming convention so when
+Run K runs we can grep logs for `race:` vs raw reasons (any raw means
+daemon bug surfaced as `error`-class).  Retry loop + error-class raise
+land in T9.
 
 ### Cost characteristics and HTTP caps
 

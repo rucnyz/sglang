@@ -942,7 +942,7 @@ async def probe_r2_b1_multi_rank_hash_round_trip() -> None:
                 "applied": len(applied),
                 "applied_hashes": applied,
                 "skipped": [
-                    {"hash": h, "reason": "not_in_tree"}
+                    {"hash": h, "reason": "race:not_in_tree"}
                     for h in dispatched if h not in sglang_tree_hashes
                 ],
             }

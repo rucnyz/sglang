@@ -98,7 +98,7 @@ def main() -> None:
     # (B) ALL skips in round 1 must be exactly 'not_a_leaf' (every target was a
     #     pre-snapshot HBM unit, so 'no_data' / 'not_in_tree' would be a bug).
     skip_reasons = {s["reason"] for s in resp["skipped"]}
-    assert skip_reasons <= {"not_a_leaf"}, f"unexpected round-1 skip reasons: {skip_reasons}"
+    assert skip_reasons <= {"race:not_a_leaf"}, f"unexpected round-1 skip reasons: {skip_reasons}"
 
     state1 = fetch_state()
     after_hashes = {u["hash"] for u in state1["units"]}
@@ -134,20 +134,20 @@ def main() -> None:
     r = migrate([{"hash": h_dram, "target_tier": "DRAM"}])
     print(f"[4] DRAM on HBM-only: applied={r['applied']}, skip={r['skipped']}")
     assert r["applied"] == 0
-    assert r["skipped"][0]["reason"] == "demote_requires_existing_host_backup", r
+    assert r["skipped"][0]["reason"] == "race:demote_requires_existing_host_backup", r
 
     # HBM probe -- HBM-resident node => already_on_hbm
     h_hbm = fresh[1]["hash"] if len(fresh) > 1 else fresh[0]["hash"]
     r = migrate([{"hash": h_hbm, "target_tier": "HBM"}])
     print(f"[5] HBM on HBM-resident: applied={r['applied']}, skip={r['skipped']}")
     assert r["applied"] == 0
-    assert r["skipped"][0]["reason"] == "already_on_hbm", r
+    assert r["skipped"][0]["reason"] == "race:already_on_hbm", r
 
     # Explicit not_a_leaf binding (audit BLOCKER #4).  Pick a leftover internal
     # node from round 1 that's still in the tree.
     leftover_internal = next(
         (s["hash"] for s in resp["skipped"]
-         if s["reason"] == "not_a_leaf" and s["hash"] in {u["hash"] for u in state_probe["units"]}),
+         if s["reason"] == "race:not_a_leaf" and s["hash"] in {u["hash"] for u in state_probe["units"]}),
         None,
     )
     if leftover_internal is not None:
@@ -157,7 +157,7 @@ def main() -> None:
         # is acceptable but the bug would be a 5xx or a different string.
         assert r["applied"] in (0, 1)
         if r["skipped"]:
-            assert r["skipped"][0]["reason"] in {"not_a_leaf", "no_data"}, r
+            assert r["skipped"][0]["reason"] in {"race:not_a_leaf", "race:no_data"}, r
     else:
         print("[6] no leftover internal node to probe explicitly; skipped")
 
@@ -203,7 +203,7 @@ def main() -> None:
     # (c) every skip reason is in the legal set
     skip_reasons = {s["reason"] for s in r["skipped"]}
     assert skip_reasons <= {
-        "not_a_leaf", "no_data", "not_in_tree", "already_acted_this_batch"
+        "race:not_a_leaf", "race:no_data", "race:not_in_tree", "already_acted_this_batch"
     }, skip_reasons
     from collections import Counter
     reason_count = Counter(s["reason"] for s in r["skipped"])
@@ -249,7 +249,7 @@ def main() -> None:
         if "already_acted_this_batch" in reasons:
             must_block_first_applied += 1
             actual_block_first_applied += 1
-        elif "not_a_leaf" in reasons:
+        elif "race:not_a_leaf" in reasons:
             cascade_promoted += 1
         else:
             # h applied with no recorded skip for the other occurrence; this
@@ -287,14 +287,14 @@ def main() -> None:
     assert h_real is not None
     # (a) missing 'hash' -> hash_to_node.get(None) -> None -> not_in_tree
     r = migrate([{"target_tier": "DROP"}])
-    assert r["applied"] == 0 and r["skipped"][0]["reason"] == "not_in_tree", r
+    assert r["applied"] == 0 and r["skipped"][0]["reason"] == "race:not_in_tree", r
     # (b) target_tier=None on a REAL hash -> (None or '').upper() == '' -> unknown
     r = migrate([{"hash": h_real, "target_tier": None}])
     assert r["applied"] == 0
     assert "unknown_target_tier" in r["skipped"][0]["reason"], r
     # (c) non-string hash -> lookup miss -> not_in_tree
     r = migrate([{"hash": 42, "target_tier": "DROP"}])
-    assert r["applied"] == 0 and r["skipped"][0]["reason"] == "not_in_tree", r
+    assert r["applied"] == 0 and r["skipped"][0]["reason"] == "race:not_in_tree", r
     # (d) missing target_tier on a REAL hash -> '' upper -> unknown
     r = migrate([{"hash": h_real}])
     assert r["applied"] == 0
@@ -328,7 +328,7 @@ def main() -> None:
     print(f"[10] IPC unknown keys: applied={r['applied']}, skipped={r['skipped']}")
     assert "applied" in r and "applied_hashes" in r and "skipped" in r
     # Action should have applied (the node was a fresh HBM leaf).
-    assert r["applied"] == 1 or (r["skipped"] and r["skipped"][0]["reason"] in {"not_a_leaf", "no_data"})
+    assert r["applied"] == 1 or (r["skipped"] and r["skipped"][0]["reason"] in {"race:not_a_leaf", "race:no_data"})
 
     # ---------- COST: slow-path 1k+ real-DROPs ----------
     print("\n[11] COST: slow-path real-DROP batch")
@@ -469,10 +469,10 @@ def main() -> None:
         f"skip reasons: {skip_reasons_t}"
     )
     legal_reasons = {
-        "not_in_tree", "not_a_leaf", "no_data",
+        "race:not_in_tree", "race:not_a_leaf", "race:no_data",
         "already_acted_this_batch",
-        "demote_requires_existing_host_backup", "already_on_dram",
-        "already_on_hbm", "promote_not_yet_wired",
+        "race:demote_requires_existing_host_backup", "race:already_on_dram",
+        "race:already_on_hbm", "promote_not_yet_wired",
         "disk_tier_not_yet_wired",
     }
     assert skip_reasons_t <= legal_reasons, (

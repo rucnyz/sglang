@@ -65,13 +65,26 @@ def _default_eviction_score(node, layer) -> float:
 
 
 def _load_eviction_scorer():
+    """Resolve the inline scorer per SGLANG_KV_POLICY_MODULE.
+
+    Always emits a single canonical startup line ``kv_policy_loaded=<spec>``
+    so the T9 startup-invariant grep can detect (a) which scorer is
+    active and (b) failed loads (which silently fall back to LRU).
+
+    Accepted ``kv_policy_loaded`` values for T9 to match:
+      * ``default_lru`` — env var unset (stock sglang behavior)
+      * ``<module>:<callable>`` — env var set + loaded successfully
+      * ``default_lru (load_failed:<reason>)`` — env var set but load
+        failed; T9 should HALT the run on this value
+    """
     spec = os.environ.get("SGLANG_KV_POLICY_MODULE", "").strip()
     if not spec:
+        logger.info("[aginfer] kv_policy_loaded=default_lru")
         return _default_eviction_score
     if ":" not in spec:
         logger.warning(
-            "SGLANG_KV_POLICY_MODULE=%r is malformed (need 'module:callable'); "
-            "falling back to LRU.",
+            "[aginfer] kv_policy_loaded=default_lru "
+            "(load_failed:malformed_spec=%r; expected module:callable)",
             spec,
         )
         return _default_eviction_score
@@ -79,14 +92,12 @@ def _load_eviction_scorer():
     try:
         mod = importlib.import_module(mod_name)
         fn = getattr(mod, attr)
-        logger.info(
-            "[aginfer] eviction scorer overridden by SGLANG_KV_POLICY_MODULE=%s",
-            spec,
-        )
+        logger.info("[aginfer] kv_policy_loaded=%s", spec)
         return fn
     except Exception as e:
         logger.warning(
-            "Failed to load SGLANG_KV_POLICY_MODULE=%r (%s); falling back to LRU.",
+            "[aginfer] kv_policy_loaded=default_lru "
+            "(load_failed:%r exception=%s)",
             spec,
             e,
         )
@@ -2274,7 +2285,9 @@ class UnifiedRadixCache(BasePrefixCache):
             target = (action.get("target_tier") or "").upper()
             node = hash_to_node.get(h)
             if node is None:
-                skipped.append({"hash": h, "reason": "not_in_tree"})
+                # race: tree mutated between daemon's state-read and
+                # this write — unit no longer indexed in our tree.
+                skipped.append({"hash": h, "reason": "race:not_in_tree"})
                 continue
             if node.id in acted_node_ids:
                 # Defensive: duplicate (or aliasing) action against the same
@@ -2289,13 +2302,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
             if target == "DROP":
                 if not (has_device or has_host):
-                    skipped.append({"hash": h, "reason": "no_data"})
+                    # race: data evicted between daemon's read and this write.
+                    skipped.append({"hash": h, "reason": "race:no_data"})
                     continue
                 if not is_leaf:
-                    # Daemon should drop descendants first; we refuse to
-                    # tombstone internal nodes (would break prefix matching
-                    # downstream).
-                    skipped.append({"hash": h, "reason": "not_a_leaf"})
+                    # race: tree mutated — a child appeared under this node
+                    # since daemon's state-read.  Internal nodes can't be
+                    # dropped (breaks prefix matching); daemon must drop
+                    # descendants first.
+                    skipped.append({"hash": h, "reason": "race:not_a_leaf"})
                     continue
                 tracker = new_tracker()
                 for comp in components:
@@ -2321,20 +2336,25 @@ class UnifiedRadixCache(BasePrefixCache):
                     applied_hashes.append(h)
                     acted_node_ids.add(node.id)
                 elif has_host:
-                    skipped.append({"hash": h, "reason": "already_on_dram"})
+                    # race: already demoted by inline scorer / prior daemon
+                    # call between daemon's read and this write.
+                    skipped.append({"hash": h, "reason": "race:already_on_dram"})
                 elif has_device:
+                    # race: HiCache backup_thread hadn't caught up at the
+                    # moment daemon decided to demote; retry on next event.
                     skipped.append(
-                        {"hash": h, "reason": "demote_requires_existing_host_backup"}
+                        {"hash": h, "reason": "race:demote_requires_existing_host_backup"}
                     )
                 else:
-                    skipped.append({"hash": h, "reason": "no_data"})
+                    skipped.append({"hash": h, "reason": "race:no_data"})
             elif target == "HBM":
                 if has_device:
-                    skipped.append({"hash": h, "reason": "already_on_hbm"})
+                    # race: already on HBM (state was stale).
+                    skipped.append({"hash": h, "reason": "race:already_on_hbm"})
                 elif has_host:
                     skipped.append({"hash": h, "reason": "promote_not_yet_wired"})
                 else:
-                    skipped.append({"hash": h, "reason": "no_data"})
+                    skipped.append({"hash": h, "reason": "race:no_data"})
             elif target == "DISK":
                 skipped.append({"hash": h, "reason": "disk_tier_not_yet_wired"})
             else:
