@@ -16,9 +16,13 @@
   θ_hi. Pause is enforced at the proxy via
   `program_tracker.pause(p)`.
 * On `pressure_resolved`: resume paused programs in FIFO order
-  (oldest pause first) one at a time, ack each via re-poll of
-  `/aginfer/state`, stop when the next resume would cross θ_hi again
-  (hysteresis).
+  (oldest pause first), draining progressively (re-poll
+  `/aginfer/state` between each resume) until either the FIFO is
+  empty OR HBM occ rises back to θ_lo (hysteresis gap = θ_hi − θ_lo).
+  Bounded by `max_pauses_per_event` per single event.  Note: sglang's
+  webhook is edge-triggered on HIGH→OK, so a single event must drain
+  as much as it safely can — round-1 N4 made one-resume-per-event
+  the bug; the drain-with-θ_lo-gate is the fix.
 * Uses the **same** `OursGreedyPolicy._value` from `baselines/ours_greedy.py`
   — just aggregated per program. No separate heuristic.
 
@@ -86,7 +90,47 @@ Mechanism. `verify/t8_admission.py`:
 | Run K mini with `θ_hi=0.99` (effectively no admission) | env override | per-trial mean ≤ Run F' × 1.10 (= 960 s); proves admission's contribution is bounded above by gap to no-admission | mini harbor run |
 ## RESULTS
 
-**PASSED (v1, pre-audit)** — all 11 verify steps, ~5 s on agsched env.
+**PASSED (post audit round-1)** — 12 verify steps + 3 bisect probes,
+~7 s on agsched env.
+
+### Audit round-1 findings + fixes
+
+The first audit caught 2 BLOCKER + 3 MAJOR + 4 MINOR + 2 NIT.
+Notably, B1 was a paper-§7 claim violation (admission's V_u was
+silent-missing the holding-tax term) and N4 was a design bug (FIFO
+strands forever because sglang's pressure_resolved is edge-
+triggered, not heartbeat).  All fixes follow the same bisect
+protocol: write probe → confirm pre-fix FAIL → apply fix →
+confirm post-fix PASS.
+
+| ID | Finding | Fix layer |
+|---|---|---|
+| **B1** | `_value_at_current_tier` passed `cap=0` to `holding_unit_cost` → short-circuit to 0.0 → holding tax silently dropped.  Admission's V_u was only `p_hat * saved_prefill`, breaking the paper-§7 claim README §22 explicitly made.  Effect: byte-heavy shared prefixes (low p_hat) scored same as small unique tails → pause victim picked wrong. | **Production**: thread `SchedulerState` into `_value_at_current_tier`; use real `used_bytes`/`cap_bytes` for the holding-tax term.  Matches `OursGreedyPolicy._value` exactly. |
+| **B2** | `attach_admission_controller` silently captured `prior=None` if called BEFORE `attach_kv_scheduler`; later kv_scheduler attach OVERWROTE the composite; admission never fired, no log. | **Production**: raise `RuntimeError` in attach if no prior handler exists for MEMORY_PRESSURE / PRESSURE_RESOLVED.  Fail-loud at bootstrap. |
+| **M1** | Step [1] only pinned ranking (prog-3 lowest).  A regression to "sum raw V_u, ignore holders" would pass. | **Test**: numerical pin — assert `score[prog-i] == V_tail_i + V_shared/4` (per-program), not just ranking. |
+| **M2** | Step [9] forced 16-pause spin under fixed state; HTTP RTTs dominated, algorithmic regression invisible. | **Test**: new step [12] uses state-mutator (drop occ after first pause) to measure the SINGLE-pause path; budget 5 ms (vs step [9]'s 10 ms with 16 iterations). |
+| **M3** | Step [11] asserted both side effects fired but NOT order.  A regression to admission-first → kv_scheduler-second would pass. | **Test**: monkey-patch admission.handle to append to a shared timeline; stub migrate to do same; assert `idx(kv_scheduler:migrate) < idx(admission:enter)`. |
+| **N1** | README §3 said "stop when next resume would cross θ_hi" but code uses θ_lo as the gate (correct hysteresis intent). | **Doc**: rewrote README §3 to "drain until either FIFO empty OR occ rises back to θ_lo (hysteresis gap = θ_hi − θ_lo)". |
+| **N2** | Step [10] only tested `theta_lo > theta_hi`.  Missing: equal, > 1, == 0, negatives. | **Test**: parameterize over 6 boundary cases; each asserts `ValueError` with "theta" in the message. |
+| **N3** | Step [8] asserted `<= 16`; a regression bumping the cap to 32 would still pass (16 ≤ 32 is false but cap-removed unbounded would also fail for different reason; the real concern is silent cap-loosening). | **Test**: tightened to `== 16` (exact).  Fixture has 20 programs + persistent pressure → cap MUST stop at 16. |
+| **N4** | `pressure_resolved` is edge-triggered on sglang's side (single fire on HIGH→OK).  Admission resumed 1 program per event → FIFO with N > 1 paused programs stranded forever. | **Production**: `_on_resolved` now DRAINS — loop up to `max_pauses_per_event` times, resume oldest each iter, re-fetch state, stop when `occ >= theta_lo` (hysteresis). |
+
+### Latency summary (multi-run, per memory:feedback-latency-multi-run)
+
+| stage | mean ± std | envelope (mean+3σ) | budget |
+|---|---|---|---|
+| handler @ 32 programs (step [9], 16-pause spin) | 4.18 ± 0.17 ms | 4.67 ms | < 10 ms |
+| **single-pause** @ 32 programs (step [12], algorithmic path) | 4.10 ± 0.05 ms | 4.27 ms | **< 5 ms** |
+
+Single-pause is dominated by 2× HTTP RTT (one to trigger pause,
+one to see occ dropped + exit); algorithmic work (~score + pick)
+is sub-ms.
+
+* raw logs:
+  * `results/20260526_120256_run1.log` — v1 (pre-audit)
+  * `results/<YYYYMMDD_HHMMSS>_run2_audit1.log` — post audit round-1
+  * `results/<YYYYMMDD_HHMMSS>_regression_probe.log` — bisect demos
+    for B1, B2, N4
 
 * date: 2026-05-26
 * daemon code: ~280 LoC `daemon/admission_controller.py` (new);

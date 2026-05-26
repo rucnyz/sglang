@@ -87,19 +87,25 @@ _DEFAULT_MAX_PAUSES_PER_EVENT = int(
 # ----------------------------------------------------------------- scoring
 
 
-def _value_at_current_tier(u: ReuseUnit, costs, pi_u: float) -> float:
+def _value_at_current_tier(
+    u: ReuseUnit, state: SchedulerState, costs, pi_u: float
+) -> float:
     """Paper §7 ``V_u(tau)`` evaluated at the unit's CURRENT tier.
 
-    This is the steady-state "keep value" — saved-prefill minus the
-    holding tax over the expected reuse interval.  Used in the
-    program score as the per-unit contribution before shared-aware
-    division.
+    The steady-state "keep value" — saved-prefill minus the holding
+    tax over the expected reuse interval.  Matches
+    ``OursGreedyPolicy._value`` line for line (B1 audit fix: round-1
+    passed ``used=0, cap=0`` to ``holding_unit_cost`` which short-
+    circuited to 0, silently dropping the holding-tax term and
+    making admission's score = ``p_hat * saved_prefill`` only).
     """
     save_prefill = u.p_hat * (
         reload_cost(u, Tier.DROP, costs, pi_u)
         - reload_cost(u, u.tier, costs, pi_u)
     )
-    h = holding_unit_cost(u.tier, 0, 0, costs)  # tier_usage unused at unit scope
+    used = state.tier_usage.used_bytes.get(u.tier, 0)
+    cap = state.tier_usage.capacity_bytes.get(u.tier, 0)
+    h = holding_unit_cost(u.tier, used, cap, costs)
     hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
     return save_prefill - h * u.n_bytes * hold_time
 
@@ -123,7 +129,7 @@ def shared_aware_prog_scores(
             # An "unowned" unit (e.g. system prefix with no session
             # tags yet) doesn't contribute to any program's score.
             continue
-        v = _value_at_current_tier(u, costs, pi_u)
+        v = _value_at_current_tier(u, state, costs, pi_u)
         share = v / len(u.holders)
         for sid in u.holders:
             scores[sid] = scores.get(sid, 0.0) + share
@@ -231,51 +237,70 @@ class AdmissionController:
             )
 
     async def _on_resolved(self, event: Event, router) -> None:  # noqa: ANN001
-        """Resume programs in FIFO order one at a time; stop when the
-        next resume would cross theta_hi (hysteresis)."""
-        # First, prune any pids from the FIFO that aren't actually
-        # PAUSED any more (e.g., an external resume() call).
-        self._paused_fifo = [
-            pid for pid in self._paused_fifo
-            if self.tracker.state(pid) == State.PAUSED
-        ]
-        if not self._paused_fifo:
-            logger.info("admission: pressure_resolved but nothing to resume")
-            return
+        """Drain the paused FIFO while ``occ < theta_lo`` (paper §9
+        hysteresis: pause at theta_hi, resume at theta_lo to prevent
+        flapping).
 
-        try:
-            state_json = await router.fetch_state()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "admission: state fetch failed for %s: %s",
-                event.kind.value, exc,
+        Audit round-1 N4: sglang's webhook fires ``pressure_resolved``
+        ONCE on the HIGH→OK edge transition; there's no
+        ``still_resolved`` heartbeat.  Round-1 admission resumed only
+        one program per event, so any FIFO with N > 1 programs left
+        N-1 stranded indefinitely.  Now we drain until either the
+        FIFO is empty OR ``occ >= theta_lo`` (so we leave the
+        configured hysteresis gap of ``theta_hi - theta_lo`` of
+        headroom).  Re-fetch state between each resume so the gate
+        check sees the live occupancy.
+        """
+        for _ in range(self.max_pauses_per_event):
+            # Prune dead pids each iteration (an external resume() may
+            # have cleared a state we still hold in the FIFO).
+            self._paused_fifo = [
+                pid for pid in self._paused_fifo
+                if self.tracker.state(pid) == State.PAUSED
+            ]
+            if not self._paused_fifo:
+                logger.info(
+                    "admission: pressure_resolved drained; nothing left to resume"
+                )
+                return
+
+            try:
+                state_json = await router.fetch_state()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "admission: state fetch failed for %s: %s",
+                    event.kind.value, exc,
+                )
+                return
+            sched_state = build_paper_state(
+                state_json,
+                event=event,
+                tracker=self.tracker,
+                unknown_tier_log=self._unknown_tier_log,
             )
-            return
-        sched_state = build_paper_state(
-            state_json,
-            event=event,
-            tracker=self.tracker,
-            unknown_tier_log=self._unknown_tier_log,
-        )
-        occ = self._hbm_occ(sched_state)
-        if occ >= self.theta_lo:
-            # Watermark hasn't truly dropped below the resume floor —
-            # don't release pressure prematurely.  Sglang's webhook
-            # will fire another pressure_resolved when occ drops further.
+            occ = self._hbm_occ(sched_state)
+            if occ >= self.theta_lo:
+                # Hysteresis: stop resuming once we're back into the
+                # caution zone.  Programs still in the FIFO will be
+                # resumed on a future pressure_resolved event (when
+                # occ has dropped further); if no such event ever
+                # comes, sglang's still_high heartbeat will fire
+                # pause+migrate cycles that eventually free HBM and
+                # transition state back to OK.
+                logger.info(
+                    "admission: pressure_resolved halted at occ=%.3f >= "
+                    "theta_lo=%.3f; %d programs still paused",
+                    occ, self.theta_lo, len(self._paused_fifo),
+                )
+                return
+            # Resume the oldest paused program.
+            victim = self._paused_fifo.pop(0)
+            self.tracker.resume(victim)
+            self.resume_decisions += 1
             logger.info(
-                "admission: pressure_resolved but occ=%.3f >= theta_lo=%.3f; "
-                "hold FIFO (no resume this event)",
-                occ, self.theta_lo,
+                "admission: resumed %s (oldest in FIFO; occ=%.3f < theta_lo=%.3f)",
+                victim, occ, self.theta_lo,
             )
-            return
-        # Resume one (the oldest paused).
-        victim = self._paused_fifo.pop(0)
-        self.tracker.resume(victim)
-        self.resume_decisions += 1
-        logger.info(
-            "admission: resumed %s (oldest in FIFO; occ=%.3f < theta_lo=%.3f)",
-            victim, occ, self.theta_lo,
-        )
 
     # ---- helpers ----
 
@@ -301,13 +326,26 @@ def attach_admission_controller(
 
     Composition order matters: if admission ran first, it would over-
     pause based on stale (pre-migrate) state.
+
+    **Required order:** call ``attach_kv_scheduler(router, ...)``
+    BEFORE this function.  Audit round-1 B2: previously this silently
+    captured ``prior=None`` if called first, and a later
+    ``attach_kv_scheduler`` would OVERWRITE the composite — admission
+    never fires, no log.  Now we raise loudly to catch the
+    bootstrap-ordering bug at registration time.
     """
     for kind in (EventKind.MEMORY_PRESSURE, EventKind.PRESSURE_RESOLVED):
         prior = router._handlers.get(kind.value)
+        if prior is None:
+            raise RuntimeError(
+                f"attach_admission_controller: no prior handler for "
+                f"EventKind.{kind.name}.  Call attach_kv_scheduler() "
+                f"first (round-1 B2: silent overwrite would otherwise "
+                f"break admission)."
+            )
 
         async def _composite(evt, r, _prior=prior, _adm=admission):
-            if _prior is not None:
-                await _prior(evt, r)
+            await _prior(evt, r)
             await _adm.handle(evt, r)
 
         router.set_handler(kind, _composite)

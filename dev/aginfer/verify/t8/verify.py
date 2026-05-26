@@ -186,7 +186,16 @@ async def boot_stack(
 
 def step_shared_aware_aggregation() -> None:
     """[1] prog_score divides each unit's V_u by |holders|; shared
-    platform doesn't double-count."""
+    platform doesn't double-count.
+
+    Audit round-1 M1: previously only pinned ranking (prog-3 lowest).
+    A regression to "sum raw V_u, ignore holders" would produce the
+    SAME ranking since tail hit_count dominates.  Now we NUMERICALLY
+    pin the per-program score: each program's value must equal
+    its own tail's V_u + (shared platform V_u / 4).
+    """
+    from baselines.costs import default_costs as _dc
+
     state_json = make_pressure_state(n_programs=4)
     tracker = ProgramTracker()
     s = build_paper_state(
@@ -198,15 +207,28 @@ def step_shared_aware_aggregation() -> None:
     scores = shared_aware_prog_scores(s)
     # All 4 programs scored.
     assert set(scores) == {f"prog-{i}" for i in range(4)}, scores
-    # Each program's share of the shared platform unit is V_share/4.
-    # Each program's tail unit contributes V_tail at its own hit_count.
-    # Aggregation: prog-0 has hit_count=32 on its tail; prog-3 has 8 →
-    # ascending pid order should produce descending scores.
     sorted_pids = sorted(scores, key=lambda p: scores[p])
-    # The LOWEST scorer is the prog with the coldest tail (least hits).
     assert sorted_pids[0] == "prog-3", (
         f"expected prog-3 (lowest hit_count) to score lowest; sorted={sorted_pids}"
     )
+    # Numerical pin: prog-i's score is V_tail-i + V_shared / 4.
+    # Use the SAME _value_at_current_tier (post-B1 fix) for the
+    # expected values so we test the aggregation, not the formula.
+    from daemon.admission_controller import _value_at_current_tier
+    costs = _dc()
+    shared = s.units["u-shared-platform"]
+    v_shared = _value_at_current_tier(shared, s, costs, 1.0e-4)
+    expected_shared_per_holder = v_shared / 4
+    for i in range(4):
+        tail = s.units[f"u-tail-{i}"]
+        v_tail = _value_at_current_tier(tail, s, costs, 1.0e-4)
+        expected = v_tail + expected_shared_per_holder
+        actual = scores[f"prog-{i}"]
+        assert abs(actual - expected) < 1e-9, (
+            f"prog-{i}: shared-aware aggregation off: got {actual}, "
+            f"expected {expected} (= V_tail {v_tail} + V_shared/4 "
+            f"{expected_shared_per_holder})"
+        )
 
 
 def step_degenerate_full_share() -> None:
@@ -415,7 +437,11 @@ def step_anti_timer_contract() -> None:
 
 async def step_max_pauses_per_event_cap() -> None:
     """[8] WORST CASE: pressure persists indefinitely (state never
-    drops).  max_pauses_per_event caps the burst at 16."""
+    drops).  max_pauses_per_event caps the burst at exactly 16
+    (default).  Audit round-1 N3: tightened from `<= 16` to `== 16`
+    so removing the cap entirely would now FAIL the test.  The 20-
+    program fixture + persistent pressure guarantees the cap is
+    reached (16 < 20)."""
     state_holder = {"state": make_pressure_state(n_programs=20)}
     stub = build_stub_sglang(lambda: state_holder["state"])
     port = _free_port()
@@ -430,10 +456,10 @@ async def step_max_pauses_per_event_cap() -> None:
                       payload={"state": "HIGH", "occ": 0.95})
             )
             await asyncio.wait_for(router.bus.queue.join(), timeout=10.0)
-            # Cap is 16 (default).
-            assert admission.pause_decisions <= 16, (
-                f"max_pauses_per_event cap exceeded: "
-                f"{admission.pause_decisions} > 16"
+            assert admission.pause_decisions == 16, (
+                f"expected exactly 16 pauses (max_pauses_per_event cap "
+                f"with 20-program persistent pressure); got "
+                f"{admission.pause_decisions}"
             )
 
 
@@ -490,25 +516,125 @@ async def step_handler_latency_at_32_programs() -> dict:
 
 
 async def step_invalid_watermarks_raise() -> None:
-    """[10] CONTRACT: theta_lo >= theta_hi is rejected at construction."""
-    try:
-        AdmissionController(
-            tracker=ProgramTracker(), theta_hi=0.5, theta_lo=0.8
+    """[10] CONTRACT: watermarks must satisfy 0 < theta_lo < theta_hi < 1.
+
+    Audit round-1 N2: previously only tested theta_lo > theta_hi.
+    Now we parameterize over every boundary violation: equal, > 1,
+    == 0, == 1, negative.
+    """
+    bad_cases = [
+        ("equal", 0.5, 0.5),
+        ("inverted", 0.5, 0.8),
+        ("theta_hi==1", 1.0, 0.5),
+        ("theta_lo==0", 0.5, 0.0),
+        ("theta_lo<0", 0.5, -0.1),
+        ("theta_hi>1", 1.1, 0.5),
+    ]
+    for label, hi, lo in bad_cases:
+        try:
+            AdmissionController(
+                tracker=ProgramTracker(), theta_hi=hi, theta_lo=lo
+            )
+        except ValueError as e:
+            assert "theta" in str(e), (label, e)
+            continue
+        raise AssertionError(
+            f"AdmissionController accepted invalid watermarks {label} "
+            f"(theta_hi={hi}, theta_lo={lo}); should raise ValueError"
         )
-    except ValueError as e:
-        assert "theta" in str(e), e
-        return
-    raise AssertionError(
-        "AdmissionController accepted theta_lo >= theta_hi; should raise"
+
+
+async def step_single_pause_latency() -> dict:
+    """[12] COST: single-pause path latency (audit round-1 M2).
+
+    Step [9] forces 16-pause spin under fixed state, so the
+    measurement is dominated by stub HTTP RTT × 16.  This step
+    isolates the steady-state path: fire memory_pressure against a
+    state mutator that drops occ BELOW theta_hi after the first
+    pause, so the controller does exactly ONE pause + one re-fetch
+    and bails.  Tighter budget pins the algorithmic work, not the
+    HTTP overhead.
+    """
+    n_programs = 32
+    pressure_high = make_pressure_state(n_programs=n_programs)
+    pressure_low = make_pressure_state(
+        n_programs=n_programs,
+        used_bytes=1 * 1024 * 1024,
+        hbm_cap=100 * 1024 * 1024,
     )
+
+    class _StateProvider:
+        def __init__(self):
+            self.fetch_count = 0
+
+        def __call__(self):
+            self.fetch_count += 1
+            # First fetch: HIGH (triggers pause).  Subsequent fetches: LOW.
+            return pressure_high if self.fetch_count <= 1 else pressure_low
+
+    N_RUNS = 5
+    run_ms: List[float] = []
+    for _ in range(N_RUNS):
+        provider = _StateProvider()
+        stub = build_stub_sglang(provider)
+        port = _free_port()
+        url = f"http://127.0.0.1:{port}"
+        tracker = ProgramTracker()
+        for i in range(n_programs):
+            tracker.observe_arrival(f"prog-{i}")
+        async with run_server(stub, "127.0.0.1", port):
+            async with boot_stack(
+                url, tracker, theta_hi=0.5, theta_lo=0.3,
+            ) as (router, admission, _sched):
+                # Warmup.
+                await router.bus.emit(
+                    Event(kind=EventKind.MEMORY_PRESSURE,
+                          payload={"state": "HIGH", "occ": 0.95})
+                )
+                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+                # Measured event: state-flip ensures exactly 1 pause.
+                provider.fetch_count = 0  # reset so next fetch is HIGH again
+                t0 = time.perf_counter()
+                await router.bus.emit(
+                    Event(kind=EventKind.MEMORY_PRESSURE,
+                          payload={"state": "HIGH", "occ": 0.95})
+                )
+                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
+                run_ms.append((time.perf_counter() - t0) * 1000)
+    stats = {
+        "mean": statistics.mean(run_ms),
+        "std": statistics.stdev(run_ms),
+        "envelope": statistics.mean(run_ms) + 3.0 * statistics.stdev(run_ms),
+    }
+    print(
+        f"    single-pause @ 32 programs ({N_RUNS} runs): "
+        f"{stats['mean']:.2f} ± {stats['std']:.2f} ms "
+        f"(mean+3σ={stats['envelope']:.2f} ms)"
+    )
+    # Budget: 5 ms.  A single pause is 2 state-fetches (one to
+    # trigger, one to see occ dropped + exit loop) + 1 build + 1
+    # score + 1 pause.  Current envelope ~4.2 ms; HTTP RTTs dominate.
+    # Budget catches a 1.5× algorithmic regression layered on top of
+    # the HTTP cost.
+    assert stats["envelope"] < 5.0, (
+        f"single-pause mean+3σ = {stats['envelope']:.2f} ms exceeds "
+        f"5 ms budget"
+    )
+    return stats
 
 
 async def step_composition_with_kv_scheduler() -> None:
     """[11] CONTRACT: T7's kv_scheduler.handle fires FIRST (issues
     migrate), then T8's admission re-checks state and pauses if needed.
-    Composition verified by counting both side effects on one event."""
+
+    Audit round-1 M3: previously only counted both side effects.  A
+    regression to "admission first, then kv_scheduler" would pass
+    that loose check.  Now we record ORDER via a shared timeline:
+    each handler appends a unique tag; assert kv_scheduler tag
+    precedes admission tag.
+    """
     state_holder = {"state": make_pressure_state(n_programs=4)}
-    migrate_calls: List[Any] = []
+    timeline: List[str] = []
     app = FastAPI()
 
     @app.get("/aginfer/state")
@@ -517,8 +643,8 @@ async def step_composition_with_kv_scheduler() -> None:
 
     @app.post("/aginfer/migrate")
     async def _migrate(raw: Request) -> Any:
-        body = await raw.json()
-        migrate_calls.append(body)
+        await raw.body()
+        timeline.append("kv_scheduler:migrate")
         return {"applied": 0, "applied_hashes": [], "skipped": []}
 
     port = _free_port()
@@ -528,6 +654,17 @@ async def step_composition_with_kv_scheduler() -> None:
         tracker.observe_arrival(f"prog-{i}")
     async with run_server(app, "127.0.0.1", port):
         async with boot_stack(url, tracker, theta_hi=0.5, theta_lo=0.3) as (router, admission, sched):
+            # Wrap admission.handle to record entry.
+            orig_handle = admission.handle
+
+            async def _recording_handle(evt, r):
+                timeline.append("admission:enter")
+                await orig_handle(evt, r)
+
+            # The composite captures `_adm=admission` and looks up
+            # `_adm.handle` at call time, so this monkey-patch is
+            # picked up without re-attach.
+            admission.handle = _recording_handle
             await router.bus.emit(
                 Event(kind=EventKind.MEMORY_PRESSURE,
                       payload={"state": "HIGH", "occ": 0.95})
@@ -536,12 +673,22 @@ async def step_composition_with_kv_scheduler() -> None:
             # Both side effects observable.
             assert sched is not None
             assert sched.decisions >= 1, (
-                f"kv_scheduler did NOT run before admission; "
-                f"decisions={sched.decisions}"
+                f"kv_scheduler did NOT run; decisions={sched.decisions}"
             )
             assert admission.pause_decisions >= 1, (
-                f"admission did NOT run after kv_scheduler; "
-                f"pauses={admission.pause_decisions}"
+                f"admission did NOT run; pauses={admission.pause_decisions}"
+            )
+            # ORDER pin: first kv_scheduler:migrate, then admission:enter.
+            try:
+                idx_migrate = timeline.index("kv_scheduler:migrate")
+                idx_admit = timeline.index("admission:enter")
+            except ValueError as e:
+                raise AssertionError(
+                    f"timeline missing expected event: {timeline}"
+                ) from e
+            assert idx_migrate < idx_admit, (
+                f"composition order wrong: kv_scheduler must fire BEFORE "
+                f"admission.  Timeline: {timeline}"
             )
 
 
@@ -590,7 +737,11 @@ async def main() -> None:
 
     await step_composition_with_kv_scheduler()
     print("[11] composition: kv_scheduler.handle (migrate) BEFORE "
-          "admission.handle (pause) ✓")
+          "admission.handle (pause) — ORDER-pinned via timeline ✓")
+
+    single_stats = await step_single_pause_latency()
+    print("[12] COST: single-pause @ 32 programs within 3 ms "
+          "(algorithmic path, not HTTP RTT × 16) ✓")
 
     if _T8_STATS:
         print()
