@@ -304,22 +304,35 @@ def build_paper_state(
         last_access = int(raw["last_access_time"])
         hits = int(raw["hit_count"])
         age = max(1, now_counter - last_access)
-        # baseline λ + p_hat from inline scorer (hits/age proxy).
+        # baseline λ from inline scorer (hits/age proxy).
         # `age` is `max(1, ...)` above, so it's always >= 1.
-        p_hat = min(1.0, hits / age)
+        # p_hat is computed below from the program-alive rule (T11a).
         lam = max(1e-3, hits / age)
-        # If ANY holder of this unit is in ACTING state, clamp λ to the
-        # ACTING floor.  A unit on the platform/tool_def prefix may
-        # have many holders; one ACTING holder is enough to indicate
-        # "expected reuse interval is now ~tool duration, not historic
-        # tick frequency".  Paper §7 lambda is unit-centric, not
-        # program-centric; this OR is the right reduction for
-        # multi-holder units.
+        # Iterate holders to compute two reductions in one pass:
+        #   * any_acting  → clamp λ to the ACTING floor (paper §7
+        #     "expected reuse interval ~ tool duration" rule).
+        #   * any_alive   → program-alive rule (T11a): if any holder's
+        #     program is tracked-alive, p_hat = 1.0.  Rationale:
+        #     conditional on the queryable predicate
+        #     `ProgramTracker.state(sid) is not None`, monotonic-
+        #     extension workloads have P(next-step reuse) = 1 within
+        #     paper §7's 1-step horizon.  hits/age is unbiased only
+        #     under uniform-Poisson, which multi-turn agent workloads
+        #     violate; the proxy under-values young trunk units (low
+        #     age, hits=1) by ~20× vs structural 1.0.  System-prompt
+        #     high value emerges from T8's shared-aware aggregation
+        #     across many alive holders, not from a separate rule.
+        #     Known limitation: tracker has no ENDED state yet; an
+        #     ended program stays state()!=None until manually
+        #     forgotten.  Bounded over-estimation; v1 trade-off.
         session_ids = raw["session_ids"]
         any_acting = False
+        any_alive = False
         for sid in session_ids:
+            st = tracker.state(sid)
+            if st is not None:
+                any_alive = True
             if sid not in program_lambda:
-                st = tracker.state(sid)
                 # Audit round-2 R2-M1: PAUSED programs are STILL
                 # mid-tool-call (admission_controller pinned them).
                 # Paper §7's "expected reuse interval ~ tool duration"
@@ -340,6 +353,12 @@ def build_paper_state(
             lam = program_lambda[
                 next(sid for sid in session_ids if program_lambda[sid] > 0)
             ]
+        # Program-alive rule (see comment above).  Fall back to
+        # hits/age proxy when ALL holders are unknown (orphan unit).
+        if any_alive:
+            p_hat = 1.0
+        else:
+            p_hat = min(1.0, hits / age)
         units[uhash] = ReuseUnit(
             id=uhash,
             type=UnitType.SESSION,  # platform / tool_def tags arrive later
