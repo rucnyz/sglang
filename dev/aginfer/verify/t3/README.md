@@ -43,10 +43,53 @@ Mechanism. `verify/t3_session_passthrough.py`:
 ```
 
 ## RESULTS
-* date: _pending_
-* sglang sha:
-* lines added:
-* shared prefix has both ids: _pending_
-* concurrent 32-program test: _pending_
-* per-request latency delta vs baseline: _pending_
-* raw log: `verify/results/t3_<datetime>.log`
+
+**PASSED** — all 7 steps on Qwen3-0.6B + `--attention-backend flashinfer`.
+
+* date: 2026-05-26
+* sglang sha: (this commit)
+* lines added: ~40 across 9 files (protocol.py + io_struct.py +
+  tokenizer_manager.py + serving_chat.py + serving_completions.py +
+  scheduler.py + schedule_batch.py + base_prefix_cache.py +
+  unified_radix_cache.py)
+* Two-program shared prefix (step [1]): 7 units total, 1 node carries
+  both `prog-A` AND `prog-B` (the shared system prompt), 2 nodes per
+  program in their diverging suffixes. ✓
+* No fake tags (step [2]): every unit's `session_ids` is either the
+  expected program_ids or empty. ✓
+* OpenAI client `extra_body={"program_id": ...}` end-to-end (step [3]):
+  reaches the radix tree as a top-level field after client-side
+  unpacking. ✓
+  - Note: the server only sees a top-level `program_id` field; the
+    OpenAI client library does the `extra_body` -> top-level unpack
+    BEFORE sending. Verify uses the real `openai` package for this
+    test (falls back to top-level if `openai` package is missing).
+* Concurrent 32-program shared-prefix stress (step [4]): the
+  shared-prefix node carries ALL 32 program_ids in its
+  `session_ids` set. ✓ (the strongest test of the contract)
+* Untagged request (step [5]): leaves `session_ids = []` on every
+  node it touches; no exception. ✓
+* Bogus program_id shapes (step [6]): 5 cases — `{"oh": "no"}`,
+  `42`, `"x" * 10_000`, `["a", "b"]`, `True`. All sanitized to a
+  ≤64-char string at Req construction; no HTTP 400, no 5xx. ✓
+  Pydantic field needed `Optional[Any]` (otherwise Pydantic rejects
+  bogus shapes at the HTTP layer before our sanitizer runs).
+* Tagging overhead (step [7]): -0.18 ms/req (noise level) for 20
+  tagged vs 20 untagged chat completions. Well under the 5 ms
+  ceiling. ✓
+* raw log: `results/<YYYYMMDD_HHMMSS>_run4.log`
+
+### Implementation notes (forward-compat for T4-T8)
+
+* Wire path: `extra_body.program_id` (OpenAI client) -> top-level
+  `program_id` -> `ChatCompletionRequest` -> `GenerateReqInput` ->
+  `TokenizedGenerateReqInput` -> `Req` -> `InsertParams.program_id`
+  -> tagged on each node in `_insert_helper`.
+* Sanitizer (`_sanitize_program_id` in schedule_batch.py) runs ONCE
+  at `Req.__init__`; downstream code can assume `req.program_id` is
+  either None or a stable ≤64-char string.
+* Split node: when a radix node is split (a longer prefix becomes
+  the parent of two diverging tails), the new internal node inherits
+  the union of `session_ids` from the original child. Without this
+  the admission_controller (T8) would under-count program ownership
+  on shared ancestors. Verified by step [4].

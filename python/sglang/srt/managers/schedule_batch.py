@@ -602,6 +602,26 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+def _sanitize_program_id(pid: Any) -> Optional[str]:
+    """Best-effort coercion of an aginfer program_id to a stable short string.
+
+    Worst-case row in verify/t3/README.md: bogus shapes (dict, int, very long
+    str) must NOT raise.  Coerce to str, truncate to 64 chars, return None
+    for the empty / None case so untagged requests stay None.
+    """
+    if pid is None:
+        return None
+    if not isinstance(pid, str):
+        try:
+            pid = str(pid)
+        except Exception:
+            return None
+    pid = pid.strip()
+    if not pid:
+        return None
+    return pid[:64]
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -639,6 +659,7 @@ class Req(ReqDllmMixin):
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        program_id: Any = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
@@ -714,6 +735,11 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+
+        # aginfer: program-level identity, sanitized once at Req construction.
+        # Stored as a short string (≤64 chars) or None.  Untagged requests
+        # leave this as None; every node they touch gets session_ids = ∅.
+        self.program_id = _sanitize_program_id(program_id)
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None

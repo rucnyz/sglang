@@ -123,6 +123,11 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
 
+        # aginfer §3 state: set of program_ids that touched this node.
+        # Populated on insert/cache_finished_req from req.program_id; read
+        # by dump_aginfer_state.  Empty for untagged requests.
+        self.session_ids: set[str] = set()
+
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
 
@@ -586,7 +591,10 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params = None
 
         if is_insert:
-            insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
+            insert_params = InsertParams(
+                prev_prefix_len=req.cache_protected_len,
+                program_id=getattr(req, "program_id", None),
+            )
 
             # components prepare insert data + return effective cache_len
             effective_cache_len = len(token_ids)
@@ -652,7 +660,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # components prepare insert data + return effective cache_len
         insert_params = InsertParams(
-            prev_prefix_len=req.cache_protected_len, chunked=chunked
+            prev_prefix_len=req.cache_protected_len,
+            chunked=chunked,
+            program_id=getattr(req, "program_id", None),
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -872,6 +882,11 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        # aginfer: the new internal node inherits every program_id that
+        # touched the original (longer) prefix.  Without this the radix
+        # split loses session_ids on the ancestor path and admission_
+        # controller under-counts ownership.
+        new_node.session_ids |= child.session_ids
 
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
@@ -936,6 +951,11 @@ class UnifiedRadixCache(BasePrefixCache):
         params: InsertParams,
     ) -> InsertResult:
         self._touch_node(node)
+        # aginfer: tag root + every node we visit with the program_id.
+        # ``params.program_id`` is sanitized at Req construction so it is
+        # safe to insert into a set; None skips silently for untagged
+        # requests (the worst-case "no program_id" row).
+        pid = params.program_id
         if len(key) == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
@@ -944,6 +964,8 @@ class UnifiedRadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
+            if pid is not None:
+                node.session_ids.add(pid)
             prefix_len = node.key.match(key, page_size=self.page_size)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
@@ -1009,6 +1031,8 @@ class UnifiedRadixCache(BasePrefixCache):
             is_new_leaf = True
         else:
             target_node = node
+        if pid is not None:
+            target_node.session_ids.add(pid)
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node

@@ -365,6 +365,14 @@ class CompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # aginfer: program-level identity. Every radix-tree node touched by this
+    # request adds ``program_id`` to its ``session_ids`` set; daemon reads
+    # the result via /aginfer/state.  Pass via top-level field or
+    # ``extra_body={"program_id": "..."}``.  Typed as ``Any`` (rather than
+    # str) so the worst-case "bogus shape" row (dict / int / list / very
+    # long string) is silently sanitized at Req construction instead of
+    # 400'd at the HTTP layer.
+    program_id: Optional[Any] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -730,6 +738,14 @@ class ChatCompletionRequest(BaseModel):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    # aginfer: program-level identity. Every radix-tree node touched by this
+    # request adds ``program_id`` to its ``session_ids`` set; daemon reads
+    # the result via /aginfer/state.  Pass via top-level field or
+    # ``extra_body={"program_id": "..."}``.  Typed as ``Any`` (rather than
+    # str) so the worst-case "bogus shape" row (dict / int / list / very
+    # long string) is silently sanitized at Req construction instead of
+    # 400'd at the HTTP layer.
+    program_id: Optional[Any] = None
     # Priority for the request
     priority: Optional[int] = None
 

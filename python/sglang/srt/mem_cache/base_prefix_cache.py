@@ -64,6 +64,12 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
 
+    # aginfer: program-level identity. When non-None, every radix-tree
+    # node touched by this insert path (matched ancestors + new leaf)
+    # picks up ``program_id`` in its ``session_ids`` set.  Daemon reads
+    # the aggregated set via /aginfer/state.
+    program_id: Optional[str] = None
+
 
 @dataclasses.dataclass
 class InsertResult:

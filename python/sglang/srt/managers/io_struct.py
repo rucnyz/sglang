@@ -227,6 +227,17 @@ class GenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # aginfer §3 state: program-level identity that the daemon's
+    # admission_controller / kv_scheduler uses to aggregate per-program
+    # value (paper §7).  Every radix-tree node touched by this request
+    # adds ``program_id`` to its ``session_ids`` set; daemon reads this
+    # via /aginfer/state.  Passed through from the OpenAI request's
+    # top-level ``program_id`` field (or ``extra_body.program_id``).
+    # Typed as ``Any`` so bogus shapes (dict / int / list / very long
+    # string) are sanitized at Req construction instead of failing
+    # Pydantic validation at the HTTP layer.
+    program_id: Optional[Any] = None
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -690,6 +701,11 @@ class GenerateReqInput(BaseReq):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
+            program_id=(
+                self.program_id[i]
+                if isinstance(self.program_id, list) and i < len(self.program_id)
+                else self.program_id
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -775,6 +791,11 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # aginfer §3 state: program-level identity, see GenerateReqInput.program_id.
+    # Typed as Any so bogus shapes survive serialization through ZMQ;
+    # sanitized at Req construction.
+    program_id: Optional[Any] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
