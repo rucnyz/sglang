@@ -237,6 +237,13 @@ class Session:
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,
+            # aginfer §3 state: forward program_id through the session
+            # multi-turn path. Without this, requests that reuse a
+            # session_id silently drop their tag (Req.program_id default
+            # is None). Same class as the EPD-disagg drop fixed in
+            # encode_receiver.create_req. Verified via
+            # verify/t3/regression_probe.py [A].
+            program_id=req.program_id,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )

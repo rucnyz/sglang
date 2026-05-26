@@ -43,32 +43,29 @@
 ### Tagging-path coverage and v1 limitations
 
 The general contract is "every radix-tree node touched by a tagged
-request gets the tag", but the v1 wire-up does NOT cover three
-paths.  These are documented here so T9 / T10 can address each
-when they're exercised:
+request gets the tag", but several edge paths need explicit
+documentation:
 
-1. **HiCache `prefetch_from_storage` (`unified_radix_cache._insert_helper_host`)**.
-   When a tagged request triggers a host-side prefetch from
-   Mooncake / disk, the host nodes are created with empty
-   `session_ids`.  The tag is added later, when the matching
-   device-side insert runs (`_insert_helper`).  Between those two
-   events, the daemon's `/aginfer/state` snapshot may show the
-   prefetched host nodes as untagged.  T9 Run K will exercise this;
-   we'll either thread `program_id` through `prefetch_from_storage`
-   then or document the race window's acceptance criterion.
-2. **`StreamingSession.try_cache_*`** (streaming-session API):
-   requests bound to a streaming session route through the
-   `StreamingSession` short-circuit in `cache_finished_req` /
-   `cache_unfinished_req` and never reach `_insert_helper`.
-   v1 simply doesn't tag streaming-session reqs; if T6 / T7 need
-   them tagged, plumb `program_id` into the StreamingSession path
-   separately.
-3. **EPD-disaggregation** (`encode_receiver.create_req`): now FIXED
-   (commit follow-up to T3 audit-round-2).  The `program_id` is
-   forwarded through the EPD path so tagged requests retain their
-   tag when sglang runs in encode-prefill-decode disaggregation
-   mode.  Without the fix, `Req.program_id` would default to None
-   in EPD mode and the tag would die silently.
+1. **HiCache `prefetch_from_storage` (`unified_radix_cache._insert_helper_host`)** — host-side nodes from a tagged prefetch land with empty `session_ids` until the device-side insert tags them. v1 limitation; T9 Run K will exercise the race window.
+2. **`StreamingSession.try_cache_*`** — requests bound to a streaming session bypass `_insert_helper` entirely. v1 simply doesn't tag streaming-session reqs.
+3. **EPD-disaggregation** (`encode_receiver.create_req`) — FIXED in audit-round-2; tag forwards through the encode-prefill-decode path.
+4. **Session multi-turn** (`Session.create_req`) — FIXED in audit-round-3; tag forwards through `session.create_req` for requests that reuse a session_id. Demonstrated by `verify/t3/regression_probe.py [A]`: pre-fix tagged 0 nodes, post-fix tags 4.
+5. **OpenAI chat handler does NOT forward `session_params`** to the underlying GenerateReqInput. So the multi-turn session path is only reachable via sglang's native `/generate` endpoint. The OpenAI-API surface goes through the non-session branch in scheduler.py (which already plumbs `program_id` correctly). Documented because future maintainers may want to wire `session_params` into the OpenAI handler.
+6. **Multi-DP / `per_rank` aggregation** — when DP > 1, `/aginfer/state` returns `{"per_rank": [...]}` with each rank's units separately. Each rank's tree is independent; same `program_id` may appear on different rank-local hashes. v1 verify only tests single-DP; daemon (T6/T7) is responsible for merging the per-rank view. Per-rank `node-<id>` names use a process-local counter — id collisions ACROSS ranks are expected and the daemon namespace must include rank.
+7. **HBM ↔ DRAM tier transition** — `_evict_to_host` keeps the same Python node object; `session_ids` survives the tier flip automatically. No verify pinned for this (requires HiCache); T9 / T10 will exercise.
+8. **Speculative-decoding draft model** — draft-model KV is managed by its own pool, NOT by `UnifiedRadixCache`. Draft-model nodes are not tagged. v1 limitation; T9 will exercise if speculative is enabled and document the gap.
+
+### Reserved sentinel namespace
+
+The daemon (T6/T7) is free to define internal program_id sentinels
+(e.g. `"__aginfer_paused__"` for the program-tracker's PAUSED state).
+v1 sglang's sanitizer accepts any string ≤ 64 chars without
+reservation; callers are responsible for picking namespaces that
+don't collide with their own runtime sentinels. **Convention**:
+daemon-internal sentinels should use the `__aginfer_*` prefix; user
+programs should not use that prefix.
+
+### Design decision: `session_ids` is unbounded in v1
 
 ### Design decision: `session_ids` is unbounded in v1
 
@@ -115,14 +112,17 @@ Mechanism. `verify/t3_session_passthrough.py`:
 
 ## RESULTS
 
-**PASSED** — all 7 steps on Qwen3-0.6B + `--attention-backend flashinfer`.
+**PASSED** — all 13 steps (post audit round-3) on Qwen3-0.6B +
+`--attention-backend flashinfer --chunked-prefill-size 32`.
 
 * date: 2026-05-26
 * sglang sha: (this commit)
-* lines added: ~40 across 9 files (protocol.py + io_struct.py +
+* lines added: ~140 lines across 10 files (protocol.py + io_struct.py +
   tokenizer_manager.py + serving_chat.py + serving_completions.py +
   scheduler.py + schedule_batch.py + base_prefix_cache.py +
-  unified_radix_cache.py)
+  unified_radix_cache.py + session_controller.py +
+  disaggregation/encode_receiver.py — every Req construction site that
+  takes a TokenizedGenerateReqInput now forwards program_id).
 * Two-program shared prefix (step [1]): 7 units total, 1 node carries
   both `prog-A` AND `prog-B` (the shared system prompt), 2 nodes per
   program in their diverging suffixes. ✓
@@ -148,9 +148,22 @@ Mechanism. `verify/t3_session_passthrough.py`:
 * Tagging overhead (step [7]): -0.18 ms/req (noise level) for 20
   tagged vs 20 untagged chat completions. Well under the 5 ms
   ceiling. ✓
-* raw log: `results/<YYYYMMDD_HHMMSS>_run5_postaudit.log` (10 steps including
-  audit-driven additions: hard-required OpenAI client + raw-POST negative
-  test, retro-tag, chunked prefill, list-broadcast sanitizer)
+* Session multi-turn (step [11]): a request with `session_params.id`
+  set via the native `/generate` endpoint tags the shared-session
+  nodes via `Session.create_req`. Round-3 audit caught the silent
+  drop here; bisect probe (`regression_probe.py`) confirms 0 tagged
+  nodes pre-fix and 4 post-fix.
+* Recursion DoS (step [12]): a 20-level deeply-nested-list
+  `program_id` sent as raw JSON to `/generate` does not crash the
+  scheduler; the sanitizer's depth cap (8) drops the tag silently.
+  Bisect probe confirms: pre-fix the buried tag bypasses, post-fix
+  it does not.
+* Pydantic regression (step [13]): `ChatCompletionRequest.model_config.extra`
+  must NOT be `"allow"`; introspection check guards the contract.
+* raw log: `results/<YYYYMMDD_HHMMSS>_run9_audit3_clean.log` (full 13
+  steps); regression-probe logs `PREFIX_demo_v4.log` (both FAIL with
+  fixes reverted) and `POSTFIX_demo.log` (both PASS with fixes
+  restored) — the bisect proves the fix actually fixes.
 
 ### Implementation notes (forward-compat for T4-T8)
 

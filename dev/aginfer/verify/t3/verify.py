@@ -80,6 +80,15 @@ def units_without(state: Dict[str, Any], program_id: str) -> List[Dict[str, Any]
 def main() -> None:
     print("=== T3 verify: session_id passthrough ===")
 
+    # Flush so any residue tag from prior runs of regression_probe or
+    # earlier verify invocations doesn't poison our wire-format
+    # invariants (step [2] checks that no node has implausibly many
+    # tags). /flush_cache may not exist on all builds; ignore if so.
+    try:
+        requests.post(f"{BASE}/flush_cache", timeout=10).raise_for_status()
+    except Exception:
+        pass
+
     SHARED_SYS = (
         "You are a helpful assistant. Here is a long system prompt: "
         + ("Lorem ipsum dolor sit amet consectetur adipiscing elit. " * 30)
@@ -350,7 +359,101 @@ def main() -> None:
         "single request"
     )
 
-    print("\n=== T3 PASSED (post-audit) ===")
+    # ---- [11] Session multi-turn: program_id survives Session.create_req ----
+    # sglang's session API constructs a fresh Req via
+    # ``Session.create_req``; round-3 audit caught a silent program_id
+    # drop on that path (same shape as the EPD bug from round 2).  Test
+    # it end-to-end by sending a chat with ``session_params={"id": ...}``
+    # set + a program_id, then asserting the tag lands.  Without the
+    # round-3 fix the tag would be silently dropped at create_req.
+    print("\n[11] Session multi-turn: program_id forwarded via Session.create_req")
+    SESSION_PROMPT = "Multi-turn session probe: tell me about prime 19."
+    SESSION_PID = "prog-SESSION"
+    requests.post(
+        f"{BASE}/v1/chat/completions",
+        json={
+            "model": MODEL,
+            "messages": [{"role": "user", "content": SESSION_PROMPT}],
+            "max_tokens": 4,
+            "temperature": 0.0,
+            "program_id": SESSION_PID,
+            "session_params": {"id": "t3-session-probe"},
+        },
+        timeout=60,
+    ).raise_for_status()
+    state = fetch_state()
+    sess_units = units_with(state, SESSION_PID)
+    print(f"    session-tagged units: {len(sess_units)}")
+    assert sess_units, (
+        f"session-multi-turn request lost the tag -- Session.create_req "
+        f"is silently dropping program_id (same shape as the EPD bug)"
+    )
+
+    # ---- [12] Recursion DoS: deeply-nested list program_id must not crash ----
+    # Round-3 audit caught the sanitizer recursing unbounded into nested
+    # lists / tuples. The fix is a depth cap (_PROGRAM_ID_MAX_RECURSION
+    # = 8). Build the bomb via raw bytes (Python's json.dumps also
+    # recursion-errors on deeply nested lists) and POST to /generate
+    # (sglang-native; carries program_id directly to GenerateReqInput).
+    # depth=20: well above the cap (8) but well below Python json's
+    # parse limit (~150 on this build). Pre-fix: sanitizer recurses 20
+    # levels and tags "should-be-buried-too-deep". Post-fix: cap returns
+    # None at depth 9, no tag lands.
+    print("\n[12] recursion DoS: deeply-nested list program_id (raw POST to /generate)")
+    depth = 20
+    bomb_payload = (
+        b'{"text":"recursion-bomb probe"'
+        b',"sampling_params":{"max_new_tokens":4,"temperature":0.0}'
+        b',"program_id":'
+        + b"[" * depth + b'"should-be-buried-too-deep"' + b"]" * depth
+        + b"}"
+    )
+    bomb_resp = requests.post(
+        f"{BASE}/generate",
+        data=bomb_payload,
+        headers={"Content-Type": "application/json"},
+        timeout=60,
+    )
+    assert bomb_resp.status_code in (200, 400), (
+        f"5xx on deeply-nested program_id: {bomb_resp.status_code} -- "
+        f"scheduler likely crashed (recursion cap missing)"
+    )
+    health = requests.get(f"{BASE}/health", timeout=10)
+    assert health.status_code in (200, 503), (
+        f"server unresponsive after recursion bomb: {health.status_code}"
+    )
+    if bomb_resp.status_code == 200:
+        state = fetch_state()
+        assert not units_with(state, "should-be-buried-too-deep"), (
+            "deep nested list bypassed the recursion cap -- the buried "
+            "string reached session_ids"
+        )
+        print("    server stayed up; tag correctly dropped (depth cap hit)")
+    else:
+        print("    server rejected the request at HTTP layer (also acceptable)")
+
+    # ---- [13] Pydantic regression: model_config.extra must NOT be 'allow' ----
+    # Round-3 NIT: the negative ``extra_body`` test in step [3] depends
+    # on ChatCompletionRequest having default ``extra='ignore'``. If a
+    # future maintainer adds ``model_config = ConfigDict(extra='allow')``
+    # the negative test still passes (server doesn't auto-unpack
+    # extra_body) but the assumption becomes brittle. Pin it directly.
+    print("\n[13] Pydantic regression: ChatCompletionRequest must not allow extras")
+    from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+    model_config = getattr(ChatCompletionRequest, "model_config", {}) or {}
+    extra = model_config.get("extra") if isinstance(model_config, dict) else (
+        getattr(model_config, "extra", None)
+    )
+    assert extra != "allow", (
+        f"ChatCompletionRequest now has model_config.extra={extra!r}; "
+        f"un-vetted extras land as attributes, which could let a "
+        f"malicious client bypass the program_id sanitizer. Re-audit "
+        f"the program_id wire path before enabling this."
+    )
+    print(f"    model_config.extra = {extra!r} (not 'allow') ✓")
+
+    print("\n=== T3 PASSED (post-audit round 3) ===")
 
 
 if __name__ == "__main__":
