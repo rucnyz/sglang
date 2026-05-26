@@ -675,7 +675,7 @@ async def aginfer_state():
 
 # POST /aginfer/migrate -- apply paper §4 (u, τ_target) actions in batch.
 # Body: {"actions": [{"hash": str, "target_tier": "HBM"|"DRAM"|"DISK"|"DROP"}, ...]}
-# Response: {"applied": int, "skipped": [{"hash":..., "reason":...}, ...]}
+# Response: {"applied": int, "applied_hashes": [...], "skipped": [{"hash":..., "reason":...}, ...]}
 # Unresolved or unsupported actions are listed in `skipped` rather than
 # raised, so the daemon's idempotent re-issue loop stays simple.
 @app.post("/aginfer/migrate")
@@ -696,11 +696,22 @@ async def aginfer_migrate(raw_request: Request):
     )
     if len(responses) == 1:
         out = responses[0]
-        return ORJSONResponse({"applied": out.applied, "skipped": out.skipped})
+        return ORJSONResponse(
+            {
+                "applied": out.applied,
+                "applied_hashes": out.applied_hashes,
+                "skipped": out.skipped,
+            }
+        )
     return ORJSONResponse(
         {
             "per_rank": [
-                {"applied": r.applied, "skipped": r.skipped} for r in responses
+                {
+                    "applied": r.applied,
+                    "applied_hashes": r.applied_hashes,
+                    "skipped": r.skipped,
+                }
+                for r in responses
             ]
         }
     )

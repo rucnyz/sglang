@@ -1717,6 +1717,7 @@ class MigrateAginferReq(BaseReq):
 @dataclass
 class MigrateAginferReqOutput(BaseReq):
     applied: int
+    applied_hashes: List[str]
     skipped: List[Dict[str, Any]]
 
 

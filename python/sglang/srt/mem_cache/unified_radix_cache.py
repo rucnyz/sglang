@@ -2190,7 +2190,10 @@ class UnifiedRadixCache(BasePrefixCache):
     def apply_aginfer_migrations(self, actions: list[dict]) -> dict:
         """Apply a batch of paper §4 ``(u, τ_target)`` actions.
 
-        Returns ``{"applied": int, "skipped": [{"hash":..., "reason":...}]}``.
+        Returns ``{"applied": int, "applied_hashes": [...],
+                    "skipped": [{"hash":..., "reason":...}]}``.
+        ``applied_hashes`` lists the input hashes that actually mutated state,
+        so the daemon can prune its retry set without re-walking the tree.
         Unresolved actions never raise — the daemon re-issues idempotently
         on the next event.
 
@@ -2210,6 +2213,11 @@ class UnifiedRadixCache(BasePrefixCache):
                   "disk_tier_not_yet_wired".
         """
         # Build hash → node lookup with one DFS (O(N), same cost as state walk).
+        # Two hash schemes: HiCache-finalised nodes have a real hash_value
+        # (hex SHA-256); transient nodes fall back to ``node-<id>`` where
+        # ``id`` is a class-level monotonic counter that is NEVER recycled
+        # (UnifiedTreeNode.counter strictly increases), so the fallback name
+        # is also stable for the daemon's lifetime.
         hash_to_node = {}
         stack = [self.root_node]
         root = self.root_node
@@ -2223,6 +2231,7 @@ class UnifiedRadixCache(BasePrefixCache):
             stack.extend(node.children.values())
 
         applied = 0
+        applied_hashes: list[str] = []
         skipped: list[dict] = []
         components = self._components_tuple
         base = BASE_COMPONENT_TYPE
@@ -2260,6 +2269,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._remove_leaf_from_parent(node)
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 applied += 1
+                applied_hashes.append(h)
             elif target == "DRAM":
                 if has_device and has_host:
                     tracker = new_tracker()
@@ -2269,6 +2279,7 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                     self._update_evictable_leaf_sets(node)
                     applied += 1
+                    applied_hashes.append(h)
                 elif has_host:
                     skipped.append({"hash": h, "reason": "already_on_dram"})
                 elif has_device:
@@ -2291,7 +2302,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     {"hash": h, "reason": f"unknown_target_tier:{target!r}"}
                 )
 
-        return {"applied": applied, "skipped": skipped}
+        return {"applied": applied, "applied_hashes": applied_hashes, "skipped": skipped}
 
     # ---- aginfer daemon snapshot (paper §3 state s_t) ----
     def dump_aginfer_state(self) -> dict:
@@ -2400,6 +2411,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 if type(unit_hash) is not str:
                     unit_hash = str(unit_hash)
             else:
+                # Fallback for transient (pre-HiCache-backup) nodes.
+                # UnifiedTreeNode.counter strictly increases, so this name is
+                # stable for the daemon's lifetime (no id-recycle aliasing).
                 unit_hash = f"node-{node.id}"
             try:
                 sids = node.session_ids
@@ -2486,6 +2500,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 if type(unit_hash) is not str:
                     unit_hash = str(unit_hash)
             else:
+                # Fallback for transient (pre-HiCache-backup) nodes.
+                # UnifiedTreeNode.counter strictly increases, so the
+                # name stays stable for the daemon's lifetime.
                 unit_hash = f"node-{node.id}"
             try:
                 sids = node.session_ids
@@ -2497,8 +2514,8 @@ class UnifiedRadixCache(BasePrefixCache):
             else:
                 units_buf += b","
             units_buf += b'{"hash":"'
-            # hex SHA-256 / "node-<int>" — both JSON-safe ASCII, never
-            # contain "/\\" / control chars.
+            # Hash bytes (hex SHA-256 or numeric str) are JSON-safe ASCII;
+            # the radix never emits "/", "\\" or control chars.
             buf_extend(unit_hash.encode("ascii", "backslashreplace"))
             units_buf += b'","tier":'
             units_buf += tier_lit

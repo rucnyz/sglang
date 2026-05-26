@@ -3362,6 +3362,7 @@ class Scheduler(
         if apply is None:
             return MigrateAginferReqOutput(
                 applied=0,
+                applied_hashes=[],
                 skipped=[
                     {
                         "hash": a.get("hash"),
@@ -3373,6 +3374,7 @@ class Scheduler(
         result = apply(recv_req.actions or [])
         return MigrateAginferReqOutput(
             applied=int(result.get("applied", 0)),
+            applied_hashes=list(result.get("applied_hashes", [])),
             skipped=list(result.get("skipped", [])),
         )
 

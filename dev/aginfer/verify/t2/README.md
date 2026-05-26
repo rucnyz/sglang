@@ -20,9 +20,15 @@
 | Failure mode | How to force | Predicted floor | Assertion |
 |---|---|---|---|
 | hash-not-found race | Insert a node, capture its hash, internally `_evict_device_leaf` to remove it; immediately POST `/aginfer/migrate` for that hash | response is `{applied: 0, skipped: [{hash: X, reason: not_in_tree}]}`; no exception | parse response, assert structure + counts |
-| HiCache backup target tier full (audit #14, deterministic version) | Fill DRAM to 100 % via real warmup (load N×page_size tokens into the host pool with a tight in-process loop until `tier_usage.DRAM.used_bytes ≈ cap_bytes`). Then POST 1k migrate(target=DRAM) actions for HBM-resident hashes | Every action returns `{skipped: capacity_full}`; cache state unchanged; daemon's idempotent re-issue does NOT amplify (sees no progress, but doesn't crash) | poll /aginfer/state to confirm pre+post are identical, assert response shape |
-| Capacity-full promote | HBM at 100 %, POST migrate(X, HBM); | response `{applied: 0, skipped: [{hash: X, reason: capacity_full}]}`; no eviction triggered as side-effect | state assert |
-| 1000 actions / batch under load | Insert 10 k nodes, drive concurrent traffic at 30 RPS, then POST a single migrate with 1 k random actions | per-action amortized < 2 ms (= 2× ceiling under load); no daemon timeout | timeit, assert |
+| unknown target_tier (typo / version skew) | POST migrate with `target_tier="DOESNOTEXIST"` for a live hash | response `{applied: 0, skipped: [{hash: X, reason: unknown_target_tier:'DOESNOTEXIST'}]}`; no exception | parse, assert reason substring |
+| DISK tier in v1 (not wired) | POST migrate with `target_tier="DISK"` for a live hash | response `{applied: 0, skipped: [{hash: X, reason: disk_tier_not_yet_wired}]}` | parse, assert reason |
+| Malformed payload | POST migrate with `{}`, `{"actions": "not a list"}`, or non-JSON body | HTTP 400 on all three; no exception, no partial mutation | requests + status assert |
+| DRAM demote with no host backup (v1 contract) | POST migrate(target=DRAM) for an HBM-only hash (no HiCache backup populated) | response `{applied: 0, skipped: [{hash: X, reason: demote_requires_existing_host_backup}]}` — same safety floor as HiCache-full, the daemon retries idempotently | parse, assert reason |
+| Slow-path 1k batch latency (real DROPs) | warm 60+ distinct leaves, POST migrate(target=DROP) for all of them | per-action amortized < 1 ms; all real targets actually evict | timeit + causal absence check |
+| Idempotent replay | POST migrate(DROP) once for hashes H1..Hn; capture {applied}; immediately POST the same batch again with no traffic in between | second response has `applied == 0`; reasons ⊆ {`not_in_tree`, `no_data`, `not_a_leaf`}; no crash | strict applied==0 assert |
+| HiCache backup target tier full (audit #14) — deferred to T9/Run K | Fill DRAM to 100 % via real warmup under `--enable-hierarchical-cache`. Then POST 1k migrate(target=DRAM) actions for HBM-resident hashes | Daemon falls back via `demote_requires_existing_host_backup` until backup_thread catches up; once host is full the response carries the existing HiCache pool's `out_of_capacity` skip reason verbatim. Idempotent re-issue does NOT amplify | requires HiCache; exercised in T9 |
+| Capacity-full promote — deferred to T9 | HBM at 100 %, POST migrate(target=HBM) for a DRAM hash | v1 returns `promote_not_yet_wired`; promote semantics land in T9 when the kv_scheduler decides promotions explicitly | T9 |
+| 1000 actions / batch under 30 RPS load — deferred to T10 | Insert 10 k nodes, drive concurrent traffic at 30 RPS, then POST a single migrate with 1 k random actions | per-action amortized < 2 ms (= 2× ceiling under load); no daemon timeout | T10 (requires RPS generator) |
 
 ## HOW WE VERIFY
 
@@ -44,27 +50,60 @@ Mechanism. `verify/t2_migrate_endpoint.py`:
 
 ## RESULTS
 
-**PASSED** — happy path (DROP) + 4 forced-injection worst-case rows. Run on Qwen3-0.6B + `--attention-backend flashinfer`, GPU 7, single-DP.
+**PASSED** — happy path + 4 in-suite worst-case rows + audit-tightened replay
+test. Run on Qwen3-0.6B + `--attention-backend flashinfer`, GPU 7, single-DP.
+Three rows of the predicted contract are deferred to T9/T10 with explicit
+justifications below — none of them are environmentally reachable on the
+smoke harness without HiCache or an RPS generator.
 
-* date: 2026-05-25
+* date: 2026-05-26
 * sglang sha: (this commit)
-* lines added: ~120 (io_struct + scheduler dispatch + mixin pair + HTTP handler + tree migration logic)
-* DROP applied: ✓ 21 of 44 HBM units successfully dropped (the other 23 were internal nodes → `not_a_leaf` reason, daemon should drop bottom-up). All 21 reported-applied hashes were gone from `/aginfer/state` on re-fetch.
-* DRAM demote: not yet exercised — requires HiCache backup to populate `host_value`. Smoke test runs without `--enable-hierarchical-cache`. v1 contract: returns `demote_requires_existing_host_backup` skip reason. Will exercise in T9 / Run K (V4-Flash + HiCache).
-* HBM promote: not yet wired (v1 contract). Returns `promote_not_yet_wired`. Daemon falls back to sglang's normal cache-hit auto-load.
+* lines added: ~150 across 5 files (io_struct + scheduler dispatch + mixin
+  pair + HTTP handler + tree migration logic)
+* DROP applied: ✓ 21 leaves of 44 HBM units in round 1; the other 23 were
+  internal nodes (`not_a_leaf`, daemon should drop bottom-up). All 21
+  server-reported `applied_hashes` were absent in the immediately-after
+  state snapshot (causal check ✓). Server cannot fabricate hashes outside
+  the pre-snapshot — verified.
+* DROP cascade (audit Q6): round-2 replay of the same batch applied 20 more
+  hashes, ALL drawn from round-1's `not_a_leaf` bucket (size 23). This is
+  the bottom-up cascade the design promises, not unstable addressing.
+* DRAM demote: not yet exercised — requires HiCache backup to populate
+  `host_value`. v1 contract: returns `demote_requires_existing_host_backup`
+  skip reason for HBM-only nodes. Will exercise in T9 / Run K with
+  `--enable-hierarchical-cache`.
+* HBM promote: not wired (v1). Returns `promote_not_yet_wired`. v1 falls
+  back to sglang's normal cache-hit auto-load.
 * DISK tier: returns `disk_tier_not_yet_wired` (v1 contract).
-* not_in_tree: 2 bogus hashes → both skipped with correct reason.
-* unknown target_tier: 1 bogus tier → skipped with `unknown_target_tier:'...'` reason.
+* not_in_tree: 2 bogus hashes → both skipped correctly.
+* unknown target_tier: 1 bogus tier → skipped with `unknown_target_tier:'...'`.
 * Malformed payload (empty, non-list actions, non-JSON body): all return 400.
 * Per-action latency:
-  - 44-action mixed (real hashes): **0.14 ms/action** (6 ms total)
-  - 1000-action all-bogus (not_in_tree fast path): **0.010 ms/action** (10 ms total)
-  - both well under the 1 ms/action ceiling.
-* Idempotent replay: re-issuing the same DROP set after the targets are gone returns sane responses — no crash.
-* raw log: `results/<YYYYMMDD_HHMMSS>_run1.log`
+  - **Slow path** (147-action batch, real targets, 61 actual DROPs):
+    **0.044 ms/action** (6 ms total). This is the ceiling-relevant path.
+  - **Fast path** (1000-action all-bogus → not_in_tree dict miss):
+    **0.007 ms/action** (7 ms total). Sanity floor.
+  - Original v1 verify only measured the fast path; audit Q3 flagged this.
+    The slow path is now first-class. Both are 23× under the 1 ms/action
+    ceiling.
+* raw log: `results/<YYYYMMDD_HHMMSS>_run2.log`
 
 ### Caveats (deferred, NOT regressions)
 
-* HiCache backup capacity-full row of the worst-case table (#14) is deferred to T9 / Run K because it requires `--enable-hierarchical-cache`. v1 daemon already refuses DRAM demote without a host backup, so the failure mode reduces to `demote_requires_existing_host_backup` — equivalent safety floor.
-* HBM-promote-under-capacity-full row is deferred for the same reason: HBM promote is not yet wired in v1; v1 simply trusts sglang's normal cache-hit auto-load. Promote semantics will land in T9.
-* 1k-actions-under-30RPS row tested without concurrent traffic; ran 1000-action batch standalone since RPS generator is not yet wired. T10 will re-run this under concurrent load.
+* **HiCache backup capacity-full row** — predicted `out_of_capacity` skip
+  reason verbatim from the existing HiCache pool. Deferred to T9/Run K
+  because it requires `--enable-hierarchical-cache`. On the smoke harness
+  the failure mode reduces to `demote_requires_existing_host_backup`, which
+  is the same safety floor: the daemon retries idempotently, no amplification.
+* **HBM promote under capacity-full** — deferred to T9 along with promote
+  semantics. v1 returns `promote_not_yet_wired`; the next-request cache-hit
+  path auto-loads back.
+* **1k-actions-under-30RPS concurrency row** — deferred to T10 (requires RPS
+  generator). The standalone slow-path measurement at 0.044 ms/action gives
+  us 22× headroom under the 2× cost-under-load ceiling.
+* Behavioral note: `node.id` (used in the `node-<id>` fallback for
+  pre-HiCache-backup nodes) comes from `UnifiedTreeNode.counter`, a
+  class-level **monotonic** counter that strictly increases for the lifetime
+  of the process — id-recycle aliasing is impossible. The auditor's
+  initial concern (replay applying 21 to the "same" hashes after they
+  vanished) turned out to be the cascade behavior, not address instability.
