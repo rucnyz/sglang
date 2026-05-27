@@ -30,7 +30,12 @@ cleanup() {
     [[ -n "${SGLANG_PID:-}" ]] && kill "$SGLANG_PID" 2>/dev/null
     [[ -n "${MOONCAKE_PID:-}" ]] && kill "$MOONCAKE_PID" 2>/dev/null
     sleep 3
-    pkill -9 -f "thunderagent" 2>/dev/null
+    # IMPORTANT: `-f thunderagent` would match this very script's path
+    # (/scratch/.../verify/t9/run_thunderagent.sh) → self-SIGKILL → cleanup
+    # stops mid-flight → next cycle's GPU pre-flight HALTs.  Use specific
+    # patterns that match only the actual TA process cmdline.
+    pkill -9 -f "thunderagent --host" 2>/dev/null  # actual TA bin invocation
+    pkill -9 -f "python.*-m ThunderAgent" 2>/dev/null  # alternative entry
     pkill -9 -f "python.*sglang\\.launch_server" 2>/dev/null
     pkill -9 -f "sglang::" 2>/dev/null
     pkill -9 -f "mooncake_master" 2>/dev/null
