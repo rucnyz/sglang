@@ -93,20 +93,39 @@ matter on the current dataset — not because the design is wrong,
 but because the workload's variance is dominated by decode-bound
 outliers.
 
-## Confirmatory test (plan B from goal)
+## Confirmatory test (plan B): H'_now N=3 matrix (no daemon)
 
-Run a single fresh harbor cycle with `--ak max_completion_tokens
-=4096` (or similar) and `temperature=0.0` kept.  Expected outcome:
-* mean per-trial time drops to ~ 300–500 s (close to Run H' 885 s
-  or below — H' likely had similar / smaller runaways)
-* runaway-request fraction → 0
-* now any T11a / KV-scheduling delta would actually be visible.
+Ran 2026-05-27: 3 cycles of `harbor → sglang :30000 directly`, no
+daemon, same `temperature=0.0 seed=42 -l 32 -n 32`, same sglang
+HEAD as the matrix.  Discriminates whether daemon proxy itself
+explains any of the gap to historical H' 885 s.
 
-If that confirms, **the right T11 evaluation protocol is**:
-* keep temperature=0.0 seed=42 (reproducibility)
-* cap completion_tokens at workload-realistic value (4k)
-* THEN run a matrix to see if KV scheduling helps the remaining
-  prefix-reuse-bound traffic
+| config | N=3 per-trial mean (s) | Δ vs matrix baseline |
+|---|---|---|
+| matrix baseline (daemon, kv_off settings) | 1389.3 ± 39.7 | — |
+| matrix ours (daemon, T11a) | 1344.0 ± 54.6 | −45 (noise) |
+| **H'_now (NO daemon, direct)** | **1392.8 ± 53.6** | **+3.5 (noise)** |
+
+H'_now ≈ matrix baseline.  **Daemon proxy contributes 3.5 s/trial
+at most — not 500 s.**  The "gap to Run H' 885 s" is NOT from the
+daemon proxy.
+
+So the original "500 s gap" is fully accounted for by:
+1. **Setting drift** — historical H' didn't use `temperature=0`;
+   under default sampling the model's stochastic decoding has
+   probabilistic escape from runaway-generation patterns.  Once
+   we pinned `temperature=0` (this matrix), runaways dominate.
+2. **sglang HEAD drift** — multiple internal edits since H'
+   (UnifiedRadixCache wire-contract, peek_time_counter,
+   --log-requests overhead, --enable-cache-report) — each small,
+   collectively non-trivial.
+3. **Possible model/agent prompt drift** — DeepSeek-V4-Flash
+   weights and terminus-2 prompt are pulled fresh, not pinned.
+
+**For T11 design**: see "Implications" above.  daemon-side and
+inline-side T11a are both equally unable to help runaway requests.
+The real path forward for a clean KV-scheduling eval is to cap
+`max_completion_tokens` so runaways can't dominate.
 
 ## Files
 
