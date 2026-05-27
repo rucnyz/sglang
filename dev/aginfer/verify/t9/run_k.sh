@@ -111,6 +111,11 @@ cleanup() {
     done
     # Harbor docker leftovers.  Pipe failure (no match) is fine.
     docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'instance_|swebenchpro' | xargs -r docker kill 2>/dev/null
+    # Reap orphaned networks (Docker's default bridge pool has ~30
+    # /24 slots; without `docker compose down`, networks linger across
+    # killed runs and eventually `up` fails with
+    # "all predefined address pools have been fully subnetted").
+    docker network prune -f 2>/dev/null
     # End cleanup with explicit success so the EXIT trap doesn't
     # propagate a cosmetic non-zero from the last pipe (docker ps |
     # grep with no match) into the script's exit code.
