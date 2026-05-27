@@ -90,8 +90,14 @@ cleanup() {
     # Force-kill the full process trees.  Match by cmdline substring
     # since Linux truncates comm to 15 chars (sglang::scheduler →
     # sglang::schedul) — a pkill on the full name silently misses.
-    pkill -9 -f "daemon.main" 2>/dev/null
-    pkill -9 -f "sglang" 2>/dev/null      # catches launch_server, srt, schedul, detoken, tp
+    #
+    # IMPORTANT: do NOT match bare "sglang" with -f because our script
+    # path /scratch/.../sglang/dev/aginfer/verify/... contains "sglang",
+    # so `pkill -f sglang` would SIGKILL this very script and skip the
+    # rest of cleanup.  Use specific patterns instead.
+    pkill -9 -f "daemon\\.main" 2>/dev/null
+    pkill -9 -f "python.*sglang\\.launch_server" 2>/dev/null  # parent process
+    pkill -9 -f "sglang::" 2>/dev/null                         # scheduler / detokenizer / TP children
     pkill -9 -f "mooncake_master" 2>/dev/null
     sleep 2
     # Drain any remaining zombies (PPID=1, state=Z) — the kernel

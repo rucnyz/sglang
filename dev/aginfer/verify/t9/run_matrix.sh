@@ -69,9 +69,23 @@ for i in "${!CYCLES[@]}"; do
     echo "[matrix] $(date '+%Y-%m-%d %H:%M:%S') cycle ${cycle_idx} done"
     echo ""
 
-    # Cool-off between cycles: give the kernel + nvidia-smi time to
-    # actually reap the zombies the cleanup tried to drain.
-    sleep 5
+    # Cool-off between cycles: actively wait for GPU memory to drop
+    # below pre-flight threshold (1024 MiB).  Without this, cleanup's
+    # SIGKILL'd processes still hold VRAM for 5–20s after death and
+    # the next cycle's pre-flight check trips a false HALT.
+    IFS=',' read -ra _GPU_LIST <<< "${AGINFER_GPUS:-4,7}"
+    for tick in $(seq 1 30); do
+        all_clear=1
+        for gpu in "${_GPU_LIST[@]}"; do
+            used=$(nvidia-smi -i "$gpu" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+            if (( ${used:-0} > 1024 )); then all_clear=0; fi
+        done
+        if (( all_clear )); then
+            echo "[matrix] GPU drain confirmed @ tick $tick"
+            break
+        fi
+        sleep 2
+    done
 done
 
 echo "[matrix] all cycles attempted.  Results under $MATRIX_ROOT/cycleN_<cfg>/"
