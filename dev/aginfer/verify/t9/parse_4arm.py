@@ -84,16 +84,20 @@ def main():
     # 2. TA  — new
     arms["TA"] = arm_cycles_for_lru_ta("TA")
 
-    # 3. OURS_inline — from previous H'_now matrix
-    h_prime_root = sorted(find_dirs("run_H_prime_now_matrix_*"))
+    # 3. OURS_inline — from previous H'_now matrix.
+    # Pattern `run_H_prime_now_matrix_*` matches BOTH the matrix root
+    # and its sibling cycleN dirs (`...matrix_TAG_cycleN`).  Exclude
+    # the latter by requiring no `_cycle\d+$` suffix.
+    h_prime_root = [
+        d for d in find_dirs("run_H_prime_now_matrix_*")
+        if not re.search(r"_cycle\d+$", d.name)
+    ]
     if h_prime_root:
-        # use the matrix root's cycleN symlinks
         cycle_dirs = []
         for p in h_prime_root[-1].iterdir():
             if p.is_symlink() and re.match(r"cycle\d+_h_prime_now", p.name):
                 cycle_dirs.append(p.resolve())
         if not cycle_dirs:
-            # fallback: the sibling cycleN dirs
             tag = h_prime_root[-1].name.replace("run_H_prime_now_matrix_", "")
             for i in (1, 2, 3):
                 p = RESULTS / f"run_H_prime_now_matrix_{tag}_cycle{i}"
