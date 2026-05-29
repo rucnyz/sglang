@@ -68,10 +68,16 @@ def find_dirs(pattern: str):
 
 
 def arm_cycles_for_lru_ta(cfg: str):
-    # New 4-arm cycles
+    # 4-arm cycles + extension cycles
     dirs = []
     for p in find_dirs(f"run_{cfg}_now_matrix_*"):
+        if not re.search(r"_cycle\d+_(lru|ta|h_prime_now)$", p.name):
+            continue  # skip matrix root dirs without a cycle suffix
         dirs.append(p)
+    # Also include extension cycles (run_LRU_now_extend_*)
+    for p in find_dirs(f"run_{cfg}_now_extend_*"):
+        if re.search(r"_cycle\d+_(lru|ta)$", p.name):
+            dirs.append(p)
     return dirs
 
 
@@ -106,14 +112,19 @@ def main():
         arms["OURS_inline"] = cycle_dirs
 
     # 4. OURS_full — from previous matrix (cycles 2/4/6 are "ours")
+    # plus any extension cycles (run_K_full_extend_*).
     matrix_root = sorted(find_dirs("run_K_matrix_*"))
+    cycle_dirs = []
     if matrix_root:
-        cycle_dirs = []
         for i in (2, 4, 6):
             for p in find_dirs(f"run_K_full_matrix_*_cycle{i}_ours"):
                 cycle_dirs.append(p)
                 break
-        arms["OURS_full"] = cycle_dirs
+    # Extension cycles
+    for p in find_dirs("run_K_full_extend_*"):
+        if re.search(r"_cycle\d+_ours$", p.name):
+            cycle_dirs.append(p)
+    arms["OURS_full"] = cycle_dirs
 
     print("# T9 4-arm fairness matrix\n")
     print(f"Generated: {datetime.now().isoformat()}\n")

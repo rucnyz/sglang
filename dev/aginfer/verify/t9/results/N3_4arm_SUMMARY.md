@@ -66,62 +66,92 @@ current `temperature=0.0 seed=42` settings.
 
 **Across-cycle**: **1344.0 ± 54.6 s**
 
-## Final ranking (by per-trial mean)
+## Final ranking (by per-trial mean) — N=4 LRU + N=4 OURS_full
 
-| rank | arm | mean ± std (s) | Δ vs LRU |
-|---|---|---|---|
-| 1 | **OURS_full** | **1344.0 ± 54.6** | **−127.8 (8.7 % faster)** |
-| 2 | OURS_inline | 1392.8 ± 53.6 | −79.0 (5.4 %) |
-| 3 | TA | 1429.4 ± 62.4 | −42.4 (2.9 %) |
-| 4 | LRU | 1471.8 ± 104.7 | baseline |
+After +1+1 extension cycle on GPUs 0,1 (2026-05-29):
+
+| rank | arm | N | mean ± std (s) | Δ vs LRU |
+|---|---|---|---|---|
+| 1 | **OURS_full** | **4** | **1391.7 ± 105.3** | **−123.4 (8.1 %)** |
+| 2 | OURS_inline | 3 | 1392.8 ± 53.6 | −122.3 (8.1 %) |
+| 3 | TA | 3 | 1429.4 ± 62.4 | −85.7 (5.7 %) |
+| 4 | LRU | 4 | 1515.1 ± 121.7 | baseline |
 
 Ordering matches paper §8 expectation: **OURS > TA > LRU**.
 
-## Pairwise Welch t-tests
+(N=3 means before extension were: OURS_full 1344.0 ± 54.6,
+LRU 1471.8 ± 104.7.  Adding one GPU-0,1 cycle to each arm
+inflated their mean **and** ~doubled their stdev — see GPU
+confound below.)
 
-| arm A | arm B | A mean ± std | B mean ± std | Δ (A−B) | SE | z |
-|---|---|---|---|---|---|---|
-| LRU | OURS_full | 1471.8 ± 104.7 | 1344.0 ± 54.6 | **+127.8** | 68.2 | **+1.87** |
-| TA | OURS_full | 1429.4 ± 62.4 | 1344.0 ± 54.6 | +85.4 | 47.9 | +1.78 |
-| LRU | OURS_inline | 1471.8 ± 104.7 | 1392.8 ± 53.6 | +79.0 | 67.9 | +1.16 |
-| OURS_inline | OURS_full | 1392.8 ± 53.6 | 1344.0 ± 54.6 | +48.8 | 44.2 | +1.10 |
-| TA | OURS_inline | 1429.4 ± 62.4 | 1392.8 ± 53.6 | +36.6 | 47.5 | +0.77 |
-| LRU | TA | 1471.8 ± 104.7 | 1429.4 ± 62.4 | +42.4 | 70.4 | +0.60 |
+## Pairwise Welch t-tests (N=4 LRU + N=4 OURS_full + N=3 others)
 
-* No pair reaches |z| > 2 (95 % CI cutoff).
-* **OURS_full vs LRU** is the closest at **z = +1.87**
-  (one-sided p ≈ 0.031, two-sided p ≈ 0.062 — *marginally
-  significant*).
-* The 9 % spread in mean across the 4 arms is consistent with the
-  paper §8 ordering but N=3 doesn't have enough power to call
-  pairwise wins above noise.
+| arm A | arm B | A mean ± std | B mean ± std | Δ (A−B) | SE | z | two-sided p |
+|---|---|---|---|---|---|---|---|
+| LRU | OURS_inline | 1515.1 ± 121.7 | 1392.8 ± 53.6 | +122.3 | 68.2 | +1.79 | 0.073 |
+| LRU | OURS_full | 1515.1 ± 121.7 | 1391.7 ± 105.3 | +123.4 | 80.4 | +1.53 | 0.125 |
+| LRU | TA | 1515.1 ± 121.7 | 1429.4 ± 62.4 | +85.7 | 70.7 | +1.21 | 0.225 |
+| TA | OURS_inline | 1429.4 ± 62.4 | 1392.8 ± 53.6 | +36.6 | 47.5 | +0.77 | 0.441 |
+| TA | OURS_full | 1429.4 ± 62.4 | 1391.7 ± 105.3 | +37.7 | 63.8 | +0.59 | 0.555 |
+| OURS_inline | OURS_full | 1392.8 ± 53.6 | 1391.7 ± 105.3 | +1.1 | 61.0 | +0.02 | 0.984 |
+
+* No pair reaches |z| > 1.96 (95 % CI cutoff).
+* Best pair after extension: **LRU vs OURS_inline z = +1.79
+  (p ≈ 0.07)**.  LRU vs OURS_full *dropped* from z=1.87 (N=3) to
+  z=1.53 (N=4) because the new OURS_full cycle on GPUs 0,1 came
+  in at 1534.7 s (vs ~1344 s on GPUs 4,7) and roughly doubled the
+  OURS_full stdev.
+* The 4-arm ordering is preserved but **all pairwise differences
+  are now in the noise**.
+
+### N=3 (GPUs 4,7-dominant) snapshot for reference
+
+Before the extension cycle on 0,1, the N=3 numbers were:
+
+| pair | Δ | z |
+|---|---|---|
+| LRU vs OURS_full | 127.8 | **+1.87** (p ≈ 0.062) |
+| TA vs OURS_full | 85.4 | +1.78 |
+
+That snapshot was the strongest signal we got; adding one more
+0,1-cycle each diluted it (variance grew faster than √N could
+compensate).
 
 ## Caveats
 
-### GPU-pair confound
+### GPU-pair confound (the dominant noise source)
 
-Cycles 1, 3 (LRU) and 2 (TA) ran on **GPUs 4, 7**.
-Cycles 4, 6 (TA) and 5 (LRU) ran on **GPUs 0, 1** (after a forced
-switch when other users took 4, 7).  OURS_inline and OURS_full
-ran entirely on GPUs 4, 7.
+The 2026-05-29 +1+1 extension exposed a much larger GPU-pair
+effect than expected.  Per-GPU-pair means:
 
-If GPUs 0, 1 are systematically slower (different NVLink lane,
-PCIe topology, or memory bandwidth) than 4, 7, this would
-inflate LRU's and TA's measured mean — making OURS look better
-than it is.
+| arm | GPUs 4, 7 | GPUs 0, 1 | Δ (0,1 − 4,7) |
+|---|---|---|---|
+| LRU | 1412 s (N=2) | **1618 s (N=2)** | **+206 s** |
+| TA | 1455 s (N=1) | 1417 s (N=2) | −38 s |
+| OURS_full | 1344 s (N=3) | **1534 s (N=1)** | **+190 s** |
+| OURS_inline | 1393 s (N=3) | — | — |
 
-Within-GPU partial comparison (GPUs 4, 7 only):
-* LRU (N=2 of 3 cycles): 1412 s
-* TA (N=1 of 3 cycles): 1455 s
-* OURS_inline (N=3): 1393 s
-* OURS_full (N=3): 1344 s
+GPUs 0,1 are systematically **~200 s slower than 4,7** for LRU
+and OURS_full — that's **larger than the scheduler-vs-scheduler
+spread** (≈128 s).  When the two pairs are mixed in one arm, the
+within-arm stdev roughly doubles and the Welch z drops.
 
-Ordering still preserved (OURS_full < OURS_inline < LRU), but TA
-flips to ≈ LRU at N=1 on the cleaner pair.  Not enough data to
-conclude.
+This is now the biggest single source of noise in the matrix.
+TA happens to have the opposite sign for its 0,1 vs 4,7 delta,
+which is presumably variance in its own right (TA has N=1 on 4,7).
 
-Closing this cleanly would require redoing the LRU and TA arms
-fully on GPUs 4, 7 — another ~6 cycles, ~6 h GPU time.
+### Closing the confound
+
+The right scientific fix is to redo LRU and OURS_full
+exclusively on a single GPU pair (4,7) for at least N=4 each
+(~4–5 hours GPU time on a quiet machine), then re-aggregate.
+We have **not** done this — at the time of writing GPUs 4, 7
+are occupied by other users for an indeterminate window.
+
+Alternative paper-level fix per `N3_GAPS.md` §4: change the
+workload (cap `max_completion_tokens`, shrink KV pool) to push
+the scheduler-driven Δ above the GPU-pair noise; then the
+confound becomes negligible.
 
 ### Runaway dominance
 
