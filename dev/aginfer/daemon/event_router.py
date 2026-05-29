@@ -193,9 +193,15 @@ class EventRouter:
     # ---- worker ----
 
     async def _event_worker(self) -> None:
+        from ._metrics import m as _m
         while True:
             event = await self.bus.queue.get()
             self.events_received += 1
+            _m(
+                "event_received",
+                kind=event.kind.value,
+                sid=event.session if event.session else "-",
+            )
             try:
                 async with self._dispatch_lock:
                     handler = self._handlers.get(

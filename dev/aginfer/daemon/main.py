@@ -137,6 +137,30 @@ def main(argv=None) -> None:
         args.sglang_base_url, args.port,
     )
 
+    # Register a shutdown handler that dumps cumulative counters as a
+    # single structured-metric line.  parse_daemon_events.py looks
+    # for `event=cycle_summary`.  Wall-clock side: this fires once per
+    # daemon lifetime, on SIGTERM/SIGINT; cost is negligible.
+    @app.on_event("shutdown")
+    async def _emit_cycle_summary():  # type: ignore[unused-function]
+        from ._metrics import m as _m
+        kv_calls = sched.migrate_calls if sched is not None else 0
+        kv_decisions = sched.decisions if sched is not None else 0
+        adm_pauses = admission.pause_decisions if admission is not None else 0
+        adm_resumes = admission.resume_decisions if admission is not None else 0
+        _m(
+            "cycle_summary",
+            events_received=router.events_received,
+            events_handled=router.events_handled,
+            handler_failures=router.handler_failures,
+            kv_decisions=kv_decisions,
+            kv_migrate_calls=kv_calls,
+            adm_pauses=adm_pauses,
+            adm_resumes=adm_resumes,
+            theta_hi=args.theta_hi,
+            theta_lo=args.theta_lo,
+        )
+
     uvicorn.run(
         app, host=args.host, port=args.port, log_level=args.log_level
     )

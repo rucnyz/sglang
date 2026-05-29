@@ -123,7 +123,15 @@ class ProgramTracker:
         overwrites the state (which is correct, because the caller
         successfully got past wait_if_paused).
         """
+        prev = self._states.get(pid)
         self._states[pid] = State.REASONING
+        from ._metrics import m as _m
+        _m(
+            "program_state",
+            pid=pid,
+            from_=prev.value if prev is not None else "NONE",
+            to="REASONING",
+        )
 
     def observe_completion(self, pid: str) -> None:
         """Mark the response stream end / unary completion for ``pid``.
@@ -135,6 +143,8 @@ class ProgramTracker:
         """
         if self._states.get(pid) == State.REASONING:
             self._states[pid] = State.ACTING
+            from ._metrics import m as _m
+            _m("program_state", pid=pid, from_="REASONING", to="ACTING")
 
     # ---- admission_controller hooks ----
 
@@ -146,9 +156,17 @@ class ProgramTracker:
         PAUSED entry so a later arrival blocks correctly (worst-case
         row in T6 README).
         """
+        prev = self._states.get(pid)
         self._states[pid] = State.PAUSED
         self._event(pid).clear()
         logger.info("program_tracker: paused %s", pid)
+        from ._metrics import m as _m
+        _m(
+            "program_state",
+            pid=pid,
+            from_=prev.value if prev is not None else "NONE",
+            to="PAUSED",
+        )
 
     def resume(self, pid: str) -> None:
         """Release any waiter blocked on ``wait_if_paused(pid)``.

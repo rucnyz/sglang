@@ -573,7 +573,33 @@ class KvScheduler:
                 "kv_scheduler: /aginfer/state fetch failed for %s: %r",
                 event.kind.value, exc,
             )
+            from ._metrics import m as _m
+            _m("state_fetch_failed", kind=event.kind.value)
             return
+        # Emit HBM/DRAM occupancy snapshot for every handled event.
+        # (Bounded ~10k–20k lines per cycle; ~16 ms wall.)  This is the
+        # raw data behind T9 G5 (HBM occ trajectory).
+        from ._metrics import m as _m
+        try:
+            tu = (_flatten_per_rank(state_json)).get("tier_usage") or {}
+            hbm = tu.get("HBM", {})
+            dram = tu.get("DRAM", {})
+            occ_hbm = (
+                int(hbm.get("used_bytes", 0)) / max(int(hbm.get("cap_bytes", 1)), 1)
+            )
+            occ_dram = (
+                int(dram.get("used_bytes", 0)) / max(int(dram.get("cap_bytes", 1)), 1)
+            )
+            n_units = len(state_json.get("units") or [])
+            _m(
+                "state_fetched",
+                kind=event.kind.value,
+                occ_hbm=occ_hbm,
+                occ_dram=occ_dram,
+                units=n_units,
+            )
+        except Exception:  # noqa: BLE001
+            pass  # metric emission must not break the worker
         try:
             sched_state = build_paper_state(
                 state_json,
@@ -584,10 +610,17 @@ class KvScheduler:
             )
         except Exception:  # noqa: BLE001
             logger.exception("kv_scheduler: build_paper_state raised; skip")
+            _m("kv_decide", kind=event.kind.value, outcome="build_state_raised")
             return
         self.last_decision_set_size = len(sched_state.decision_set)
         if not sched_state.decision_set:
             # Nothing to decide on (e.g. LLM_PREFILL or empty top-k).
+            _m(
+                "kv_decide",
+                kind=event.kind.value,
+                dset_size=0,
+                outcome="empty_decision_set",
+            )
             return
         action = self.policy.decide(sched_state)
         self.decisions += 1
@@ -595,7 +628,20 @@ class KvScheduler:
         if not action.assignments:
             # Policy declined to migrate — paper §7 says this happens
             # whenever Vt is non-positive for every alternative tier.
+            _m(
+                "kv_decide",
+                kind=event.kind.value,
+                dset_size=self.last_decision_set_size,
+                outcome="policy_declined",
+            )
             return
+        _m(
+            "kv_decide",
+            kind=event.kind.value,
+            dset_size=self.last_decision_set_size,
+            action_n=len(action.assignments),
+            outcome="dispatched",
+        )
         await self._dispatch_migrate(action.assignments)
 
     async def _dispatch_migrate(
@@ -604,12 +650,14 @@ class KvScheduler:
         body = {"actions": assignments_to_wire(assignments)}
         client = await self.ensure_client()
         url = f"{self.sglang_base_url}/aginfer/migrate"
+        from ._metrics import m as _m
         try:
             r = await client.post(url, json=body)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "kv_scheduler: migrate POST raised: %s", exc
             )
+            _m("migrate_post", status="exception", n_actions=len(assignments))
             return
         self.migrate_calls += 1
         if r.status_code >= 400:
@@ -617,6 +665,28 @@ class KvScheduler:
                 "kv_scheduler: migrate returned %d: %s",
                 r.status_code, r.text[:200],
             )
+            _m(
+                "migrate_post",
+                status=r.status_code,
+                n_actions=len(assignments),
+                applied=0,
+            )
+            return
+        # Parse sglang's response for applied vs skipped counts.
+        try:
+            resp = r.json()
+            applied = int(resp.get("applied") or 0)
+            skipped = len(resp.get("skipped") or [])
+        except Exception:  # noqa: BLE001
+            applied = -1
+            skipped = -1
+        _m(
+            "migrate_post",
+            status=r.status_code,
+            n_actions=len(assignments),
+            applied=applied,
+            skipped=skipped,
+        )
 
 
 # ----------------------------------------------------------------- attach

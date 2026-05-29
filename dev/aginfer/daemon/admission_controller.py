@@ -192,6 +192,8 @@ class AdmissionController:
 
     async def _on_pressure(self, event: Event, router) -> None:  # noqa: ANN001
         """Pause the lowest-scoring program(s) until HBM occ < theta_hi."""
+        from ._metrics import m as _m
+        n_paused_this_event = 0
         for _ in range(self.max_pauses_per_event):
             try:
                 state_json = await router.fetch_state()
@@ -210,6 +212,17 @@ class AdmissionController:
             occ = self._hbm_occ(sched_state)
             if occ < self.theta_hi:
                 # Pressure cleared by the migrate (T7) or natural eviction.
+                # G9 — this branch quantifies "wasted RTT" when sglang's
+                # webhook fires at theta_hi=0.7 but admission only acts at
+                # theta_hi=0.85: occ in [0.7, 0.85) ⇒ we fetched state and
+                # declined here.
+                _m(
+                    "admission_pressure",
+                    occ=occ,
+                    theta_hi=self.theta_hi,
+                    will_act="false",
+                    paused_this_event=n_paused_this_event,
+                )
                 return
             scores = shared_aware_prog_scores(sched_state)
             # Filter out already-paused programs.
@@ -223,6 +236,13 @@ class AdmissionController:
                     "eligible victim (all programs already paused)",
                     occ, self.theta_hi,
                 )
+                _m(
+                    "admission_pressure",
+                    occ=occ,
+                    theta_hi=self.theta_hi,
+                    will_act="false",
+                    reason="no_eligible_victim",
+                )
                 return
             # Pick the LOWEST scoring program.  Tie-break by pid for
             # determinism (= FIFO of program_id string order, which
@@ -231,9 +251,17 @@ class AdmissionController:
             self.tracker.pause(victim)
             self._paused_fifo.append(victim)
             self.pause_decisions += 1
+            n_paused_this_event += 1
             logger.info(
                 "admission: paused %s (score=%.4g; HBM occ=%.3f >= %.3f)",
                 victim, eligible[victim], occ, self.theta_hi,
+            )
+            _m(
+                "admission_pause",
+                pid=victim,
+                score=float(eligible[victim]),
+                occ=occ,
+                theta_hi=self.theta_hi,
             )
 
     async def _on_resolved(self, event: Event, router) -> None:  # noqa: ANN001
@@ -300,6 +328,14 @@ class AdmissionController:
             logger.info(
                 "admission: resumed %s (oldest in FIFO; occ=%.3f < theta_lo=%.3f)",
                 victim, occ, self.theta_lo,
+            )
+            from ._metrics import m as _m
+            _m(
+                "admission_resume",
+                pid=victim,
+                occ=occ,
+                theta_lo=self.theta_lo,
+                fifo_remaining=len(self._paused_fifo),
             )
 
     # ---- helpers ----
