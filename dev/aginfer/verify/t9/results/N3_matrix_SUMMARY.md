@@ -87,4 +87,8 @@ Suggested next probes (all faster than another full matrix):
 * harbor results: `results/run_K_*_matrix_20260526_234639_cycleN_*/`
 * sglang_v4flash.log per cycle: same dirs
 * aggregate (this file): `verify/t9/results/N3_matrix_SUMMARY.md`
+* root cause of "500 s gap" vs Run H': `verify/t9/results/N3_ROOT_CAUSE.md`
+* per-request distribution: `verify/t9/results/N3_ttft_analysis.md`
+* **what's NOT measured / where the daemon's expected wins don't show**:
+  `verify/t9/results/N3_GAPS.md`
 * methodology: `verify/t9/methodology.md`
