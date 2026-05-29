@@ -1,5 +1,26 @@
 # T6 — program_tracker state machine
 
+## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
+
+> See also `verify/t9/results/N3_GAPS.md` for the cross-T catalog
+> of unmet ideals.
+
+* **No `ENDED` state.**  Tracker has only REASONING / ACTING /
+  PAUSED.  `state(pid)` returns `None` ONLY for never-observed
+  programs; a 200-turn trial that fully completed still shows as
+  ACTING forever.  No `mark_ended(pid)` API.
+* **`EventBus.forget(pid)` is a placeholder.**  Code comment says
+  *"v1 doesn't call this yet"*; called by nothing.
+* **No `SESSION_END` event kind.**  paper §4 has 8 events; we emit
+  6 + sglang webhook 2; there's no end-of-program signal at all.
+* **Consequence for T11a `program-alive` rule**: the rule keys on
+  `state(pid) is not None`, which over-counts dead programs as
+  alive.  Bounded over-estimation by N=trials, but it's a real
+  semantic hole.
+* **Ideal fix**: add `SESSION_END` `EventKind` + harbor / proxy
+  emit on connection close or trial-completion → tracker
+  `mark_ended(pid)` + `EventBus.forget(pid)`.
+
 ## WHAT WE PROMISED
 
 **Capability**

@@ -1,5 +1,35 @@
 # T8 — admission_controller (event-driven pause/resume)
 
+## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
+
+> See `verify/t9/results/N3_GAPS.md` for the cross-T catalog.
+
+* **G1 — # of pauses per real harbor cycle never measured.**
+  daemon already logs `program_tracker: paused %s`; never
+  aggregated.  We don't know if admission has ever paused a
+  program on a real run.  Possible the mechanism never triggered.
+* **G9 — theta mismatch (sglang webhook ↔ daemon admission)**.
+  sglang's `classify(occ)` fires `memory_pressure` at
+  `theta_hi=0.7` (and `theta_crit=0.9`); daemon's
+  `admission_controller.theta_hi=0.85`.  Events for
+  `occ ∈ [0.7, 0.85)` reach the daemon, the daemon fetches
+  `/aginfer/state`, runs the V_u calc, decides nothing → wasted
+  RTT.  Either align both to one theta in the launch script, or
+  let the daemon suppress the fetch when its own theta wouldn't
+  act.  Noted during 2026-05-26 single-shot K-full inspection.
+* **G6 — shared-aware aggregation effect never measured on real
+  workload.**  T8 verify pins it numerically (audit M1) but in
+  the 4-arm matrix we have no audit that the system-prompt
+  prefix unit was actually protected from eviction vs the LRU
+  arm.  Migration-trace scan + system-prompt unit-hash
+  cross-reference would close this.
+* **Ideal fix**:
+  - parse daemon log for `paused %s` / `resumed %s` per cycle (G1)
+  - align thetas (G9: 1-line change in launch_sglang_v4flash.sh
+    or a launcher env var); then re-test on a known-pressure
+    workload
+  - per-tier hit-rate diff (G4 → G6 inference) via sglang patch
+
 ## WHAT WE PROMISED
 
 **Capability**

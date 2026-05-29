@@ -1,5 +1,24 @@
 # T10 — integration / concurrency / recovery / GC
 
+## ⚠️ STATUS (2026-05-29)
+
+**Entire task pending — zero implementation, zero verify steps run.**
+
+This is the biggest unstarted bucket in the project.  See also
+`verify/t9/results/N3_GAPS.md` cross-T catalog.  Specific items
+still owed:
+
+* **Forced-fault verifies** never run (process kill, network
+  partition, sglang scheduler exit, daemon restart mid-Run-K).
+* **Concurrency stress / restart / GC** never run (50 concurrent
+  /aginfer/state pollers, 24 h synthetic load for tracker GC).
+* **4-tier (HBM/DRAM/DISK/DROP) end-to-end**: DISK tier is still
+  a placeholder.  daemon does NOT drive real Mooncake demotion
+  yet.  This is the largest design hole vs paper §3 (4-tier
+  claim).
+* **Inline scorer ↔ daemon conflict-rate audit** never measured
+  (the < 1 % conflict-rate goal in capability).
+
 ## WHAT WE PROMISED
 
 This is the cross-component stress + recovery suite. T1-T8 verify each

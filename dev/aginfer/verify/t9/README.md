@@ -1,5 +1,36 @@
 # T9 — Run K e2e + K-a + J ablations
 
+## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
+
+The full catalog lives in `results/N3_GAPS.md`; this section
+distills the T9-specific items so the README readers know what
+T9 itself is missing.
+
+* **A1 — clean p < 0.05 LRU vs OURS_full**.  Best signal so far:
+  z = 1.87 (N=3 GPUs-4,7-dominant); the +1+1 extension on GPUs
+  0,1 dropped z to 1.53 because GPUs 0,1 run ~ 200 s/trial slower
+  than 4,7 for LRU and OURS_full.  Need N≥4 of LRU + OURS_full
+  on a single GPU pair to clear the 95 % CI bar.
+* **A2 — diagnostics never instrumented in production runs**
+  (G2 memory_pressure event count, G4 per-tier hit-rate split,
+  G5 HBM occupancy trajectory).  We know aggregate cache hit
+  ≈ 95.5 % but not which tier serves what.  No HBM time series
+  → can't say whether the workload ever entered the pressure
+  regime.
+* **A3 — workload-regime gap**.  Current `temperature=0.0 seed=42`
+  gives 1 % runaway requests = 80 % LLM time (decode-bound, KV
+  scheduling can't help).  Need: cap `max_completion_tokens=4k`
+  + shrink KV pool, then re-run a matrix.  Without this the
+  scheduler's theoretical maximum gain is < 1 % of trial wall
+  (see `N3_GAPS.md` §3).
+* **A6 — Run J (HiCache OFF) never executed**.  paper §9
+  deployment claim that the 3 daemon layers add value w/o
+  HiCache is currently unsupported by data.
+* **K-a single-arm N=3 never run**.  Original single-shot K-a
+  (admission OFF) is SUPERSEDED.  Without an N=3 admission-OFF
+  arm we cannot isolate admission_controller's marginal
+  contribution from kv_scheduler's.
+
 > ⚠️ **2026-05-29 status update — acceptance criteria below predate
 > the setting-drift discovery.**
 >

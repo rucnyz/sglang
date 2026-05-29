@@ -1,5 +1,23 @@
 # T11 — Empirical p_hat / scoring function (replace paper §7 1-step greedy)
 
+## ⚠️ OPEN WORK (ideal not yet achieved)
+
+> Per-T cross-catalog: `verify/t9/results/N3_GAPS.md`.
+
+* **T11a inline-side** (`baselines/sglang_adapter.py:_node_to_unit`)
+  — deliberately NOT implemented; daemon-side already shows no
+  signal under current workload.  Reopen when A3 (cap
+  `max_completion_tokens`) is done.
+* **T11b — empirical residual estimator** for orphan units (all
+  holders ended).  Not started.  Needs trace harvest (see
+  `notes/trace_hooks.md`) which is also not implemented.
+* **T11c — re-eval matrix** after T11a/b land.  Not started.
+* **Beyond §7 myopic 1-step V_u** — MDP solver / MPC / RL with
+  multi-turn horizon.  Paper-level reformulation; not started.
+* **Inline scorer ↔ daemon V_u sync mechanism** — currently both
+  sides compute `p_hat` from `hits/age` independently and can
+  drift.  No source-of-truth mechanism designed.
+
 ## WHY THIS TASK EXISTS (REWRITTEN 2026-05-29)
 
 > ⚠️ **Original WHY was based on a debunked "1.76× slowdown" claim.**

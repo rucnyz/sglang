@@ -1,5 +1,25 @@
 # T7 — kv_scheduler event handlers (paper §4 events → migrations)
 
+## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
+
+> See `verify/t9/results/N3_GAPS.md` for the cross-T catalog.
+
+* **G3 — migrate POST counts never observed in production runs.**
+  Verify pins the daemon emits a `/aginfer/migrate` body on each
+  event; we have never aggregated over a real harbor cycle the
+  numbers:
+  * # migrate POSTs sent per event kind
+  * % accepted by sglang vs % skipped (e.g. `not_a_leaf`,
+    `race:*` reasons)
+  * tier transition matrix (HBM→DRAM, DRAM→HBM, …) per cycle
+* **Consequence**: we can't currently demonstrate that the
+  scheduler's decisions actually materialize as state-of-the-tree
+  changes.  Paper §8 story has a missing causal link.
+* **Ideal fix**: log-parser script that scans
+  `daemon.log + sglang.log` per cycle and emits these counters;
+  call from `parse_matrix.py` so every aggregated cycle carries
+  them.
+
 ## WHAT WE PROMISED
 
 **Capability**
