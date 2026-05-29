@@ -78,6 +78,7 @@ follow-up.
 | **G6** | shared-aware aggregation protects system-prompt prefix | **No measurement** — hit rate is symmetric across configs so we can't tell if `shared_aware_prog_scores` actually changed behavior | parse migration trace + cross-ref with system-prompt unit hash |
 | **G7** | Inline-side T11a (`sglang_adapter.py:_node_to_unit` swap) helps when daemon proxy is bypassed | **Never implemented** — deliberately deferred because daemon-side N=3 showed no signal; would need a separate matrix |
 | **G8** | Run J — daemon without HiCache (paper §9 deployment claim) | **Never run** — was scoped in original T9 plan, dropped during noise discovery | run_J variant of run_matrix.sh + N=3 cycles |
+| **G9** | sglang webhook and daemon admission thresholds are consistent | **Implementation mismatch unverified**: sglang fires `memory_pressure` at occ ≥ `theta_hi=0.7` (and `theta_crit=0.9`); daemon's `admission_controller` only pauses at occ ≥ `theta_hi=0.85`.  Events in occ ∈ [0.7, 0.85) → daemon fetches `/aginfer/state` but takes no action ⇒ wasted RTT.  Noted during single-shot K-full inspection (2026-05-26).  Whether this hurts wall time or just adds harmless RTT was never measured. | (a) align both to one theta in launch script; OR (b) suppress sglang fire when daemon's own theta would not act.  Measure via G2 + per-event "no-op" count. |
 
 ## 3. Why the expected wins probably don't exist on this workload
 
