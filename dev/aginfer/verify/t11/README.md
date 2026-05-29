@@ -1,24 +1,41 @@
 # T11 — Empirical p_hat / scoring function (replace paper §7 1-step greedy)
 
-## WHY THIS TASK EXISTS
+## WHY THIS TASK EXISTS (REWRITTEN 2026-05-29)
 
-T9 Run K full and K-a both came in ~1.76× slower than the inline-
-scorer-only baseline (Run H' ≈ 885 s).  Disabling `admission_controller`
-changed nothing.  Both ablations share the inline scorer +
-`kv_scheduler`'s V_u-based decisions, and **V_u depends on `p_hat`,
-which we currently estimate as `min(1.0, hits/age)`**.
+> ⚠️ **Original WHY was based on a debunked "1.76× slowdown" claim.**
+> The N=3 matrix (2026-05-26) measured ours_full = 1344 ± 55 s vs
+> kv_off baseline = 1389 ± 40 s, **Δ = −45 s, z = −1.16 — not
+> significant**.  The historical Run H' 885 s baseline used a
+> DIFFERENT setting (no `temperature=0.0`); the H'_now N=3 control
+> (1392.8 ± 53.6 s, no daemon, current settings) confirmed there's
+> no real ~500 s gap to explain.  See
+> `verify/t9/results/N3_ROOT_CAUSE.md`.
 
-Per user direction (memory:feedback-design-ideal-over-pragmatic):
-"design follows the ideal — don't optimise for ease".  Per user
-direction (this conversation, 2026-05-26): don't try to derive a
-new closed-form formula; go **empirical** — measure the actual
-reuse distribution and use that directly.
+**Why T11 is still worth doing — theoretical, not empirical**:
 
-**T11 is a substantial reformulation.** Paper §7's 1-step greedy
-V_u may be the wrong frame entirely for multi-turn agent workloads
-(swebenchpro / terminus-2 / 200-turn rollouts).  The `hits/age`
-proxy can't see the multi-turn reuse horizon.  Empirical p_hat is
-the first thing to try before escalating to MDP / MPC / RL.
+Paper §7's `p_hat = min(1.0, hits/age)` is a uniform-Poisson proxy.
+For terminus-2 / swebenchpro / 200-turn agent rollouts, reuse is
+clearly NOT uniform — the workload is monotonic-extension with
+strong session-state structure (see
+`notes/workload_characterisation.md`).  Whether or not §7's V_u
+*currently* leaves performance on the table at temperature=0
+(N=3 says: not measurably — runaway generation dominates), the
+proxy is still theoretically wrong.
+
+So T11 is now **future-work motivation**, not bug-fix.  When the
+workload character changes (cap `max_completion_tokens` to remove
+runaway, or use a non-runaway-prone agent), the prefix-reuse
+story becomes load-bearing and `hits/age` quality starts to matter.
+
+**Current T11 status (2026-05-29)**:
+* T11a daemon-side (`kv_scheduler.py:build_paper_state` program-
+  alive rule): **DONE**, N=3-tested, no significant Δ vs hits/age
+  baseline.
+* T11a inline-side (`sglang_adapter.py:_node_to_unit`):
+  **DELIBERATELY NOT IMPLEMENTED** — H'_now N=3 control showed
+  the daemon proxy isn't the bottleneck, so changing the inline
+  scorer wouldn't help either while runaways dominate.
+* T11b residual estimator: **not started** — same reason.
 
 ## SCOPE
 

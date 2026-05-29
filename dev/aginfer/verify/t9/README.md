@@ -1,5 +1,27 @@
 # T9 — Run K e2e + K-a + J ablations
 
+> ⚠️ **2026-05-29 status update — acceptance criteria below predate
+> the setting-drift discovery.**
+>
+> Authoritative results live in:
+> * `results/N3_matrix_SUMMARY.md` — N=3 baseline vs ours, no
+>   significant Δ.
+> * `results/N3_ROOT_CAUSE.md` — why historical Run H' 885 s is
+>   not comparable (runaway generation under `temperature=0.0`).
+> * `results/N3_ttft_analysis.md` — per-request distribution.
+> * (4-arm matrix in progress — LRU + TA × N=3 vs OURS arms.)
+>
+> The "< 716 s mean" / "< 1336 s p99" acceptance criteria below were
+> anchored on Run G 666 s and Run H' 1336 s — those numbers were
+> measured under a DIFFERENT setting (no `temperature=0.0`).
+> Under current settings (`temperature=0.0 seed=42`), 1% of LLM
+> requests run away to 60k completion tokens and dominate trial
+> wall time; no KV scheduling can help that and the historical
+> floors don't transfer.  See `N3_ROOT_CAUSE.md`.
+>
+> The "Run K full / K-a / kv_off" single-shot RUN_K_*.md files in
+> `results/` carry SUPERSEDED banners.  Read the N3_* docs first.
+
 ## WHAT WE PROMISED
 
 **Capability (acceptance criteria, revised per audit #18)**

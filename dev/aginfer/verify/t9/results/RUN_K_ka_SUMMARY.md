@@ -1,5 +1,21 @@
 # Run K-a (admission OFF) — 2026-05-26 16:38-17:34
 
+> ⚠️ **SUPERSEDED — N=1 single-shot, claims invalidated.**
+>
+> See `N3_matrix_SUMMARY.md` for the authoritative N=3 result and
+> `N3_ROOT_CAUSE.md` for why the "~1.76× slower than Run H'"
+> framing was wrong.  TL;DR: H' 885 s was a different setting
+> (no `temperature=0.0`); under current settings even H'_now (no
+> daemon, ours_greedy inline) is 1392.8 ± 53.6 s — i.e. the
+> regression doesn't exist when you re-measure the baseline.
+>
+> The "Design-level concern" section below — that paper §7 1-step
+> greedy V_u is wrong because of multi-turn horizon blindness —
+> remains a valid *theoretical* worry (see `todo-empirical-phat`
+> memory) but its empirical justification here (the 1.76× number)
+> is dead.  T11a daemon-side was implemented and N=3-tested;
+> result was Δ=−45 s (not significant).
+
 **Variant:** kv_scheduler=enabled + admission_controller=**disabled** + HiCache ON
 
 | metric | K full | K-a | delta |

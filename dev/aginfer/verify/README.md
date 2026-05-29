@@ -68,9 +68,9 @@ Each task lives in its own folder `tN/` with:
 | 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | **passed** (2026-05-26, audit round-1 done; Layer A 10 steps + Layer B real-GPU watermark test) |
 | 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | **passed** (2026-05-26, 13 verify steps + 22 bisect probes across 5 audit rounds; ~510 LoC daemon code; build 2.7 ms / decide 1.4 ms @ 1k units) |
 | 8 | T8 | admission_controller (event-driven pause/resume) | [`t8/`](t8/) | **passed** (2026-05-26, 12 verify steps + 5 bisect probes across 2 audit rounds; ~315 LoC daemon code; single-pause 4 ms @ 32 programs) |
-| 9 | T9 | Run K + K-a + J ablation | [`t9/`](t9/) | **K full + K-a: both ~1550 s mean, FAIL <716 s target; admission_controller NOT the cause; kv_off (diagnostic) + J pending** (2026-05-26) |
+| 9 | T9 | Run K + K-a + J ablation | [`t9/`](t9/) | **N=3 matrix done 2026-05-26: baseline 1389±40s vs ours 1344±55s, Δ=−45s z=−1.16 NOT significant; H'_now N=3 control done 2026-05-27: 1393±54s (no daemon, same settings) — daemon proxy adds only ~4s/trial. The "1.76× vs Run H' 885s" framing was a setting-drift artifact (`temperature=0.0` runaway generation); see results/N3_ROOT_CAUSE.md. 4-arm matrix (LRU/TA/OURS-inline/OURS-full) partial: 3/6 cycles done, paused for shared GPU.** |
 | 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies + daemon-controlled L3 (DISK) tier via Mooncake (paper §3 4-tier completion) | [`t10/`](t10/) | pending |
-| **11** | **T11** | **empirical p_hat / scoring (replace paper §7 hits/age proxy)** | [`t11/`](t11/) | **scoped 2026-05-26; T9 K-full+K-a empirical evidence that §7 1-step greedy V_u is wrong for multi-turn agent workloads; T11a trace harvest → T11b estimator → T11c re-run K** |
+| **11** | **T11** | **empirical p_hat / scoring (replace paper §7 hits/age proxy)** | [`t11/`](t11/) | **T11a daemon-side DONE & N=3-tested 2026-05-26: no significant Δ. T11a inline-side and T11b residual estimator deferred — no empirical signal under current settings (runaway generation dominates), kept as future-work theoretical motivation per `todo-empirical-phat` memory.** |
 
 Per-task `tN/results/` directories hold raw outputs (logs, JSON, harbor
 result dirs, optimization writeups) for that task only — no cross-task
@@ -93,6 +93,20 @@ All verify files share these checks (audit findings made them explicit):
   set. Verified in T9 + T10.
 
 ## Pre-committed worst-case floor for Run K
+
+> ⚠️ **2026-05-29: floor numbers below predate the setting-drift
+> discovery and are not directly comparable to current matrix
+> results.**  Historical Run F' 873 s and Run H' 885 s were
+> measured under sglang default sampling.  Current matrix /
+> H'_now runs use `temperature=0.0 seed=42`, which deterministically
+> triggers runaway generation for ~1% of LLM requests; those
+> outliers dominate trial wall time and the historical floors
+> don't transfer.
+>
+> Empirical floor under current settings is the N=3 baseline
+> `1389.3 ± 39.7 s` (kv_off, inline scorer only).  Any
+> regression below that *under temperature=0.0 settings* would
+> be a real signal.  See `verify/t9/results/N3_matrix_SUMMARY.md`.
 
 Even if the daemon layers misbehave in every documented way (events
 lost, state stale, races), the floor is:

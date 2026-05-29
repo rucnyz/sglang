@@ -1,5 +1,25 @@
 # Run K (full) — 2026-05-26 14:16-15:08
 
+> ⚠️ **SUPERSEDED — N=1 single-shot, claims invalidated.**
+>
+> Authoritative result is `N3_matrix_SUMMARY.md`
+> (N=3 cycles, alternating B-O-B-O-B-O):
+> * baseline (kv_off): **1389.3 ± 39.7 s**
+> * ours (full): **1344.0 ± 54.6 s**
+> * **Δ = −45.3 s, z = −1.16 → not statistically significant.**
+>
+> The "1.76× Run H' 885 s" framing below is wrong on two counts:
+> 1. Single-shot 1559 s was inside ~150 s SEM; not a real signal vs N=3 mean 1344 s.
+> 2. Run H' 885 s was measured under a DIFFERENT setting
+>    (no `temperature=0.0 seed=42`).  Per `N3_ROOT_CAUSE.md`, this
+>    matrix's runaway-generation outliers dominate trial time —
+>    not anything T11a daemon scheduling does.  See H'_now N=3
+>    matrix (1392.8 ± 53.6 s, no daemon, current settings) — the
+>    daemon proxy adds ~4 s/trial, not 500 s.
+>
+> Keeping this doc as a historical artifact; targets/verdicts below
+> are not authoritative.
+
 **Variant:** kv_scheduler=enabled + admission_controller=enabled + HiCache ON
 
 **Acceptance:**

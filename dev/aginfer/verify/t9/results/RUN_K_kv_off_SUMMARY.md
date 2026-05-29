@@ -1,5 +1,25 @@
 # Run K — kv_off variant (T9 diagnostic)
 
+> ⚠️ **SUPERSEDED — diagnosis was wrong.**
+>
+> This file's "500 s gap = inline scorer also broken" diagnosis is
+> invalidated by the **H'_now N=3 control** run 2026-05-27:
+> direct harbor → sglang (NO daemon), same `temperature=0.0
+> seed=42` settings as this kv_off, gives **1392.8 ± 53.6 s**.
+> kv_off here was 1457 s.  Δ = 65 s — **daemon proxy is ~4 s/trial,
+> not 100 s and not 570 s**.
+>
+> True root cause of the H' 885 s ↔ current ~1390 s "gap": setting
+> drift.  Historical H' didn't use `temperature=0.0`; under greedy
+> decoding 1% of requests run away to 60k completion tokens and
+> consume 80% of all LLM time (see `N3_ROOT_CAUSE.md`).
+>
+> The "T11a inline-side: PENDING" line below was the prescribed
+> next step under the wrong diagnosis.  T11a daemon-side was done
+> and showed no signal; inline-side was deliberately NOT done
+> because the H'_now control showed the gap isn't from the daemon
+> at all.
+
 ## Setup
 * date: 2026-05-26 (sglang head 888ea822, daemon-side T11a NOT yet
   active — kv_off ran against pre-T11a daemon module)

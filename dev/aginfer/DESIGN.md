@@ -377,6 +377,21 @@ matches the semantics in `OursGreedyPolicy._net_value`.
 
 ## Done = Run K narrows the gap to TA (revised per audit)
 
+> ⚠️ **2026-05-29: numerical acceptance targets in this section
+> predate the setting-drift discovery.**  Historical Run G 666 s
+> / Run H' 885 s / Run F' 873 s were measured under sglang default
+> sampling.  Current matrix runs use `temperature=0.0 seed=42`
+> which deterministically triggers runaway generation; those
+> historical baselines do not transfer.
+>
+> Authoritative results: `verify/t9/results/N3_matrix_SUMMARY.md`
+> (N=3, baseline 1389±40 s vs ours 1344±55 s, Δ not significant)
+> and `verify/t9/results/N3_ROOT_CAUSE.md` (why historical
+> baselines aren't comparable).  Architectural design below is
+> unchanged; the numerical targets need re-derivation under
+> current settings (typically by capping `max_completion_tokens`
+> to suppress runaway).
+
 Realistic acceptance — pre-committed before the run:
 
 * `K.successful ≥ 28`
@@ -450,6 +465,16 @@ T4's verify uses `program_tracker.pause/resume`):
 Total: ~2.5 days.
 
 ## Pre-committed worst-case floor
+
+> ⚠️ **2026-05-29: floor numbers below predate setting-drift
+> discovery; not directly comparable to current matrix.**
+> Under current `temperature=0.0 seed=42` settings, the empirical
+> N=3 baseline (no daemon scheduling, inline ours_greedy only) is
+> 1389 ± 40 s — see `verify/t9/results/N3_matrix_SUMMARY.md`.
+> The Run F'/H' floors below were measured under a different
+> sampling regime and don't anchor the current run.  Architectural
+> floors (`degrades to inline-only`, etc.) are still correct as
+> the mechanism story.
 
 Every verify file (T1-T10) has a **WORST CASE (forced)** section that
 *actually injects* the failure mode and asserts the system stays

@@ -5,6 +5,19 @@
 > infercept,continuum,kvflow,ours_greedy}.py` for the policy specializations
 > from paper §8.
 
+> ⚠️ **Setting note (added 2026-05-29).**  The "real-serving
+> validation" mentioned later in this doc (Run H' 885 s vs Run F'
+> 873 s; p99 −28 %; std −19 %) was measured under sglang **default
+> sampling**.  Under current settings (`temperature=0.0 seed=42`,
+> used by the T9 N=3 matrix and 4-arm runs), Ours vs LRU is
+> **not statistically distinguishable** (Δ=−45 s, z=−1.16) because
+> 1% of LLM requests run away to 60k completion tokens and
+> dominate trial wall time.  The closed-form simulator results in
+> this doc are unaffected by this setting drift; only the
+> "real-serving validation" callout (~line 60-71) carries the
+> caveat.  See `dev/aginfer/verify/t9/results/N3_matrix_SUMMARY.md`
+> and `N3_ROOT_CAUSE.md`.
+
 ## Workload
 
 Synthetic agent-DAG event stream (see `baselines.compare.WorldConfig`):

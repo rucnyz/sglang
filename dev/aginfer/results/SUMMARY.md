@@ -1,5 +1,20 @@
 # SWE-bench Pro × V4-Flash × HiCache: baseline matrix
 
+> ⚠️ **Setting note (added 2026-05-29).**  All runs A–H' in this
+> document used sglang **default sampling** (no `temperature`,
+> no `seed`) and an earlier sglang HEAD.  They are NOT directly
+> comparable to the 2026-05-26+ T9 matrix / H'_now / 4-arm runs
+> which pin `temperature=0.0 seed=42` for reproducibility — that
+> change deterministically triggers runaway generation for ~1%
+> of LLM requests (60k-token completions), which dominate trial
+> wall time and inflate all numbers ~50%.
+>
+> For current authoritative numbers see
+> `dev/aginfer/verify/t9/results/N3_matrix_SUMMARY.md` and
+> `N3_ROOT_CAUSE.md`.  The historical Run F'/G/H' numbers in the
+> table below remain accurate records of those runs but should
+> not be used as targets / floors for new work.
+
 ## Setup
 - **Model**: DeepSeek-V4-Flash, TP=2 EP=2 on 2× B300 (GPUs 5,6)
 - **Dataset**: SWE-bench Pro Python subset (`uv run swebenchpro --language python --limit 32` → 32 tasks)
