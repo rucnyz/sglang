@@ -2242,9 +2242,13 @@ class UnifiedRadixCache(BasePrefixCache):
                   it up). Without an existing host backup we skip; the
                   daemon can retry once HiCache's backup_thread catches
                   up, or fall back to DROP.
-          HBM   : promote DRAM→HBM. v1: not wired (sglang's existing
-                  cache-hit path auto-loads back on next request, so this
-                  is optimisation-only). Returns "promote_not_yet_wired".
+          HBM   : promote DRAM→HBM. Wired to ``load_back`` (the same
+                  host→device path the cache-hit fast-path uses). Fails
+                  (returns ``promote_load_back_declined``) when device
+                  pool can't fit the transfer or load_back's internal
+                  thresholds reject — daemon idempotently retries on
+                  next event. (G11 fix, 2026-05-30; prior behaviour
+                  was an unconditional ``promote_not_yet_wired`` stub.)
           DISK  : Mooncake/SSD spill. v1: not exposed. Returns
                   "disk_tier_not_yet_wired".
         """
@@ -2353,7 +2357,32 @@ class UnifiedRadixCache(BasePrefixCache):
                     # race: already on HBM (state was stale).
                     skipped.append({"hash": h, "reason": "race:already_on_hbm"})
                 elif has_host:
-                    skipped.append({"hash": h, "reason": "promote_not_yet_wired"})
+                    # Promote DRAM → HBM via the same `load_back` path
+                    # the cache-hit fast-path uses (line ~1446).
+                    # Failure modes mapped to skip reasons:
+                    #   * load_back returns False → device pool too
+                    #     full + couldn't evict enough, or transfer
+                    #     below load_back_threshold, or lock contention
+                    #   * load_back raises → defensive: don't crash the
+                    #     /aginfer/migrate handler on a single bad action
+                    try:
+                        ok = self.load_back(node)
+                    except Exception as exc:  # noqa: BLE001
+                        skipped.append(
+                            {
+                                "hash": h,
+                                "reason": f"promote_raised:{type(exc).__name__}",
+                            }
+                        )
+                        continue
+                    if ok:
+                        applied += 1
+                        applied_hashes.append(h)
+                        acted_node_ids.add(node.id)
+                    else:
+                        skipped.append(
+                            {"hash": h, "reason": "promote_load_back_declined"}
+                        )
                 else:
                     skipped.append({"hash": h, "reason": "race:no_data"})
             elif target == "DISK":
