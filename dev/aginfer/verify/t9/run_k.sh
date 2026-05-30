@@ -16,11 +16,11 @@
 
 set -euo pipefail
 
-VARIANT="${1:?usage: run_k.sh <full|ka|J|kv_off>}"
+VARIANT="${1:?usage: run_k.sh <full|ka|J|kv_off|a3>}"
 case "$VARIANT" in
-    full|ka|J|kv_off) ;;
+    full|ka|J|kv_off|a3) ;;
     *)
-        echo "[run_k] invalid variant: $VARIANT (expected: full|ka|J|kv_off)" >&2
+        echo "[run_k] invalid variant: $VARIANT (expected: full|ka|J|kv_off|a3)" >&2
         exit 2
         ;;
 esac
@@ -30,6 +30,9 @@ AGINFER_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$AGINFER_DIR/scripts/env.sh"
 
 # ---- variant config ----
+# A few variants need extra `--ak <k>=<v>` pairs sent to harbor; the
+# a3 variant uses this to cap completion tokens.  Default is empty.
+declare -a EXTRA_AK_OPTS=()
 case "$VARIANT" in
     full)
         HICACHE_FLAG="--enable-hierarchical-cache"
@@ -58,6 +61,25 @@ case "$VARIANT" in
         HICACHE_FLAG="--enable-hierarchical-cache"
         DAEMON_KV="disabled"
         DAEMON_ADMISSION="disabled"
+        ;;
+    a3)
+        # "A3" — push workload into HBM pressure regime.  Same daemon
+        # config as `full` (kv ON + admission ON + HiCache ON) but with:
+        #   1. --max-total-tokens = 256K (default ~10M → too loose)
+        #   2. --ak llm_call_kwargs={"max_tokens":4096} caps runaway
+        #
+        # See verify/t9/results/N3_A3_PLAN.md for the rationale and
+        # expected daemon counters (specifically: HBM occ peak > 0.85,
+        # memory_pressure events > 0, admission pauses > 0, migrate_post
+        # count > 0).  If still 0 under a3, escalate to G10 fix.
+        HICACHE_FLAG="--enable-hierarchical-cache"
+        DAEMON_KV="enabled"
+        DAEMON_ADMISSION="enabled"
+        # 256K-token KV pool → forces HBM into pressure regime.
+        export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-262144}"
+        # 4k-cap completion → kills runaway 60k-token decode tail.
+        # parse_kwargs JSON-decodes the value into a dict.
+        EXTRA_AK_OPTS=("--ak" 'llm_call_kwargs={"max_tokens":4096}')
         ;;
 esac
 
@@ -290,6 +312,7 @@ echo "[run_k:$VARIANT] starting harbor (n_tasks=${HARBOR_N_TASKS}, concurrent=${
         --ak max_turns="${HARBOR_MAX_TURNS}" \
         --ak temperature=0.0 \
         --ak seed=42 \
+        "${EXTRA_AK_OPTS[@]}" \
         -l "${HARBOR_N_TASKS}" \
         -n "${HARBOR_N_CONCURRENT}" \
         -k "${HARBOR_ATTEMPTS}" \

@@ -55,6 +55,7 @@ def summarize_cycle(log_path: Path) -> Dict[str, object]:
     kv_outcome = Counter()      # kv_decide outcome
     kv_by_kind = defaultdict(Counter)  # kv_decide by (kind, outcome)
     migrate_status = Counter()  # migrate_post status
+    skip_reasons = Counter()    # migrate_skipped reason
     migrate_applied = 0
     migrate_skipped = 0
     pauses = []                 # (pid, occ)
@@ -83,6 +84,8 @@ def summarize_cycle(log_path: Path) -> Dict[str, object]:
                 migrate_skipped += int(kv.get("skipped", 0))
             except ValueError:
                 pass
+        elif ev == "migrate_skipped":
+            skip_reasons[kv.get("reason", "?")] += 1
         elif ev == "admission_pressure":
             occ = float(kv.get("occ", 0.0))
             pressure_occ_distribution.append(occ)
@@ -112,6 +115,7 @@ def summarize_cycle(log_path: Path) -> Dict[str, object]:
         "migrate_status": migrate_status,
         "migrate_applied": migrate_applied,
         "migrate_skipped": migrate_skipped,
+        "skip_reasons": skip_reasons,
         "pauses": pauses,
         "resumes": resumes,
         "pressure_acted": pressure_acted,
@@ -148,6 +152,11 @@ def print_summary(name: str, s: dict) -> None:
         f"  applied total: {s['migrate_applied']}  "
         f"skipped total: {s['migrate_skipped']}"
     )
+    if s["skip_reasons"]:
+        print(f"  skip reasons:")
+        for reason, n in s["skip_reasons"].most_common():
+            pct = 100 * n / sum(s["skip_reasons"].values())
+            print(f"    {reason}: {n} ({pct:.1f}%)")
 
     print(f"\n### admission_controller (T8 G1)")
     print(f"  pauses: {len(s['pauses'])}")

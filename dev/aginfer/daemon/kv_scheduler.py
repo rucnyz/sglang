@@ -676,10 +676,12 @@ class KvScheduler:
         try:
             resp = r.json()
             applied = int(resp.get("applied") or 0)
-            skipped = len(resp.get("skipped") or [])
+            skipped_list = resp.get("skipped") or []
+            skipped = len(skipped_list)
         except Exception:  # noqa: BLE001
             applied = -1
             skipped = -1
+            skipped_list = []
         _m(
             "migrate_post",
             status=r.status_code,
@@ -687,6 +689,16 @@ class KvScheduler:
             applied=applied,
             skipped=skipped,
         )
+        # Per-action skip reason breakdown — high-value for finding
+        # G11-class issues (race:already_on_dram / promote_not_yet_wired
+        # / race:not_in_tree / etc.).  Each line ≈ 1 µs, fires at most
+        # `skipped` times per POST.
+        for entry in skipped_list:
+            if isinstance(entry, dict):
+                _m(
+                    "migrate_skipped",
+                    reason=entry.get("reason", "?"),
+                )
 
 
 # ----------------------------------------------------------------- attach
