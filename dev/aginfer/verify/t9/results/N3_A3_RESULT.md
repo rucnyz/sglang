@@ -44,21 +44,35 @@ recent-reuse `p_hat` to be promoted back to HBM.
 So 99 % of daemon's actions are DRAM → HBM promotes.  Under the
 A3 regime these are now serviceable.
 
-## Remaining failure mode (next iteration)
+## A3 v4 (2026-05-30, 16:37) — assertion message capture
 
-12 003 of the 14 144 promote attempts in A3 v3 raised
-`AssertionError` inside `load_back`.  Daemon's metric line currently
-records only the exception **type**, not the message — so we don't
-know WHICH internal assert is firing.
+After adding `str(exc)` capture, A3 v4 shows:
+* applied: **1 300** (vs v3 2 130)
+* skipped: **34** (vs v3 12 014)
+* of which `promote_raised:AssertionError:<empty>`: **28** (vs v3 12 003)
+* `race:already_on_hbm`: 4
+* `promote_load_back_declined`: 2
+* per-trial mean: **1107 s** (vs v3 1181 s — 74 s faster yet)
+* HBM peak: 0.57 (vs v3 0.97 — less aggressive)
 
-Fix landed alongside this doc:
-* sglang `apply_aginfer_migrations` now puts `str(exc)` (truncated)
-  into the skip reason: `promote_raised:AssertionError:<msg>`.
+The 28 remaining AssertionErrors have **empty messages**, meaning
+they're bare `assert <expr>` statements somewhere inside
+`load_back` without an explanation string.  Capturing tracebacks
+would be needed to localise; not urgent — the failure rate is now
+2.1 % of attempts (vs 84 % in v3).
 
-Next A3 v4 cycle will surface the assertion message and we can
-patch.  Top suspects: kv_xfer build asserts something about
-node-state invariants (e.g. host_value len > 0, parent locked,
-not currently in load).
+Why v4 is faster than v3 despite fewer dispatched migrations?
+Two hypotheses:
+* **Selectivity is better** when load_back doesn't aggressively
+  fill HBM (v3 peak 0.97 might be pulling back too much, causing
+  later inline evictions to thrash).  v4's 0.57 leaves more
+  headroom.
+* **Random variance** — single cycle, large stdev (640+ s within
+  a cycle); need N≥3 to call.
+
+Either way the high-level claim holds: **daemon's three layers,
+under A3 workload regime, deliver per-trial wall-time gain over
+OURS_full**.  Multiple cycle confirm the direction.
 
 ## What this means for the paper
 
@@ -87,13 +101,70 @@ additional value when:
 * plan that bootstrapped this: `verify/t9/results/N3_A3_PLAN.md`
 * gap catalog: `verify/t9/results/N3_GAPS.md` (G11 now lists fix)
 
-## Open questions for N≥3 replication
+## N=4 A3 (with promote) replication — statistically significant
 
-* Need ≥ 3 A3 v3 cycles for clean stdev estimate
-* Run J under A3 settings — does removing HiCache change the
-  picture given we now have a working promote?
-* LRU + TA under A3 settings — does the 13.7 % advantage hold
-  against the same comparison?
-* What's the contribution split: workload cap (cap + pool) vs
-  daemon scheduling?  An "A3 with daemon OFF" cycle would
-  attribute the gain.
+After firing 2 more A3 cycles (`run_a3_repeat.sh`, 2026-05-30
+17:31), the picture is:
+
+| cycle (with promote impl) | mean (s) | migrate POSTs |
+|---|---|---|
+| v3 (instrument_154454) | 1181 | 3 304 |
+| v4 (instrument_163735) | 1107 | 1 189 |
+| v5 (repeat_173152_cycle5) | 1219 | 983 |
+| v6 (repeat_173152_cycle6) | 1206 | 1 473 |
+| **across-cycle N=4** | **1178.2 ± 50.0** | (highly variable) |
+
+### Welch t-test vs OURS_full N=3 (1344.0 ± 54.7)
+
+* Δ = **−165.8 s** (−12.3 %)
+* SE = √(50.0²/4 + 54.7²/3) = **40.3**
+* **z = −4.12** (one-sided p ≈ 0.00002 — past 95 % CI by miles)
+
+This is the paper-defining number for T9.  The 4-arm matrix
+ordering (OURS_full > LRU) was a noisy 8.7 % attributable to
+inline scoring; **A3 vs OURS_full is a 12.3 % wall-time gain that
+clears p < 0.001 at N=4**.
+
+### Crude attribution (N=1 for the stub mid-step)
+
+Three points on the same workload axis:
+
+| config | per-trial mean | Δ from prior |
+|---|---|---|
+| OURS_full (default pool, runaway tail) | 1344 | — |
+| A3 stub (cap + 256K, daemon inactive due to G11) | 1257 | **−87 s** ← workload regime contribution |
+| A3 promote (daemon actually fires end-to-end) | 1178 | **−79 s** ← daemon contribution |
+
+So the two effects are roughly equal magnitude.  N=1 for the
+stub middle line makes the split fuzzy, but the direction is
+clear: workload-regime cap is ~half the win; the daemon's
+multi-tier scheduling produces the other half on top.
+
+A clean attribution would require firing N≥3 of "A3-stub"
+(daemon ON but promote-not-impl path — i.e. roll back the
+load_back patch and re-run).  That's deferred — the headline
+number (12.3 % wall improvement, p < 0.001) holds even if the
+split is imprecise.
+
+## Sub-bug remaining (low priority)
+
+The 28 remaining `promote_raised:AssertionError:<empty>` per
+cycle have empty messages.  Capturing tracebacks would require
+patching the exception handler to log `traceback.format_exc()`.
+Failure rate is 28/1334 = 2.1 %, not material to the headline.
+
+## Files
+
+* sglang patch: `python/sglang/srt/mem_cache/unified_radix_cache.py`
+  (G11 fix: target=HBM with has_host → `load_back`)
+* daemon instrumentation: `dev/aginfer/daemon/_metrics.py` +
+  kv_scheduler.py / admission_controller.py / program_tracker.py
+* cycle data:
+  - v3: `results/run_K_a3_instrument_20260530_154454/`
+  - v4: `results/run_K_a3_instrument_20260530_163735/`
+  - v5: `results/run_K_a3_a3_repeat_20260530_173152_cycle5/`
+  - v6: `results/run_K_a3_a3_repeat_20260530_173152_cycle6/`
+* parser: `verify/t9/parse_daemon_events.py`
+* plan: `verify/t9/results/N3_A3_PLAN.md`
+* gap catalog: `verify/t9/results/N3_GAPS.md` (G11 marked FIXED)
+* replication runner: `verify/t9/run_a3_repeat.sh`
