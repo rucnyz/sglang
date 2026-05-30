@@ -143,6 +143,102 @@ generate the pre-conditions either layer needs to do work.
   3. (re-)disable HiCache (Run J — chained, pending) so eviction
      goes to DROP, forcing the migration story
 
+## A3 (capped completion + 256 K KV pool) — daemon finally fires, sglang rejects
+
+`run_K_a3_instrument_*` (2026-05-30) ran the workload variant
+defined in `N3_A3_PLAN.md` — same daemon config as OURS_full
+but with `--ak llm_call_kwargs={"max_tokens":4096}` capping the
+runaway tail and `MAX_TOTAL_TOKENS=262144` shrinking the KV
+pool from default ~10 M tokens to 256 K.
+
+### Hard numbers (A3 v2, with per-action skip-reason instrumentation)
+
+```
+events_received   18 213
+kv_decisions      12 140
+  empty_decision_set 6 073 (33.3%)
+  policy_declined   7 433 (40.8%)
+  dispatched        4 707 (25.8%)   ← non-zero for the first time
+kv_migrate_calls   4 707 (status=200)
+applied total     0                 ← but ALL skipped at sglang
+skipped total     7 049
+  skip reasons:
+    promote_not_yet_wired   7 033 (99.8%)   ← 4-tier promote unimplemented
+    race:already_on_hbm        15 (0.2%)
+    race:not_in_tree            1 (0.0%)
+
+per-trial mean    1 257 s   (vs OURS_full ~1 369 s, −8.2 %)
+sglang pool peak  0.55      (vs OURS_full 0.02 — pressure regime
+                              reached)
+HBM occ peak (daemon view)  0.000   (G10 divergence persists)
+memory_pressure events       0
+admission pauses             0
+```
+
+### What A3 conclusively proves
+
+**The daemon's V_u policy works**.  Under genuine pressure
+(pool peak 0.55) it correctly identifies 4 707 positive-value
+migrations across 18 k events — that's a 25.8 % dispatch rate.
+The math isn't broken.
+
+**sglang's `/aginfer/migrate` handler is half-built.**  The
+DRAM → HBM promote path is a literal stub:
+
+```python
+elif target == "HBM":
+    if has_device:
+        skipped.append({"hash": h, "reason": "race:already_on_hbm"})
+    elif has_host:
+        skipped.append({"hash": h, "reason": "promote_not_yet_wired"})  ← STUB
+    ...
+```
+
+(`python/sglang/srt/mem_cache/unified_radix_cache.py:2356`)
+
+Because HiCache's `write_through_selective` aggressively demotes
+units from HBM to host once they're committed (host pool has the
+copy + device pool freed), **almost everything daemon sees is in
+DRAM tier**.  V_u then correctly says "promote the useful ones
+back to HBM" — but sglang has nothing to copy.  Skips are 99.8 %
+`promote_not_yet_wired`.
+
+This is now logged as **G11** in `N3_GAPS.md`.
+
+### Why HBM occ STILL reads 0 (G10 still active under A3)
+
+Even with pool peak at 0.55, the daemon's `tier_usage.HBM.used_bytes`
+remains 0 across all 18 213 fetches.  The radix-tree-walk view
+counts only committed prefix nodes whose `cd.value` is non-empty.
+With `write_through_selective`, those device tensors are nulled
+out after the host backup completes, so the radix walk sees 0
+in HBM even when the allocator has 55 % of the pool in flight.
+G10 (radix vs allocator divergence) is robust to workload regime.
+
+### What A3 ruled out
+
+* **Race conditions are not the root cause** — `race:*` skip
+  reasons sum to 16 out of 7 049 (0.2 %).
+* **The daemon's V_u isn't pathologically declining** under
+  pressure — 25.8 % dispatch rate is real activity.
+* **The "workload doesn't need it" framing from N3_GAPS §3 is
+  obsolete under A3** — there IS scheduler work to do.
+
+### Open questions A3 doesn't yet answer
+
+* **Does implementing promote unlock real wall-time gains?**
+  We'd need (G11 fix) AND a re-run of A3 with 4 707 promotes
+  actually applied to know whether daemon scheduling delivers
+  value on top of inline scoring.
+* **Would shrinking the pool further drive demote instead?**
+  At 0.55 peak, V_u still picks promote.  Pool ≈ 128 K might
+  push HBM near full enough that demote becomes optimal under
+  V_u math.
+* **Does G10 actually matter under A3?**  Daemon never fetches
+  state for memory_pressure (sglang doesn't fire it because
+  the allocator stays under 0.7).  G10 might only matter if a
+  fix to (G10) or workload pushes the allocator past 0.7.
+
 ## K-a + Run J answer (chain run 2026-05-30)
 
 Both chained cycles produce the **same null result** as OURS_full:
