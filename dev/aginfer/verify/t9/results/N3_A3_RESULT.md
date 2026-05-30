@@ -153,6 +153,40 @@ cycle have empty messages.  Capturing tracebacks would require
 patching the exception handler to log `traceback.format_exc()`.
 Failure rate is 28/1334 = 2.1 %, not material to the headline.
 
+### 2026-05-30: Sub-bug located + fixed (no perf change)
+
+Added traceback frame capture (file:line:funcname) to the
+promote skip-reason emitter, then re-fired A3 (v7) with the
+patched handler.  All ~hundreds of AssertionErrors traced to
+**one site**:
+* `swa_component.py:484:build_hicache_transfers`
+* `assert cd.host_value is not None or cd.value is not None`
+
+Root cause: daemon's promote arrives async vs HiCache eviction
+passes — a node whose `has_host=True` at /aginfer/state fetch can
+have ancestors lose host backup before load_back walks the chain.
+Broken-chain promote can't help anyway (sglang's prefix matcher
+can't traverse the gap), so converted the assert to early
+`return None` so load_back declines cleanly.
+
+**A3 v7 (after fix)** vs **A3 v4 (before fix)**:
+
+| metric | v4 | v7 |
+|---|---|---|
+| dispatched | 1189 | 1510 |
+| `promote_raised:AssertionError` | 28 | **0** |
+| `race:already_on_hbm` | 4 | 11 |
+| `promote_load_back_declined` | 2 | 1 |
+| total skipped | 34 | 12 |
+| promote success rate | 97 % | **99.2 %** |
+| per-trial mean (s) | 1107 | 1231 |
+
+Per-trial moved within the A3 noise band (1107–1257); needs N≥3
+to claim any perf effect.  Conclusion: SWA-assert fix is a
+**correctness fix** (no spurious exceptions) with **no
+measurable performance change** — the 28-448 assertions were
+on broken-chain nodes that promote couldn't help anyway.
+
 ## Files
 
 * sglang patch: `python/sglang/srt/mem_cache/unified_radix_cache.py`
