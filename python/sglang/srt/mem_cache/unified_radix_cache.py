@@ -1450,7 +1450,9 @@ class UnifiedRadixCache(BasePrefixCache):
         req=None,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
+        self._last_load_back_decline = None
         if self.cache_controller is None:
+            self._last_load_back_decline = "no_cache_controller"
             return False
 
         # Build KV transfer
@@ -1480,9 +1482,16 @@ class UnifiedRadixCache(BasePrefixCache):
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
-        ):
+        if kv_tokens < self.load_back_threshold and not comp_xfers:
+            self._last_load_back_decline = (
+                f"below_threshold:kv_tokens={kv_tokens}<thr={self.load_back_threshold}"
+            )
+            self.dec_lock_ref(best_match_node, ancestor_lock_params)
+            return False
+        if mem_quota is not None and kv_tokens > mem_quota + result.delta:
+            self._last_load_back_decline = (
+                f"exceeds_mem_quota:kv_tokens={kv_tokens}>quota={mem_quota}+delta={result.delta}"
+            )
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return False
 
@@ -1491,6 +1500,9 @@ class UnifiedRadixCache(BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
+                self._last_load_back_decline = (
+                    f"evict_short:needed={needed}>evicted={result.num_tokens_evicted}"
+                )
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 return False
 
@@ -1505,6 +1517,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
+            self._last_load_back_decline = "controller_load_returned_none"
             return False
 
         # Commit: each component gets only its own transfers
@@ -2402,8 +2415,20 @@ class UnifiedRadixCache(BasePrefixCache):
                         applied_hashes.append(h)
                         acted_node_ids.add(node.id)
                     else:
+                        # load_back returned False without raising. Use only
+                        # the leading category so the daemon's Counter
+                        # aggregates cleanly; numeric detail is still on
+                        # self._last_load_back_decline for live debugging.
+                        detail = (
+                            getattr(self, "_last_load_back_decline", None)
+                            or "unknown"
+                        )
+                        category = detail.split(":", 1)[0]
                         skipped.append(
-                            {"hash": h, "reason": "promote_load_back_declined"}
+                            {
+                                "hash": h,
+                                "reason": f"promote_load_back_declined:{category}",
+                            }
                         )
                 else:
                     skipped.append({"hash": h, "reason": "race:no_data"})
