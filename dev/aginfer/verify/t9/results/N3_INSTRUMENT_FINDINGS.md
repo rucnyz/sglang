@@ -143,14 +143,47 @@ generate the pre-conditions either layer needs to do work.
   3. (re-)disable HiCache (Run J — chained, pending) so eviction
      goes to DROP, forcing the migration story
 
-## Open questions to answer with the K-a / Run J chain
+## K-a + Run J answer (chain run 2026-05-30)
 
-* **K-a** (kv_scheduler ON + admission OFF): expect identical
-  daemon-decision pattern as OURS_full above.  If different,
-  admission was somehow inhibiting kv decisions.
-* **Run J** (full daemon + HiCache OFF): no DRAM tier ⇒ daemon
-  must demote to DROP (or nowhere).  Expect HBM occ to rise.
-  Watch for `migrate_post` count > 0 here for the first time.
+Both chained cycles produce the **same null result** as OURS_full:
+
+| metric | OURS_full | K-a | Run J |
+|---|---|---|---|
+| events_received | 18 039 | 17 684 | 18 043 |
+| kv_decisions | 12 017 | 11 782 | 12 020 |
+| **migrate_post** | **0** | **0** | **0** |
+| **adm_pauses** | **0** | **0** | **0** |
+| HBM occ (daemon view, all samples) | 0.000 | 0.000 | 0.000 |
+| sglang peak `full token usage` | 0.02 | 0.02 | **0.07** |
+| per-trial mean (s) | ~1369 | similar | 1351 |
+
+### What this rules out
+
+* **K-a vs OURS_full**: admission_controller's marginal
+  contribution is **exactly 0**, because admission never even
+  ran in OURS_full (pause_count = 0).  Disabling something that
+  was already a no-op changes nothing.  Confirmed by identical
+  daemon decision breakdowns.
+* **Run J HiCache-OFF hypothesis**: turning off the DRAM tier
+  did NOT push HBM into the pressure regime.  Peak only rises
+  from 2 % → 7 %; still nowhere near the 70 % sglang-fires
+  threshold.
+
+### Why Run J still couldn't pressure HBM
+
+The default `--max-total-tokens` is ~10 M tokens.  Even with
+HiCache OFF (no DRAM spill), the workload's 32-trial concurrent
+KV footprint is far smaller than the pool.  Per
+`N3_GAPS.md` §3 / §4 the right fix is **both**:
+
+1. `--ak max_completion_tokens=4096` (drop the runaway tail that
+   eats 80 % of LLM time)
+2. `--max-total-tokens 256K-512K` (shrink pool so HBM occ can
+   reach > 0.7)
+
+Either alone is not enough — runaway dominates wall time so
+mean wouldn't move; pool-shrink alone leaves runaway-decode
+free to OOM the small pool.
 
 ## Side bug surfaced (G_NEW)
 
