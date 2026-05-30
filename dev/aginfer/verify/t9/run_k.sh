@@ -177,7 +177,7 @@ if [[ -n "$HICACHE_FLAG" ]]; then
 fi
 
 # ---- 2. sglang ----
-echo "[run_k:$VARIANT] starting sglang (TP=$SGLANG_TP, GPUs=$AGINFER_GPUS, HiCache=${HICACHE_FLAG:-OFF})..."
+echo "[run_k:$VARIANT] starting sglang (TP=${SGLANG_TP:-2}, GPUs=$AGINFER_GPUS, HiCache=${HICACHE_FLAG:-OFF})..."
 # T9 README §"For ALL variants": ours_greedy_score scorer is the
 # load-bearing inline path; without it, the floor argument breaks.
 # Export here (NOT in env.sh) so the env stays local to Run K.
