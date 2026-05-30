@@ -2364,14 +2364,26 @@ class UnifiedRadixCache(BasePrefixCache):
                     #     full + couldn't evict enough, or transfer
                     #     below load_back_threshold, or lock contention
                     #   * load_back raises → defensive: don't crash the
-                    #     /aginfer/migrate handler on a single bad action
+                    #     /aginfer/migrate handler on a single bad action.
+                    #     Include exc message so daemon's migrate_skipped
+                    #     log line is actionable (otherwise we just see
+                    #     "AssertionError" with no context).
                     try:
                         ok = self.load_back(node)
                     except Exception as exc:  # noqa: BLE001
+                        msg = str(exc) or "<empty>"
+                        # Strip whitespace + keep first 80 chars; daemon's
+                        # metric format is space-separated so an
+                        # unrestricted assertion message would corrupt
+                        # downstream parsing.
+                        short = "_".join(msg.split())[:80]
                         skipped.append(
                             {
                                 "hash": h,
-                                "reason": f"promote_raised:{type(exc).__name__}",
+                                "reason": (
+                                    f"promote_raised:"
+                                    f"{type(exc).__name__}:{short}"
+                                ),
                             }
                         )
                         continue

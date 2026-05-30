@@ -695,9 +695,11 @@ class KvScheduler:
         # `skipped` times per POST.
         for entry in skipped_list:
             if isinstance(entry, dict):
+                reason = entry.get("reason", "?")
+                # Replace spaces with _ since metric format is space-sep.
                 _m(
                     "migrate_skipped",
-                    reason=entry.get("reason", "?"),
+                    reason=str(reason).replace(" ", "_")[:120],
                 )
 
 
