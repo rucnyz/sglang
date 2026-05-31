@@ -2024,6 +2024,9 @@ for pause/resume).
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
 | **Idempotent daemon→sglang actions**: every endpoint accepts re-application — migrate (a no-op `applied=0` with a `race:*` skip when the target tier already matches), pause/resume (200 with `applied:false` when the program is already in the requested state), hint PUT (overwrite-by-stamp).  Same reasoning across all of them: the daemon may emit the same action twice across consecutive event handlers because state-dump propagation lags the daemon's just-emitted action; the sglang side must absorb this without error | sglang endpoints |
 | **Outbound queue is volatile**: the daemon's outbound action queue lives in memory only.  On daemon crash, pending actions are lost — and that's correct.  After restart, the daemon's first `GET /aginfer/state` reads the live state; if the lost action was needed, `joint_decide` re-issues it.  No disk WAL exists for outbound actions, by the same first-principles argument that rules out a webhook persistence WAL (§11): every authoritative quantity already lives in sglang's state, the daemon is just a decision function over it | daemon outbound worker |
+| **No daemon-side hint cache**: the daemon does not maintain a shadow `{hash: last_pushed_value}` map.  Per-event, the daemon re-scores the units in `D_t` (small set, ≤ K_MAX = 256) and pushes their hints unconditionally; sglang's hint table is overwrite-by-stamp (§6) and dedupes on its side.  Eliminates an unbounded daemon-side data structure; the trade is some redundant PUTs that overwrite identical values — negligible at D_t cardinality | daemon kv_scheduler hint emitter |
+| **Proxy gate releases on client disconnect**: a request held in the proxy gate awaits BOTH the gate condition AND `request.is_disconnected()`; whichever fires first wins.  TCP disconnect deterministically signals the client gave up — no timer, no fallback.  On disconnect the proxy releases the gated request locally, the daemon's `program_tracker.client_disconnected(p)` enqueues `PUT /aginfer/program_paused {transition: END, ...}` onto the outbound queue, and `p`'s residence is reaped at the next state-dump | daemon proxy gate |
+| **Observability for state-dump cost**: every `GET /aginfer/state` records its wall-clock latency on the sglang side, and the daemon logs (a) latency-per-fetch and (b) event-queue depth at handler entry.  No backpressure mechanism is wired (drop-on-full / coalescing) — these are kept off the spec until measured evidence shows the queue grows unboundedly.  The logs are the first-class signal for when to revisit | sglang dump path + daemon event_router metrics |
 | **Atomic unit visibility**: units appear in `/aginfer/state.units` **only after sglang commits the chunk to the radix tree** (page-aligned commit boundary).  Partial-prefill chunks under chunked prefill do not appear as units; the daemon does not observe in-progress prefill state, only the post-commit snapshot.  This eliminates a class of "what's the p_hat of a half-written unit" questions by construction — half-written units don't exist in the spec's data model | sglang radix-tree commit path |
 | **Preemption transparency**: sglang's continuous-batching preempt-and-resume of in-flight requests changes `per_program_usage[p].hbm.inflight` between events without any daemon action.  The daemon does not track inflight state across events (cf. always-fresh invariant); each handler re-fetches state, so a preempted-then-resumed program is indistinguishable from one that never preempted.  Forecast / `bytes_needed` / pause_relief are computed on the live snapshot, so they always reflect post-preemption truth | always-fresh state + §5 per_program_usage |
 | **State-dump internal consistency**: a single `/aginfer/state` response is a snapshot taken under a single read-side lock on sglang's tree cache + allocator + per-program tables.  `units[*]`, `per_program_usage[*].unit_hashes`, and `pool_usage` always refer to the same logical timestamp; `state.units[h]` is safe to dereference for every `h ∈ per_program_usage[p].unit_hashes` | sglang `dump_aginfer_state` |
@@ -2108,7 +2111,34 @@ the first 200 after a failure:
 3. `program_tracker` state is preserved daemon-side; proxy gate
    re-applies to incoming requests.
 
-### sglang's webhook fire-and-forget contract
+### SESSION_END for a PAUSED program
+
+If harbor signals `SESSION_END` while p is in the PAUSED state
+(its next request is sitting in the proxy gate), the daemon's
+event handler performs:
+
+```python
+def on_session_end(p, event):
+    if program_tracker.state(p) == PAUSED:
+        gated = proxy.gate.release(p)
+        if gated is not None:
+            # Cancel the still-pending request — the client said
+            # they're done with this session, so the in-flight
+            # request is implicitly cancelled.  Respond with 499
+            # (client closed request) so the client's framework
+            # treats it as their own cancellation.
+            gated.respond(status=499, body=b"")
+    program_tracker.set_state(p, ENDED)
+    outbound.enqueue(PUT(
+        "/aginfer/program_paused",
+        {"program_id": p, "transition": "END", "pre_pause_state": null}))
+```
+
+The PUT to sglang clears `state.per_program_usage[p].state` to
+ENDED and `pre_pause_state` to null on the next state-dump.
+`session_scoped_units(p)` then becomes the §7 D_t for the
+`SESSION_END` event, demoting / dropping any units only p
+owned (per §7 table).
 
 If sglang fires a webhook while the daemon is down, the event is
 **lost** — and that's by construction the correct behaviour, not
