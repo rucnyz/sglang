@@ -118,7 +118,7 @@ Three layers, three cadences (none of them periodic).
 | Layer | Where | Trigger event | Role |
 |---|---|---|---|
 | inline scorer | inside sglang's eviction-decision callsite | sglang-internal: free-pages-now | scoring function for the allocator's eviction heap (operates on the hint table) |
-| kv_scheduler | daemon | workload events (11 kinds, §4) | **unit-migrate candidate generator** consumed by §9 `joint_decide` |
+| kv_scheduler | daemon | workload events (12 kinds, §4) | **unit-migrate candidate generator** consumed by §9 `joint_decide` |
 | admission_controller | daemon | every workload event | **program pause / resume candidate generator** consumed by §9 `joint_decide` |
 
 All three use the **same V_u rule**.  They live where they live
@@ -126,7 +126,7 @@ because of **event ownership**, not as fallbacks for each other:
 the eviction-decision callsite is sglang-internal, fires
 synchronously on the scheduler step, and cannot wait for an HTTP
 round-trip to the daemon, so its V_u handler must be in-process.
-The 11 workload events are surfaced over HTTP (proxy + sglang
+The 12 workload events are surfaced over HTTP (proxy + sglang
 webhook), so their V_u handlers live in the daemon.
 
 ### Aginfer is sglang's decision pipeline (superset framing)
@@ -176,7 +176,7 @@ restructuring the framework.
 
 ## 4. Events
 
-Eleven event kinds.  The daemon is **strictly reactive** to events;
+Twelve event kinds.  The daemon is **strictly reactive** to events;
 the system has no internal timer.
 
 | kind | emitted by | semantic |
@@ -192,6 +192,7 @@ the system has no internal timer.
 | `MEMORY_PRESSURE` | sglang webhook | allocator-truth HBM occupancy crossed `theta_hi` upward (HIGH band); while in HIGH or CRITICAL, sglang re-fires every `heartbeat_s` (default 5 s) so the daemon stays caught up if it missed earlier events |
 | `PRESSURE_CRITICAL` | sglang webhook | allocator-truth HBM occupancy crossed `theta_crit` upward (above HIGH); same payload shape as `MEMORY_PRESSURE`.  Routing-priority signal: the event router preempts any pending lower-priority event and runs `joint_decide` immediately.  See §9 for why no decision-rule branch is needed (forecast + widened `Pause.relief` carry the urgency) |
 | `PRESSURE_RESOLVED` | sglang webhook | allocator-truth HBM occupancy crossed `theta_lo` downward (back to OK band, hysteresis) |
+| `APPLY_FAILED` | sglang webhook | a daemon-issued action could not be applied; payload carries `{endpoint, action_id, reason}` where `endpoint ∈ {migrate, program_paused, hints, thresholds}` and `reason` is the skip-class (§6 `POST /aginfer/migrate` reasons + the analogue for other endpoints).  The daemon's `joint_decide` re-evaluates on the next event handler entry; idempotent invariants (§10) let it safely re-issue any superseding action without explicit retry bookkeeping |
 
 Each event carries (`kind`, `session_id` if applicable, `payload`).
 The payload may include event-specific context the decision rule can
@@ -439,8 +440,36 @@ class of bug the always-fresh invariant exists to rule out.
 
 ## 6. Action surfaces
 
-Two daemon → sglang endpoints, both write-only from the daemon's
+Daemon → sglang endpoints, write-only from the daemon's
 perspective.
+
+### Fire-and-forget delivery (all action endpoints)
+
+Every daemon-issued action endpoint (`POST /aginfer/migrate`,
+`PUT /aginfer/program_paused`, `PUT /aginfer/thresholds`,
+`PUT /aginfer/hints`) is **fire-and-forget** from the event
+handler's perspective:
+
+1. Handler computes the plan and **enqueues each action** onto the
+   daemon's outbound `asyncio.Queue`; the handler returns immediately.
+2. A dedicated outbound worker task consumes the queue, issues
+   the HTTP `POST` / `PUT`, and on 200 simply drops the response.
+3. If sglang returns a non-2xx or the apply path raises **inside
+   sglang**, sglang fires an `APPLY_FAILED` webhook back to the
+   daemon (§4) carrying `{endpoint, action_id, reason}`.  The
+   daemon treats the webhook like any other workload event — the
+   next `joint_decide` re-evaluates the state and may re-issue a
+   superseding action.  Idempotency (§10) makes re-issue safe.
+
+This decouples handler latency from sglang processing latency.
+Under a 200 ms sglang stall (CUDA-graph capture, prefill batch
+serialization), a synchronous awaited POST would freeze the entire
+event router; fire-and-forget keeps the inbound queue draining and
+defers the action to the outbound worker.
+
+Each action carries an `action_id` (UUID generated at the daemon)
+so `APPLY_FAILED` can be correlated to a specific in-flight
+attempt; the id is logged on both sides.
 
 ### `POST /aginfer/migrate` — apply residence-set transitions
 
@@ -1970,6 +1999,7 @@ for pause/resume).
 | **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer anywhere — kv_scheduler, admission, forecast refresh, program_tracker, and the proxy all recompute only on event arrival.  SESSION_END is signalled by the client explicitly (§4); there is no time-based fallback | asyncio queue + single consumer |
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
 | **Idempotent daemon→sglang actions**: every endpoint accepts re-application — migrate (a no-op `applied=0` with a `race:*` skip when the target tier already matches), pause/resume (200 with `applied:false` when the program is already in the requested state), hint PUT (overwrite-by-stamp).  Same reasoning across all of them: the daemon may emit the same action twice across consecutive event handlers because state-dump propagation lags the daemon's just-emitted action; the sglang side must absorb this without error | sglang endpoints |
+| **Outbound queue is volatile**: the daemon's outbound action queue lives in memory only.  On daemon crash, pending actions are lost — and that's correct.  After restart, the daemon's first `GET /aginfer/state` reads the live state; if the lost action was needed, `joint_decide` re-issues it.  No disk WAL exists for outbound actions, by the same first-principles argument that rules out a webhook persistence WAL (§11): every authoritative quantity already lives in sglang's state, the daemon is just a decision function over it | daemon outbound worker |
 | **State-dump internal consistency**: a single `/aginfer/state` response is a snapshot taken under a single read-side lock on sglang's tree cache + allocator + per-program tables.  `units[*]`, `per_program_usage[*].unit_hashes`, and `pool_usage` always refer to the same logical timestamp; `state.units[h]` is safe to dereference for every `h ∈ per_program_usage[p].unit_hashes` | sglang `dump_aginfer_state` |
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
