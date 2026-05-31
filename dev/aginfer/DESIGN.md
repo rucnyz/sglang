@@ -235,7 +235,6 @@ not a decision-rule concern.
 
 ```json
 {
-  "page_size": int,
   "time_counter": int,                  // monotonic access tick
 
   "tier_usage": {                       // RADIX-TREE view; aggregate per tier
@@ -255,15 +254,26 @@ not a decision-rule concern.
                                          // registry (one component per
                                          // attention type per architecture;
                                          // see sglang unified_cache_components/).
+                                         //
+                                         // `page_bytes` is per-(tier, subpool)
+                                         // because paged-KV allocators may use
+                                         // different page sizes per subpool
+                                         // (MLA's latent layers, GQA groups,
+                                         // Mamba snapshot chunks); §9's DP
+                                         // quantises each axis at its own
+                                         // `page_bytes`.
     "HBM":  {"subpools": {"<name>": {"used_bytes": int, "cap_bytes": int,
                                      "available_bytes": int,
-                                     "evictable_bytes": int}}},
+                                     "evictable_bytes": int,
+                                     "page_bytes": int}}},
     "DRAM": {"subpools": {"<name>": {"used_bytes": int, "cap_bytes": int,
                                      "available_bytes": int,
-                                     "evictable_bytes": int}}},
+                                     "evictable_bytes": int,
+                                     "page_bytes": int}}},
     "DISK": {"subpools": {"<name>": {"used_bytes": int, "cap_bytes": int,
                                      "available_bytes": int,
-                                     "evictable_bytes": int}}}
+                                     "evictable_bytes": int,
+                                     "page_bytes": int}}}
   },
 
   "per_program_usage": {                // PER-PROGRAM-OWNED view
@@ -742,7 +752,7 @@ because the constraint is a one-sided byte threshold.
 | `bw_free(σ, τ)` | bytes/sec | live free bandwidth on σ↔τ link; reads `state.link_stats[σ→τ].recent_throughput_bps` when active, falls through to `peak_bw_bps` when link idle |
 | `transfer_bytes(u, σ, τ)` | bytes | `bytes_at(u, σ)` — what the link physically moves when adding τ to residence (source is `authoritative_tier(residence)`) |
 | `transfer_time(σ, τ)` | seconds | `transfer_bytes / bw_free` |
-| `page_bytes` | bytes | DP quantisation granularity = sglang's allocator page size in bytes (model-architecture dependent; for paged-KV with non-uniform per-layer pools, the smallest page across all (tier, subpool) pairs governs) |
+| `page_bytes(τ, sp)` | bytes | per-(tier, subpool) DP quantisation granularity, read from `state.pool_usage[τ].subpools[sp].page_bytes`.  §9's multi-axis DP uses each axis's own bucket size — no global LCM/min collapse |
 | `cost`, `gain`, `V_u`, `V_u_program` | seconds | net value at the same time-axis |
 | `relief`, `re_use`, `bytes_moved`, `bytes_needed` | bytes | HBM-resource axis |
 | `forecast(state)` | dict[subpool, bytes] | per-HBM-subpool predicted bytes at the next event arrival if no scheduling action is taken: `pool_usage.HBM.subpools[sp].used_bytes + forecast_inflight_demand(state)[sp]`.  Compare each entry against `theta_hi × subpools[sp].cap_bytes`.  Horizon = `forecast_horizon(state)`, see §8 |
@@ -1716,11 +1726,13 @@ def joint_decide(state, event):
                          for sub in (c.relief if isinstance(c, Migrate)
                                      else {"HBM": c.relief}).values()
                          for b in sub.values())]
+        bucket_size = {(tier, sp): state.pool_usage[tier]["subpools"][sp]["page_bytes"]
+                       for (tier, sp) in (list(bytes_needed) + list(cap_left))}
         return knapsack_min_cost_multi(
             items        = cands,
             bytes_needed = bytes_needed,             # keyed by (HBM, sp)
             cap_left     = cap_left,                 # keyed by (DRAM|DISK, sp)
-            bucket_size  = page_bytes,
+            bucket_size  = bucket_size,              # per-axis page granularity
         )
 
     # Headroom: per HBM-subpool slack budget.  Resumes consume HBM
@@ -1733,10 +1745,12 @@ def joint_decide(state, event):
     if all(r > 0 for r in free_room.values()):
         cands = admission.resume_candidates(state)
         cands = [c for c in cands if any(b > 0 for b in c.re_use.values())]
+        bucket_size = {(tier, sp): state.pool_usage[tier]["subpools"][sp]["page_bytes"]
+                       for (tier, sp) in free_room}
         return knapsack_max_value_multi(
             items       = cands,
             budget      = free_room,                 # keyed by (HBM, sp)
-            bucket_size = page_bytes,
+            bucket_size = bucket_size,               # per-axis page granularity
         )
 
     return []                                        # hysteresis dead-zone
@@ -1795,14 +1809,17 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
     (b) for each (DRAM|DISK, sp) axis a:
         Σ_{s∈S} acquired[a](s)       <= cap_left[a]
 
+    `bucket_size` is a dict keyed by axis (tier, sp); each axis uses
+    its own page granularity per §5 pool_usage[tier].subpools[sp].page_bytes.
+
     Pure-remove Migrates contribute 0 to (b) by construction.
     Pauses contribute relief on the HBM tier only.  Quantises
     relief round-DOWN (safe for >=); quantises destination
     consumption round-UP (safe for <=)."""
     relief_axes = list(bytes_needed.keys())          # list of (HBM, sp)
     cap_axes    = list(cap_left.keys())              # list of (DRAM|DISK, sp)
-    W    = {a: _bk_up(bytes_needed[a], bucket_size) for a in relief_axes}
-    Wcap = {a: _bk(cap_left[a], bucket_size)        for a in cap_axes}
+    W    = {a: _bk_up(bytes_needed[a], bucket_size[a]) for a in relief_axes}
+    Wcap = {a: _bk(cap_left[a], bucket_size[a])        for a in cap_axes}
     K    = len(items)
     INF  = float("inf")
 
@@ -1814,9 +1831,9 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
     dp   = {zero_state(): 0.0}
     take = {}
     for k, c in enumerate(items, start=1):
-        d_relief = tuple(_bk(_relief_at(c, tier, sp), bucket_size)
+        d_relief = tuple(_bk(_relief_at(c, tier, sp), bucket_size[(tier, sp)])
                          for (tier, sp) in relief_axes)
-        d_cap    = tuple(_bk_up(_acquire_at(c, tier, sp), bucket_size)
+        d_cap    = tuple(_bk_up(_acquire_at(c, tier, sp), bucket_size[(tier, sp)])
                          for (tier, sp) in cap_axes)
         new_dp = dict(dp)
         for s, cost in dp.items():
@@ -1859,9 +1876,11 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
             cap_buckets = list(s_pick[n:])
             for i, (tier, sp) in enumerate(relief_axes):
                 r_buckets[i] = max(0, r_buckets[i]
-                                  - _bk(_relief_at(c, tier, sp), bucket_size))
+                                  - _bk(_relief_at(c, tier, sp),
+                                        bucket_size[(tier, sp)]))
             for i, (tier, sp) in enumerate(cap_axes):
-                cap_buckets[i] -= _bk_up(_acquire_at(c, tier, sp), bucket_size)
+                cap_buckets[i] -= _bk_up(_acquire_at(c, tier, sp),
+                                         bucket_size[(tier, sp)])
             s_pick = tuple(r_buckets) + tuple(cap_buckets)
         k -= 1
     return chosen
@@ -1871,17 +1890,18 @@ def knapsack_max_value_multi(items, budget, bucket_size):
     """0/1 knapsack: subset S maximising Σ gain(s∈S) subject to
     for each (HBM, sp) axis a:
         Σ_{s∈S} re_use[sp](s)   <= budget[a]
-    Quantises re_use round-UP (safe for <=).  Same sparse multi-axis
-    DP shape as knapsack_min_cost_multi."""
+    `bucket_size` keyed by axis (tier, sp); each axis quantises at its
+    own page granularity.  Quantises re_use round-UP (safe for <=).
+    Same sparse multi-axis DP shape as knapsack_min_cost_multi."""
     axes = list(budget.keys())                       # list of (HBM, sp)
-    W    = {a: _bk(budget[a], bucket_size) for a in axes}
+    W    = {a: _bk(budget[a], bucket_size[a]) for a in axes}
     K    = len(items)
     NEG  = float("-inf")
 
     dp   = {tuple(0 for _ in axes): 0.0}
     take = {}
     for k, c in enumerate(items, start=1):
-        d = tuple(_bk_up(c.re_use.get(sp, 0), bucket_size)
+        d = tuple(_bk_up(c.re_use.get(sp, 0), bucket_size[(tier, sp)])
                   for (tier, sp) in axes)
         new_dp = dict(dp)
         for s, gain in dp.items():
@@ -1901,7 +1921,7 @@ def knapsack_max_value_multi(items, budget, bucket_size):
             c = items[k - 1]
             chosen.append(c)
             s_pick = tuple(s_pick[i] - _bk_up(c.re_use.get(axes[i][1], 0),
-                                              bucket_size)
+                                              bucket_size[axes[i]])
                            for i in range(len(axes)))
         k -= 1
     return chosen
@@ -2004,6 +2024,8 @@ for pause/resume).
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
 | **Idempotent daemon→sglang actions**: every endpoint accepts re-application — migrate (a no-op `applied=0` with a `race:*` skip when the target tier already matches), pause/resume (200 with `applied:false` when the program is already in the requested state), hint PUT (overwrite-by-stamp).  Same reasoning across all of them: the daemon may emit the same action twice across consecutive event handlers because state-dump propagation lags the daemon's just-emitted action; the sglang side must absorb this without error | sglang endpoints |
 | **Outbound queue is volatile**: the daemon's outbound action queue lives in memory only.  On daemon crash, pending actions are lost — and that's correct.  After restart, the daemon's first `GET /aginfer/state` reads the live state; if the lost action was needed, `joint_decide` re-issues it.  No disk WAL exists for outbound actions, by the same first-principles argument that rules out a webhook persistence WAL (§11): every authoritative quantity already lives in sglang's state, the daemon is just a decision function over it | daemon outbound worker |
+| **Atomic unit visibility**: units appear in `/aginfer/state.units` **only after sglang commits the chunk to the radix tree** (page-aligned commit boundary).  Partial-prefill chunks under chunked prefill do not appear as units; the daemon does not observe in-progress prefill state, only the post-commit snapshot.  This eliminates a class of "what's the p_hat of a half-written unit" questions by construction — half-written units don't exist in the spec's data model | sglang radix-tree commit path |
+| **Preemption transparency**: sglang's continuous-batching preempt-and-resume of in-flight requests changes `per_program_usage[p].hbm.inflight` between events without any daemon action.  The daemon does not track inflight state across events (cf. always-fresh invariant); each handler re-fetches state, so a preempted-then-resumed program is indistinguishable from one that never preempted.  Forecast / `bytes_needed` / pause_relief are computed on the live snapshot, so they always reflect post-preemption truth | always-fresh state + §5 per_program_usage |
 | **State-dump internal consistency**: a single `/aginfer/state` response is a snapshot taken under a single read-side lock on sglang's tree cache + allocator + per-program tables.  `units[*]`, `per_program_usage[*].unit_hashes`, and `pool_usage` always refer to the same logical timestamp; `state.units[h]` is safe to dereference for every `h ∈ per_program_usage[p].unit_hashes` | sglang `dump_aginfer_state` |
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
@@ -2206,6 +2228,49 @@ dense table is intractable but the reachable-cell count under
 agent workloads (where most candidates touch only 1–2 axes
 nontrivially) stays in the 10⁵ envelope.
 
+### S5 — Speculative decoding (orthogonal to S1–S4)
+
+Speculative decoding adds a `draft` subpool whose bytes are
+**per-request transient**: allocated by the verifier, lived
+across one verify step, then discarded or promoted into the
+attention subpool.  Draft units are **not radix-tree-cached** —
+they never appear in `state.units`.  Their bytes show up only
+in `state.per_program_usage[p].hbm.inflight["draft"]`.
+
+| field | shape |
+|---|---|
+| `pool_usage.HBM.subpools` | adds `"draft"` alongside the base scenario's keys (`"attn"` or `"full"/"swa"` or `"full"/"mamba"`) |
+| `state.units` | no change — draft KV is not radix-tracked |
+| `per_program_usage[p].hbm.inflight["draft"]` | bytes currently in the draft buffer for p |
+| `n_bytes` for tree units | no `draft` key (drafts are never tree units) |
+| §9 DP axes | +1 HBM axis (`("HBM", "draft")`) |
+
+The `forecast_inflight_demand[draft]` formula matches the
+attention case: programs decoding draft tokens have growing
+`inflight["draft"]` proportional to `decode_throughput(p) ×
+draft_factor`, where `draft_factor` is the model's speculative
+expansion (typically 4–8× for Medusa / Eagle).  Draft bytes
+saturate at a fixed maximum per request (the draft window).
+
+Pause-relief for a program in spec-decoding mode includes the
+draft subpool: pausing a program frees its `inflight["draft"]`
+bytes (the verifier discards them).  Migrate candidates over
+draft units don't exist — drafts can't be demoted to DRAM (no
+prefix-reuse value in a discarded draft); the only action over
+draft bytes is "pause the program that owns them".
+
+### Out of scope (current spec, framework-compatible)
+
+**Multi-LoRA serving**.  Adapter activations live per-request
+in HBM, much like draft KV.  They fit the named-subpool
+abstraction (deploy an `"adapter"` subpool, route adapter bytes
+via `per_program_usage[p].hbm.inflight["adapter"]`).  Current
+benchmark workloads do not exercise multi-LoRA serving; the
+spec's primitives are sufficient when a future scenario lights
+this up, but the spec does not instantiate it.  No
+multi-LoRA-specific schema or decision-rule machinery is
+required — the deployment just declares the adapter subpool.
+
 ### Residence evolution
 
 A unit's `residence` set evolves through the §6
@@ -2233,7 +2298,7 @@ involved live in different subpools (see S3).
 
 ### Scenario-independent assertions
 
-Across S1 – S4 the daemon code path is identical: read
+Across S1 – S5 the daemon code path is identical: read
 `pool_usage.HBM.subpools.keys()` at state-dump entry, iterate
 over those keys for every per-subpool quantity (`forecast`,
 `bytes_needed`, `cap_left`, `pause_relief`, `re_use`,
