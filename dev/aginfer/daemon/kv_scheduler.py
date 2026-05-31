@@ -565,11 +565,14 @@ def _top_k_by_regret(
     rho_disk = costs.rho[Tier.DISK]
     items: List[Tuple[float, str]] = []
     for uid, u in units.items():
-        if u.tier != Tier.HBM:
-            # v1: only HBM-resident units are demote candidates.  T10
-            # extends this to also rank DRAM units once the daemon-
-            # controlled DISK (L3 / Mooncake) tier is wired — paper §7.1
-            # says regret should rank across all current-tier units.
+        if Tier.HBM not in u.residence:
+            # v1: only HBM-resident units are demote candidates.  Post-
+            # T17, a unit is "in HBM" iff Tier.HBM ∈ residence (set
+            # semantics — a unit can be HBM+DRAM simultaneously).
+            # T10/T34 extends this to also rank DRAM units once the
+            # daemon-controlled DISK (L3 / Mooncake) tier is wired —
+            # paper §7.1 says regret should rank across all current-
+            # tier units.
             continue
         saved = u.p_hat * (rho_disk - rho_hbm) * u.n_tokens
         # Holding tax proxy (per unit time):
