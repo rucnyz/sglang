@@ -341,6 +341,51 @@ the inline scorer always has the same V_u inputs the daemon
 would have used at the time of the last event — it is not a
 defensive LRU fallback.
 
+### Multi-rank protocol (TP / EP / DP)
+
+The daemon talks to a single sglang HTTP endpoint regardless of
+how the inference engine is parallelised.  Per-rank coordination
+happens inside sglang.
+
+| parallelism | per-rank HBM holds | daemon's view | actions |
+|---|---|---|---|
+| TP > 1 | same logical unit's **different head-dim slice** on each rank | sglang's tokenizer-server fans `/aginfer/state` / `migrate` / `hints` out to all rank schedulers; the snapshot returned to the daemon is aggregated across ranks (`tier_usage`, `pool_usage`, `per_program_usage` summed) | every action is **all-rank atomic by semantic requirement** — see below |
+| EP > 1 | prefix KV mirrored across ranks (same as TP); only the MoE expert weights / activations differ per rank | same as TP from the daemon's perspective — expert weights aren't in the daemon's scheduling scope | same as TP |
+| DP > 1 | each DP replica has its own independent KV pool serving its own program subset | each DP replica is a **separate sglang endpoint** with its own daemon-sglang pairing; no cross-replica daemon coordination | independent per replica |
+
+### Why TP forces all-rank-atomic actions (not a v1 simplification)
+
+TP attention computes `softmax(QK^T)V` with each rank handling
+`1/N` of the heads.  Every rank must have the unit's KV slice in
+HBM at compute time, otherwise the rank without it stalls
+loading from DRAM while the others wait for the all-reduce.
+
+→ The state "unit U is in HBM" is **binary across the whole
+N-rank ensemble** — either all ranks have U in HBM or none do.
+A migrate or pause must apply atomically across all ranks.
+
+This is **not** a per-rank-actions-deferred limitation; it's the
+TP semantic.  A future "rank-targeted action" would mean
+"different ranks hold different units" — under TP attention that
+breaks correctness, not just performance.
+
+A meaningful "cross-rank HBM tier" doesn't exist either: each
+rank's HBM stores its own head-dim slice, slices aren't
+substitutable across ranks, NVLink/NCCL is used for compute
+all-reduce not for storage tiering.  There is no useful "borrow
+rank 1's HBM space for rank 0's units" operation.
+
+### Hint consistency across ranks
+
+When `PUT /aginfer/hints` fans out, ranks may apply with slight
+skew (one rank in CUDA graph capture, etc.).  This is
+**eventual-consistent by design**: an inline scorer using a
+stale hint may make a slightly sub-optimal eviction; the worst
+case is one missed unit recoverable via re-prefill.  No strong
+consistency / global lock — at hint update rate (≤ event rate ≈
+10²/s), the daemon's next push will reach the lagging rank
+within milliseconds.
+
 ## 7. Decision rule
 
 Per event, the daemon constructs a **decision set** `D_t ⊆ units`
