@@ -66,10 +66,11 @@ Three layers, three cadences (none of them periodic).
        │  on_event(e):                                     │
        │    state ← fetch /aginfer/state                   │
        │    D_t   ← decision_set(e.kind)                   │
-       │    a_t   ← kv_scheduler.decide(state, D_t)        │
+       │    a_t   ← kv_scheduler.decide(state, D_t, e)     │
        │    POST /aginfer/migrate(a_t)                     │
-       │    if e.kind ∈ {MEMORY_PRESSURE, PRESSURE_RESOLVED}: │
-       │        admission.act(state)                       │
+       │    admission.evaluate(state, e)                   │
+       │      # runs every event — its decision may change │
+       │      # at SESSION_ARRIVAL / TOOL_CALL_* / *PRESSURE* │
        │                                                   │
        │  program_tracker — REASONING / ACTING / PAUSED   │
        │    state machine, driven from the same events     │
@@ -249,70 +250,145 @@ _value(u, τ, state)     = p_hat × (reload_from_DROP - reload_from_τ)
 
 ### Inputs to `_net_value`
 
-`_net_value` is parameterised by four quantities.  The ideal estimator
-for each is:
+`_net_value` is parameterised by four quantities.  The ideal
+estimator for each is below; the current implementation uses crude
+proxies and is acknowledged as the highest-value future improvement.
+Replacing them **must not require changing `decide()` or the event /
+D_t contract** — the system is parameterised on these inputs.
 
-| input | ideal estimator | current implementation |
+#### `p_hat(u, Δt)` — probability u is accessed within Δt
+
+A unit's reuse probability is **conditional on the observable state
+of its holders**, not the output of a stochastic process fit to its
+history.  Per holder s ∈ `u.session_ids`:
+
+```
+p_access(u, s, Δt)  depends on s.program_state:
+  REASONING  →  high if u is in s's recent prefix tail;
+                decays with turn-distance from current tail
+  ACTING     →  ≈ P(s's tool returns within Δt)
+                ETA pulled from event payload or tool registry
+  PAUSED     →  0   (no access until admission resume)
+  ENDED      →  0
+```
+
+Aggregated across independent holders:
+
+```
+p_hat(u, Δt) = 1 - ∏_{s ∈ u.session_ids} (1 - p_access(u, s, Δt))
+```
+
+Why this beats "fit a Poisson / Hawkes rate":
+
+* PAUSED holders' contribution is *exactly zero* — the admission
+  controller's decisions feed directly into V_u, no warm-up period
+* Shared prefix held by N concurrent programs aggregates correctly
+  via the product (no ad-hoc "1/N weighting") — high |session_ids|
+  → at-least-one-holder probability → near 1 → stays HBM
+* ACTING holders' p depends on the **specific tool's ETA**, not a
+  per-unit static rate — long tool ⇒ low near-term p ⇒ demote
+  becomes profitable
+
+The Poisson formulation collapses all of this into one scalar λ,
+discarding the holder-state information the daemon already has.
+First-principles ideal exploits the observables; the rate-fit is a
+lossy summarisation.
+
+| input | ideal | current implementation |
 |---|---|---|
-| `p_hat(u)` — future reuse probability of unit u | online Bayesian update from observed accesses; bursty workloads use Hawkes (self-exciting) | `min(1.0, hits / age)` proxy — coarse |
-| `λ(u)` — reuse rate (1 / expected reuse interval) | empirical Poisson / Hawkes fit per unit class | calibrated floor per program state (ACTING / REASONING) |
-| `h_τ(occupancy)` — per-byte holding cost at tier τ as a function of how loaded τ is | live measurement: cost ∝ marginal value of a free byte at τ, observable from the allocator's recent pressure trajectory | static `cost × (1 + occupancy²)` |
-| `bw_free(σ, τ)` — free bandwidth on σ↔τ link | live measurement: bytes/sec idle on the actual transfer path | static config default |
-
-Inputs are crude proxies today; replacing them with the ideal
-estimators is the highest-value scheduler improvement and **must
-not require changing the decide() algorithm or the event/D_t
-contract** — the system is parameterised on these inputs.
+| `p_hat(u, Δt)` | conditional-on-holder-state product above, with tool ETA from event payload | `min(1.0, hits / age)` proxy |
+| `hold_time` for *this* decision | per-event physical ETA (see "Event-specific context" below) | `1 / λ(u)` per-unit constant |
+| `h_τ(occupancy)` — per-byte holding cost at tier τ | live: marginal cost of a free byte at τ, observable from the allocator's pressure trajectory | static `cost × (1 + occupancy²)` |
+| `bw_free(σ, τ)` — free σ↔τ link bandwidth | live measurement on the actual transfer path | static config default |
 
 ### Event-specific context
 
-Events may carry decision-relevant context the rule can use beyond
-the unit's intrinsic state.  Concrete case: `TOOL_CALL_START`
-ideally carries the **tool's expected duration** (looked up from
-the tool registry or historical mean) so `hold_time` for THIS
-demote decision is the actual ETA — not the unit's global lambda.
+Events carry decision-relevant context the rule must use beyond a
+unit's intrinsic state.  Concrete cases:
 
-* short ETA → demote not worth (transfer round-trip > savings)
-* long ETA → demote profitable
+* **`TOOL_CALL_START`** carries the tool's expected duration (tool
+  registry lookup or historical mean per tool name).  This is the
+  `Δt` plugged into `p_hat` *and* the `hold_time` for the demote
+  decision being considered right now.  Short ETA → transfer
+  round-trip > savings → don't demote.  Long ETA → demote profits.
+* **`SUB_DISPATCH_*`** carries whether the sub-agent inherits the
+  parent's prefix — drives which units in D_t need to stay HBM
+  vs are safe to demote.
 
-This is the right model because hold_time is a per-decision physical
-quantity, not a per-unit invariant.  When the event carries the
-information, the scheduler must use it.
+The principle: `hold_time` is a **per-decision physical quantity**,
+not a per-unit invariant.  Per-unit lambda is the right input only
+in absence of per-event context; when the event carries it, the
+scheduler must use it.
 
 ## 8. Admission
 
-Triggered by `MEMORY_PRESSURE` (after kv_scheduler's per-unit
-migrate has had a chance to relieve pressure).
+Admission is a decision function: "given current `(programs,
+HBM pressure, paused queue)`, which active programs should be
+paused and which paused programs resumed?".  It must run on **every
+event whose information could change that answer**, not just on a
+single "pressure crossed" trigger.
+
+### Triggers (first-principles)
+
+| event | why admission's decision can change |
+|---|---|
+| `SESSION_ARRIVAL` | new program enters → expected HBM demand rises; if free capacity < forecast demand, **pre-pause** a low-V_u program before contention starts (proactive) |
+| `TOOL_CALL_START` | program voluntarily idles → **pause cost ≈ 0** at this moment (no reasoning state is being interrupted); the cheapest possible time to free this program's HBM if its V_u is low |
+| `TOOL_CALL_END` | program returns and must reason → reconsider whether any currently-paused program now outranks one of the actives that just came back |
+| `MEMORY_PRESSURE` | sglang reports allocator at `theta_hi` → reactive pause (already late; should be rare if proactive triggers do their job) |
+| `PRESSURE_RESOLVED` | allocator drops below `theta_lo` → consider resuming paused programs in V_u order |
+| `SUB_DISPATCH_*` | sub-agent dispatch changes the dependency structure between programs; may affect pause eligibility |
+
+The four "reactive" triggers (the last four) match what the paper
+specifies.  The two "proactive" triggers (`SESSION_ARRIVAL`,
+`TOOL_CALL_START`) are the first-principles extension: admission's
+decision changes at those moments too, so it must evaluate.
+
+### Decision rule (one definition; reused per trigger)
 
 ```python
-def admission_on_pressure(state):
-    occ = state.pool_pressure[HBM]              # allocator truth
-    if occ < theta_hi: return                   # kv_scheduler handled it
-    while occ > theta_hi:
-        victim = argmin_program(V_u_program(p) for p in active_programs)
-        pause(victim)
-        occ = recompute(state, paused={victim})
+def admission_evaluate(state):
+    # state.pool_pressure[HBM] is the allocator truth (§5).
+    occ = state.pool_pressure[HBM]
+    forecast = occ + forecast_inflight_demand(state)
+
+    while forecast > theta_hi and active_programs(state):
+        victim = argmin(active_programs, key=V_u_program)
+        if marginal_pause_cost(victim) > marginal_relief_value(victim, occ):
+            break
+        pause(victim); forecast -= victim.hbm_footprint
+    while paused and forecast < theta_lo:
+        candidate = argmax(paused, key=V_u_program)
+        if not capacity_fits(candidate, state): break
+        resume(candidate); forecast += candidate.hbm_footprint
 ```
 
-```python
-def admission_on_resolved(state):
-    while paused and state.pool_pressure[HBM] < theta_lo:
-        candidate = oldest_paused_program
-        if room_for(candidate, state):
-            resume(candidate)
-```
+* `forecast_inflight_demand` adds expected HBM growth from
+  REASONING programs that haven't peaked yet (and at
+  `SESSION_ARRIVAL` time, the incoming program's estimated need).
+* `marginal_pause_cost(p)` is near zero when p is ACTING (idle
+  anyway), positive when REASONING (interrupting work).  This is
+  what makes TOOL_CALL_START such a cheap pause opportunity.
+* `V_u_program(p)` is the program-level aggregate of unit V_u.
+  Note that under the conditional p_hat formulation (§7), PAUSED
+  programs' units already contribute 0 to V_u, so PAUSED programs
+  naturally sort to the bottom of resume priority.
 
-`V_u_program(p) = Σ_{u ∈ p.units} (V_u(u) / |u.session_ids|)`.
+### Why aggregation isn't `Σ V_u / |session_ids|` anymore
 
-The `1 / |session_ids|` weight prevents shared prefix from being
-double-counted across programs that reference it.  PAUSED programs
-remain in the denominator because pausing one active program doesn't
-free a unit still held by paused ones.
+Earlier formulations had a `1/|session_ids|` weight on each unit
+to prevent shared-prefix double-counting across programs.  Under
+the conditional p_hat formulation (§7), this is built in: the
+product over holders already handles attribution correctly.  No
+extra weight needed.
+
+### Threshold parity
 
 `theta_hi` and `theta_lo` are sglang/daemon-shared constants
-(currently 0.85 / 0.70).  The sglang webhook uses `theta_hi` as
-its OK↔HIGH threshold so the two systems agree on when admission
-should be triggered.
+(currently 0.85 / 0.70).  sglang's webhook uses `theta_hi` as its
+OK↔HIGH threshold, so when MEMORY_PRESSURE fires, the daemon
+agrees pressure has actually crossed.  Both ends must be launched
+from the same value — enforced by the launch contract (§10).
 
 ## 9. Why two channels (unit migrate + program pause)
 
