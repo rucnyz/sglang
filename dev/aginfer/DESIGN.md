@@ -237,6 +237,18 @@ not a decision-rule concern.
 {
   "time_counter": int,                  // monotonic access tick
 
+  "throughput_ema": {                   // sglang-observed throughput EMAs,
+                                         // updated on every prefill / decode
+                                         // step over a ~1 s window.  Input to
+                                         // §7 marginal_pause_cost (prefill)
+                                         // and §8 forecast_inflight_demand
+                                         // (decode).
+    "prefill_bps": float,               // global prefill bytes / sec
+    "decode_per_program": {
+      "<program_id>": float             // p's decode bytes / sec (tokens × bytes_per_token)
+    }
+  },
+
   "pool_usage": {                       // ALLOCATOR-TRUTH view; per-subpool
                                          // breakdown.  Each tier carries a
                                          // `subpools` dict keyed by
@@ -454,15 +466,20 @@ Every daemon-issued action endpoint (`POST /aginfer/migrate`,
 `PUT /aginfer/hints`) is **fire-and-forget** from the event
 handler's perspective:
 
-1. Handler computes the plan and **enqueues each action** onto the
-   daemon's outbound `asyncio.Queue`; the handler returns immediately.
+1. Handler computes the plan (`joint_decide` output: a
+   `list[Migrate | Pause | Resume]`), groups the items **by
+   endpoint** (all `Migrate`s → one `POST /aginfer/migrate`
+   batch; each `Pause`/`Resume` → one `PUT /aginfer/program_paused`
+   call), and enqueues each batch onto the outbound
+   `asyncio.Queue`; the handler returns immediately.
 2. A dedicated outbound worker task consumes the queue, issues
    the HTTP `POST` / `PUT`, and on 200 simply drops the response.
-3. If sglang returns a non-2xx or the apply path raises **inside
-   sglang**, sglang fires an `APPLY_FAILED` webhook back to the
-   daemon (§4) carrying `{endpoint, action_id, reason}`.  The
-   daemon treats the webhook like any other workload event — the
-   next `joint_decide` re-evaluates the state and may re-issue a
+3. If sglang returns a non-2xx or any individual item in a batch
+   fails, sglang fires an `APPLY_FAILED` webhook back to the
+   daemon (§4) carrying the batch envelope and a list of failed
+   items with structured `reason` strings.  The daemon treats
+   the webhook like any other workload event — the next
+   `joint_decide` re-evaluates the state and may re-issue a
    superseding action.  Idempotency (§10) makes re-issue safe.
 
 This decouples handler latency from sglang processing latency.
@@ -471,9 +488,23 @@ serialization), a synchronous awaited POST would freeze the entire
 event router; fire-and-forget keeps the inbound queue draining and
 defers the action to the outbound worker.
 
-Each action carries an `action_id` (UUID generated at the daemon)
-so `APPLY_FAILED` can be correlated to a specific in-flight
-attempt; the id is logged on both sides.
+**Identifier model.**  Each outbound HTTP request carries a
+`batch_id` (UUID generated at the daemon at enqueue time, written
+into the request body envelope).  Each individual action inside
+the batch also carries its own `action_id` (UUID, in the per-item
+object).  This lets `APPLY_FAILED` correlate at either granularity:
+the webhook payload names the `batch_id` once and lists per-item
+`action_id` + `reason` for every item that failed.  Successful
+items are not echoed back (silence == applied).
+
+**Per-item failure reasons** are the structured skip-class strings
+already defined per endpoint (see `POST /aginfer/migrate` below
+for the canonical list: `race:*`, `promote_load_back_declined:*`,
+`promote_raised:*`, `write_through_declined:*`, `unknown_tier:*`,
+`unsupported_tree_cache:*`).  The same reason taxonomy is used
+both in sglang's synchronous response body (for any code path
+that does still read it, e.g. cold-start probes) and in the
+`APPLY_FAILED` webhook (the fire-and-forget steady-state path).
 
 ### `POST /aginfer/migrate` — apply residence-set transitions
 
@@ -587,15 +618,31 @@ Request:
 ```
 
 * `PAUSE`: payload carries `pre_pause_state` (the state the
-  program was in immediately before admission paused it).  sglang
-  sets `state = PAUSED`, `pre_pause_state = payload.pre_pause_state`.
+  program was in immediately before admission paused it).
+  **Source for the value**: the daemon reads
+  `state.per_program_usage[p].state` from the state snapshot
+  fetched at handler entry (the always-fresh snapshot — not the
+  daemon's `program_tracker` cache, which may already reflect a
+  prior pause).  sglang on receipt sets `state = PAUSED`,
+  `pre_pause_state = payload.pre_pause_state`.  The proxy gate
+  (in the daemon's proxy process) starts queueing p's next
+  request immediately upon the daemon's `Pause(p)` decision —
+  the PUT is the persistence side; the gate is the enforcement
+  side.  Both happen on the daemon side of the wire.
 * `RESUME`: daemon sends `pre_pause_state = null` (sentinel, not
   the restored state).  sglang reads its **own** stored
   `pre_pause_state` to determine the restored state, then sets
   `state = (the stored pre_pause_state)` and `pre_pause_state =
   null`.  The payload field is intentionally null-only on RESUME
   to make it impossible for the daemon to disagree with sglang's
-  authoritative view.
+  authoritative view.  **Proxy-gate release**: in parallel with
+  enqueueing the RESUME PUT, the daemon releases p's currently-
+  gated request (if any) from the proxy gate so it can flow
+  through to sglang.  Resume's two effects (state field update
+  via PUT, gated request release via local proxy.gate) are
+  intentionally split: sglang owns the persistent state, the
+  daemon owns the request-flow control.  No `/aginfer/`
+  endpoint releases the gate — it's a daemon-internal operation.
 * `END`: sglang sets `state = ENDED`; `pre_pause_state` is
   cleared.  Payload `pre_pause_state` is ignored.
 
@@ -732,6 +779,58 @@ broken and the design needs a stronger primitive.
 > used in §9 to derive new instances of frozen `@dataclass(frozen=True)`
 > candidates (Migrate / Pause / Resume) without mutation.
 
+### Formal model
+
+The system is a partially-observable MDP that aginfer solves
+event-by-event:
+
+* **State `S`** — per `/aginfer/state` snapshot at handler entry
+  (always-fresh per §10).  Includes: every unit's `residence ⊆
+  {HBM, DRAM, DISK}` plus per-(tier, subpool) bytes; every
+  program's `state ∈ {REASONING, ACTING, PAUSED, ENDED}` plus
+  `pre_pause_state` and HBM `committed`/`inflight` byte
+  footprints; per-tier per-subpool allocator occupancy; per-link
+  bandwidth EMA; per-tier per-subpool holding-cost constant.
+  Sglang is the authoritative store; the daemon is stateless
+  modulo a derived `program_tracker` cache (§11).
+* **Action `A`** — joint over the union space `{unit migrate} ∪
+  {program pause/resume}`.  Unit migrate = residence-set
+  transition `(add_tiers, remove_tiers)` for a single unit (§7
+  `migrate_candidates`).  Program pause/resume = state-machine
+  transition (§8 `pause_candidates` / `resume_candidates`).
+  Action set per event is enumerated by `joint_decide` (§9) and
+  the chosen subset is applied via §6 endpoints.
+* **Transition** — driven by sglang's allocator / scheduler /
+  request stream, **not by aginfer**.  Aginfer's actions
+  steer the transition (a Pause re-shapes future
+  `inflight_bytes`; a Migrate re-shapes future `residence` for
+  the affected unit) but do not by themselves advance time.
+  The MDP "tick" is the next workload event.
+* **Reward** — negative seconds-cost.  Per-event reward is the
+  total `cost` of the chosen subset under §9's knapsack
+  objective (lower is better in the pressure phase, negated for
+  the headroom phase's max-gain).  Long-run reward is total
+  inference seconds-saved vs the always-DROP baseline, per the
+  paper's reward decomposition.
+* **Policy `π`** — `joint_decide(state, event)` from §9.
+  Deterministic given state + event + policy parameters
+  (`theta_hi`, `theta_lo`, `theta_crit`, `K_MAX`, etc).  Policy
+  is **not learned** — it solves an exact 0/1 knapsack over the
+  per-event action set, with the V_u formula (§7) as the
+  ranking signal.  A learned alternative (RL over the same
+  state/action/reward) is in scope as an extension; the §7 V_u
+  rule serves as both the policy's scoring function and as a
+  bootstrap for any learned variant.
+
+The formulation is **partially observable** in two ways: (a)
+sglang's per-rank distributed cache state is summed to a
+single-rank-equivalent view in `/aginfer/state` (§6 multi-rank);
+the daemon never sees per-rank disagreement.  (b) future
+workload events (next `LLM_PREFILL` arrival, tool ETA accuracy)
+are estimated, not observed.  Estimators feed `p_hat` and
+`E[remaining_tokens]` (§7 / §8); the policy is exact w.r.t. its
+estimator inputs even when those inputs are noisy.
+
 ### Symbols and units
 
 All cost-side quantities are in **seconds** (paper §3 Reward
@@ -800,12 +899,12 @@ class Resume:
     re_use: dict[str, int]    # per-HBM-subpool bytes
                               # = expected_peak_hbm_after_resume (§8).
                               # Subpool-keyed because Resume only affects
-                              # the HBM tier.  §9's headroom DP consumes
-                              # this directly (indexed by subpool against
-                              # the (HBM, sp) axes); no rewrite needed,
-                              # unlike Pause.relief which the pressure DP
-                              # nests into {HBM: relief} to share axes
-                              # with Migrate.
+                              # the HBM tier.  §9's joint_decide nests this
+                              # into {HBM: re_use} before feeding the
+                              # headroom DP (symmetric with Pause.relief);
+                              # all candidate types share the
+                              # nested {tier: {sp: int}} shape inside the
+                              # DP code path.
 ```
 
 ### kv_scheduler is a candidate generator
@@ -978,14 +1077,14 @@ lookup MUST serve from σ; the in-flight σ → τ transfer continues
 uninterrupted and the access pays `σ_latency` (not `τ_latency`).
 The next access — after transfer completes — pays `τ_latency`.
 
-This is option **(C) race-serve-from-source**, and it strictly
+This is option **(C) concurrent-serve-from-source**, and it strictly
 dominates the alternatives:
 
 | | this access | next access | bytes wasted |
 |---|---|---|---|
 | (A) wait for transfer | σ_latency + transfer_time | τ_latency | 0 |
 | (B) cancel transfer | σ_latency | σ_latency | partial transfer |
-| **(C) race** | σ_latency | τ_latency | 0 |
+| **(C) concurrent-serve** | σ_latency | τ_latency | 0 |
 
 (C) requires σ to remain valid throughout the transfer window —
 guaranteed by the write-through write policy.  Under (C):
@@ -1096,10 +1195,13 @@ bytes_needed_total(state) =
                 - theta_hi × pool_usage.HBM.subpools[sp].cap_bytes)
                         # summed across HBM subpools; §9 keeps the per-axis
                         # breakdown but top-k sizing only needs the total
-mean_unit_bytes(state) = (Σ_{u ∈ state.units}
-                            sum(bytes_at(u, τ) for τ in u.residence))
-                       / |state.units|
-                        # arithmetic mean across all units in HBM+DRAM+DISK
+mean_unit_bytes(state) = (Σ_{u : HBM ∈ u.residence} bytes_at(u, HBM))
+                       / |{u : HBM ∈ u.residence}|
+                        # arithmetic mean over HBM-resident units only —
+                        # top_k_pressure sizes the pressure-phase
+                        # candidate count and only HBM-resident units are
+                        # plausible pressure-relief candidates.  K_MAX
+                        # clamp protects against an empty-HBM edge case
 
 top_k_pressure(state) =
     min(K_MAX,
@@ -1715,6 +1817,27 @@ function.
   free room.  Goal: maximise total V_u gain subject to per-subpool
   bytes-reclaimed ≤ `free_room[sp]`.
 
+**Pressure suppresses headroom across all subpools.**  When any
+HBM subpool is pressured, the headroom phase does not run for any
+subpool — even subpools sitting in slack.  This is intentional:
+resuming a paused program tends to grow inflight bytes across
+*every* subpool that program decodes into (attention `full`
+always, plus `swa`/`mamba` if the architecture uses them), so
+resuming during partial pressure would make the pressured subpool
+worse before headroom can help.  The pressure→headroom transition
+waits for full slack on all subpools.
+
+**`LLM_PREFILL` runs `joint_decide` like every other event.**
+Even though `LLM_PREFILL`'s `D_t` is `∅` (§7) so
+`migrate_candidates` returns `[]`, the admission generators
+(`pause_candidates` / `resume_candidates`) still produce
+candidates from the live state.  joint_decide runs the same DP;
+typically there is nothing to do (no pressure, no slack-to-fill)
+and an empty plan is returned, but the entry-point is uniform.
+A reader skimming for "what events trigger decisions" should
+read: all 12 events trigger `joint_decide`; what differs is
+which candidates are eligible.
+
 The two phases are mutually exclusive per event (forecast is
 either too high or too low; in between is the hysteresis band
 where neither phase has anything to do).
@@ -1773,7 +1896,15 @@ def joint_decide(state, event):
     }
     if all(r > 0 for r in free_room.values()):
         cands = admission.resume_candidates(state)
-        cands = [c for c in cands if any(b > 0 for b in c.re_use.values())]
+        # Normalise Resume.re_use to the per-(tier, subpool) nested
+        # shape — symmetric with the pressure-phase Pause.relief
+        # rewrite above.  Both DPs now consume candidates of one
+        # uniform shape.
+        cands = [replace(c, re_use={"HBM": c.re_use}) for c in cands]
+        cands = [c for c in cands
+                 if any(b > 0
+                        for sub in c.re_use.values()
+                        for b in sub.values())]
         bucket_size = {(tier, sp): state.pool_usage[tier]["subpools"][sp]["page_bytes"]
                        for (tier, sp) in free_room}
         return knapsack_max_value_multi(
@@ -1799,8 +1930,18 @@ per architecture (see §12 Scenarios for concrete counts).
 
 Dense table size grows exponentially in axis count; the DP runs
 **sparse** over a `dp` dict (cells reachable from any subset-take).
-On representative candidate sets fewer than ~10⁵ tuples are
-reachable, ≪ dense bound, at any practical axis count.
+Reachable-cell count is bounded by `K × ∏_axis (1 + r_axis)` where
+`r_axis` is the typical bucket-delta each candidate contributes
+along that axis.  Worked example: K = 30 candidates, 5 axes, each
+candidate touches 1–2 axes non-trivially (most Migrate candidates
+free bytes on one HBM subpool and consume on one DRAM/DISK
+subpool; Pauses touch only HBM subpools).  With median r ≈ 2 on
+touched axes and r = 0 on untouched axes, the upper-bound product
+is `30 × 3² ≈ 270` *new* cells per item, capped at `K × ∏ buckets`
+along touched axes per item — empirically ≤ 10⁵ reachable cells
+on T9 / T11 runs (see PLAN §1 for the calibration task).  At K_MAX
+= 256 this scales to ~10⁶ in the worst case; still microseconds
+per `joint_decide`.
 
 ```python
 def _bk(n, bucket_size):                            # round-down quantisation
@@ -1918,10 +2059,13 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
 def knapsack_max_value_multi(items, budget, bucket_size):
     """0/1 knapsack: subset S maximising Σ gain(s∈S) subject to
     for each (HBM, sp) axis a:
-        Σ_{s∈S} re_use[sp](s)   <= budget[a]
-    `bucket_size` keyed by axis (tier, sp); each axis quantises at its
-    own page granularity.  Quantises re_use round-UP (safe for <=).
-    Same sparse multi-axis DP shape as knapsack_min_cost_multi."""
+        Σ_{s∈S} re_use[HBM][sp](s)   <= budget[a]
+    `bucket_size` keyed by axis (tier, sp); each axis quantises at
+    its own page granularity.  Quantises re_use round-UP (safe for
+    <=).  Same sparse multi-axis DP shape as knapsack_min_cost_multi.
+    Assumes items' `re_use` has the nested {tier: {sp: bytes}} shape
+    (joint_decide normalises Resume.re_use to {HBM: re_use} before
+    calling)."""
     axes = list(budget.keys())                       # list of (HBM, sp)
     W    = {a: _bk(budget[a], bucket_size[a]) for a in axes}
     K    = len(items)
@@ -1930,7 +2074,8 @@ def knapsack_max_value_multi(items, budget, bucket_size):
     dp   = {tuple(0 for _ in axes): 0.0}
     take = {}
     for k, c in enumerate(items, start=1):
-        d = tuple(_bk_up(c.re_use.get(sp, 0), bucket_size[(tier, sp)])
+        d = tuple(_bk_up(c.re_use.get(tier, {}).get(sp, 0),
+                         bucket_size[(tier, sp)])
                   for (tier, sp) in axes)
         new_dp = dict(dp)
         for s, gain in dp.items():
@@ -1949,8 +2094,9 @@ def knapsack_max_value_multi(items, budget, bucket_size):
         if take.get((k, s_pick)):
             c = items[k - 1]
             chosen.append(c)
-            s_pick = tuple(s_pick[i] - _bk_up(c.re_use.get(axes[i][1], 0),
-                                              bucket_size[axes[i]])
+            s_pick = tuple(s_pick[i] - _bk_up(
+                                c.re_use.get(axes[i][0], {}).get(axes[i][1], 0),
+                                bucket_size[axes[i]])
                            for i in range(len(axes)))
         k -= 1
     return chosen
@@ -2049,7 +2195,9 @@ for pause/resume).
 
 | invariant | enforced by |
 |---|---|
+| **Daemon is a single asyncio process**: one OS process hosts the event_router consumer task, the proxy's request-forwarding tasks, and the outbound action worker task.  They share memory directly (no IPC).  On crash all tasks die together; "the daemon" and "the proxy" never desynchronise.  This makes the volatile-queue and proxy-gate invariants below well-defined as a single failure domain | daemon launch script + asyncio runtime |
 | **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer anywhere — kv_scheduler, admission, forecast refresh, program_tracker, and the proxy all recompute only on event arrival.  SESSION_END is signalled by the client explicitly (§4); there is no time-based fallback | asyncio queue + single consumer |
+| **Unit hashes are content-derived and collision-free in practice**: `u.hash` is sglang's existing radix-tree key — a 128-bit content-derived hash over the unit's token prefix.  Collision probability is negligible at any tree size aginfer encounters (≤ 10⁷ live units, birthday-paradox upper bound < 10⁻²²).  Collision is therefore treated as impossible; on the off-chance of one, behavior is undefined and falls under "deployment bug" — the design does not carry a collision-detection / merge path | sglang radix-tree hash function |
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
 | **Idempotent daemon→sglang actions**: every endpoint accepts re-application — migrate (a no-op `applied=0` with a `race:*` skip when the target tier already matches), pause/resume (200 with `applied:false` when the program is already in the requested state), hint PUT (overwrite-by-stamp).  Same reasoning across all of them: the daemon may emit the same action twice across consecutive event handlers because state-dump propagation lags the daemon's just-emitted action; the sglang side must absorb this without error | sglang endpoints |
 | **Outbound queue is volatile**: the daemon's outbound action queue lives in memory only.  On daemon crash, pending actions are lost — and that's correct.  After restart, the daemon's first `GET /aginfer/state` reads the live state; if the lost action was needed, `joint_decide` re-issues it.  No disk WAL exists for outbound actions, by the same first-principles argument that rules out a webhook persistence WAL (§11): every authoritative quantity already lives in sglang's state, the daemon is just a decision function over it | daemon outbound worker |
@@ -2063,7 +2211,7 @@ for pause/resume).
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
 | **Pool-truth admission, per subpool**: admission's `forecast(state)` returns a dict over HBM subpools, each reading `state.pool_usage.HBM.subpools[sp].used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes).  Pressure fires when **any** subpool's forecast crosses `theta_hi`; this prevents the failure mode where a Mamba snapshot subpool at 95 % is hidden by an attention subpool at 60 %.  If the snapshot lacks `pool_usage.HBM.subpools` the daemon halts loudly | daemon `admission_controller.forecast` |
-| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_(τ, sp)(occ)` reads `state.tier_holding_cost[τ][sp].h_max_per_byte_sec`, never a constant baked into the daemon.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; operator config sets per-(tier, subpool) `h_max`); the daemon consumes them.  If `link_stats` or `tier_holding_cost` are missing the daemon halts loudly | sglang instrumentation + operator config |
+| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_(τ, sp)(occ)` reads `state.tier_holding_cost[τ][sp].h_max_per_byte_sec`, never a constant baked into the daemon; `prefill_throughput(state)` reads `state.throughput_ema.prefill_bps`; `decode_throughput(p)` reads `state.throughput_ema.decode_per_program[p]`.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; the prefill / decode loops update their per-step throughput EMA; operator config sets per-(tier, subpool) `h_max`); the daemon consumes them.  If any of these state fields are missing the daemon halts loudly | sglang instrumentation + operator config |
 | **Pool-truth V_u**: V_u's `h_(τ, sp)(occ)` term reads `pool_usage[τ].subpools[sp]` (the per-subpool allocator-truth view) so holding cost reflects real pressure, not an inferred radix-tree slice | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
 | **Hint table covers every live unit**: sglang seeds a "fresh access just happened" entry on unit birth (`p_hat ≈ 1` for the next event horizon); the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
@@ -2141,6 +2289,33 @@ the first 200 after a failure:
 3. `program_tracker` state is preserved daemon-side; proxy gate
    re-applies to incoming requests.
 
+### SESSION_END normal path (REASONING / ACTING / ENDED programs)
+
+The common case: harbor signals `SESSION_END` for a program that
+is not held in the proxy gate.
+
+```python
+def on_session_end(p, event):
+    if program_tracker.state(p) == PAUSED:
+        return on_session_end_paused(p, event)     # see below
+    # joint_decide for SESSION_END uses D_t = session_scoped_units(p)
+    # (§7 decision_set table), so migrate_candidates yields demote/drop
+    # candidates for p's exclusive units.  Admission generators see
+    # p with state==ENDED, which is filtered out of both pause_candidates
+    # (state ∈ {REASONING, ACTING}) and resume_candidates (state == PAUSED).
+    plan = joint_decide(state, event)
+    program_tracker.set_state(p, ENDED)
+    outbound.enqueue(plan)                          # migrate batch
+    outbound.enqueue(PUT(
+        "/aginfer/program_paused",
+        {"program_id": p, "transition": "END", "pre_pause_state": null}))
+```
+
+`session_scoped_units(p)` are the units only p holds; with
+`session_ids == {p}` they are pure-eviction-candidates after p
+ends (no remaining holder).  Units p shared with other programs
+are untouched — they survive p.
+
 ### SESSION_END for a PAUSED program
 
 If harbor signals `SESSION_END` while p is in the PAUSED state
@@ -2197,6 +2372,59 @@ already holds.  At-least-once delivery doesn't add information
 to a system where the recipient re-reads the source on every
 handler — the recipient already has at-least-once knowledge of
 state via the pull.
+
+### Burst pressure: harmless duplicate plans
+
+Two `MEMORY_PRESSURE` events arrive in quick succession (e.g.,
+sglang fires both an up-crossing and a heartbeat within
+`heartbeat_s` while the daemon is still draining its outbound
+queue from event 1).  Trace:
+
+1. Event 1: handler enters, fetches state, computes plan A,
+   enqueues plan A's actions to outbound, returns.
+2. Outbound worker starts issuing plan A to sglang (asynchronously).
+3. Event 2: handler enters, fetches state.  Sglang may or may not
+   have applied plan A yet; the fresh state reflects whatever has
+   landed.  Handler computes plan B against this snapshot.
+4. If plan A has fully applied, plan B sees relieved pressure
+   and emits an empty / minimal plan.
+5. If plan A is mid-flight, plan B may overlap plan A — e.g.
+   re-issue the same `Migrate` for some unit.  Sglang's
+   idempotency invariant (§10) makes this a 200 `applied=0`
+   `race:*` skip per duplicate action.
+6. APPLY_FAILED webhooks may fire for the skips; the daemon
+   treats them as ordinary events and the next handler sees
+   the updated state.
+
+This is harmless by construction — the always-fresh + idempotent
+combination absorbs the duplication.  The cost is some wasted
+outbound HTTP and APPLY_FAILED chatter.  If profiling shows this
+chatter dominates, the cure is upstream (lower the heartbeat
+re-fire rate while in HIGH), not downstream (action de-dup at
+the daemon).
+
+### Threshold tuning guidance (operator notes)
+
+Defaults that survived T9 / T11 sweeps and are the daemon's CLI
+defaults:
+
+* `theta_hi = 0.85` — pressure trigger.  Lower if APPLY_FAILED
+  rate is high (more headroom margin).  Raise toward 0.90 only
+  on workloads with very smooth occupancy curves.
+* `theta_lo = 0.70` — pressure-resolved threshold.  Should sit
+  ≥ 10 % below `theta_hi` so the hysteresis band absorbs a
+  decode cycle's worth of growth without re-triggering pressure.
+* `theta_crit = 0.95` — escalation watermark.  Don't tune; if
+  you're hitting `theta_crit` regularly, `theta_hi` is too high.
+* `heartbeat_s = 5` — webhook re-fire interval while in HIGH /
+  CRITICAL.  Lower (1–2 s) on workloads where pressure resolves
+  fast enough that 5 s feels stale; raise (10–15 s) on workloads
+  where pressure persists and the chatter is wasted.
+
+For new workloads, start at the defaults and adjust based on
+T14 (state-dump observability) telemetry: queue depth growth +
+APPLY_FAILED rate are the leading indicators that thresholds
+need re-tuning.
 
 ## 12. Scenarios
 
