@@ -358,8 +358,12 @@ def migrate_candidates(state, D_t) -> list[Migrate]:
                 out.append(Migrate(u.id, τ, cost, relief))
     return out
 
-# V_u value at a tier (paper §7, conditional-p_hat form §7 above):
-_value(u, τ, state) = p_hat(u, hold_time) × (reload_from_DROP - reload_from_τ)
+# V_u value at a tier (paper §7, conditional-p_hat form §7 above).
+# Δt and hold_time are DISTINCT inputs (see §7 below) — Δt is the
+# decision look-ahead window for p_hat, hold_time is the expected
+# physical residence in τ.  Under Poisson they collapse to 1/λ;
+# under our conditional formulation they do not.
+_value(u, τ, state) = p_hat(u, Δt) × (reload_from_DROP - reload_from_τ)
                     - h_τ(occupancy_of_τ) × bytes × hold_time
 
 # Cost components of the σ→τ transfer itself:
@@ -454,10 +458,9 @@ the promote means the prefill races the in-flight transfer.
 
 ### Inputs to `_net_value`
 
-`_net_value` takes four quantities defined below.  The system is
+`_net_value` takes five quantities defined below.  The system is
 parameterised on these inputs; any replacement estimator must fit
-this interface without changing `decide()` or the event / D_t
-contract.
+this interface without changing the candidate-generator contract.
 
 #### `p_hat(u, Δt)` — probability u is accessed within Δt
 
@@ -490,9 +493,6 @@ Three consequences fall out of this definition:
 * ACTING holders' contribution depends on the **specific tool's
   ETA**, not a per-unit static rate.
 
-`Δt` is **the candidate decision's `hold_time`** — the same number
-fed in as the cost-side `hold_time` (below), not a separate input.
-
 **Assumption: holders' access events are conditionally independent
 given each holder's program-state.**  This is exact for
 unrelated programs and approximate for sub-agent fan-out (where a
@@ -508,18 +508,68 @@ Common stochastic-process formulations (Poisson / Hawkes rate
 fit) collapse holder-state information into a single λ; this
 formulation does not, because holder state is directly observable.
 
-#### `hold_time` — duration the candidate decision is being scored over
+#### `Δt` — decision look-ahead horizon for `p_hat`
 
-For a transfer decision the scheduler is right now considering,
-`hold_time` is the **physical time window the unit would stay in
-the candidate tier** before its next likely access.  When an event
-carries a per-decision ETA (e.g. `TOOL_CALL_START` payload includes
-the tool's expected duration), the scheduler **must** use it as
-`hold_time` — the daemon's per-unit average is not a substitute
-when a sharper per-event signal exists.
+`Δt` is "how far into the future a reuse counts as relevant for
+this decision".  It is **distinct from `hold_time` below**: a
+short Δt favours promotion (anything in this window is value-add)
+while a long Δt dilutes p_hat (more time for the access to *not*
+happen).
 
-* short ETA → transfer round-trip > savings → don't demote
-* long ETA → demote profits
+Estimator priority (highest signal first):
+
+1. **Event payload ETA**: `TOOL_CALL_START` carries
+   `tool_eta` → Δt = `tool_eta` (the access we care about is the
+   one that fires when the tool returns).
+2. **program-state expected event distance**: from the holder's
+   `program_tracker` history, the expected time to its next LLM
+   event.  For a REASONING program mid-decode this is one decode
+   step; for an ACTING program waiting on a tool whose ETA isn't
+   in payload, use the tool's historical mean.
+3. **Global default**: average inter-event spacing (10 ms-1 s
+   range on agent workloads).  Only used when nothing better is
+   known.
+
+#### `hold_time` — expected duration in the candidate tier
+
+`hold_time` is "how long the unit will actually stay in τ before
+the next migrate/evict/drop reconsiders it".  This is the time
+the `h_τ(occupancy) × bytes × hold_time` holding tax integrates
+over — a **physical residence time**, not a prediction window.
+
+Under Poisson-rate models the two quantities collapse to `1/λ`
+because every access is an evaluation opportunity, and λ governs
+both reuse frequency and reconsideration frequency.  The
+conditional `p_hat` formulation doesn't share that property:
+units are re-evaluated by the daemon's event loop (every event
+where the unit is in D_t), which is **independent of the unit's
+own access pattern**.  hold_time tracks the *evaluation* cadence;
+Δt tracks the *access* horizon.
+
+Estimator priority:
+
+1. **Time until next event with u ∈ D_t**: estimable from
+   D_t selection rules (§7) + the per-event-kind expected
+   inter-event distance for the relevant holders.
+2. **Coarse default**: average inter-event spacing across all
+   events (same fallback as Δt's level 3).  In steady state on
+   busy agent workloads, hold_time ≈ Δt; the two diverge sharply
+   when the unit is held by a quiet program (long stretches with
+   no D_t-relevant event).
+
+The two are typically close on a busy workload but **must be
+estimated independently**; conflating them is the Poisson
+simplification the rest of §7 has already dropped.
+
+#### Per-event override
+
+When the event payload carries a sharper signal than either
+estimator produces, the per-event signal wins.  Concrete:
+`TOOL_CALL_START`'s tool ETA sets both Δt and hold_time for
+demote decisions over the caller's session tail (the unit is
+about to be idle for ETA and the relevant reuse window is also
+ETA).  This is the common case where Δt ≈ hold_time arises
+naturally — not from forcing them equal in the formula.
 
 #### `h_τ(occupancy)` — per-byte holding cost at tier τ
 
