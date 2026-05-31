@@ -832,16 +832,18 @@ relief, which is the common case in agent workloads.
 
 ### Joint decide
 
-Two phases, each is a re-ranking greedy on the relevant resource:
+Two phases, each is a **0/1 knapsack solved by exact DP** on the
+relevant resource:
 
 * **Pressure phase** runs when HBM pool is above `theta_hi`.
-  Candidates: Pause programs + Migrate-HBM-out units.  Resource:
-  HBM bytes.  Goal: free enough HBM to drop below `theta_hi`.
+  Items: Pause programs + Migrate-HBM-out units.  Resource: HBM
+  bytes.  Goal: free at least `bytes_needed` HBM, **minimising
+  total V_u cost**.
 * **Headroom phase** runs when HBM pool has dropped below
-  `theta_lo`.  Candidates: Resume paused programs.  Resource:
-  same HBM budget but the constraint is "don't overshoot".  Goal:
-  recover the most V_u per HBM byte re-occupied without crossing
-  `theta_hi` again.
+  `theta_lo`.  Items: Resume paused programs.  Resource: HBM
+  bytes available before crossing `theta_hi` again.  Goal:
+  **maximise total V_u gain** subject to bytes-re-occupied ≤
+  free_room.
 
 The two phases are mutually exclusive per event (forecast is
 either too high or too low; in between is the hysteresis band
@@ -851,68 +853,116 @@ where neither phase has anything to do).
 def joint_decide(state, event):
     cap_total = state.pool_usage["HBM"]["cap_bytes"]
     cap_left  = {τ: capacity_left_bytes(state, τ)
-                 for τ in (HBM, DRAM, DISK)}      # per-tier sub-budgets
+                 for τ in (HBM, DRAM, DISK)}
 
-    plan, applied = [], []
-
-    # ----- pressure phase -----
+    # ----- pressure phase: min-cost knapsack subject to relief >= bytes_needed -----
     bytes_needed = max(0, forecast(state) - theta_hi * cap_total)
-    while bytes_needed > 0:
+    if bytes_needed > 0:
         cands  = kv_scheduler.migrate_candidates(state, decision_set(event, state.units))
         cands += admission.pause_candidates(state, event)
-        # Drop candidates that would overflow a destination tier.
         cands  = [c for c in cands if c.relief > 0
                   and (not isinstance(c, Migrate) or cap_left[c.target_tier] >= c.bytes_moved)]
-        if not cands: break
-        best   = min(cands, key=lambda c: c.cost / c.relief)
-        if best.cost / best.relief == math.inf: break       # nothing positive-relief left
-        plan.append(best); applied.append(best)
-        apply_in_simulation(state, cap_left, best)          # update state for next pick
-        bytes_needed = max(0, forecast(state) - theta_hi * cap_total)
+        return knapsack_min_cost(cands, bytes_needed, bucket_size=page_bytes)
 
-    # ----- headroom phase -----
+    # ----- headroom phase: max-value knapsack subject to re_use <= free_room -----
     free_room = max(0, theta_lo * cap_total - forecast(state))
-    while free_room > 0:
+    if free_room > 0:
         cands = admission.resume_candidates(state)
-        cands = [c for c in cands if c.re_use <= free_room]
-        if not cands: break
-        # Highest gain per byte re-occupied first.
-        best = max(cands, key=lambda c: c.gain / c.re_use)
-        plan.append(best); applied.append(best)
-        apply_in_simulation(state, cap_left, best)
-        free_room = max(0, theta_lo * cap_total - forecast(state))
+        cands = [c for c in cands if c.re_use > 0]
+        return knapsack_max_value(cands, free_room, bucket_size=page_bytes)
 
-    return plan
+    return []                                            # hysteresis dead-zone
 ```
 
-Three properties this satisfies that the previous draft did not:
+Both phases are **exact 0/1 knapsack** at K ≈ tens of items.
+Concrete sizing: pressure-phase `bytes_needed` is at most
+`(theta_hi - theta_lo) × cap_bytes` (one hysteresis band's worth);
+quantised at `page_bytes` granularity that's ≈ 100 buckets;
+candidates are tens.  DP table 30 × 100 = 3 000 cells, microseconds.
 
-1. **Re-rank on mutation.**  Each loop body re-fetches candidates
-   from the updated state (`apply_in_simulation` mutates the
-   in-memory copy of state and cap_left).  Without re-ranking
-   the second-best Pause's `cost/relief` would be stale after
-   the first Pause changed `marginal_relief_value` for every
-   program that shared units with it.  Same fresh-state
-   discipline as §10's invariant.
+```python
+def knapsack_min_cost(items, bytes_needed, bucket_size):
+    """0/1 knapsack: subset S minimising Σ cost(s∈S)
+    subject to Σ relief(s∈S) >= bytes_needed.
+    Quantises relief at bucket_size so the DP table fits."""
+    W = (bytes_needed + bucket_size - 1) // bucket_size
+    K = len(items)
+    INF = float("inf")
+    dp = [[INF] * (W + 1) for _ in range(K + 1)]
+    take = [[False] * (W + 1) for _ in range(K + 1)]
+    for k in range(K + 1):
+        dp[k][0] = 0
+    for k in range(1, K + 1):
+        r_bk = min(W, items[k - 1].relief // bucket_size)
+        for w in range(W + 1):
+            dp[k][w] = dp[k - 1][w]                            # skip
+            w_prev   = max(0, w - r_bk)
+            picked   = dp[k - 1][w_prev] + items[k - 1].cost
+            if picked < dp[k][w]:
+                dp[k][w] = picked
+                take[k][w] = True
+    # Reconstruct.
+    chosen, w = [], W
+    for k in range(K, 0, -1):
+        if take[k][w]:
+            chosen.append(items[k - 1])
+            w = max(0, w - min(W, items[k - 1].relief // bucket_size))
+    return chosen
+
+def knapsack_max_value(items, budget_bytes, bucket_size):
+    """Symmetric: subset maximising Σ gain(s) subject to Σ re_use(s) <= budget."""
+    ...  # dual recurrence
+```
+
+#### Why exact DP, not greedy
+
+LP-relaxation greedy (sort by `cost/relief`, take cheapest-per-byte
+until budget met) is the standard 0/1 knapsack approximation.
+Worst-case it's 2× off — e.g. budget 100, items A=(cost 10, relief
+99) and B=(cost 11, relief 100): greedy picks A then B for total
+cost 21, optimal is B alone at 11.
+
+That worst case happens whenever a single sufficient item is
+slightly less efficient per byte than a sequence of insufficient
+items that together waste cost.  In admission this is the
+"one-pause-could-have-solved-it but we did three migrates first"
+scenario.  Not adversarially constructed — common when one runaway
+program could cover the budget alone.
+
+At K ≈ 30 and bucketised W ≈ 100, exact DP is microseconds — the
+same order as greedy.  There is **no efficiency reason** to use
+the approximation.  The exact form is the design.
+
+#### Properties this satisfies
+
+1. **Optimal cost / gain** under the knapsack formulation.  No
+   1/2-approximation gap.
 2. **Per-tier sub-budgets.**  `cap_left[τ]` tracks how many bytes
-   remain in each destination tier.  A migrate candidate is
-   filtered out if it would overflow τ.  Without this guard the
-   plan could schedule 50 HBM→DRAM moves into a DRAM that's
-   already 95 % full.
+   remain in each destination tier; migrate candidates are
+   filtered up-front if they'd overflow τ.  Without this guard
+   the plan could schedule 50 HBM→DRAM moves into a DRAM
+   that's already 95 % full.
 3. **Pause/Migrate vs Resume disjoint.**  Pressure phase only
    handles `freeing` actions (Pause, HBM-out Migrate).  Headroom
    phase only handles `claiming` actions (Resume).  They never
-   compete in the same sort, so the "Resume always welcome while
-   capacity_fits" intent is enforced by phase, not by a
-   negative-cost trick.
+   compete in the same knapsack.
 
-`apply_in_simulation(state, cap_left, action)` mutates the
-in-memory `state` copy and `cap_left` map as if the action had
-been applied: source-tier bytes are returned to `cap_left[σ]`,
-destination-tier bytes are debited from `cap_left[τ]`,
-`per_program_usage` flips for paused programs, `pool_usage` is
-recomputed.  This is **pure-in-memory** — sglang isn't notified
-until §3's apply step at the end.
+#### Always-fresh state at the inter-event boundary
+
+Exact DP solves one knapsack against a single snapshot of state.
+Within that DP, candidates' `cost` / `relief` are evaluated **on
+the snapshot fetched at event entry** — the formulation is
+exact w.r.t. that snapshot, so no per-pick re-ranking is needed
+(unlike a greedy loop which mutates state mid-pass).  The
+always-fresh invariant (§10) is satisfied at the event boundary:
+the next event's joint_decide will refetch state and re-solve
+its knapsack from scratch.
+
+> **Planned (implementation).**  v1 may implement the greedy form
+> instead of exact DP for simplicity.  Worst-case 2× cost gap is
+> bounded; the daemon's `decide_latency` metric should report
+> the chosen algorithm and (if greedy) the post-hoc cost gap vs
+> a periodic DP audit so drift is observable.
 
 ### What collapses out
 
