@@ -702,11 +702,42 @@ Migrates; headroom phase uses Resumes.
   HBM footprint.  Resume candidates failing this gate are omitted
   by the generator (not in the candidate set).
 * `forecast(state)` — `state.pool_pressure[HBM].token_usage +
-  forecast_inflight_demand(state)`.  The second term is the
-  expected HBM growth before the next event — for REASONING
-  programs, `Σ max_remaining_tokens(p) × bytes_per_token` bounded
-  by `max_completion_tokens`; for SESSION_ARRIVAL, the incoming
-  program's seed estimate.
+  forecast_inflight_demand(state)`.
+
+  The second term is the **expected** HBM growth before the next
+  event, summed over programs that will still be allocating:
+
+  ```
+  forecast_inflight_demand(state) =
+    Σ_{p ∈ REASONING} E[remaining_tokens(p)] × bytes_per_token
+  ```
+
+  `E[remaining_tokens(p)]` is the expected residual decode length
+  conditional on p's observable state.  Estimator priority:
+
+  1. Event payload hint, if any (e.g. an in-band signal from the
+     agent that the current decode will be short).
+  2. p's own per-turn decode-length history.
+  3. Workload-prior fit over recent same-class programs.
+  4. **Bootstrap**: `max_completion_tokens` — only at cold-start
+     before history accumulates.  A one-shot warning is logged so
+     the bootstrap window is visible.
+
+  Using **`max`** instead of `E[·]` (the bootstrap fallback as the
+  steady-state rule) is wrong: it inflates the forecast by the
+  ratio `max / mean`, which on agent workloads is ~5×.  Admission
+  then over-pauses by ~5×, HBM is left under-utilized, and the
+  daemon's whole throughput advantage is eaten by pessimism.  The
+  error direction matters: under-estimating `E[remaining]` is
+  recoverable (sglang's reactive `MEMORY_PRESSURE` webhook fires
+  and admission catches up), over-estimating is a continuous
+  throughput loss.  Same principle as §7's conditional `p_hat`:
+  use observed conditional distributions, not constant upper
+  bounds.
+
+  At `SESSION_ARRIVAL` the incoming program has no history; the
+  workload prior provides the seed `E[remaining_tokens]` for
+  programs of the same class.
 
 ### Triggers
 
