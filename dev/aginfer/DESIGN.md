@@ -301,6 +301,13 @@ not a decision-rule concern.
                                          //   pool_usage.DRAM.subpools per §12
       },
       "state": "REASONING"|"ACTING"|"PAUSED"|"ENDED",
+                                         // exhaustive — these are the only
+                                         //   states ever surfaced to the
+                                         //   daemon.  Any sglang-internal
+                                         //   intermediate (e.g. mid-preempt
+                                         //   queueing) is collapsed into
+                                         //   the nearest of these four at
+                                         //   dump time.
                                          // sglang derives REASONING/ACTING
                                          // locally from request liveness
                                          // (it sees every chat-completion
@@ -369,11 +376,16 @@ not a decision-rule concern.
                                          // put/get for DRAM↔DISK)
       "time_since_last_sample_s": float // seconds since the most recent
                                          // bytes-moved sample on this link.
-                                         // Daemon distinguishes "measured
-                                         // idle" (gap > LINK_IDLE_SECONDS,
-                                         // currently 1.0) from "freshly
-                                         // measured" by this number — see
-                                         // §7 bw_free for the rule.
+                                         // Cold-start (link never used since
+                                         // boot): set to +Inf, which trips
+                                         // the > LINK_IDLE_SECONDS branch in
+                                         // §7 bw_free and returns peak_bw_bps
+                                         // (correct — an unused link is idle
+                                         // by definition).  Daemon
+                                         // distinguishes "measured idle"
+                                         // (gap > LINK_IDLE_SECONDS = 1.0)
+                                         // from "freshly measured" by this
+                                         // number — see §7 bw_free.
     }
   },
 
@@ -507,6 +519,16 @@ for the canonical list: `race:*`, `promote_load_back_declined:*`,
 both in sglang's synchronous response body (for any code path
 that does still read it, e.g. cold-start probes) and in the
 `APPLY_FAILED` webhook (the fire-and-forget steady-state path).
+
+**Unknown `batch_id` after daemon restart.**  Daemon emits batch X
+→ daemon crashes → daemon restarts → sglang's `APPLY_FAILED` for X
+arrives at the new daemon, which has no record of X (outbound
+queue is volatile per §10).  The daemon drops the webhook silently
+and continues; the load-class fault classification (§10) and the
+always-fresh + idempotent invariants together guarantee
+re-convergence — the next handler entry re-fetches state and any
+still-needed action gets re-emitted.  Not a deployment-bug fault;
+no forensic dump.
 
 ### `POST /aginfer/migrate` — apply residence-set transitions
 
@@ -695,9 +717,23 @@ happens inside sglang.
 
 | parallelism | per-rank HBM holds | daemon's view | actions |
 |---|---|---|---|
-| TP > 1 | same logical unit's **different head-dim slice** on each rank | sglang's tokenizer-server fans `/aginfer/state` / `migrate` / `hints` out to all rank schedulers; the snapshot returned to the daemon is aggregated across ranks (`pool_usage`, `per_program_usage` summed) | every action is **all-rank atomic by semantic requirement** — see below |
+| TP > 1 | same logical unit's **different head-dim slice** on each rank | sglang's tokenizer-server fans `/aginfer/state` / `migrate` / `hints` out to all rank schedulers; the snapshot returned to the daemon is aggregated across ranks per the rules below | every action is **all-rank atomic by semantic requirement** — see below |
 | EP > 1 | prefix KV mirrored across ranks (same as TP); only the MoE expert weights / activations differ per rank | same as TP from the daemon's perspective — expert weights aren't in the daemon's scheduling scope | same as TP |
 | DP > 1 | each DP replica has its own independent KV pool serving its own program subset | each DP replica is a **separate sglang endpoint** with its own daemon-sglang pairing; no cross-replica daemon coordination | independent per replica |
+
+### Per-field aggregation rule (TP > 1)
+
+| field | aggregation | reason |
+|---|---|---|
+| `pool_usage.<tier>.subpools[sp].{used_bytes, cap_bytes, available_bytes, evictable_bytes}` | sum across ranks | each rank holds an independent slice of the unit's bytes; total occupancy is the sum |
+| `per_program_usage[p].{hbm,dram}.{committed,inflight}[sp]` | sum across ranks | same reason |
+| `link_stats[σ→τ].{peak_bw_bps, recent_throughput_bps}` | sum across ranks | each rank moves its own slice on its own link concurrently; total free bandwidth scales with rank count |
+| `link_stats[σ→τ].time_since_last_sample_s` | `max` across ranks | "link has been idle long enough" requires *every* rank's link to have been idle that long |
+| `throughput_ema.prefill_bps` | mean across ranks | each rank sees the same wall-clock prefill batch; per-rank EMA is a measurement of the same logical work, so the mean is the unbiased estimator (sum would inflate by N×) |
+| `throughput_ema.decode_per_program[<pid>]` | mean across ranks | same reason: same logical decode rate observed N times |
+| `tier_holding_cost[τ][sp].h_max_per_byte_sec` | identical across ranks (operator config) | static; sglang halts loudly on cross-rank disagreement |
+| `units[i].n_bytes[τ][sp]` | identical across ranks | derived from architecture; cross-rank disagreement is a deployment bug → `fatal()` |
+| `pool_usage.<tier>.subpools` keys | identical set across ranks | every rank runs the same architecture, so subpool component names match; mismatch is a deployment bug → `fatal()` |
 
 ### Why TP forces all-rank-atomic actions
 
@@ -816,10 +852,10 @@ event-by-event:
   (`theta_hi`, `theta_lo`, `theta_crit`, `K_MAX`, etc).  Policy
   is **not learned** — it solves an exact 0/1 knapsack over the
   per-event action set, with the V_u formula (§7) as the
-  ranking signal.  A learned alternative (RL over the same
-  state/action/reward) is in scope as an extension; the §7 V_u
-  rule serves as both the policy's scoring function and as a
-  bootstrap for any learned variant.
+  ranking signal.  A learned alternative over the same
+  state/action/reward is neither in scope nor ruled out by the
+  framework; the V_u rule could serve as a bootstrap if such a
+  variant were ever pursued.
 
 The formulation is **partially observable** in two ways: (a)
 sglang's per-rank distributed cache state is summed to a
@@ -994,10 +1030,20 @@ def bytes_acquired_by_migrate(u, add_tiers):
         acquired[τ] = dict(u.n_bytes[source])
     return acquired
 
-unavailability_cost(u, add_tiers, remove_tiers) =
-    p_hat(u, transfer_time(add_tiers, u, state))     # access during transfer
-  × P(serve-from-source fails | write-through-semantics)  # 0 under write-through
-  × reload_from(u, authoritative_tier(u.residence))
+def unavailability_cost(u, add_tiers, remove_tiers, state):
+    # Sum across each new tier τ being added: probability of an
+    # access landing during u's source→τ transfer × probability that
+    # serving from the source fails × reload penalty from the source.
+    # Under write-through HiCache the middle factor is 0 in steady
+    # state; the term is kept in the formula for non-write-through
+    # write policies (zero-copy moves, etc.) without rewriting _value.
+    σ = authoritative_tier(u.residence)
+    return sum(
+        p_hat(u, transfer_time(u, σ, τ, state))
+        * P_serve_from_source_fails(σ, write_policy(σ))
+        * reload_from(u, σ)
+        for τ in add_tiers if τ not in u.residence
+    )
 
 def migrate_candidates(state, D_t) -> list[Migrate]:
     """Enumerate the meaningful residence-set transitions for each u ∈ D_t.
@@ -1027,7 +1073,7 @@ def migrate_candidates(state, D_t) -> list[Migrate]:
             cost  = _value(u, set(u.residence), state) \
                   - _value(u, new_residence, state)
             cost += migration_cost(u, add, remove, state)
-            cost += unavailability_cost(u, add, remove)
+            cost += unavailability_cost(u, add, remove, state)
 
             relief   = bytes_freed_by_migrate(u, add, remove)
             acquired = bytes_acquired_by_migrate(u, add)
@@ -1197,13 +1243,19 @@ bytes_needed_total(state) =
                 - theta_hi × pool_usage.HBM.subpools[sp].cap_bytes)
                         # summed across HBM subpools; §9 keeps the per-axis
                         # breakdown but top-k sizing only needs the total
-mean_unit_bytes(state) = (Σ_{u : HBM ∈ u.residence} bytes_at(u, HBM))
-                       / |{u : HBM ∈ u.residence}|
-                        # arithmetic mean over HBM-resident units only —
-                        # top_k_pressure sizes the pressure-phase
-                        # candidate count and only HBM-resident units are
-                        # plausible pressure-relief candidates.  K_MAX
-                        # clamp protects against an empty-HBM edge case
+mean_unit_bytes(state) =
+    if |{u : HBM ∈ u.residence}| == 0:
+        return ∞        # short-circuit: empty HBM means pressure-phase
+                        # cannot fire (bytes_needed_total would also be
+                        # 0 since pool_usage HBM is empty).  Returning
+                        # ∞ makes top_k_pressure collapse to K_MIN via
+                        # the max() guard; the DP runs trivially.
+    else:
+        return (Σ_{u : HBM ∈ u.residence} bytes_at(u, HBM))
+             / |{u : HBM ∈ u.residence}|
+        # arithmetic mean over HBM-resident units only — top_k_pressure
+        # sizes the pressure-phase candidate count and only HBM-resident
+        # units are plausible pressure-relief candidates.
 
 top_k_pressure(state) =
     min(K_MAX,
@@ -1731,9 +1783,13 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
 
   ```
   forecast_horizon(state) =
-      min(heartbeat_s,                     # bounded by webhook re-fire
-          1.0 / recent_event_rate(state))  # typical when active
+      heartbeat_s if recent_event_rate(state) <= 0
+      else min(heartbeat_s,                # bounded by webhook re-fire
+               1.0 / recent_event_rate(state))  # typical when active
   ```
+  `recent_event_rate == 0` is the cold-start case before any event
+  has been observed; capping at `heartbeat_s` is correct since that's
+  the next guaranteed event arrival (the sglang heartbeat).
 
   Under HIGH/CRITICAL pressure, sglang re-fires every
   `heartbeat_s` (≈ 5 s default), so the horizon is at most that.
@@ -2062,15 +2118,24 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
     # Feasible cells: every (HBM, sp) relief axis hit its bucket bound.
     full_r = tuple(W[a] for a in relief_axes)
     feasible = [(c, s) for s, c in dp.items() if s[:len(relief_axes)] == full_r]
-    assert feasible, (
-        f"joint_decide infeasible: no candidate subset can satisfy "
-        f"bytes_needed={bytes_needed} under cap_left={cap_left}.  "
-        f"Items: {[(type(c).__name__, c.cost, c.relief) for c in items]}.  "
-        f"This is a structural deployment failure — DRAM/DISK cap_left "
-        f"cannot absorb HBM relief at this scale.  Re-firing the next "
-        f"webhook will not change cap topology; the operator must grow "
-        f"destination tiers or revisit thresholds."
-    )
+    if not feasible:
+        # Reaching here is an algorithm bug, not a workload reality:
+        # the candidate set always includes DROP (acquired={}) and Pause
+        # (acquired={}) options that don't consume destination capacity,
+        # so a feasible plan must exist unless top_k_pressure undersized
+        # the candidate set or migrate_candidates filtered something it
+        # shouldn't have.  Halt loudly with a forensic dump so the bug
+        # can be diagnosed; do NOT silently emit a partial plan that
+        # masks the bug.
+        fatal("joint_decide_infeasible",
+              event=event, state=state,
+              decision_set=decision_set(event, state),
+              candidates=items,
+              bytes_needed=bytes_needed, cap_left=cap_left,
+              bucket_size=bucket_size,
+              dp_size=len(dp))
+        # fatal() never returns; see §10 "Fatal halts emit forensic
+        # state dump" for the dump contract.
     _, s_pick = min(feasible)                        # min over cost
     chosen, k = [], K
     while k > 0:
@@ -2232,6 +2297,8 @@ for pause/resume).
 | invariant | enforced by |
 |---|---|
 | **Daemon is a single asyncio process**: one OS process hosts the event_router consumer task, the proxy's request-forwarding tasks, and the outbound action worker task.  They share memory directly (no IPC).  On crash all tasks die together; "the daemon" and "the proxy" never desynchronise.  This makes the volatile-queue and proxy-gate invariants below well-defined as a single failure domain | daemon launch script + asyncio runtime |
+| **Two fault classes**: faults split into **deployment-bug** (schema mismatch, missing required state fields, hash collision, joint_decide infeasibility, `peak_bw_bps ≤ 0`, mode-switch attempt — "this should never happen in a correct deployment") and **load** (apply_failed race, sglang briefly slow, transient outbound queue depth — "this is just how the system handles bursty workload").  Deployment-bug faults `fatal(...)` — the daemon dumps forensic state and exits.  Load faults absorb — the daemon logs, continues, lets the next-event re-convergence handle it.  The two classes never blur: a load fault never becomes fatal, and a deployment-bug fault never gets a "let's retry" wrapper | daemon code review |
+| **Fatal halts emit forensic state dump**: every `fatal(reason, **context)` call writes a structured JSON file to `<daemon-data>/forensic/<reason>_<ts>.json` containing the event that triggered the handler, the full `/aginfer/state` snapshot fetched at handler entry, the candidate sets produced upstream, all DP inputs (`bytes_needed`, `cap_left`, `bucket_size`, etc.), the failure reason string, and the Python traceback — then logs a fatal-level line pointing at the file path and `sys.exit(1)`.  Supervisor restart policy is deployment-controlled; the forensic file survives the restart for post-hoc analysis | daemon `fatal()` helper |
 | **Policy mode is launch-time, never runtime-switched**: sglang launches in exactly one mode — either with the aginfer daemon attached (full policy via hint table), or with the default policy module (LRU-equivalent V_u, baseline ablation).  A daemon configured for "aginfer full" that loses its daemon mid-run halts loudly; it does not degrade to the default module.  Mode is a deployment choice, not a runtime fallback | sglang launch flags + daemon liveness check |
 | **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer anywhere — kv_scheduler, admission, forecast refresh, program_tracker, and the proxy all recompute only on event arrival.  SESSION_END is signalled by the client explicitly (§4); there is no time-based fallback | asyncio queue + single consumer |
 | **Unit hashes are content-derived and collision-free in practice**: `u.hash` is sglang's existing radix-tree key — a 128-bit content-derived hash over the unit's token prefix.  Collision probability is negligible at any tree size aginfer encounters (≤ 10⁷ live units, birthday-paradox upper bound < 10⁻²²).  Collision is therefore treated as impossible; on the off-chance of one, behavior is undefined and falls under "deployment bug" — the design does not carry a collision-detection / merge path | sglang radix-tree hash function |
@@ -2248,7 +2315,7 @@ for pause/resume).
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
 | **Pool-truth admission, per subpool**: admission's `forecast(state)` returns a dict over HBM subpools, each reading `state.pool_usage.HBM.subpools[sp].used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes).  Pressure fires when **any** subpool's forecast crosses `theta_hi`; this prevents the failure mode where a Mamba snapshot subpool at 95 % is hidden by an attention subpool at 60 %.  If the snapshot lacks `pool_usage.HBM.subpools` the daemon halts loudly | daemon `admission_controller.forecast` |
-| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_(τ, sp)(occ)` reads `state.tier_holding_cost[τ][sp].h_max_per_byte_sec`, never a constant baked into the daemon; `prefill_throughput(state)` reads `state.throughput_ema.prefill_bps`; `decode_throughput(p)` reads `state.throughput_ema.decode_per_program[p]`.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; the prefill / decode loops update their per-step throughput EMA; operator config sets per-(tier, subpool) `h_max`); the daemon consumes them.  If any of these state fields are missing the daemon halts loudly | sglang instrumentation + operator config |
+| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_(τ, sp)(occ)` reads `state.tier_holding_cost[τ][sp].h_max_per_byte_sec`, never a constant baked into the daemon; `prefill_throughput(state)` reads `state.throughput_ema.prefill_bps`; `decode_throughput(p)` reads `state.throughput_ema.decode_per_program[p]`.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; the prefill / decode loops update their per-step throughput EMA; operator config sets per-(tier, subpool) `h_max`); the daemon consumes them.  Required positivity: `peak_bw_bps > 0`, `h_max_per_byte_sec > 0`, `prefill_bps > 0` (once any prefill has run).  Missing fields or non-positive values are deployment bugs → `fatal()` | sglang instrumentation + operator config |
 | **Pool-truth V_u**: V_u's `h_(τ, sp)(occ)` term reads `pool_usage[τ].subpools[sp]` (the per-subpool allocator-truth view) so holding cost reflects real pressure, not an inferred radix-tree slice | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
 | **Hint table covers every live unit**: sglang seeds a "fresh access just happened" entry on unit birth (`p_hat ≈ 1` for the next event horizon); the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
@@ -2546,7 +2613,7 @@ but the framework supports it without modification.
 |---|---|
 | `pool_usage.HBM.subpools` | `{"full": {...}, "swa": {...}, "mamba": {...}}` |
 | `units[i].n_bytes` | `{"full": F, "swa": S, "mamba": M}` with `S = 0` when aged out of the SWA window and `M = 0` when the unit isn't a Mamba leaf |
-| §9 DP axis count | 7 (3 HBM subpools × {HBM-relief, DRAM-cap, DISK-cap} minus the relief-axis overlap; see §9 axis counting) |
+| §9 DP axis count | 9 (3 HBM-relief axes + 3 DRAM-cap axes + 3 DISK-cap axes — one per (tier, subpool) pair) |
 
 Sparse DP cell count remains the binding factor — at 7 axes the
 dense table is intractable but the reachable-cell count under
@@ -2583,6 +2650,17 @@ bytes (the verifier discards them).  Migrate candidates over
 draft units don't exist — drafts can't be demoted to DRAM (no
 prefix-reuse value in a discarded draft); the only action over
 draft bytes is "pause the program that owns them".
+
+### Composition of scenarios
+
+The scenarios are orthogonal in the subpool axis.  Real
+deployments combine them by union of subpool keys: e.g. a
+Mistral (S2) running speculative decoding (S5) has
+`pool_usage.HBM.subpools = {"full", "swa", "draft"}`; a Jamba
+(S3) + spec-decoding deployment has `{"full", "mamba", "draft"}`.
+The §9 axis count grows linearly with subpool count; the
+scenario-independent assertion below holds for any composition
+the engine exposes.
 
 ### Out of scope (current spec, framework-compatible)
 

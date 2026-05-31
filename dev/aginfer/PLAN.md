@@ -62,9 +62,10 @@ for DRAM↔DISK).  Validate that the EMA tracks reality:
 
 - Compare `recent_throughput_bps` against ground-truth wall-clock
   per migrate, under both idle-link and contended-link conditions
-- Probe the fallback path (link idle → `peak_bw_bps` reported)
-- Pin `samples_in_window > 0` consistency across consecutive
-  state-dumps
+- Probe the idle path (`time_since_last_sample_s > LINK_IDLE_SECONDS`
+  → `peak_bw_bps` reported)
+- Pin `time_since_last_sample_s` monotonicity across consecutive
+  state-dumps when the link is quiet
 
 Open output: `verify/t13/README.md`.
 
@@ -163,7 +164,9 @@ Order roughly by dependency.
 6. **`GET /aginfer/thresholds` + `PUT /aginfer/thresholds`**
    (DESIGN §6 round-6 H3):
    - bootstrap fetch returns canonical thresholds
-   - `PUT` from daemon → sglang updates local cache file atomically
+   - `PUT` from daemon → sglang updates its in-memory thresholds
+     atomically (no local cache file — round-14 dropped the cache;
+     sglang halts at bootstrap if the daemon is unreachable)
    - sglang halts on first-launch-without-cache-or-daemon
 
 7. **`APPLY_FAILED` webhook** (DESIGN §4 round-9 B4):
@@ -233,8 +236,11 @@ generalization.
    - `knapsack_min_cost_multi` with per-axis `bucket_size`
    - `knapsack_max_value_multi` for headroom phase
    - dict-keyed by `(tier, subpool)` tuple
-   - feasibility-fallback to max-relief-bucket when full target
-     unreachable under destination caps
+   - infeasibility (no subset hits every relief target under
+     destination caps) calls `fatal()` with a forensic dump per
+     §10; this is an algorithm bug — DROP + Pause are always
+     feasible so reaching here means top-k under-sized or a
+     filter dropped a candidate it shouldn't have
 
 3. **`authoritative_tier(residence)`** (DESIGN §7):
    - HBM if present else DRAM else DISK
@@ -274,6 +280,17 @@ generalization.
     - event-queue depth at handler entry
     - time-in-queue per event
     - failure-class counters for APPLY_FAILED breakdown
+
+11. **`fatal(reason, **context)` helper** (DESIGN §10):
+    - shared entry point for every deployment-bug-class halt
+    - serialises `(event, state, candidates, dp inputs, reason,
+      traceback)` to `<daemon-data>/forensic/<reason>_<ts>.json`
+    - logs fatal-level line pointing at the file path
+    - `sys.exit(1)`; supervisor decides restart policy
+    - call sites: `joint_decide` infeasibility; `bytes_at` τ-not-in-
+      residence assertion; missing `link_stats` / `tier_holding_cost`
+      / `throughput_ema` fields; cross-rank subpool-key disagreement;
+      `peak_bw_bps ≤ 0`; daemon-attached mode losing daemon mid-run
 
 ## 5. Scenario-specific verification
 
