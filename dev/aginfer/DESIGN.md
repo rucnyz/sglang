@@ -394,6 +394,17 @@ guaranteed by the write-through write policy.  Under (C):
 `P(serve-from-σ fails) = 0`, so `unavailability_cost = 0` in
 every term of `_net_value`.
 
+> **Planned (sglang code lag).**  Today sglang's `match_prefix`
+> path takes the host-only segment via `init_load_back`, which
+> synchronously queues a new `load_back` and lets the forward
+> pass wait on the CUDA stream `producer_event.finish_event` —
+> functionally option (A) "wait for transfer", not (C).  This
+> adds `transfer_time` to TTFT instead of the formula's
+> `unavailability_cost = 0`.  Closing the gap requires sglang
+> to expose a "DRAM-serve while load_back in-flight" branch in
+> lookup; the design's `unavailability_cost` form already covers
+> both (A) and (C) by parameterising on `P(serve-from-σ fails)`.
+
 If the write policy ever changes such that σ is invalidated
 during transfer (e.g. zero-copy move), `P(serve-from-σ fails) =
 1` and the unavailability term kicks in fully — without any
