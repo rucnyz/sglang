@@ -78,16 +78,19 @@ Three layers, three cadences (none of them periodic).
                  │ proxied requests         │ /aginfer/* admin HTTP
                  ▼                          ▼
        ┌──────────────────────────────────────────────────┐
-       │  sglang  (V4-Flash, TP=2, HiCache + Mooncake)     │
+       │  sglang (inference engine; HBM↔DRAM via HiCache,  │
+       │          DRAM↔Disk via Mooncake)                   │
        │                                                   │
-       │  inline scorer — V_u handler for the                │
-       │    sglang-internal alloc-failure event            │
-       │    (drive_eviction).  Same V_u rule as the daemon,│
-       │    uses daemon-fed lambda/p_hat hints when fresh. │
+       │  inline scorer — V_u handler for the              │
+       │    eviction-decision callsite (synchronous, in-   │
+       │    process; the daemon's HTTP round-trip is too   │
+       │    slow for this event).  Reads V_u inputs from   │
+       │    a hint table pushed by the daemon (§6).        │
        │                                                   │
        │  admin endpoints:                                 │
        │    GET  /aginfer/state                            │
        │    POST /aginfer/migrate                          │
+       │    PUT  /aginfer/hints                            │
        │                                                   │
        │  outbound webhook (mandatory):                    │
        │    POST <daemon>/aginfer/event                    │
@@ -99,21 +102,22 @@ Three layers, three cadences (none of them periodic).
 
 | Layer | Where | Trigger event | Decision granularity |
 |---|---|---|---|
-| inline scorer | inside sglang's `drive_eviction` | sglang-internal alloc-failure | eviction heap key for this one evict |
-| kv_scheduler | daemon | workload events (8 kinds, §4) | batch of `(hash, target_tier)` over D_t |
+| inline scorer | inside sglang's eviction-decision callsite | sglang-internal: free-pages-now | which unit(s) to drop to satisfy this allocation |
+| kv_scheduler | daemon | workload events (10 kinds, §4) | batch of `(hash, target_tier)` over D_t |
 | admission_controller | daemon | every workload event | per-program pause / resume |
 
 All three use the **same V_u rule**.  They live where they live
 because of **event ownership**, not as fallbacks for each other:
-the alloc-failure event is internal to sglang and not exposed over
-HTTP, so its V_u handler must live in-process; the 8 workload events
-are visible to the daemon's proxy / sglang webhook, so their V_u
-handlers live in the daemon.
+the eviction-decision callsite is sglang-internal, fires
+synchronously on the scheduler step, and cannot wait for an HTTP
+round-trip to the daemon, so its V_u handler must be in-process.
+The 10 workload events are surfaced over HTTP (proxy + sglang
+webhook), so their V_u handlers live in the daemon.
 
 ## 4. Events
 
-Eight event kinds.  The daemon is **strictly reactive** to events;
-the system has no internal timer.
+Ten event kinds.  The daemon is **strictly reactive** to events; the
+system has no internal timer.
 
 | kind | emitted by | semantic |
 |---|---|---|
@@ -123,36 +127,56 @@ the system has no internal timer.
 | `TOOL_CALL_END` | proxy | tool returned, program resuming |
 | `SUB_DISPATCH_BLOCKING` | proxy | program dispatches a sync sub-agent |
 | `SUB_DISPATCH_ASYNC` | proxy | program dispatches an async sub-agent |
+| `SUB_RETURN` | proxy | sub-agent terminated (parent tail becomes a promote candidate; child output may become a new shared `subagent_ctx` unit) |
+| `SESSION_END` | proxy | program terminated (no more arrivals); its session-scoped units become demote/drop candidates and contribute 0 to future `p_hat` |
 | `MEMORY_PRESSURE` | sglang webhook | allocator-truth HBM occupancy crossed `theta_hi` upward |
 | `PRESSURE_RESOLVED` | sglang webhook | allocator-truth HBM occupancy crossed `theta_lo` downward (hysteresis) |
 
 Each event carries (`kind`, `session_id` if applicable, `payload`).
 The payload may include event-specific context the decision rule can
-exploit (see §7).
+exploit (see §7) — e.g. `TOOL_CALL_START` carries the tool's
+expected duration, `SUB_DISPATCH_*` carries the inherit-prefix flag.
+
+`SESSION_END` is non-trivial to detect from the OpenAI proxy: the
+last request looks like any other.  The proxy commits a program as
+ENDED when the harbor / agent client closes its session explicitly
+(out-of-band signal), or — as a fallback — when no arrival has been
+seen for `T_idle` (this is the **only** place the system uses a
+time-based decision; `T_idle` is a deployment constant, not a tuning
+knob).
 
 ## 5. State surface — `/aginfer/state`
 
 ```json
 {
   "page_size": int,
-  "bytes_per_token": int,
-  "time_counter": int,                   // monotonic access tick
+  "bytes_per_token": int,              // n_bytes = n_tokens × bytes_per_token
+                                        // is a derived quantity, not authoritative
+  "time_counter": int,                  // monotonic access tick
 
-  "tier_usage": {                        // RADIX-TREE view
+  "tier_usage": {                       // RADIX-TREE view
     "HBM":  {"used_bytes": int, "cap_bytes": int},
     "DRAM": {"used_bytes": int, "cap_bytes": int},
-    "DISK": {"used_bytes": int, "cap_bytes": int}
+    "DISK": {"used_bytes": int, "cap_bytes": int}    // zero-stub until L3 wired
   },
 
-  "pool_usage": {                        // ALLOCATOR-TRUTH view
+  "pool_usage": {                       // ALLOCATOR-TRUTH view
     "HBM": {
       "used_bytes":      int,
       "cap_bytes":       int,
       "available_bytes": int,
       "evictable_bytes": int,
-      "token_usage":     float           // = (cap - avail - evictable) / cap
-                                          // matches sglang full_token_usage,
-                                          // i.e. real pressure after eviction
+      "token_usage":     float,         // = (cap - avail - evictable) / cap
+                                         // matches sglang full_token_usage
+      // SWA hybrid attention exposes the underlying sub-pools.
+      // For non-SWA models these fields are absent; the daemon
+      // gates `token_usage` regardless and ignores the sub-pool detail.
+      "full_token_usage":      float?,
+      "swa_token_usage":       float?,
+      "swa_used_bytes":        int?,
+      "swa_cap_bytes":         int?,
+      "swa_available_bytes":   int?,
+      "swa_evictable_bytes":   int?
     }
   },
 
@@ -161,7 +185,13 @@ exploit (see §7).
      "n_tokens": int, "n_bytes": int,
      "last_access_time": int, "hit_count": int,
      "session_ids": list[str]}
-  ]
+  ],
+
+  // Diagnostic: emitted by sglang only when the loaded tree cache
+  // class lacks dump_aginfer_state.  Daemon halts loudly on this —
+  // running aginfer against an incompatible cache is a deployment
+  // bug, not a graceful-degradation case.
+  "unsupported_tree_cache": str?
 }
 ```
 
@@ -183,7 +213,34 @@ it's actually decode-full) or makes admission asleep at the wheel
 (thinks HBM is empty when it's actually pressured).  Two views,
 two consumers, no overlap.
 
-## 6. Action surface — `/aginfer/migrate`
+### Why pull (per-event re-fetch), not push-mirror
+
+Every event handler re-fetches `/aginfer/state` at entry rather
+than maintain a local mirror updated by delta-push from sglang.
+The pull model is correct under three conditions, all of which
+hold here:
+
+* Event rate is high enough (10²/s in active workloads) that
+  state drift between fetches is bounded by ~10 ms — small enough
+  that a decision on slightly-stale state strictly dominates "no
+  decision".
+* The pull is also the snapshot-resync mechanism for daemon
+  restart; eliminating it from the steady-state path would force
+  a separate snapshot endpoint anyway.
+* sglang's `dump_aginfer_state` is allocation-light (bytes path,
+  ~ms-scale on 10⁴-node trees); the cost is acceptable per event.
+
+A delta-push channel would shave the per-event latency but at the
+cost of two state-tracking implementations (daemon mirror +
+sglang authoritative), and the events-mirror skew is exactly the
+class of bug the always-fresh invariant exists to rule out.
+
+## 6. Action surfaces
+
+Two daemon → sglang endpoints, both write-only from the daemon's
+perspective.
+
+### `POST /aginfer/migrate` — apply tier transitions
 
 Request:
 ```json
@@ -196,7 +253,7 @@ Response:
  "skipped": [{"hash": str, "reason": str}, ...]}
 ```
 
-### Skip-reason classes
+#### Skip-reason classes (canonical list in code)
 
 * **`race:*`** — time-window race between daemon's state fetch and
   apply; tree mutated by concurrent evict / request.  Retryable.
@@ -212,6 +269,38 @@ Response:
 
 The daemon's retry / debug loop dispatches on the **class prefix**,
 not the literal string.
+
+### `PUT /aginfer/hints` — push V_u inputs to the inline scorer
+
+Request: `{"hints": [{"hash": str, "p_hat": float, "lambda": float, "stamp": int}, ...]}`
+
+Response: `{"applied": int}`.
+
+The inline scorer fires on sglang's allocation-decision callsite,
+which cannot wait for an HTTP round-trip to fetch fresh V_u inputs
+from the daemon.  Hints solve that with a daemon→sglang push: the
+daemon pushes the latest `p_hat` / `λ` for any unit whose value
+has changed beyond a threshold; sglang's inline scorer reads the
+hint table when computing eviction order.
+
+Lifecycle:
+
+* **Unit birth** (sglang creates a new tree node): sglang seeds the
+  hint table locally with `p_hat = 1.0, λ = λ_NEW_UNIT_DEFAULT`
+  — newborn units are at-least-once reusable by construction
+  (the request that created them is still in-flight).  Initialised
+  in-process, no daemon round-trip.
+* **Daemon refresh**: on every event the daemon scores units in
+  D_t (§7) and pushes the resulting `p_hat` / `λ` via `PUT
+  /aginfer/hints` for any unit whose value changed beyond a
+  threshold.  sglang's hint table is overwrite-by-stamp.
+* **Unit death** (eviction / drop): sglang clears the hint entry.
+
+There is no "missing hint" case: every live unit has either the
+sglang-side birth default or a daemon-refined value.  This means
+the inline scorer always has the same V_u inputs the daemon
+would have used at the time of the last event — it is not a
+defensive LRU fallback.
 
 ## 7. Decision rule
 
@@ -244,12 +333,20 @@ _value(u, τ, state)     = p_hat × (reload_from_DROP - reload_from_τ)
 |---|---|
 | `SESSION_ARRIVAL` | shared prefix units (preload before first prefill) |
 | `LLM_PREFILL` | ∅ (no migrate; the event still advances `program_tracker` to REASONING and admission re-evaluates) |
-| `TOOL_CALL_START` | session tail units of the caller (demote candidate while idle) |
-| `TOOL_CALL_END` | session tail units of the caller (promote candidate, about to reuse) |
+| `TOOL_CALL_START` | session tail units of the caller (demote candidate while idle); promote-ahead is scheduled here too, timed by the tool ETA so the unit lands before the next prefill |
+| `TOOL_CALL_END` | session tail units of the caller (promote-now if ahead-of-time promote didn't catch up; otherwise no-op) |
 | `SUB_DISPATCH_BLOCKING` | parent tail + shared prefix |
 | `SUB_DISPATCH_ASYNC` | shared prefix only |
+| `SUB_RETURN` | parent tail (promote candidate) + the child's output that just materialised as a new `subagent_ctx` unit (decide initial tier) |
+| `SESSION_END` | session-scoped units of the ending program (demote or drop, depending on remaining holders) |
 | `MEMORY_PRESSURE` | top-k by regret across all units |
 | `PRESSURE_RESOLVED` | top-k by regret across all units |
+
+`TOOL_CALL_START` carries the tool's expected duration; the
+scheduler schedules the promote-back action for `T_start +
+tool_ETA - load_back_latency` so the unit is ready exactly when
+the next prefill arrives.  Waiting until `TOOL_CALL_END` to start
+the promote means the prefill races the in-flight transfer.
 
 ### Inputs to `_net_value`
 
@@ -274,7 +371,7 @@ p_access(u, s, Δt)  depends on s.program_state:
   ENDED      →  0
 ```
 
-Aggregated across independent holders:
+Aggregated under an **independence-across-holders** assumption:
 
 ```
 p_hat(u, Δt) = 1 - ∏_{s ∈ u.session_ids} (1 - p_access(u, s, Δt))
@@ -292,10 +389,20 @@ Three consequences fall out of this definition:
 `Δt` is **the candidate decision's `hold_time`** — the same number
 fed in as the cost-side `hold_time` (below), not a separate input.
 
-> *Note:* Common stochastic-process formulations (Poisson / Hawkes
-> rate fit) collapse all of the holder-state information into a
-> single λ; this formulation does not because the holder state is
-> directly observable.
+**Assumption: holders' access events are conditionally independent
+given each holder's program-state.**  This is exact for
+unrelated programs and approximate for sub-agent fan-out (where a
+parent and its children's accesses are correlated through the
+join).  When the assumption fails, the product underestimates
+`p_hat` (treats correlated events as independent → product is
+smaller than true OR-probability).  Conservative direction: the
+scheduler will demote slightly too eagerly, never promote too
+eagerly.  See §7 "Event-specific context" for how
+`SUB_DISPATCH_*` payload can correct this when known a priori.
+
+Common stochastic-process formulations (Poisson / Hawkes rate
+fit) collapse holder-state information into a single λ; this
+formulation does not, because holder state is directly observable.
 
 #### `hold_time` — duration the candidate decision is being scored over
 
@@ -353,44 +460,59 @@ single "pressure crossed" trigger.
 | `LLM_PREFILL` | program-state advances to REASONING; the inputs to `V_u_program` for that program have changed |
 | `TOOL_CALL_START` | program voluntarily idles → **pause cost ≈ 0** at this moment (no reasoning state is being interrupted); the cheapest possible time to free this program's HBM if its V_u is low |
 | `TOOL_CALL_END` | program returns and must reason → reconsider whether any currently-paused program now outranks one of the actives that just came back |
+| `SUB_RETURN` | parent reactivates; child terminates → footprint accounting changes for both, V_u_program rankings shift |
+| `SESSION_END` | program terminates → its footprint is freed; eligible to resume more paused programs |
 | `MEMORY_PRESSURE` | sglang reports allocator at `theta_hi` → reactive pause |
 | `PRESSURE_RESOLVED` | allocator dropped below `theta_lo` → consider resuming paused programs in V_u order |
 
 ### Decision rule (one definition; reused per trigger)
 
 ```python
-def admission_evaluate(state):
-    # state.pool_pressure[HBM] is the allocator truth (§5).
-    occ = state.pool_pressure[HBM]
-    forecast = occ + forecast_inflight_demand(state)
-
-    while forecast > theta_hi and active_programs(state):
-        victim = argmin(active_programs, key=V_u_program)
-        if marginal_pause_cost(victim) > marginal_relief_value(victim, occ):
+def admission_evaluate(event):
+    # Always-fresh state (§10): re-fetch inside the loop because
+    # each pause / resume mutates allocator state.
+    while True:
+        state = fetch_state()
+        if forecast(state) <= theta_hi: break
+        if not active_programs(state): break
+        victim = argmin(active_programs(state), key=V_u_program)
+        if marginal_pause_cost(victim, event) > marginal_relief_value(victim, state):
             break
-        pause(victim); forecast -= victim.hbm_footprint
-    while paused and forecast < theta_lo:
-        candidate = argmax(paused, key=V_u_program)
+        pause(victim)
+
+    while True:
+        state = fetch_state()
+        if forecast(state) >= theta_lo: break
+        if not paused_programs(state): break
+        candidate = argmax(paused_programs(state), key=V_u_program)
         if not capacity_fits(candidate, state): break
-        resume(candidate); forecast += candidate.hbm_footprint
+        resume(candidate)
 ```
 
-* `forecast_inflight_demand` adds expected HBM growth from
-  REASONING programs that haven't peaked yet (and at
-  `SESSION_ARRIVAL` time, the incoming program's estimated need).
-* `marginal_pause_cost(p)` is near zero when p is ACTING (idle
-  anyway), positive when REASONING (interrupting work).  This is
-  what makes TOOL_CALL_START such a cheap pause opportunity.
-* `V_u_program(p)` is the program-level aggregate of unit V_u.
-  Note that under the conditional p_hat formulation (§7), PAUSED
-  programs' units already contribute 0 to V_u, so PAUSED programs
-  naturally sort to the bottom of resume priority.
+Component definitions:
 
-### Program aggregation
-
-`V_u_program(p) = Σ_{u ∈ p.units} V_u(u)`.  No `1/|session_ids|`
-weight is needed: the conditional p_hat from §7 is already a
-holder-product, so shared-prefix attribution is built in.
+* `forecast(state)` = `state.pool_pressure[HBM].token_usage +
+  forecast_inflight_demand(state)`.  The second term is the
+  expected HBM growth before the next reasonable re-evaluation —
+  for REASONING programs, `Σ max_remaining_tokens(p) × bytes_per_token`
+  bounded by the program's `max_completion_tokens` cap; for new
+  programs arriving at SESSION_ARRIVAL, the seed estimate.
+* `marginal_pause_cost(p, event)` — work-loss penalty of pausing
+  p **at this event's moment**.  Near zero when the event is
+  `TOOL_CALL_START` for p (p was going off-GPU anyway); positive
+  when p is mid-REASONING (interrupting in-flight decode).
+* `marginal_relief_value(p, state)` — HBM bytes freed by pausing
+  p; for ACTING p with HiCache write-through, this is its full
+  HBM footprint; for REASONING p, this is the unfinished decode
+  KV that the next eviction pass would have to drop.
+* `capacity_fits(candidate, state)` — true iff resuming candidate
+  would leave `forecast(state)` still ≤ `theta_hi` after
+  re-incorporating candidate's HBM footprint.
+* `V_u_program(p) = Σ_{u ∈ p.units} V_u(u)` — the conditional
+  p_hat from §7 is already a holder-product, so shared-prefix
+  attribution is built in; no `1/|session_ids|` weight is needed.
+  PAUSED programs naturally sort to the bottom of resume priority
+  because their units already contribute 0 to V_u.
 
 ### Threshold parity
 
@@ -428,6 +550,8 @@ purely for code clarity.
 | **Idempotent migrate**: re-applying the same action returns 200 with `applied=0` and a `race:*` skip | sglang `apply_aginfer_migrations` |
 | **Threshold parity**: `theta_hi` and `theta_lo` are sourced from a single config; sglang's webhook and daemon's admission controller never read divergent values | launch scripts pass aligned `--aginfer-theta-*` flags |
 | **Webhook mandatory**: sglang's launch contract always passes `--aginfer-notify-url`; the admission trigger path is not optional | `launch_sglang_v4flash*.sh` |
-| **Pool-truth admission**: admission reads `pool_usage.HBM.token_usage`, not `tier_usage` | daemon `admission_controller._hbm_occ` |
+| **Pool-truth admission**: admission reads `pool_usage.HBM.token_usage`, not `tier_usage`; if the snapshot lacks `pool_usage` the daemon halts loudly (sglang too old / misconfigured) | daemon `admission_controller._hbm_occ` |
 | **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
-| **Layer-disableable**: kv_scheduler, admission, and HiCache each have an independent enable flag; turning one off forfeits only its contribution, never breaks the others | daemon CLI + sglang flags |
+| **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
+| **Hint table covers every live unit**: sglang seeds `(p_hat=1, λ=λ_NEW)` on unit birth; the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
+| **Layer enable flags**: HiCache, kv_scheduler, and admission each have an independent enable flag.  Admission can only fire when kv_scheduler is also on (admission's pre-pause migrate path requires the daemon's V_u machinery).  HiCache is independent of both | daemon CLI + sglang flags |
