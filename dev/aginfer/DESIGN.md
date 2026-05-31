@@ -726,6 +726,12 @@ broken and the design needs a stronger primitive.
 
 ## 7. Decision rule
 
+> **Pseudocode conventions.**  Python-flavored pseudocode in §7 and
+> §9 assumes the standard `from dataclasses import dataclass, replace`
+> and standard typing names (`dict`, `list`, `tuple`).  `replace` is
+> used in §9 to derive new instances of frozen `@dataclass(frozen=True)`
+> candidates (Migrate / Pause / Resume) without mutation.
+
 ### Symbols and units
 
 All cost-side quantities are in **seconds** (paper §3 Reward
@@ -792,9 +798,13 @@ class Resume:
     gain: float               # seconds (V_u_program_if_active)
     re_use: dict[str, int]    # per-HBM-subpool bytes
                               # = expected_peak_hbm_after_resume (§8).
-                              # Same shape convention as Pause.relief —
-                              # subpool-keyed because Resume only affects
-                              # the HBM tier.
+                              # Subpool-keyed because Resume only affects
+                              # the HBM tier.  §9's headroom DP consumes
+                              # this directly (indexed by subpool against
+                              # the (HBM, sp) axes); no rewrite needed,
+                              # unlike Pause.relief which the pressure DP
+                              # nests into {HBM: relief} to share axes
+                              # with Migrate.
 ```
 
 ### kv_scheduler is a candidate generator
