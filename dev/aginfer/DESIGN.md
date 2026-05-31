@@ -322,11 +322,13 @@ hint table when computing eviction order.
 
 Lifecycle:
 
-* **Unit birth** (sglang creates a new tree node): sglang seeds the
-  hint table locally with `p_hat = 1.0, λ = λ_NEW_UNIT_DEFAULT`
-  — newborn units are at-least-once reusable by construction
-  (the request that created them is still in-flight).  Initialised
-  in-process, no daemon round-trip.
+* **Unit birth** (sglang creates a new tree node): sglang seeds
+  the hint table locally with `p_hat = 1.0` and a near-term
+  expected-use signal — newborn units are at-least-once reusable
+  by construction (the request that created them is still
+  in-flight).  Initialised in-process, no daemon round-trip.
+  Initial tier is HBM by allocator semantics (see §7 "Initial
+  tier for newly created units").
 * **Daemon refresh**: on every event the daemon scores units in
   D_t (§7) and pushes the resulting `p_hat` / `λ` via `PUT
   /aginfer/hints` for any unit whose value changed beyond a
@@ -600,6 +602,38 @@ must exploit beyond a unit's intrinsic state.  Concrete cases:
 invariant.  Per-unit averages are an acceptable input only when no
 per-event signal exists.
 
+### Initial tier for newly created units
+
+A new unit is born whenever a request commits fresh KV to the
+radix tree — concretely on `LLM_PREFILL` commit (prefill output),
+on decode-step commit, and on `SUB_RETURN` when the child's
+output materialises as a `subagent_ctx` unit.
+
+**Policy: new units are born in HBM** by sglang's allocator
+semantics, with no per-unit scheduler decision.  The hint table
+seed (§6) marks the unit as freshly accessed (`p_hat ≈ 1` for the
+next event horizon) so the inline scorer's eviction heap doesn't
+evict it before its first joint_decide evaluation.
+
+The first joint_decide event that includes the unit in D_t may
+immediately demote it (e.g. `SUB_DISPATCH_ASYNC` payload + parent
+ACTING with a long tool ETA → low `p_hat` for the new
+`subagent_ctx` → demote to DRAM).  Worst-case cost of this
+"born-HBM-then-demote" path is one H→D transfer per unit that
+would have been better-off born elsewhere — accepted as
+overhead until measurement shows it matters.
+
+> **Planned (future opportunity).**  The ideal would have the
+> scheduler pick initial tier via the same `_net_value` argmin
+> on the candidate's predicted p_hat at birth time — same
+> formula as a migration decision, just applied before
+> allocation.  Realising this requires extending sglang's
+> allocator API with `alloc_at_tier(σ)`.  Not pursued until a
+> workload demonstrates the born-HBM-then-demote overhead is
+> material; on busy agent workloads where almost every newborn
+> is about to be consumed by an in-flight request, HBM-default
+> is correct anyway.
+
 ## 8. Admission — program-level candidate generator
 
 Admission is the **program-level candidate generator** that feeds
@@ -840,7 +874,7 @@ for pause/resume).
 | **Pool-truth admission**: admission reads `state.pool_usage.HBM.token_usage`, not `tier_usage`; if the snapshot lacks `pool_usage` the daemon halts loudly (sglang too old / misconfigured) | daemon `admission_controller._hbm_occ` |
 | **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
-| **Hint table covers every live unit**: sglang seeds `(p_hat=1, λ=λ_NEW)` on unit birth; the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
+| **Hint table covers every live unit**: sglang seeds a "fresh access just happened" entry on unit birth (`p_hat ≈ 1` for the next event horizon); the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
 | **Hint atomicity**: the inline scorer's read of a hint entry and the daemon's `PUT` of a new entry are atomic per-key (read-modify-write would race a daemon update against an in-flight eviction).  Per-key seqlock or compare-and-swap suffices; full RW lock is overkill at 10²/s | sglang hint-table data structure |
 | **Layer enable flags**: HiCache, kv_scheduler, and admission each have an independent enable flag.  Admission can only fire when kv_scheduler is also on (admission's pre-pause migrate path requires the daemon's V_u machinery).  HiCache is independent of both | daemon CLI + sglang flags |
 | **Threshold convention**: launch operators must pass the SAME `theta_hi` / `theta_lo` values to sglang and the daemon.  Mismatch is a known footgun (sglang fires `MEMORY_PRESSURE` at its threshold but daemon refuses to act because its threshold is higher, leaving admission silently inert).  Not currently enforced by a single config source; weakening this from an invariant to a convention surfaces the gap honestly | launch scripts pass aligned `--aginfer-theta-*` flags + daemon CLI defaults match the sglang defaults |
