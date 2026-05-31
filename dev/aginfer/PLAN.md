@@ -117,8 +117,10 @@ Order roughly by dependency.
 ### Schema-side
 
 1. **State-dump schema upgrade** (DESIGN §5):
-   - `pool_usage.<tier>.subpools` dict (currently `pool_usage.HBM`
-     is flat; SWA fields exist as optional)
+   - `pool_usage.<tier>.subpools` dict — replaces the current flat
+     pool_usage.HBM fields and the current SWA optional fields
+     (the upgrade *replaces*, does not add-alongside; the daemon
+     halts loudly if the new schema isn't present)
    - `pool_usage.<tier>.subpools[sp].page_bytes` per subpool
    - `per_program_usage[p].hbm.committed` / `inflight` as
      per-subpool dicts
@@ -127,9 +129,15 @@ Order roughly by dependency.
    - `per_program_usage[p].unit_hashes` materialised list
    - `units[i].residence: list[Tier]` (round-9 part 4b)
    - `units[i].n_bytes: {tier: {subpool: bytes}}` nested
-   - `link_stats` with peak / recent / samples per direction
+   - `link_stats` per direction: peak_bw_bps,
+     recent_throughput_bps, time_since_last_sample_s
+     (no samples_in_window — the daemon needs the idle gap, not
+     a sample count, per round-14 F2)
    - `tier_holding_cost` per-(tier, subpool)
-   - Drop legacy top-level `page_size` field
+   - `throughput_ema.prefill_bps`, `throughput_ema.decode_per_program[<pid>]`
+   - Drop the current top-level `page_size` field
+   - Drop the current SWA `swa_*` optional fields (subsumed by
+     subpools dict)
 
 2. **State-dump internal consistency** (DESIGN §10 R1):
    - single-snapshot under one read-lock so `units[*]` and

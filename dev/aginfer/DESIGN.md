@@ -367,11 +367,13 @@ not a decision-rule concern.
                                          // sglang's IO callsites (HiCache
                                          // dispatcher for HBM↔DRAM, Mooncake
                                          // put/get for DRAM↔DISK)
-      "samples_in_window":       int    // 0 when link is idle; daemon uses
-                                         // this to decide between
-                                         // `recent_throughput_bps` (link
-                                         // active) and `peak_bw_bps`
-                                         // (link idle → assume free)
+      "time_since_last_sample_s": float // seconds since the most recent
+                                         // bytes-moved sample on this link.
+                                         // Daemon distinguishes "measured
+                                         // idle" (gap > LINK_IDLE_SECONDS,
+                                         // currently 1.0) from "freshly
+                                         // measured" by this number — see
+                                         // §7 bw_free for the rule.
     }
   },
 
@@ -525,7 +527,7 @@ A few physical interpretations:
 |---|---|---|
 | `["DRAM"]` | `[]` | write-through to DRAM (create host backup, keep HBM live) |
 | `[]` | `["HBM"]` | evict from HBM (DRAM backup retained if present) |
-| `["DRAM"]` | `["HBM"]` | write-through then evict — the legacy "HBM→DRAM migrate" |
+| `["DRAM"]` | `["HBM"]` | write-through then evict — the canonical "HBM→DRAM migrate" |
 | `["HBM"]` | `[]` | load_back / predictive promote (HBM populated, DRAM kept) |
 | `[]` | `["HBM","DRAM","DISK"]` | DROP from radix tree entirely |
 | `["DISK"]` | `[]` | archive to disk via Mooncake; DRAM kept until DRAM pressure |
@@ -567,27 +569,24 @@ not the literal string.
 ### `GET /aginfer/thresholds` — canonical hysteresis thresholds
 
 The daemon is the source of truth for `theta_hi` / `theta_lo` /
-`theta_crit` / `heartbeat_s`.  Three-stage lifecycle, no
-startup coupling:
+`theta_crit` / `heartbeat_s`.  Two-stage lifecycle:
 
 1. **Bootstrap fetch (sglang side).**  At sglang launch, sglang
-   tries `GET /aginfer/thresholds`.  If the daemon is up, sglang
-   writes the response to a local cache file
-   (`<sglang-data>/aginfer_thresholds.json`).  If the daemon is
-   down, sglang loads the existing cache and proceeds — sglang
-   can start without the daemon, using the last-known thresholds.
-   First-ever launch with no cache and no daemon is a deployment
-   bug; sglang refuses with an explicit error.
+   `GET /aginfer/thresholds`.  If the daemon is unreachable,
+   sglang halts loudly — this is a deployment-ordering bug
+   (daemon must be up before sglang).  No local cache, no
+   last-known values: aginfer-managed sglang has one canonical
+   thresholds source and that source is the daemon.
 2. **Daemon-side update broadcast.**  When the daemon's threshold
    config changes at runtime (operator restart with new defaults,
    reload via signal), the daemon enqueues a `PUT /aginfer/thresholds`
    onto its outbound queue (§6 "Fire-and-forget delivery") — handler
    returns immediately, the outbound worker issues the HTTP.  Sglang
-   updates its cache file atomically on receipt.  Until the broadcast
-   propagates (≪ event interval typically), sglang and daemon may
-   transiently disagree by one update; the next state-fetch reconciles.
-   If the apply fails, sglang fires `APPLY_FAILED` (§4) and the
-   daemon's next handler re-enqueues.
+   updates its in-memory thresholds atomically on receipt.  Until
+   the broadcast propagates (≪ event interval typically), sglang
+   and daemon may transiently disagree by one update; the next
+   state-fetch reconciles.  If the apply fails, sglang fires
+   `APPLY_FAILED` (§4) and the daemon's next handler re-enqueues.
 3. **Mismatch is loud.**  If an operator passes `--aginfer-theta-*`
    to sglang AND the value disagrees with the daemon's view at the
    time of bootstrap fetch, sglang halts.  The daemon's view wins;
@@ -843,7 +842,7 @@ because the constraint is a one-sided byte threshold.
 |---|---|---|
 | `u.n_bytes`, `u.n_tokens` | nested-dict / tokens | `u.n_bytes` is a nested dict `{tier: {subpool: bytes}}` (per §5).  `bytes_at(u, τ)` = bytes u occupies at tier τ (= sum over τ's subpools, returns 0 if τ ∉ residence) |
 | `p_hat(u, Δt)` | unitless ∈ [0,1] | conditional reuse probability over horizon Δt |
-| `λ` | accesses / sec | per-program-state access rate used in hint-pushed `p_access` estimators (§6 hint table, §7 estimator chain); legacy Poisson-fit shorthand subsumed by the conditional `p_hat` form |
+| `λ` | accesses / sec | per-program-state access rate used in hint-pushed `p_access` estimators (§6 hint table, §7 estimator chain); a Poisson-fit shorthand subsumed by the conditional `p_hat` form |
 | `Δt` | seconds | decision look-ahead horizon (§7 inputs) |
 | `hold_time` | seconds | expected residence in candidate tier (§7 inputs) |
 | `reload_from(u, τ)`, `reload_from_DROP(u)` | seconds | per-paper-§3 reload costs `ρ_τ × n_tokens`, `π_u × n_tokens` |
@@ -950,10 +949,13 @@ occupancy_of(τ, sp, state) =
       state.pool_usage[τ].subpools[sp].used_bytes
     / state.pool_usage[τ].subpools[sp].cap_bytes
 
-# Bytes a unit occupies at tier τ (sum across τ's subpools);
-# 0 if τ not in residence.
+# Bytes a unit occupies at tier τ (sum across τ's subpools).
+# Caller MUST check `τ in u.residence` first; otherwise a KeyError
+# fires loudly — per §10 "Subpool key consistency", missing keys
+# are a deployment bug, not a silent zero.
 def bytes_at(u, τ):
-    return sum(u.n_bytes.get(τ, {}).values())
+    assert τ in u.residence, f"bytes_at called for {τ} not in u.residence"
+    return sum(u.n_bytes[τ].values())
 
 # Link bandwidth cost of a transition.  Each tier added that wasn't
 # already in residence costs a transfer over the relevant link;
@@ -1295,9 +1297,10 @@ Estimator priority (highest signal first):
    event.  For a REASONING program mid-decode this is one decode
    step; for an ACTING program waiting on a tool whose ETA isn't
    in payload, use the tool's historical mean.
-3. **Global default**: average inter-event spacing (10 ms-1 s
-   range on agent workloads).  Only used when nothing better is
-   known.
+3. **Bootstrap (cold-start)**: average inter-event spacing
+   (10 ms–1 s range on agent workloads).  Used only at session
+   warm-up before per-event-kind statistics accumulate; falls
+   away as program_tracker history fills in.
 
 #### `hold_time` — expected duration in the candidate tier
 
@@ -1320,11 +1323,12 @@ Estimator priority:
 1. **Time until next event with u ∈ D_t**: estimable from
    D_t selection rules (§7) + the per-event-kind expected
    inter-event distance for the relevant holders.
-2. **Coarse default**: average inter-event spacing across all
-   events (same fallback as Δt's level 3).  In steady state on
-   busy agent workloads, hold_time ≈ Δt; the two diverge sharply
-   when the unit is held by a quiet program (long stretches with
-   no D_t-relevant event).
+2. **Bootstrap (cold-start)**: average inter-event spacing
+   across all events (matches Δt's level-3 cold-start case).
+   Used only at session warm-up before per-event-kind statistics
+   accumulate.  In steady state on busy agent workloads,
+   hold_time ≈ Δt; the two diverge sharply when the unit is held
+   by a quiet program (long stretches with no D_t-relevant event).
 
 The two are typically close on a busy workload but **must be
 estimated independently**; conflating them is the Poisson
@@ -1391,12 +1395,26 @@ Live bytes-per-second available on the σ↔τ link, read directly
 from `state.link_stats`:
 
 ```
+LINK_IDLE_SECONDS = 1.0    # deployment constant; idle gap classifier
+
 bw_free(σ, τ) =
-    state.link_stats["σ->τ"].recent_throughput_bps
-        if state.link_stats["σ->τ"].samples_in_window > 0
-    else
-        state.link_stats["σ->τ"].peak_bw_bps   # link idle → assume free
+    let s = state.link_stats["σ->τ"]
+    if s.time_since_last_sample_s > LINK_IDLE_SECONDS:
+        # Link has genuinely been idle long enough that no other
+        # traffic is competing.  Physics: full peak available.
+        return s.peak_bw_bps
+    else:
+        # A recent sample exists; the EMA is the live view.
+        return s.recent_throughput_bps
 ```
+
+Note the structure: there is no "what if `s` itself is missing"
+branch.  If `link_stats[σ->τ]` is absent or `peak_bw_bps` is
+unset, the daemon halts loudly (§10 invariant "Physical inputs
+sourced from sglang").  The two-branch rule above resolves *only*
+the idle-vs-active dichotomy on a live link, which is a real
+physical distinction (PCIe / NVLink / SSD bus has no contention
+when no IO is in flight).
 
 Sourcing:
 
@@ -1410,11 +1428,9 @@ Sourcing:
   HBM↔DRAM (CUDA-event bracketed), Mooncake `put` / `get` for
   DRAM↔DISK (wall-clock bracketed at the Python adapter
   boundary).  Each direction maintained separately.
-
-The fallback to `peak_bw_bps` when no recent samples exist is not
-a defensive fallback — an idle link genuinely has its full peak
-available.  The samples are the dynamic correction, the peak is
-the physical truth.
+* **`time_since_last_sample_s`** is sglang's wall-clock since
+  the most recent EMA sample on this link.  Updated on every IO
+  completion.
 
 ### Event-specific context
 
@@ -1629,10 +1645,8 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
 
   ```
   expected_peak_hbm_after_resume(p, state)[sp] =
-      Σ_{h ∈ p.unit_hashes}
-          (bytes_at_subpool(state.units[h], "HBM", sp)
-              if "HBM" not in state.units[h].residence
-              else 0)
+      Σ_{h ∈ p.unit_hashes : HBM ∉ state.units[h].residence}
+          unit_hbm_subpool_bytes(state.units[h], sp)
                                                   # only count units not
                                                   # currently HBM-resident
                                                   # (demoted, dropped, or
@@ -1644,7 +1658,20 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
     + future_inflight_savings(p, state)[sp]       # post-resume decode
                                                   # growth in subpool sp
 
-  bytes_at_subpool(u, τ, sp) = u.n_bytes.get(τ, {}).get(sp, 0)
+  unit_hbm_subpool_bytes(u, sp):
+      """How many HBM-subpool-sp bytes the unit would occupy if
+      HBM-resident.  This is a physical property of u's token
+      content (n_tokens × per-token-subpool-bytes for the
+      architecture) — independent of whether HBM is currently in
+      residence.  When HBM IS in residence, u.n_bytes[HBM][sp]
+      gives this directly; when HBM is not, sglang stores the
+      same per-architecture quantity in u.n_bytes[<other tier>][sp]
+      because the unit's content shape doesn't change between
+      tiers.  Read whichever tier is in residence; assert that at
+      least one tier is."""
+      assert u.residence, f"unit {u.hash} has empty residence"
+      τ = next(iter(u.residence))                  # any resident tier
+      return u.n_bytes[τ][sp]
   ```
 
   Why "not already in HBM" is the correct filter: HBM bytes for a
@@ -1959,15 +1986,25 @@ def _dest_cap_axes(cap_left):                       # <= axes (destinations)
     return list(cap_left.keys())                    # [(DRAM, sp), (DISK, sp), ...]
 
 def _relief_at(c, tier, sp):
-    """Bytes the candidate frees on (tier, sp).  Both Migrate and
-    Pause carry `relief: dict[Tier, dict[subpool, int]]` by the time
-    they reach the DP (joint_decide normalises Pause's flat
-    subpool dict into {HBM: relief} before calling)."""
+    """Bytes the candidate frees on (tier, sp).
+
+    Both Migrate and Pause carry `relief: dict[Tier, dict[subpool, int]]`
+    by the time they reach the DP (joint_decide normalises Pause's
+    flat subpool dict into {HBM: relief} before calling).  The dict
+    is **sparse by design**: only tiers / subpools the candidate
+    actually frees are listed.  Absent key = "this candidate
+    contributes 0 to this axis" — a meaningful encoding, not a
+    defensive guard.  Per-axis bucket arithmetic in the DP uses
+    these 0s legitimately."""
     return c.relief.get(tier, {}).get(sp, 0)
 
 def _acquire_at(c, tier, sp):
-    """Bytes the candidate adds to destination (tier, sp).  Pauses
-    and pure-remove Migrates contribute 0."""
+    """Bytes the candidate adds to destination (tier, sp).
+
+    Migrate.acquired is sparse-by-design (only destination
+    subpools touched).  Pauses have no `acquired` field by
+    construction — pausing a program never consumes destination
+    capacity — so we return 0 directly without indexing."""
     if isinstance(c, Migrate):
         return c.acquired.get(tier, {}).get(sp, 0)
     return 0
@@ -2025,17 +2062,16 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
     # Feasible cells: every (HBM, sp) relief axis hit its bucket bound.
     full_r = tuple(W[a] for a in relief_axes)
     feasible = [(c, s) for s, c in dp.items() if s[:len(relief_axes)] == full_r]
-    if feasible:
-        _, s_pick = min(feasible)                    # min over cost
-    else:
-        # No subset satisfies every (HBM, sp) target under (b) caps.
-        # Pick the cell maximising Σ relief buckets (closest to
-        # satisfying), tie-break on min cost.  Every cell already
-        # respects (b) by construction.  sglang's next webhook
-        # re-fire surfaces residual pressure.
-        s_pick = max(dp,
-                     key=lambda s: (sum(s[:len(relief_axes)]),
-                                    -dp[s]))
+    assert feasible, (
+        f"joint_decide infeasible: no candidate subset can satisfy "
+        f"bytes_needed={bytes_needed} under cap_left={cap_left}.  "
+        f"Items: {[(type(c).__name__, c.cost, c.relief) for c in items]}.  "
+        f"This is a structural deployment failure — DRAM/DISK cap_left "
+        f"cannot absorb HBM relief at this scale.  Re-firing the next "
+        f"webhook will not change cap topology; the operator must grow "
+        f"destination tiers or revisit thresholds."
+    )
+    _, s_pick = min(feasible)                        # min over cost
     chosen, k = [], K
     while k > 0:
         if take.get((k, s_pick)):
@@ -2196,6 +2232,7 @@ for pause/resume).
 | invariant | enforced by |
 |---|---|
 | **Daemon is a single asyncio process**: one OS process hosts the event_router consumer task, the proxy's request-forwarding tasks, and the outbound action worker task.  They share memory directly (no IPC).  On crash all tasks die together; "the daemon" and "the proxy" never desynchronise.  This makes the volatile-queue and proxy-gate invariants below well-defined as a single failure domain | daemon launch script + asyncio runtime |
+| **Policy mode is launch-time, never runtime-switched**: sglang launches in exactly one mode — either with the aginfer daemon attached (full policy via hint table), or with the default policy module (LRU-equivalent V_u, baseline ablation).  A daemon configured for "aginfer full" that loses its daemon mid-run halts loudly; it does not degrade to the default module.  Mode is a deployment choice, not a runtime fallback | sglang launch flags + daemon liveness check |
 | **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer anywhere — kv_scheduler, admission, forecast refresh, program_tracker, and the proxy all recompute only on event arrival.  SESSION_END is signalled by the client explicitly (§4); there is no time-based fallback | asyncio queue + single consumer |
 | **Unit hashes are content-derived and collision-free in practice**: `u.hash` is sglang's existing radix-tree key — a 128-bit content-derived hash over the unit's token prefix.  Collision probability is negligible at any tree size aginfer encounters (≤ 10⁷ live units, birthday-paradox upper bound < 10⁻²²).  Collision is therefore treated as impossible; on the off-chance of one, behavior is undefined and falls under "deployment bug" — the design does not carry a collision-detection / merge path | sglang radix-tree hash function |
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
@@ -2217,7 +2254,7 @@ for pause/resume).
 | **Hint table covers every live unit**: sglang seeds a "fresh access just happened" entry on unit birth (`p_hat ≈ 1` for the next event horizon); the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
 | **Hint atomicity**: the inline scorer's read of a hint entry and the daemon's `PUT` of a new entry are atomic per-key (read-modify-write would race a daemon update against an in-flight eviction).  Per-key seqlock or compare-and-swap suffices; full RW lock is overkill at 10²/s | sglang hint-table data structure |
 | **Layer enable flags**: HiCache, kv_scheduler, and admission each have an independent enable flag.  Admission can only fire when kv_scheduler is also on (admission's pre-pause migrate path requires the daemon's V_u machinery).  HiCache is independent of both | daemon CLI + sglang flags |
-| **Threshold parity**: sglang and the daemon use the SAME `theta_hi` / `theta_lo` / `theta_crit` / `heartbeat_s` values.  The daemon is the canonical source; sglang reads on bootstrap (or from a local cache file if the daemon is unreachable), and the daemon broadcasts runtime changes via `PUT /aginfer/thresholds` (§6).  sglang and daemon are not co-launched: each can restart independently while preserving the invariant | daemon `GET /aginfer/thresholds` + sglang local cache + daemon→sglang update broadcast |
+| **Threshold parity**: sglang and the daemon use the SAME `theta_hi` / `theta_lo` / `theta_crit` / `heartbeat_s` values.  The daemon is the canonical source; sglang halts at bootstrap if the daemon is unreachable.  Runtime changes flow daemon → sglang via `PUT /aginfer/thresholds` (§6).  Aginfer-managed sglang requires the daemon to be up first; no cache, no last-known-values fallback | daemon `GET /aginfer/thresholds` + daemon→sglang update broadcast |
 
 ## 11. Recovery (daemon restart / sglang restart)
 
