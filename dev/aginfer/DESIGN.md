@@ -17,6 +17,13 @@ The mechanism is **event-driven**, **per-unit value-based**, and
 **externalised from sglang** so the inference engine stays general
 while scheduling policy is free to iterate.
 
+**Out of scope**: multi-tenant fairness / per-program priority /
+per-tenant SLOs.  The design optimises throughput on the shared
+HBM resource and does not enforce a starvation guard for low-V_u
+programs.  Fairness is the responsibility of an upstream
+admission gating layer above harbor (route limiter, priority
+queue, etc.) that pre-shapes the workload the daemon sees.
+
 ## 2. Workload model (the hard physical facts)
 
 aginfer assumes the workload is multi-turn agentic inference:
@@ -67,7 +74,7 @@ Three layers, three cadences (none of them periodic).
        │    state ← fetch /aginfer/state                   │
        │    program_tracker.advance(e)                     │
        │    plan  ← joint_decide(state, e)   # §9          │
-       │      # one knapsack-greedy pass over the union    │
+       │      # exact 0/1 knapsack (DP) over the union     │
        │      # action space {unit migrate} ∪ {program     │
        │      # pause/resume}; selection key V_u/byte      │
        │    apply(plan):                                   │
@@ -134,7 +141,7 @@ system has no internal timer.
 | `SUB_DISPATCH_ASYNC` | proxy | program dispatches an async sub-agent |
 | `SUB_RETURN` | proxy | sub-agent terminated (parent tail becomes a promote candidate; child output may become a new shared `subagent_ctx` unit) |
 | `SESSION_END` | proxy | program terminated (no more arrivals); its session-scoped units become demote/drop candidates and contribute 0 to future `p_hat` |
-| `MEMORY_PRESSURE` | sglang webhook | allocator-truth HBM occupancy crossed `theta_hi` upward |
+| `MEMORY_PRESSURE` | sglang webhook | allocator-truth HBM occupancy crossed `theta_hi` upward; while occupancy stays above `theta_hi`, sglang re-fires every `heartbeat_s` (default 5 s) so the daemon stays caught up if it missed earlier events |
 | `PRESSURE_RESOLVED` | sglang webhook | allocator-truth HBM occupancy crossed `theta_lo` downward (hysteresis) |
 
 Each event carries (`kind`, `session_id` if applicable, `payload`).
@@ -341,6 +348,10 @@ the inline scorer always has the same V_u inputs the daemon
 would have used at the time of the last event — it is not a
 defensive LRU fallback.
 
+The hint table is read by the inline scorer concurrently with the
+daemon's `PUT`s.  See the §10 "Hint atomicity" invariant for the
+per-key seqlock / CAS requirement.
+
 ### Multi-rank protocol (TP / EP / DP)
 
 The daemon talks to a single sglang HTTP endpoint regardless of
@@ -388,6 +399,56 @@ within milliseconds.
 
 ## 7. Decision rule
 
+### Symbols and units
+
+All cost-side quantities are in **seconds** (paper §3 Reward
+units: time saved/paid against wall-clock).  All relief / re_use
+quantities are in **bytes**.  The joint knapsack (§9) mixes
+seconds-cost with bytes-budget; the comparison is well-typed
+because the constraint is a one-sided byte threshold.
+
+| symbol | unit | meaning |
+|---|---|---|
+| `u.n_bytes`, `u.n_tokens` | bytes, tokens | unit size; one-of derivable as `n_bytes = n_tokens × bytes_per_token` |
+| `p_hat(u, Δt)` | unitless ∈ [0,1] | conditional reuse probability over horizon Δt |
+| `Δt` | seconds | decision look-ahead horizon (§7 inputs) |
+| `hold_time` | seconds | expected residence in candidate tier (§7 inputs) |
+| `reload_from(u, τ)`, `reload_from_DROP(u)` | seconds | per-paper-§3 reload costs `ρ_τ × n_tokens`, `π_u × n_tokens` |
+| `h_τ(occ)` | $/byte/sec | per-byte holding cost at tier τ at occupancy `occ`; multiplied by bytes×seconds to get seconds-cost |
+| `bw_free(σ, τ)` | bytes/sec | live free bandwidth on σ↔τ link |
+| `transfer_bytes(u, σ, τ)` | bytes | `u.n_bytes` if `τ ≠ DROP` else 0 |
+| `transfer_time(σ, τ)` | seconds | `transfer_bytes / bw_free` |
+| `page_bytes` | bytes | DP quantisation granularity = `state.page_size × state.bytes_per_token` |
+| `cost`, `gain`, `V_u`, `V_u_program` | seconds | net value at the same time-axis |
+| `relief`, `re_use`, `bytes_moved`, `bytes_needed` | bytes | HBM-resource axis |
+| `forecast(state)` | unitless ∈ [0,1] | occupancy fraction (matches `pool_usage.HBM.token_usage`) |
+
+### Candidate types
+
+```python
+@dataclass(frozen=True)
+class Migrate:
+    hash: str                 # u.hash (sglang canonical key)
+    target_tier: Tier
+    cost: float               # seconds
+    relief: int               # HBM bytes freed
+    bytes_moved: int          # bytes the σ→τ transfer moves
+
+@dataclass(frozen=True)
+class Pause:
+    program_id: str
+    cost: float               # seconds (V_u_program + marginal_pause_cost)
+    relief: int               # HBM bytes freed
+
+@dataclass(frozen=True)
+class Resume:
+    program_id: str
+    gain: float               # seconds (V_u_program_if_active)
+    re_use: int               # HBM bytes re-occupied
+```
+
+### kv_scheduler is a candidate generator
+
 Per event, the daemon constructs a **decision set** `D_t ⊆ units`
 and emits **unit-level migrate candidates** for the joint decider
 in §9.  `kv_scheduler` is a **candidate generator only** — it does
@@ -404,7 +465,13 @@ def migrate_candidates(state, D_t) -> list[Migrate]:
             cost  += unavailability_cost(u, u.tier, τ)
             relief = bytes_freed_by_migrate(u, u.tier, τ)
             if relief > 0:                     # only HBM-relieving migrates
-                out.append(Migrate(u.id, τ, cost, relief))
+                out.append(Migrate(
+                    hash=u.hash,
+                    target_tier=τ,
+                    cost=cost,
+                    relief=relief,
+                    bytes_moved=transfer_bytes(u, u.tier, τ),
+                ))
     return out
 
 # V_u value at a tier (paper §7, conditional-p_hat form §7 above).
@@ -412,27 +479,41 @@ def migrate_candidates(state, D_t) -> list[Migrate]:
 # decision look-ahead window for p_hat, hold_time is the expected
 # physical residence in τ.  Under Poisson they collapse to 1/λ;
 # under our conditional formulation they do not.
-_value(u, τ, state) = p_hat(u, Δt) × (reload_from_DROP - reload_from_τ)
-                    - h_τ(occupancy_of_τ) × bytes × hold_time
+_value(u, τ, state) =
+    p_hat(u, Δt) × (reload_from_DROP(u) - reload_from(u, τ))
+  - h_τ(occupancy_of_τ(state)) × u.n_bytes × hold_time
 
-# Cost components of the σ→τ transfer itself:
-migration_cost(u, σ, τ) =
-    transfer_bytes(u, σ, τ) / bw_eff(σ, τ)
-  × per-byte-latency-while-link-busy
+# Reload costs (paper §3 Tier Parameters, renamed for legibility):
+reload_from(u, τ)    = ρ_τ × u.n_tokens     # per-token reload at tier τ
+reload_from_DROP(u)  = π_u × u.n_tokens     # full re-prefill cost
+
+# Tier occupancy ratio (derived from §5 tier_usage):
+occupancy_of_τ(state) = state.tier_usage[τ].used_bytes
+                      / state.tier_usage[τ].cap_bytes
+
+# Bytes the σ→τ transfer moves over the link:
+transfer_bytes(u, σ, τ):
+    if τ == DROP:  return 0   # drop is metadata-only
+    return u.n_bytes
+
+# σ→τ transfer time at current link utilisation:
+transfer_time(σ, τ) = transfer_bytes(u, σ, τ) / bw_free(σ, τ)
+
+# Cost of the σ→τ transfer itself (BW link contention):
+migration_cost(u, σ, τ) = transfer_bytes(u, σ, τ) / bw_free(σ, τ)
+                          # seconds the link is held; paid against
+                          # the same time-axis as prefill savings
 
 unavailability_cost(u, σ, τ) =
     p_hat(u, transfer_time(σ, τ))           # access lands during transfer
   × P(serve-from-σ fails | σ-write-policy)  # 0 under write-through
-  × (reload_from_σ - 0)                     # penalty if it does fail
+  × reload_from(u, σ)                       # penalty if it does fail
 
+# HBM-relief axis for the joint knapsack: a candidate frees HBM
+# bytes iff its source tier is HBM.  Migrates whose source is
+# DRAM / DISK return 0 here and are filtered out by the §9 loop.
 bytes_freed_by_migrate(u, σ, τ):
-    # The resource axis admission is short on is HBM.  σ→τ frees
-    # HBM bytes iff σ == HBM.  Any candidate with σ != HBM is
-    # irrelevant to HBM pressure and is dropped from the joint
-    # knapsack by the generator above (`if relief > 0`).
-    if σ != HBM:        return 0
-    if τ == DROP:       return u.n_bytes
-    return u.n_bytes    # HBM bytes vacated regardless of destination
+    return u.n_bytes if σ == HBM else 0
 ```
 
 The `if relief > 0` filter is load-bearing: it keeps the §9
@@ -484,20 +565,61 @@ during transfer (e.g. zero-copy move), `P(serve-from-σ fails) =
 1` and the unavailability term kicks in fully — without any
 change to the decision rule.
 
-### D_t per event kind
+### `decision_set(event, units)` — D_t per event kind
 
-| event | D_t |
+```python
+def decision_set(event, units):
+    """The unit subset for which §9 will solve a knapsack on this event.
+    Matches paper §4 table."""
+    e, sid = event.kind, event.session_id
+    match e:
+        case SESSION_ARRIVAL:        return shared_prefix_units(units)
+        case LLM_PREFILL:            return frozenset()
+        case TOOL_CALL_START:        return session_tail(units, sid)
+        case TOOL_CALL_END:          return session_tail(units, sid)
+        case SUB_DISPATCH_BLOCKING:  return session_tail(units, sid) | shared_prefix_units(units)
+        case SUB_DISPATCH_ASYNC:     return shared_prefix_units(units)
+        case SUB_RETURN:             return session_tail(units, sid) | {child_output_unit(event)}
+        case SESSION_END:            return session_scoped_units(units, sid)
+        case MEMORY_PRESSURE | PRESSURE_RESOLVED:
+            return top_k_by_regret(units, k=top_k_pressure(state))
+```
+
+| event | rationale |
 |---|---|
-| `SESSION_ARRIVAL` | shared prefix units (preload before first prefill) |
+| `SESSION_ARRIVAL` | shared prefix candidates (preload before first prefill) |
 | `LLM_PREFILL` | ∅ (no migrate; the event still advances `program_tracker` to REASONING and admission re-evaluates) |
-| `TOOL_CALL_START` | session tail units of the caller (demote candidate while idle); promote-ahead is scheduled here too, timed by the tool ETA so the unit lands before the next prefill |
-| `TOOL_CALL_END` | session tail units of the caller (promote-now if ahead-of-time promote didn't catch up; otherwise no-op) |
+| `TOOL_CALL_START` | session tail = demote candidate while idle; promote-ahead is scheduled here too, timed by the tool ETA so the unit lands before the next prefill |
+| `TOOL_CALL_END` | session tail = promote-now if ahead-of-time promote didn't catch up; otherwise no-op |
 | `SUB_DISPATCH_BLOCKING` | parent tail + shared prefix |
 | `SUB_DISPATCH_ASYNC` | shared prefix only |
 | `SUB_RETURN` | parent tail (promote candidate) + the child's output that just materialised as a new `subagent_ctx` unit (decide initial tier) |
 | `SESSION_END` | session-scoped units of the ending program (demote or drop, depending on remaining holders) |
-| `MEMORY_PRESSURE` | top-k by regret across all units |
-| `PRESSURE_RESOLVED` | top-k by regret across all units |
+| `MEMORY_PRESSURE`, `PRESSURE_RESOLVED` | top-k by regret across all units |
+
+#### `regret(u, state)` and `top_k_pressure(state)`
+
+For the two pressure events, the candidate set is restricted by
+**regret** — the V_u headroom we'd recover by moving u to its best
+alternative tier:
+
+```
+regret(u, state) = _value(u, u.tier, state)
+                 - max_{τ ≠ u.tier} _value(u, τ, state)
+```
+
+`top_k_by_regret(units, k)` returns the k units of highest regret.
+`k` is sized so the joint knapsack stays microsecond-scale:
+
+```
+top_k_pressure(state) =
+    min(K_MAX,
+        max(K_MIN, bytes_needed(state) / mean_unit_bytes(state) × K_SAFETY))
+```
+
+Defaults: `K_MAX = 256`, `K_MIN = 16`, `K_SAFETY = 4`.  These are
+deployment constants, not workload tuning knobs — they bound the
+DP table size (§9), not the optimality of the chosen subset.
 
 `TOOL_CALL_START` carries the tool's expected duration; the
 scheduler schedules the promote-back action for `T_start +
@@ -746,7 +868,7 @@ Migrates; headroom phase uses Resumes.
   `forecast(state)` still ≤ `theta_hi` after re-incorporating p's
   HBM footprint.  Resume candidates failing this gate are omitted
   by the generator (not in the candidate set).
-* `forecast(state)` — `state.pool_pressure[HBM].token_usage +
+* `forecast(state)` — `state.pool_usage["HBM"].token_usage +
   forecast_inflight_demand(state)`.
 
   The second term is the **expected** HBM growth before the next
@@ -968,15 +1090,17 @@ its knapsack from scratch.
 
 ### What collapses out
 
-* **Trade gate**: in the sequential version §8 needed an
-  explicit `if marginal_pause_cost > marginal_relief_value: break`
-  guard.  In the joint version, the per-iteration argmin on
-  `cost/relief` plus the `freed >= bytes_needed` stop accomplish
-  the same thing — bad trades are never picked.
-* **Composition order**: there's no "run kv_scheduler first
-  then admission".  Pause/Migrate candidates compete on the same
-  sort key in the pressure phase; whichever has the best
-  `V_u/byte` goes first.
+* **Trade gate**: the min-cost DP only includes an item in the
+  optimal subset if it reduces total cost relative to the next-
+  best subset achieving the same relief.  Any subset dominated
+  by a cheaper one is rejected by construction — there's no
+  need for the explicit `if marginal_pause_cost > marginal_relief_value:
+  break` guard a sequential greedy would require.
+* **Composition order**: the DP enumerates subsets implicitly
+  across the union; there's no "run kv_scheduler first then
+  admission".  A Pause and a Migrate can both appear in the
+  optimal subset, or only one, or neither — whichever combination
+  minimises total cost.
 * **Per-trigger D_t for admission**: admission considers every
   active / paused program every event; D_t only constrains the
   unit-migrate candidate generator.
@@ -995,10 +1119,10 @@ for pause/resume).
 
 | invariant | enforced by |
 |---|---|
-| **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer for any layer (kv_scheduler, admission, forecast refresh) — every recomputation is on event arrival | asyncio queue + single consumer |
+| **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer in kv_scheduler, admission, forecast refresh, or program_tracker — every recomputation is on event arrival.  Sole exception: the proxy's `T_idle` SESSION_END detection fallback (§4) | asyncio queue + single consumer |
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
 | **Idempotent migrate**: re-applying the same action returns 200 with `applied=0` and a `race:*` skip | sglang `apply_aginfer_migrations` |
-| **Webhook mandatory**: sglang's launch contract always passes `--aginfer-notify-url`; the admission trigger path is not optional | `launch_sglang_v4flash*.sh` |
+| **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
 | **Pool-truth admission**: admission reads `state.pool_usage.HBM.token_usage`, not `tier_usage`; if the snapshot lacks `pool_usage` the daemon halts loudly (sglang too old / misconfigured) | daemon `admission_controller._hbm_occ` |
 | **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
@@ -1035,16 +1159,24 @@ On crash + restart the daemon's recovery sequence is:
      PAUSED` at restart is re-registered as PAUSED in the
      daemon's tracker, and the proxy will gate that program's
      next arrival.  In-flight requests at crash time are
-     considered failed (proxy didn't acknowledge); harbor's
-     retry hits the gate.
+     considered failed (proxy didn't acknowledge); the client
+     hits the gate when it retries.  This relies on the client
+     using retry-on-timeout semantics — pure fire-and-forget
+     clients lose the dropped requests.  The "All traffic
+     through daemon proxy" deployment invariant (§10) implicitly
+     mandates a retrying client; clients that don't retry are
+     out of scope.
 
    `pre_pause_state` is **lost** on restart (it was in-process
    only).  The Resume gain counterfactual (§8) falls back to
    `REASONING` for any program re-registered as PAUSED without a
-   known pre_pause_state.  This biases toward resuming earlier
-   (REASONING is the higher-V_u counterfactual), which is the
-   safe direction — at worst the program is resumed slightly
-   sooner than ideal; never silently held.
+   known `pre_pause_state`.  REASONING is the safe fallback
+   because it carries the highest expected `V_u_program_if_active`
+   across the workload — a REASONING-on-resume program is by
+   construction about to issue a decode step (highest p_hat for
+   its tail).  Resume's argmax-gain prefers high counterfactual
+   value, so the fallback biases toward **resuming sooner**
+   rather than later — preferred to silently holding a program.
 3. **In-flight migrate retries**: any migrate POSTs that were
    in-flight at crash are not retried — they are idempotent
    (§10), so re-issuing on the next event is harmless and
