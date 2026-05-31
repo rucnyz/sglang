@@ -190,48 +190,71 @@ not a decision-rule concern.
 ```json
 {
   "page_size": int,
-  "bytes_per_token": int,              // n_bytes = n_tokens × bytes_per_token
-                                        // is a derived quantity, not authoritative
   "time_counter": int,                  // monotonic access tick
 
-  "tier_usage": {                       // RADIX-TREE view
+  "tier_usage": {                       // RADIX-TREE view; aggregate per tier
     "HBM":  {"used_bytes": int, "cap_bytes": int},
     "DRAM": {"used_bytes": int, "cap_bytes": int},
     "DISK": {"used_bytes": int, "cap_bytes": int}    // zero-stub until L3 wired
   },
 
-  "pool_usage": {                       // ALLOCATOR-TRUTH view
+  "pool_usage": {                       // ALLOCATOR-TRUTH view; per-subpool
+                                         // breakdown.  Each tier carries a
+                                         // `subpools` dict whose keys are
+                                         // model-determined component names
+                                         // (e.g. "full" / "swa" / "mamba"
+                                         //  for a hybrid Mamba+SWA model;
+                                         //  one key "main" for non-hybrid).
+                                         // sglang's UnifiedRadixCache exposes
+                                         // these via its component registry
+                                         // (one component per attention type
+                                         //  per architecture; see sglang
+                                         //  unified_cache_components/).
     "HBM": {
-      "used_bytes":      int,
-      "cap_bytes":       int,
-      "available_bytes": int,
-      "evictable_bytes": int,
-      "token_usage":     float,         // = (cap - avail - evictable) / cap
-                                         // matches sglang full_token_usage
-      // SWA hybrid attention exposes the underlying sub-pools.
-      // For non-SWA models these fields are absent; the daemon
-      // gates `token_usage` regardless and ignores the sub-pool detail.
-      "full_token_usage":      float?,
-      "swa_token_usage":       float?,
-      "swa_used_bytes":        int?,
-      "swa_cap_bytes":         int?,
-      "swa_available_bytes":   int?,
-      "swa_evictable_bytes":   int?
+      "subpools": {
+        "<name>": {                     // e.g. "main" | "full" | "swa" | "mamba"
+          "used_bytes":      int,
+          "cap_bytes":       int,
+          "available_bytes": int,
+          "evictable_bytes": int
+        }
+      }
+    },
+    "DRAM": {
+      "subpools": {
+        "main": {                       // single subpool by default; HiCache
+                                         // host pool is structurally a single
+                                         //   region
+          "used_bytes": int, "cap_bytes": int,
+          "available_bytes": int, "evictable_bytes": int
+        }
+      }
+    },
+    "DISK": {
+      "subpools": {
+        "main": {                       // mooncake-backed; single region
+          "used_bytes": int, "cap_bytes": int,
+          "available_bytes": int, "evictable_bytes": int
+        }
+      }
     }
   },
 
   "per_program_usage": {                // PER-PROGRAM-OWNED view
     "<program_id>": {
       "hbm": {
-        "committed_bytes": int,         // share of radix nodes attributed to
-                                         // this program, with 1/holders weight
-                                         // for nodes shared across programs
-        "inflight_bytes":  int          // bytes of in-flight decode KV
-                                         // (request-owned, not yet committed
-                                         //  to the radix tree)
+        "committed": {                  // share of radix nodes attributed to
+          "<subpool>": int              // this program per HBM subpool, with
+        },                               // 1/holders weight for nodes shared
+                                         // across programs
+        "inflight":  {                  // request-owned bytes per HBM subpool
+          "<subpool>": int              // (not yet committed to the radix
+        }                                // tree).  Per subpool because Mamba
+                                         //   inflight allocation differs from
+                                         //   attention KV inflight growth.
       },
       "dram": {
-        "committed_bytes": int          // host pool share, same attribution
+        "committed": {"main": int}      // host pool share, same attribution
       },
       "state": "REASONING"|"ACTING"|"PAUSED"|"ENDED",
                                          // sglang derives REASONING/ACTING
@@ -260,7 +283,19 @@ not a decision-rule concern.
 
   "units": [
     {"hash": str, "tier": "HBM"|"DRAM"|"DISK",
-     "n_tokens": int, "n_bytes": int,
+     "n_tokens": int,
+     "n_bytes": {                     // per-subpool bytes this unit
+       "<subpool>": int               // contributes to its current tier.
+     },                                // Subpool keys match the tier's
+                                        //   pool_usage.<tier>.subpools keys.
+                                        // Non-hybrid model: {"main": N}.
+                                        // SWA-hybrid: {"full": F, "swa": S}
+                                        //   with swa==0 once the unit ages
+                                        //   out of the sliding window.
+                                        // Mamba+attention hybrid: leaf
+                                        //   nodes carry {"full": F, "mamba": M};
+                                        //   intermediate nodes carry only
+                                        //   {"full": F}.
      "last_access_time": int, "hit_count": int,
      "session_ids": list[str]}
   ],
@@ -286,12 +321,21 @@ not a decision-rule concern.
     }
   },
 
-  "tier_holding_cost": {                // PER-TIER MARGINAL DISPLACEMENT,
-                                         // input to V_u's h_τ(occ) term
-    "HBM":  {"h_max_per_byte_sec": float},   // per-tier deployment
-    "DRAM": {"h_max_per_byte_sec": float},   //   constants; combine with
-    "DISK": {"h_max_per_byte_sec": float}    //   live occupancy via §7's
-                                              //   h_τ(occ) shape
+  "tier_holding_cost": {                // PER-(TIER, SUBPOOL) MARGINAL
+                                         //   DISPLACEMENT, input to V_u's
+                                         //   h_(τ, sp)(occ) term.  Per-subpool
+                                         //   because Mamba snapshots and
+                                         //   attention KV in the same tier
+                                         //   compete for different physical
+                                         //   bytes and saturate at different
+                                         //   occupancies.
+    "HBM": {
+      "<subpool>": {"h_max_per_byte_sec": float}    // one entry per subpool
+                                                     //   declared in
+                                                     //   pool_usage.HBM
+    },
+    "DRAM": {"main": {"h_max_per_byte_sec": float}},
+    "DISK": {"main": {"h_max_per_byte_sec": float}}
   },
 
   // Diagnostic: emitted by sglang only when the loaded tree cache
@@ -311,10 +355,11 @@ Three distinct consumers in §7 / §8 need three distinct slices:
 * `tier_usage` (radix view) — input for **V_u migration value
   scoring**.  V_u acts on tree nodes; the relevant cost is "how
   full is the tree's slice of HBM".
-* `pool_usage` (allocator view) — input for **admission's
-  pressure trigger**.  Admission decides whether to act based on
-  total HBM pressure (including in-flight decode the radix view
-  misses).
+* `pool_usage` (allocator view, **per-subpool**) — input for
+  **admission's pressure trigger**.  Admission acts when **any**
+  HBM subpool crosses its `theta_hi` threshold, not when the
+  aggregate does — a Mamba snapshot pool at 95% with attention
+  at 60% is the failure mode an aggregate view hides.
 * `per_program_usage` (program view) — input for **admission's
   victim selection**.  Pausing a program frees its committed
   share + prevents its future in-flight growth; admission needs
@@ -591,22 +636,23 @@ because the constraint is a one-sided byte threshold.
 
 | symbol | unit | meaning |
 |---|---|---|
-| `u.n_bytes`, `u.n_tokens` | bytes, tokens | unit size; one-of derivable as `n_bytes = n_tokens × bytes_per_token` |
+| `u.n_bytes`, `u.n_tokens` | bytes-dict / tokens | `u.n_bytes` is a dict `{subpool: bytes}` (per §5); `total_bytes(u) = sum(u.n_bytes.values())` |
 | `p_hat(u, Δt)` | unitless ∈ [0,1] | conditional reuse probability over horizon Δt |
 | `Δt` | seconds | decision look-ahead horizon (§7 inputs) |
 | `hold_time` | seconds | expected residence in candidate tier (§7 inputs) |
 | `reload_from(u, τ)`, `reload_from_DROP(u)` | seconds | per-paper-§3 reload costs `ρ_τ × n_tokens`, `π_u × n_tokens` |
-| `h_τ(occ)` | sec / (byte × sec of holding) | per-byte marginal displacement cost at tier τ when at occupancy `occ`; multiplied by bytes×seconds yields seconds-cost.  Linear placeholder `h_τ_max × occ` from `state.tier_holding_cost[τ]`; final shape pending T12 calibration |
+| `h_(τ, sp)(occ)` | sec / (byte × sec of holding) | per-(tier, subpool) marginal displacement cost at occupancy `occ`; one entry per subpool listed in `pool_usage[τ].subpools`.  Linear placeholder `h_(τ, sp)_max × occ` from `state.tier_holding_cost[τ][sp]`; final shape pending T12 calibration |
+| `occupancy_of(τ, sp, state)` | unitless ∈ [0,1] | `pool_usage[τ].subpools[sp].used_bytes / .cap_bytes` |
 | `bw_free(σ, τ)` | bytes/sec | live free bandwidth on σ↔τ link; reads `state.link_stats[σ→τ].recent_throughput_bps` when active, falls through to `peak_bw_bps` when link idle |
 | `transfer_bytes(u, σ, τ)` | bytes | `u.n_bytes` if `τ ≠ DROP` else 0 |
 | `transfer_time(σ, τ)` | seconds | `transfer_bytes / bw_free` |
-| `page_bytes` | bytes | DP quantisation granularity = `state.page_size × state.bytes_per_token` |
+| `page_bytes` | bytes | DP quantisation granularity = sglang's allocator page size in bytes (model-architecture dependent; for paged-KV with non-uniform per-layer pools, the smallest page across all (tier, subpool) pairs governs) |
 | `cost`, `gain`, `V_u`, `V_u_program` | seconds | net value at the same time-axis |
 | `relief`, `re_use`, `bytes_moved`, `bytes_needed` | bytes | HBM-resource axis |
-| `forecast(state)` | bytes | predicted HBM bytes occupied at the next event arrival if no scheduling action is taken: `pool_usage.HBM.used_bytes + forecast_inflight_demand(state)`.  Compare against `theta_hi × cap_bytes` / `theta_lo × cap_bytes`, both also in bytes.  Horizon = `forecast_horizon(state)`, see §8 |
+| `forecast(state)` | dict[subpool, bytes] | per-HBM-subpool predicted bytes at the next event arrival if no scheduling action is taken: `pool_usage.HBM.subpools[sp].used_bytes + forecast_inflight_demand(state)[sp]`.  Compare each entry against `theta_hi × subpools[sp].cap_bytes`.  Horizon = `forecast_horizon(state)`, see §8 |
 | `forecast_horizon(state)` | seconds | expected time to next event: `min(heartbeat_s, 1 / recent_event_rate)`.  Bounded above by webhook heartbeat under HIGH/CRITICAL pressure (≈ 5 s) and below by typical event interval under normal load (≈ 10 ms) |
 | `decode_throughput(p)` | tokens/sec | sglang-observed decode rate for p, used to cap `E[remaining_tokens]` by `horizon × throughput` |
-| `prefill_throughput(state)` | bytes/sec | sglang-observed prefill rate, used to convert `inflight_bytes` to a re-prefill seconds-cost in `marginal_pause_cost` |
+| `prefill_throughput(state)` | bytes/sec | sglang-observed prefill rate, used to convert per-program in-flight bytes (summed across HBM subpools) into a re-prefill seconds-cost in `marginal_pause_cost` |
 
 ### Candidate types
 
@@ -615,22 +661,27 @@ because the constraint is a one-sided byte threshold.
 class Migrate:
     hash: str                 # u.hash (sglang canonical key)
     target_tier: Tier
+    target_subpool: str       # destination subpool key in target_tier.subpools
+                              # (e.g. "main" for non-hybrid DRAM/DISK)
     cost: float               # seconds
-    relief: int               # HBM bytes freed
-    bytes_moved: int          # bytes the σ→τ transfer moves
+    relief: dict[str, int]    # per-HBM-subpool bytes freed at the source
+                              # (keys match pool_usage.HBM.subpools)
+    bytes_moved: int          # total bytes the σ→τ transfer moves
 
 @dataclass(frozen=True)
 class Pause:
     program_id: str
     cost: float               # seconds (V_u_program + marginal_pause_cost)
-    relief: int               # HBM bytes = snapshot_relief
-                              #          + future_inflight_savings (§8)
+    relief: dict[str, int]    # per-HBM-subpool bytes
+                              # = snapshot_relief + future_inflight_savings
+                              # (§8 — each term is itself a per-subpool dict)
 
 @dataclass(frozen=True)
 class Resume:
     program_id: str
     gain: float               # seconds (V_u_program_if_active)
-    re_use: int               # HBM bytes = expected_peak_hbm_after_resume (§8)
+    re_use: dict[str, int]    # per-HBM-subpool bytes
+                              # = expected_peak_hbm_after_resume (§8)
 ```
 
 ### kv_scheduler is a candidate generator
@@ -649,8 +700,9 @@ def migrate_candidates(state, D_t) -> list[Migrate]:
             cost   = _value(u, u.tier, state) - _value(u, τ, state)
             cost  += migration_cost(u, u.tier, τ)
             cost  += unavailability_cost(u, u.tier, τ)
-            relief = bytes_freed_by_migrate(u, u.tier, τ)
-            if relief > 0:                     # only HBM-relieving migrates
+            relief = bytes_freed_by_migrate(u, u.tier, τ)   # dict per subpool
+            if any(b > 0 for b in relief.values()):         # frees at least
+                                                             # one HBM subpool
                 out.append(Migrate(
                     hash=u.hash,
                     target_tier=τ,
@@ -660,27 +712,30 @@ def migrate_candidates(state, D_t) -> list[Migrate]:
                 ))
     return out
 
-# V_u value at a tier (paper §7, conditional-p_hat form §7 above).
-# Δt and hold_time are DISTINCT inputs (see §7 below) — Δt is the
-# decision look-ahead window for p_hat, hold_time is the expected
-# physical residence in τ.  Under Poisson they collapse to 1/λ;
-# under our conditional formulation they do not.
+# V_u value at a tier — sum over subpools.  A unit may contribute
+# to multiple subpools (e.g. a Mamba-leaf node holds both attention
+# `full` bytes and a `mamba` snapshot); both terms pay holding
+# cost at their respective subpool's occupancy.
 _value(u, τ, state) =
     p_hat(u, Δt) × (reload_from_DROP(u) - reload_from(u, τ))
-  - h_τ(occupancy_of_τ(state)) × u.n_bytes × hold_time
+  - Σ_{sp ∈ u.n_bytes}
+        h_(τ, sp)(occupancy_of(τ, sp, state)) × u.n_bytes[sp] × hold_time
 
 # Reload costs (paper §3 Tier Parameters, renamed for legibility):
 reload_from(u, τ)    = ρ_τ × u.n_tokens     # per-token reload at tier τ
 reload_from_DROP(u)  = π_u × u.n_tokens     # full re-prefill cost
 
-# Tier occupancy ratio (derived from §5 tier_usage):
-occupancy_of_τ(state) = state.tier_usage[τ].used_bytes
-                      / state.tier_usage[τ].cap_bytes
+# Per-subpool occupancy ratio (read from §5 pool_usage):
+occupancy_of(τ, sp, state) =
+      state.pool_usage[τ].subpools[sp].used_bytes
+    / state.pool_usage[τ].subpools[sp].cap_bytes
 
-# Bytes the σ→τ transfer moves over the link:
+# Total bytes the σ→τ transfer moves (sum across u's subpools at σ):
+total_bytes(u) = sum(u.n_bytes.values())
+
 transfer_bytes(u, σ, τ):
-    if τ == DROP:  return 0   # drop is metadata-only
-    return u.n_bytes
+    if τ == DROP:  return 0
+    return total_bytes(u)
 
 # σ→τ transfer time at current link utilisation.
 # DROP short-circuits to 0: DROP only updates the radix tree
@@ -700,18 +755,26 @@ unavailability_cost(u, σ, τ) =
   × P(serve-from-σ fails | σ-write-policy)  # 0 under write-through
   × reload_from(u, σ)                       # penalty if it does fail
 
-# HBM-relief axis for the joint knapsack: a candidate frees HBM
-# bytes iff its source tier is HBM.  Migrates whose source is
-# DRAM / DISK return 0 here and are filtered out by the §9 loop.
+# Per-subpool HBM relief from migrating u out of HBM.  Returns
+# a dict {subpool: bytes_freed}; subpool keys match the unit's
+# n_bytes dict.  Non-HBM-source migrates return all-zeros and are
+# filtered upstream.
 bytes_freed_by_migrate(u, σ, τ):
-    return u.n_bytes if σ == HBM else 0
+    if σ != HBM:
+        return {sp: 0 for sp in u.n_bytes}
+    return dict(u.n_bytes)              # u's bytes leave HBM entirely
+                                         # (the whole logical unit moves)
 ```
 
-The `if relief > 0` filter is load-bearing: it keeps the §9
-knapsack focused on the actual bottleneck resource (HBM bytes).
-A future redesign that admits DRAM-pressure or DISK-pressure
-events would extend `joint_decide` with parallel knapsacks per
-resource axis; the generator here would gate on each axis.
+The `any(b > 0)` filter is load-bearing: it keeps the §9 knapsack
+focused on the HBM-relief axes.  A unit's bytes are atomic per
+migrate — moving u out of HBM frees its `n_bytes` dict's value
+on every HBM subpool simultaneously; you can't migrate "just
+the SWA part of u" because the radix-tree node owns both.  The
+DP separately tracks relief per subpool because a workload can
+have **one HBM subpool pressured and another spacious**
+(canonical case: Mamba snapshot pool full at 95% while
+attention `full` pool sits at 60%).
 
 **Under our write-through HiCache semantic the unavailability
 cost evaluates to 0** — see Transfer-window semantics below.  The
@@ -975,39 +1038,50 @@ about to be idle for ETA and the relevant reuse window is also
 ETA).  This is the common case where Δt ≈ hold_time arises
 naturally — not from forcing them equal in the formula.
 
-#### `h_τ(occupancy)` — per-byte holding cost at tier τ
+#### `h_(τ, sp)(occupancy)` — per-byte holding cost at (tier, subpool)
 
 Physical meaning: the seconds of opportunity cost per byte per
-second of holding at tier τ, when τ is at occupancy `occ`.  This
-is the marginal V_u of the byte that would be displaced by adding
-one more byte to τ.  At low occupancy the displaced byte has near-
-zero value (tier has slack), at high occupancy it has the V_u of
-the next-best resident.
+second of holding at subpool `sp` of tier `τ`, when that subpool
+is at occupancy `occ`.  This is the marginal V_u of the byte
+that would be displaced by adding one more byte to that subpool.
+At low occupancy the displaced byte has near-zero value, at high
+occupancy it has the V_u of the next-best resident in the same
+subpool.
 
 ```
-h_τ(occ) = h_τ_max × occ           # linear placeholder; see below
-h_τ_max  = state.tier_holding_cost[τ].h_max_per_byte_sec
-occ      = occupancy_of_τ(state)
-         = state.tier_usage[τ].used_bytes
-         / state.tier_usage[τ].cap_bytes
+h_(τ, sp)(occ) = h_(τ, sp)_max × occ      # linear placeholder; see below
+h_(τ, sp)_max  = state.tier_holding_cost[τ][sp].h_max_per_byte_sec
+occ            = occupancy_of(τ, sp, state)
+               = pool_usage[τ].subpools[sp].used_bytes
+               / pool_usage[τ].subpools[sp].cap_bytes
 ```
+
+Why per-subpool, not per-tier: in a hybrid Mamba+attention model,
+the Mamba snapshot subpool and the attention `full` subpool can
+sit at very different occupancies and have very different
+displacement-cost curves (a Mamba snapshot is a much larger byte
+unit and rarer-to-reuse).  Sharing one `h_τ` across both subpools
+would mean Mamba pressure shows up as attention demotion or vice
+versa.
 
 The shape is **linear in occupancy as a placeholder** until T12
 calibration determines the empirical curve.  Linear is the
-simplest non-trivial monotone function — 0 cost when tier is empty
-(can't displace anything), `h_τ_max` cost when tier is full.
+simplest non-trivial monotone function — 0 cost when subpool is
+empty (can't displace anything), `h_(τ, sp)_max` cost when full.
 
-> **Planned (T12 calibration).**  The true shape of `h_τ(occ)` is
-> the relationship between current tier occupancy and the V_u of
-> the marginal (lowest-V_u) resident at that occupancy.  T12
-> measures this empirically: at every event during T9 / T11 runs,
-> log `(occ, marginal_V_u)` pairs across the workload mix.  Fit
-> candidate shapes — linear `α × occ`, power `α × occ^γ`,
-> hyperbolic `α / (1 - occ)` — and pick the one that minimises
-> residual.  Hyperbolic is the most physically motivated candidate
-> (diverges as occ → 1, matching the §9 admission cap), but the
-> data picks the shape, not the prior.  Until T12 lands, linear
-> with operator-calibrated `h_τ_max` is the spec.
+> **Planned (T12 calibration, per subpool).**  The true shape of
+> `h_(τ, sp)(occ)` is the relationship between current subpool
+> occupancy and the V_u of the marginal (lowest-V_u) resident
+> **within that subpool** at that occupancy.  T12 measures this
+> empirically per subpool: at every event during T9 / T11 runs,
+> log `(subpool, occ, marginal_V_u)` triples across the workload
+> mix.  Fit candidate shapes — linear `α × occ`, power
+> `α × occ^γ`, hyperbolic `α / (1 - occ)` — and pick the one
+> that minimises residual *per subpool*.  Hyperbolic is the most
+> physically motivated candidate (diverges as occ → 1, matching
+> the §9 admission cap), but the data picks the shape, not the
+> prior.  Until T12 lands, linear with operator-calibrated
+> per-subpool `h_max` is the spec.
 
 #### `bw_free(σ, τ)` — free bandwidth on σ↔τ link
 
@@ -1201,117 +1275,138 @@ Migrates; headroom phase uses Resumes.
 
   ```
   marginal_pause_cost(p, state) =
-      state.per_program_usage[p].hbm.inflight_bytes
+      sum(state.per_program_usage[p].hbm.inflight.values())
     / prefill_throughput(state)            # bytes/sec on the
                                             # prefill path
   ```
 
-  This formulation is **event-independent** — `inflight_bytes`
-  already encodes whether p is mid-decode.  Implications fall out
-  naturally:
+  Sum across HBM subpools because the in-flight decode allocates
+  bytes to every subpool the architecture uses (attention `full`
+  always, plus `swa` or `mamba` if hybrid).  All of those bytes
+  represent decoded-so-far tokens that re-prefill on resume.
+
+  This formulation is **event-independent** — `inflight` already
+  encodes whether p is mid-decode.  Implications fall out naturally:
 
   * `TOOL_CALL_START`: at the instant of the event, p's request
-    is completing; on the immediately-following event,
-    `inflight_bytes ≈ 0` for p → pause cost ≈ 0.  Matches the
+    is completing; on the immediately-following event, all
+    `inflight[sp] ≈ 0` for p → pause cost ≈ 0.  Matches the
     physical intuition: p was going off-GPU anyway.
-  * `LLM_PREFILL` for p mid-decode: `inflight_bytes > 0` → pause
-    cost > 0 proportional to bytes-decoded-so-far.
+  * `LLM_PREFILL` for p mid-decode: at least one `inflight[sp] > 0`
+    → pause cost > 0 proportional to total-bytes-decoded-so-far.
   * `MEMORY_PRESSURE` / `PRESSURE_CRITICAL`: cost is whatever p's
-    current `inflight_bytes` happens to be at that moment;
-    nothing special about the pressure event.
-  * Resumed-but-no-request (F4): `inflight_bytes == 0` → pause
+    current inflight bytes happen to be; nothing special about
+    the pressure event.
+  * Resumed-but-no-request (F4): all `inflight[sp] == 0` → pause
     cost == 0 (pausing an idle program loses nothing).
-* `pause_relief(p, state)` — total HBM bytes pausing p saves the
-  scheduler from holding, **including future-inflight savings the
-  pause prevents**:
+All `forecast` / `relief` / `re_use` quantities are **per-HBM-subpool
+dicts**.  A pause / migrate frees bytes from each HBM subpool it
+contributes to, and admission gates per-subpool, so the bookkeeping
+follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
+
+* `pause_relief(p, state)` — per-HBM-subpool bytes pausing p saves
+  the scheduler from holding, **including future-inflight savings
+  the pause prevents**:
 
   ```
-  pause_relief(p, state) =
-      snapshot_relief(p, state)            # bytes freed at the pause moment
-    + future_inflight_savings(p, state)    # bytes p would have allocated
-                                            # before the next event horizon
+  pause_relief(p, state)[sp] =                    # per HBM subpool sp
+      snapshot_relief(p, state)[sp]
+    + future_inflight_savings(p, state)[sp]
   ```
 
   The `future_inflight_savings` term is what makes Pauses
   trajectory-strong (Migrates only deliver snapshot relief).
   This is *why* PRESSURE_CRITICAL doesn't need a special cost
   twist in §9: under high `forecast`, `future_inflight_savings`
-  is large for REASONING programs, so Pauses win on relief/cost
-  naturally.
+  is large for actively-decoding programs, so Pauses win on
+  relief/cost naturally.
 
-  * `snapshot_relief(p, state)` — read from `state.per_program_usage[p].hbm`:
-    * **inflight_bytes** — released when p's current request
-      completes / is preempted; the pause prevents the program's
-      NEXT request from re-allocating these.
-    * **committed_bytes** — the program's exclusive share of radix
-      nodes; if pausing p drops `len(session_ids)` of a node to 0,
-      the node becomes evictable.
-  * `future_inflight_savings(p, state)` — `E[remaining_tokens(p)]
-    × bytes_per_token` if p is REASONING (same quantity that
-    `forecast_inflight_demand` sums); 0 if p is ACTING (already
-    off-GPU, the pause doesn't prevent any decode that wasn't
-    already paused by the tool).  Symmetric to forecast: if
-    forecast drops by X bytes when we pause p, that X is what
-    Pause is actually relieving.
+  * `snapshot_relief(p, state)[sp]` — read from
+    `state.per_program_usage[p].hbm`:
+    * **inflight[sp]** — bytes p is currently using in subpool sp
+      for in-flight decode; released when p's current request
+      completes / is preempted.  Pause prevents the program's NEXT
+      request from re-allocating these.
+    * **committed[sp]** — p's exclusive share of subpool-sp radix
+      bytes; if pausing p drops `len(session_ids)` of a node to 0
+      on that subpool, the node becomes evictable on that subpool.
+  * `future_inflight_savings(p, state)[sp]` — per-subpool projected
+    growth pausing p averts.  Computed symmetrically to
+    `forecast_inflight_demand` (below): cap `E[remaining_tokens(p)]`
+    by `forecast_horizon × decode_throughput(p)` and multiply by
+    p's per-token bytes contribution to subpool sp.  0 if p has
+    `inflight[sp] == 0` (p isn't currently allocating in that
+    subpool — Mamba state for a sequence is allocated once and
+    fixed; attention `full` grows monotonically with decode).
+
 * `expected_peak_hbm_after_resume(p, state)` — **incremental**
-  HBM bytes p will allocate when resumed.  Only count bytes
-  **not already in HBM**: a paused program whose units are still
-  resident (because another holder kept them alive) consumes
-  zero new HBM on resume.
+  per-HBM-subpool bytes p will allocate when resumed.  Only count
+  bytes **not already in HBM**: a paused program whose units are
+  still resident (because another holder kept them alive)
+  consumes zero new HBM on resume on that subpool.
 
   ```
-  expected_peak_hbm_after_resume(p, state) =
+  expected_peak_hbm_after_resume(p, state)[sp] =
       Σ_{h ∈ p.unit_hashes}
-          (u.n_bytes if state.units[h].tier != HBM else 0)
-                                                # only count units
-                                                # not currently in HBM —
-                                                # demoted, dropped, or
-                                                # absent ones
-    + E[remaining_tokens(p)] × bytes_per_token  # inflight allocation
-                                                # after first post-resume
-                                                # decode begins
+          (u.n_bytes[sp] if state.units[h].tier != HBM
+                          and sp in u.n_bytes
+                          else 0)
+                                                  # only count units not
+                                                  # currently in HBM —
+                                                  # demoted, dropped, or
+                                                  # absent ones
+    + future_inflight_savings(p, state)[sp]       # post-resume decode
+                                                  # growth in subpool sp
   ```
 
   Why "not already in HBM" is the correct filter: HBM bytes for a
-  unit already resident are accounted in `pool_usage.used_bytes`
-  (the first term of `forecast`).  `capacity_fits` checks
-  `forecast + re_use ≤ theta_hi × cap_bytes` — re-adding those
-  bytes via `re_use` would double-count them and over-reject
-  Resume candidates whose units are all kept alive by other
-  holders.
+  unit already resident are accounted in `pool_usage[HBM].subpools[sp].used_bytes`
+  (the first term of `forecast`).  `capacity_fits` checks each
+  subpool independently — re-adding bytes via `re_use[sp]` would
+  double-count them and over-reject Resume candidates whose units
+  are kept alive by other holders.
 
-* `capacity_fits(p, state)` — true iff resuming p would leave
-  `forecast(state) + expected_peak_hbm_after_resume(p, state)`
-  still ≤ `theta_hi × cap_bytes`.  Resume candidates failing this
-  gate are omitted by the generator (not in the candidate set).
-* `forecast(state)` — `state.pool_usage["HBM"].used_bytes +
-  forecast_inflight_demand(state)`, in bytes.  Both terms are
-  bytes; `token_usage` (the fractional view) is the wrong input
-  here because the inflight forecast is byte-scaled by
-  `bytes_per_token` and the §9 budget is byte-denominated.
+* `capacity_fits(p, state)` — true iff for **every** HBM subpool sp:
+  `forecast(state)[sp] + expected_peak_hbm_after_resume(p, state)[sp]
+   ≤ theta_hi × pool_usage[HBM].subpools[sp].cap_bytes`.
+  Resume candidates failing this gate on any subpool are omitted
+  (not in the candidate set).
+* `forecast(state)` — per-HBM-subpool dict.  For each subpool sp:
+  ```
+  forecast(state)[sp] =
+      state.pool_usage["HBM"].subpools[sp].used_bytes
+    + forecast_inflight_demand(state)[sp]
+  ```
 
   The second term is the **expected** HBM growth before the next
-  event, summed over programs that **are actively decoding right
-  now**:
+  event in subpool sp, summed over programs that **are actively
+  decoding right now in that subpool**:
 
   ```
-  forecast_inflight_demand(state) =
+  forecast_inflight_demand(state)[sp] =
     Σ_p min(E[remaining_tokens(p)],
             forecast_horizon(state) × decode_throughput(p))
-        × bytes_per_token
+        × bytes_per_token_in_subpool(p, sp)
     for p in state.per_program_usage
-    if p.hbm.inflight_bytes > 0
+    if p.hbm.inflight[sp] > 0
   ```
+  where `bytes_per_token_in_subpool(p, sp)` is the model-architecture
+  constant for how many bytes per decoded token p adds to subpool sp
+  (attention `full` ≈ `2 × num_full_layers × hidden_dim × dtype_size`;
+  SWA same but only retained within the window; Mamba state grows
+  only at snapshot boundaries, **not** per-token, so for the `mamba`
+  subpool this is 0 for in-flight forecast and snapshot allocations
+  are handled separately at radix-tree commit time).
 
   Two refinements over the naive `Σ_{p ∈ REASONING} E[remaining]`:
 
-  * **`inflight_bytes > 0` filter, not `state == REASONING`.**  A
+  * **`inflight[sp] > 0` filter, not `state == REASONING`.**  A
     program can be REASONING but have no in-flight request
     (e.g. just-resumed but client hasn't retried yet) — those
     don't contribute to near-term HBM growth.  REASONING is a
     semantic label about what the program is trying to do; the
-    physical question "is HBM growing for p RIGHT NOW" is
-    answered by `inflight_bytes`.
+    physical question "is subpool sp growing for p RIGHT NOW" is
+    answered by `inflight[sp]`.
   * **Capped by `forecast_horizon`.**  We forecast only as far as
     the next decision opportunity; beyond that, a new
     `joint_decide` will re-evaluate.  `E[remaining_tokens(p)]` is
@@ -1435,63 +1530,88 @@ either too high or too low; in between is the hysteresis band
 where neither phase has anything to do).
 
 ```python
-def capacity_left_bytes(state, τ):
-    """Bytes free in destination tier τ.  Pool view, not radix view —
-    we want to know whether the τ allocator can actually accept
-    `bytes_moved` more bytes, not whether the radix tree's slice of τ
-    has room."""
-    if τ in state.pool_usage:
-        return (state.pool_usage[τ]["cap_bytes"]
-              - state.pool_usage[τ]["used_bytes"])
-    # DRAM / DISK tiers may only expose tier_usage:
-    return (state.tier_usage[τ]["cap_bytes"]
-          - state.tier_usage[τ]["used_bytes"])
+def capacity_left_bytes(state, τ, sp):
+    """Bytes free in subpool sp of destination tier τ."""
+    s = state.pool_usage[τ]["subpools"][sp]
+    return s["cap_bytes"] - s["used_bytes"]
 
 def joint_decide(state, event):
-    cap_total = state.pool_usage["HBM"]["cap_bytes"]
-    cap_left  = {τ: capacity_left_bytes(state, τ)
-                 for τ in (DRAM, DISK)}
-    # HBM is the relief axis itself (`bytes_needed`); DROP has no
-    # destination bytes (transfer_bytes == 0).  HBM-target Migrates
-    # never reach this point: `migrate_candidates` filters them out
-    # upstream via `if relief > 0` (HBM→HBM has relief == 0).
+    hbm_subpools  = state.pool_usage["HBM"]["subpools"]
+    dram_subpools = state.pool_usage["DRAM"]["subpools"]
+    disk_subpools = state.pool_usage["DISK"]["subpools"]
 
-    # ----- pressure phase: multi-resource min-cost knapsack -----
-    bytes_needed = max(0, forecast(state) - theta_hi * cap_total)
-    if bytes_needed > 0:
+    # ----- pressure phase: multi-subpool min-cost knapsack -----
+    # bytes_needed is a dict over HBM subpools; pressure fires when
+    # ANY subpool's forecast crosses theta_hi.  Each HBM subpool is
+    # a separate resource axis with its own >= constraint.
+    bytes_needed = {
+        sp: max(0, forecast(state)[sp] - theta_hi * hbm_subpools[sp]["cap_bytes"])
+        for sp in hbm_subpools
+    }
+    if any(b > 0 for b in bytes_needed.values()):
+        cap_left = {                                     # destination caps
+            ("DRAM", sp): capacity_left_bytes(state, "DRAM", sp)
+            for sp in dram_subpools
+        } | {
+            ("DISK", sp): capacity_left_bytes(state, "DISK", sp)
+            for sp in disk_subpools
+        }
         cands  = kv_scheduler.migrate_candidates(state, decision_set(event, state))
         cands += admission.pause_candidates(state, event)
-        cands  = [c for c in cands if c.relief > 0]
+        cands  = [c for c in cands if any(b > 0 for b in c.relief.values())]
         return knapsack_min_cost_multi(
             items        = cands,
-            bytes_needed = bytes_needed,
-            cap_left     = cap_left,                       # per-dest tier budgets
+            bytes_needed = bytes_needed,                # dict keyed by HBM subpool
+            cap_left     = cap_left,                    # dict keyed by (tier, subpool)
             bucket_size  = page_bytes,
         )
 
-    # ----- headroom phase: single-resource max-value knapsack -----
-    free_room = max(0, theta_lo * cap_total - forecast(state))
-    if free_room > 0:
+    # ----- headroom phase: per-HBM-subpool max-value knapsack -----
+    # free_room is a dict over HBM subpools; headroom fires when ALL
+    # subpools have slack below theta_lo.  resume_candidates expose
+    # re_use as a per-subpool dict; the DP picks subsets satisfying
+    # all axes simultaneously (same multi-axis sparse DP, just max-
+    # value instead of min-cost).
+    free_room = {
+        sp: max(0, theta_lo * hbm_subpools[sp]["cap_bytes"] - forecast(state)[sp])
+        for sp in hbm_subpools
+    }
+    if all(r > 0 for r in free_room.values()):
         cands = admission.resume_candidates(state)
-        cands = [c for c in cands if c.re_use > 0]
-        return knapsack_max_value(cands, free_room, bucket_size=page_bytes)
+        cands = [c for c in cands if any(b > 0 for b in c.re_use.values())]
+        return knapsack_max_value_multi(
+            items       = cands,
+            budget      = free_room,                    # dict keyed by HBM subpool
+            bucket_size = page_bytes,
+        )
 
     return []                                            # hysteresis dead-zone
 ```
 
+A workload with a Mamba snapshot subpool at 95 % occupancy and an
+attention `full` subpool at 60 % will see `bytes_needed[mamba] > 0
+and bytes_needed[full] == 0` — the DP picks candidates that relieve
+specifically `mamba` (Pauses of programs holding large mamba state,
+Migrates of mamba-leaf units to DRAM/Disk), without disturbing
+attention-resident units that are cheap and healthy.
+
 Both phases are **exact 0/1 knapsack** at K ≈ tens of items
-(K_MAX = 256 per §7 top-k cap).  Concrete sizing for the
-pressure phase (multi-resource): `bytes_needed` ≤
-`(theta_hi - theta_lo) × cap_bytes` (one hysteresis band)
-quantises to ≈ 100 W buckets; DRAM-room and DISK-room each
-quantise to ≈ 100 buckets at the same granularity.  Dense 4-D
-table at typical K = 30 is 30 × 100³ ≈ 3 × 10⁷ cells; at K_MAX
-= 256 it would be ≈ 2.5 × 10⁸.  The DP runs **sparse** over the
-`dp` dict (cells reachable from any subset-take), and on
-representative candidate sets fewer than ~10⁵ tuples are
-reachable — ≪ the dense bound, even at K_MAX.  Headroom phase
-is single-resource: K × 100 ≈ 3 000 cells at typical K.  Both
-fit microseconds.
+(K_MAX = 256 per §7 top-k cap).  Resource-axis count is
+`|HBM subpools| + |DRAM subpools| + |DISK subpools|`:
+
+* Non-hybrid model (1 HBM subpool, 1 DRAM, 1 DISK): 3 axes
+* SWA-hybrid (full + swa = 2 HBM subpools, 1 DRAM, 1 DISK): 4 axes
+* Mamba+attention hybrid (full + mamba = 2 HBM subpools, 1 DRAM,
+  1 DISK): 4 axes
+* Future Mamba+SWA+full: 5 axes total
+
+Dense table size grows exponentially in axis count; the DP runs
+**sparse** over a `dp` dict (cells reachable from any subset-take).
+On representative candidate sets fewer than ~10⁵ tuples are
+reachable, ≪ dense bound, at any practical axis count.  Both
+phases fit microseconds for current models; for a 5-axis future
+case the sparse-DP cost is still bounded by reachable-cell count,
+not dense-table size.
 
 ```python
 def _bk(n, bucket_size):                            # round-down quantisation
@@ -1500,107 +1620,150 @@ def _bk(n, bucket_size):                            # round-down quantisation
 def _bk_up(n, bucket_size):                         # round-up quantisation
     return (n + bucket_size - 1) // bucket_size
 
+# Axis enumeration helpers — pressure phase has one >= axis per HBM
+# subpool and one <= axis per (DRAM|DISK, subpool); headroom phase
+# has one <= axis per HBM subpool only.
+def _hbm_relief_axes(bytes_needed):                 # >= axes (frees HBM)
+    return [("HBM", sp) for sp in bytes_needed]
+def _dest_cap_axes(cap_left):                       # <= axes (destinations)
+    return list(cap_left.keys())                    # [(DRAM, sp), (DISK, sp), ...]
+
 def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
     """0/1 knapsack: subset S minimising Σ cost(s∈S) subject to
-    (a) Σ relief(s∈S)                 >= bytes_needed   (HBM-relief)
-    (b) Σ_{s∈S: s.target==DRAM} bytes_moved  <= cap_left[DRAM]
-    (c) Σ_{s∈S: s.target==DISK} bytes_moved  <= cap_left[DISK]
-    Pauses and HBM→DROP Migrates consume nothing in (b) / (c).
+    (a) for each HBM subpool sp:
+        Σ relief[sp](s∈S)             >= bytes_needed[sp]
+    (b) for each (DRAM|DISK, sp) axis a:
+        Σ_{s∈S: s.target==a} bytes_moved  <= cap_left[a]
 
-    Quantises relief at bucket_size (round DOWN — safe direction for
-    a >=-constraint: never overstate freed bytes).  Quantises tier
-    consumption at bucket_size (round UP — safe direction for a
-    <=-constraint: never understate consumed bytes)."""
-    W   = _bk_up(bytes_needed, bucket_size)
-    Wd  = _bk(cap_left[DRAM], bucket_size)          # DRAM-room buckets
-    Ws  = _bk(cap_left[DISK], bucket_size)          # DISK-room buckets
-    K   = len(items)
-    INF = float("inf")
+    Pauses contribute 0 to (b); HBM→DROP Migrates contribute 0 to (b).
+    Quantises relief at bucket_size (round DOWN, safe for >=);
+    quantises destination consumption at bucket_size (round UP,
+    safe for <=)."""
+    relief_axes = _hbm_relief_axes(bytes_needed)    # list of HBM subpool keys
+    cap_axes    = _dest_cap_axes(cap_left)          # list of (tier, subpool)
+    # W[axis], Wcap[axis] hold the bucket bound per axis.
+    W    = {sp: _bk_up(bytes_needed[sp], bucket_size) for sp in bytes_needed}
+    Wcap = {a:  _bk(cap_left[a], bucket_size)        for a  in cap_axes}
+    K    = len(items)
+    INF  = float("inf")
 
-    # dp[k][w][wd][ws] = min cost over first k items achieving
-    #   >= w buckets of HBM-relief, <= wd DRAM-room, <= ws DISK-room.
-    # At K≈30, W≈Wd≈Ws≈100 → 3·10⁷ cells; in practice we sparse-prune
-    # by only materialising reachable (w, wd, ws) tuples.  See
-    # "Concrete sizing" below.
-    dp   = {(0, 0, 0): 0.0}
+    # dp state is a (relief_tuple, cap_tuple) → min cost mapping,
+    # encoded as a flat tuple `(*relief_buckets_per_HBM_subpool,
+    # *cap_buckets_per_dest_subpool)`.  Sparse — only reachable
+    # cells materialise.
+    def zero_state():
+        return (*(0 for _ in relief_axes), *(0 for _ in cap_axes))
+
+    dp   = {zero_state(): 0.0}
     take = {}
     for k, c in enumerate(items, start=1):
-        rb  = min(W, _bk(c.relief, bucket_size))
-        dbk = _bk_up(c.bytes_moved, bucket_size) if (
-                isinstance(c, Migrate) and c.target_tier == DRAM) else 0
-        sbk = _bk_up(c.bytes_moved, bucket_size) if (
-                isinstance(c, Migrate) and c.target_tier == DISK) else 0
-        new_dp = dict(dp)                            # skip-branch carries forward
-        for (w, wd, ws), cost in dp.items():
-            w2, wd2, ws2 = min(W, w + rb), wd + dbk, ws + sbk
-            if wd2 > Wd or ws2 > Ws: continue        # destination cap exceeded
-            cand_cost = cost + c.cost
-            if cand_cost < new_dp.get((w2, wd2, ws2), INF):
-                new_dp[(w2, wd2, ws2)] = cand_cost
-                take[(k, w2, wd2, ws2)] = True
+        # Per-axis deltas this item contributes if taken.
+        d_relief = tuple(_bk(c.relief.get(sp, 0), bucket_size)
+                         for sp in relief_axes)
+        d_cap = tuple(
+            _bk_up(c.bytes_moved, bucket_size)
+                if (isinstance(c, Migrate) and (a[0], a[1]) ==
+                    (c.target_tier, c.target_subpool))
+                else 0
+            for a in cap_axes
+        )
+        new_dp = dict(dp)
+        for s, cost in dp.items():
+            n = len(relief_axes)
+            r_buckets, cap_buckets = s[:n], s[n:]
+            r_new   = tuple(min(W[relief_axes[i]], r_buckets[i] + d_relief[i])
+                            for i in range(n))
+            cap_new = tuple(cap_buckets[i] + d_cap[i] for i in range(len(cap_axes)))
+            # Reject if any destination cap exceeded.
+            if any(cap_new[i] > Wcap[cap_axes[i]] for i in range(len(cap_axes))):
+                continue
+            s_new = r_new + cap_new
+            new_cost = cost + c.cost
+            if new_cost < new_dp.get(s_new, INF):
+                new_dp[s_new] = new_cost
+                take[(k, s_new)] = True
         dp = new_dp
 
-    # Find min-cost cell that satisfies the HBM-relief constraint
-    # (w == W, any wd ≤ Wd, any ws ≤ Ws).
-    feasible = [(c, w, wd, ws) for (w, wd, ws), c in dp.items() if w == W]
+    # Feasible cells: every HBM relief axis hit its bucket bound.
+    full_r = tuple(W[sp] for sp in relief_axes)
+    feasible = [(c, s) for s, c in dp.items() if s[:len(relief_axes)] == full_r]
     if feasible:
-        _, w, wd, ws = min(feasible)                # min over cost tuple
+        _, s_pick = min(feasible)                   # min over cost tuple
     else:
-        # Even with every candidate, we can't reach bytes_needed
-        # without overflowing DRAM / DISK.  Pick the cell that
-        # frees the MOST HBM the destination tiers can absorb
-        # (max w; tie-break on min cost).  Every dp cell already
-        # respects (b)/(c) by construction — that's what the
-        # per-cell guard on Wd / Ws enforces.  This is the largest
-        # safe relief we can deliver; sglang's next webhook
-        # re-fire will surface residual pressure for another pass.
-        ((w, wd, ws), _) = max(dp.items(),
-                               key=lambda kv: (kv[0][0], -kv[1]))
+        # No subset hits every HBM-subpool relief target while
+        # respecting destination caps.  Pick the cell maximising
+        # Σ relief buckets (closest to satisfying), tie-break min
+        # cost.  Every cell already respects (b) by construction.
+        # sglang's next webhook re-fire will surface residual pressure.
+        s_pick = max(dp,
+                     key=lambda s: (sum(s[:len(relief_axes)]),
+                                    -dp[s]))
     chosen, k = [], K
     while k > 0:
-        if take.get((k, w, wd, ws)):
+        if take.get((k, s_pick)):
             c = items[k - 1]
             chosen.append(c)
-            w  -= min(w, _bk(c.relief, bucket_size))
-            if isinstance(c, Migrate) and c.target_tier == DRAM:
-                wd -= _bk_up(c.bytes_moved, bucket_size)
-            if isinstance(c, Migrate) and c.target_tier == DISK:
-                ws -= _bk_up(c.bytes_moved, bucket_size)
+            # Undo the buckets this item added.
+            n = len(relief_axes)
+            r_buckets = list(s_pick[:n])
+            cap_buckets = list(s_pick[n:])
+            for i, sp in enumerate(relief_axes):
+                r_buckets[i] = max(0, r_buckets[i]
+                                       - _bk(c.relief.get(sp, 0), bucket_size))
+            for i, a in enumerate(cap_axes):
+                if isinstance(c, Migrate) and (a[0], a[1]) == (
+                        c.target_tier, c.target_subpool):
+                    cap_buckets[i] -= _bk_up(c.bytes_moved, bucket_size)
+            s_pick = tuple(r_buckets) + tuple(cap_buckets)
         k -= 1
     return chosen
 
-def knapsack_max_value(items, budget_bytes, bucket_size):
+
+def knapsack_max_value_multi(items, budget, bucket_size):
     """0/1 knapsack: subset S maximising Σ gain(s∈S) subject to
-    Σ re_use(s∈S) <= budget_bytes.  Quantises re_use at bucket_size
-    (round UP — safe direction for a <=-constraint: never understate
-    consumed bytes, so we never overshoot free_room)."""
-    W = _bk(budget_bytes, bucket_size)
-    K = len(items)
-    NEG = float("-inf")
-    dp   = [[NEG] * (W + 1) for _ in range(K + 1)]
-    take = [[False] * (W + 1) for _ in range(K + 1)]
-    for k in range(K + 1):
-        dp[k][0] = 0.0                              # take nothing → 0 gain
-    for k in range(1, K + 1):
-        c = items[k - 1]
-        u_bk = _bk_up(c.re_use, bucket_size)
-        for w in range(W + 1):
-            dp[k][w] = dp[k - 1][w]                 # skip
-            if u_bk <= w:
-                picked = dp[k - 1][w - u_bk] + c.gain
-                if picked > dp[k][w]:
-                    dp[k][w] = picked
-                    take[k][w] = True
-    # Pick best w in [0, W] (we're maximising, room left over is fine).
-    w = max(range(W + 1), key=lambda x: dp[K][x])
-    chosen = []
-    for k in range(K, 0, -1):
-        if take[k][w]:
+    for each HBM subpool sp:
+        Σ re_use[sp](s∈S)   <= budget[sp]
+    Quantises re_use at bucket_size (round UP — safe for <=).
+
+    Same sparse multi-axis DP shape as knapsack_min_cost_multi,
+    just objective sign flipped and only <= axes (no >=)."""
+    axes = list(budget.keys())                       # HBM subpools
+    W    = {sp: _bk(budget[sp], bucket_size) for sp in budget}
+    K    = len(items)
+    NEG  = float("-inf")
+
+    dp   = {tuple(0 for _ in axes): 0.0}
+    take = {}
+    for k, c in enumerate(items, start=1):
+        d = tuple(_bk_up(c.re_use.get(sp, 0), bucket_size) for sp in axes)
+        new_dp = dict(dp)
+        for s, gain in dp.items():
+            s_new = tuple(s[i] + d[i] for i in range(len(axes)))
+            if any(s_new[i] > W[axes[i]] for i in range(len(axes))):
+                continue
+            new_gain = gain + c.gain
+            if new_gain > new_dp.get(s_new, NEG):
+                new_dp[s_new] = new_gain
+                take[(k, s_new)] = True
+        dp = new_dp
+
+    s_pick = max(dp, key=dp.get)                     # max gain anywhere in budget
+    chosen, k = [], K
+    while k > 0:
+        if take.get((k, s_pick)):
             c = items[k - 1]
             chosen.append(c)
-            w -= _bk_up(c.re_use, bucket_size)
+            s_pick = tuple(s_pick[i] - _bk_up(c.re_use.get(axes[i], 0), bucket_size)
+                           for i in range(len(axes)))
+        k -= 1
     return chosen
 ```
+
+`Migrate` carries a new field `target_subpool: str` — when sglang's
+unified cache moves a unit's bytes from one tier to another, the
+destination tier's subpool layout determines where each component
+of the unit lands.  For non-hybrid models there's only one
+`target_subpool == "main"` so this collapses.
 
 #### Why exact DP, not greedy
 
@@ -1696,7 +1859,7 @@ for pause/resume).
 | **State-dump internal consistency**: a single `/aginfer/state` response is a snapshot taken under a single read-side lock on sglang's tree cache + allocator + per-program tables.  `units[*]`, `per_program_usage[*].unit_hashes`, and `pool_usage` always refer to the same logical timestamp; `state.units[h]` is safe to dereference for every `h ∈ per_program_usage[p].unit_hashes` | sglang `dump_aginfer_state` |
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
-| **Pool-truth admission**: admission's `forecast(state)` reads `state.pool_usage.HBM.used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes), never `tier_usage` (which is radix view); if the snapshot lacks `pool_usage.HBM` the daemon halts loudly (sglang too old / misconfigured) | daemon `admission_controller.forecast` |
+| **Pool-truth admission, per subpool**: admission's `forecast(state)` returns a dict over HBM subpools, each reading `state.pool_usage.HBM.subpools[sp].used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes), never `tier_usage` (radix view).  Pressure fires when **any** subpool's forecast crosses `theta_hi`; this prevents the failure mode where a Mamba snapshot subpool at 95 % is hidden by an attention subpool at 60 %.  If the snapshot lacks `pool_usage.HBM.subpools` the daemon halts loudly | daemon `admission_controller.forecast` |
 | **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_τ(occ)` reads `state.tier_holding_cost[τ].h_max_per_byte_sec`, never a constant baked into the daemon.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; operator config sets per-tier `h_max`); the daemon consumes them.  If `link_stats` or `tier_holding_cost` are missing the daemon halts loudly | sglang instrumentation + operator config |
 | **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
