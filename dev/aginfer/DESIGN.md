@@ -1111,42 +1111,22 @@ radix tree — concretely on `LLM_PREFILL` commit (prefill output),
 on decode-step commit, and on `SUB_RETURN` when the child's
 output materialises as a `subagent_ctx` unit.
 
-**Spec: initial tier is `_value`-argmin** over `{HBM, DRAM, DISK}`,
-using the same formula §7 uses for migration scoring, with the
-birth-time predicted `p_hat` as input.  This is symmetric with
-every other tier transition — there is no special case for
-allocation.  Birth-time `p_hat` comes from event-payload context
-when available (e.g. `SUB_DISPATCH_ASYNC` flag pointing at an
-async child whose output won't be consumed in the next event
-horizon → low `p_hat` → `_value` argmin picks DRAM directly,
-skipping the H→D transfer entirely) and falls back to the
-session-state-conditional estimate otherwise.
+**Newborns are HBM-only by physical necessity.**  The forward
+pass writes KV into HBM-backed tensors directly (GPU compute
+writes go to device memory); there is no `alloc_at_tier(σ)` API
+because there cannot be one — DRAM/Disk are pure storage
+classes, only reachable through a load-back round-trip and
+unable to host compute.  The first physical residence of every
+unit is HBM-only by construction.
 
-> **Planned (sglang code lag).**  Today sglang's allocator only
-> allocates in HBM (`alloc()` returns an HBM-backed buffer), so
-> the daemon's `_value`-argmin is recovered after-the-fact by the
-> first `joint_decide` event that includes the unit in D_t — a
-> born-HBM-then-demote round-trip.  Closing the gap requires
-> extending the allocator API with `alloc_at_tier(σ)` and routing
-> birth events to the daemon synchronously enough to score them
-> before allocation.  The design is unchanged either way: the
-> formula for picking initial tier is the same `_value` argmin.
-
-**Empirical question (T11+ workload).**  We don't yet know which
-workload regimes make this code-lag materially expensive.  The
-born-HBM-then-demote round-trip is one H→D transfer per
-"wrong-born" unit; on workloads where almost every newborn is
-consumed by an in-flight request before the next joint_decide
-(common in busy agent loops), HBM-default is correct by accident
-and the gap is zero-cost.  Workloads to target in T11 tests:
-heavy `SUB_DISPATCH_ASYNC` (children that won't be consumed for
-seconds), long-tail `subagent_ctx` units that materialise but
-aren't accessed in the parent's near-tail, and prefill-heavy
-arrivals where the new prefix is *known* to be cold (rare-class
-prompts).  Measurement should report (i) fraction of newborns
-demoted within one event horizon and (ii) cumulative H→D
-bandwidth burned on these demotions vs the same workload under a
-hypothetical `alloc_at_tier`-aware run.
+The first scheduling decision for a newborn is therefore **not
+"where to allocate"** (the allocator has no choice) but
+**"when to write-through to DRAM"** and **"when to evict from
+HBM"** — two separate transitions on the unit's residence set.
+Both are governed by the standard §7 / §8 / §9 machinery applied
+to the unit's evolving residence: a unit's `_value` at HBM
+becomes negative when its `p_hat` falls, and §9 schedules the
+write-through (if not already backed) and HBM eviction.
 
 ## 8. Admission — program-level candidate generator
 
