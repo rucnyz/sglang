@@ -265,6 +265,35 @@ not a decision-rule concern.
      "session_ids": list[str]}
   ],
 
+  "link_stats": {                       // PHYSICAL-LINK view, input to V_u
+    "<σ>-><τ>": {                       // one entry per directional link
+                                         // (HBM->DRAM, DRAM->HBM, DRAM->DISK,
+                                         //  DISK->DRAM); DROP has no link
+      "peak_bw_bps":             int,   // theoretical link peak (PCIe gen5
+                                         // x16, NVMe nominal); static per
+                                         // deployment, set from operator
+                                         // config or device probe
+      "recent_throughput_bps":   int,   // EMA over the last ~100 ms window
+                                         // of (bytes / elapsed) observed at
+                                         // sglang's IO callsites (HiCache
+                                         // dispatcher for HBM↔DRAM, Mooncake
+                                         // put/get for DRAM↔DISK)
+      "samples_in_window":       int    // 0 when link is idle; daemon uses
+                                         // this to decide between
+                                         // `recent_throughput_bps` (link
+                                         // active) and `peak_bw_bps`
+                                         // (link idle → assume free)
+    }
+  },
+
+  "tier_holding_cost": {                // PER-TIER MARGINAL DISPLACEMENT,
+                                         // input to V_u's h_τ(occ) term
+    "HBM":  {"h_max_per_byte_sec": float},   // per-tier deployment
+    "DRAM": {"h_max_per_byte_sec": float},   //   constants; combine with
+    "DISK": {"h_max_per_byte_sec": float}    //   live occupancy via §7's
+                                              //   h_τ(occ) shape
+  },
+
   // Diagnostic: emitted by sglang only when the loaded tree cache
   // class lacks dump_aginfer_state.  Daemon halts loudly on this —
   // running aginfer against an incompatible cache is a deployment
@@ -567,8 +596,8 @@ because the constraint is a one-sided byte threshold.
 | `Δt` | seconds | decision look-ahead horizon (§7 inputs) |
 | `hold_time` | seconds | expected residence in candidate tier (§7 inputs) |
 | `reload_from(u, τ)`, `reload_from_DROP(u)` | seconds | per-paper-§3 reload costs `ρ_τ × n_tokens`, `π_u × n_tokens` |
-| `h_τ(occ)` | $/byte/sec | per-byte holding cost at tier τ at occupancy `occ`; multiplied by bytes×seconds to get seconds-cost |
-| `bw_free(σ, τ)` | bytes/sec | live free bandwidth on σ↔τ link |
+| `h_τ(occ)` | sec / (byte × sec of holding) | per-byte marginal displacement cost at tier τ when at occupancy `occ`; multiplied by bytes×seconds yields seconds-cost.  Linear placeholder `h_τ_max × occ` from `state.tier_holding_cost[τ]`; final shape pending T12 calibration |
+| `bw_free(σ, τ)` | bytes/sec | live free bandwidth on σ↔τ link; reads `state.link_stats[σ→τ].recent_throughput_bps` when active, falls through to `peak_bw_bps` when link idle |
 | `transfer_bytes(u, σ, τ)` | bytes | `u.n_bytes` if `τ ≠ DROP` else 0 |
 | `transfer_time(σ, τ)` | seconds | `transfer_bytes / bw_free` |
 | `page_bytes` | bytes | DP quantisation granularity = `state.page_size × state.bytes_per_token` |
@@ -948,13 +977,68 @@ naturally — not from forcing them equal in the formula.
 
 #### `h_τ(occupancy)` — per-byte holding cost at tier τ
 
-Cost ∝ marginal value of a free byte at τ, observable from the
-allocator's recent pressure trajectory.  Same allocator-truth view
-the admission controller reads (§5 `pool_usage`).
+Physical meaning: the seconds of opportunity cost per byte per
+second of holding at tier τ, when τ is at occupancy `occ`.  This
+is the marginal V_u of the byte that would be displaced by adding
+one more byte to τ.  At low occupancy the displaced byte has near-
+zero value (tier has slack), at high occupancy it has the V_u of
+the next-best resident.
+
+```
+h_τ(occ) = h_τ_max × occ           # linear placeholder; see below
+h_τ_max  = state.tier_holding_cost[τ].h_max_per_byte_sec
+occ      = occupancy_of_τ(state)
+         = state.tier_usage[τ].used_bytes
+         / state.tier_usage[τ].cap_bytes
+```
+
+The shape is **linear in occupancy as a placeholder** until T12
+calibration determines the empirical curve.  Linear is the
+simplest non-trivial monotone function — 0 cost when tier is empty
+(can't displace anything), `h_τ_max` cost when tier is full.
+
+> **Planned (T12 calibration).**  The true shape of `h_τ(occ)` is
+> the relationship between current tier occupancy and the V_u of
+> the marginal (lowest-V_u) resident at that occupancy.  T12
+> measures this empirically: at every event during T9 / T11 runs,
+> log `(occ, marginal_V_u)` pairs across the workload mix.  Fit
+> candidate shapes — linear `α × occ`, power `α × occ^γ`,
+> hyperbolic `α / (1 - occ)` — and pick the one that minimises
+> residual.  Hyperbolic is the most physically motivated candidate
+> (diverges as occ → 1, matching the §9 admission cap), but the
+> data picks the shape, not the prior.  Until T12 lands, linear
+> with operator-calibrated `h_τ_max` is the spec.
 
 #### `bw_free(σ, τ)` — free bandwidth on σ↔τ link
 
-Live bytes-per-second idle on the physical transfer path.
+Live bytes-per-second available on the σ↔τ link, read directly
+from `state.link_stats`:
+
+```
+bw_free(σ, τ) =
+    state.link_stats["σ->τ"].recent_throughput_bps
+        if state.link_stats["σ->τ"].samples_in_window > 0
+    else
+        state.link_stats["σ->τ"].peak_bw_bps   # link idle → assume free
+```
+
+Sourcing:
+
+* **`peak_bw_bps`** is a deployment constant (PCIe gen5 ×16 for
+  HBM↔DRAM is ~64 GB/s; NVMe drive nominal for DRAM↔DISK).  Set
+  at sglang launch from operator config (`--aginfer-peak-bw-*`)
+  or device probe.
+* **`recent_throughput_bps`** is sglang's EMA over a ~100 ms
+  window of `(bytes_moved / elapsed_time)` measured at the actual
+  IO callsites: HiCache `write_backup` / `load_back` for
+  HBM↔DRAM (CUDA-event bracketed), Mooncake `put` / `get` for
+  DRAM↔DISK (wall-clock bracketed at the Python adapter
+  boundary).  Each direction maintained separately.
+
+The fallback to `peak_bw_bps` when no recent samples exist is not
+a defensive fallback — an idle link genuinely has its full peak
+available.  The samples are the dynamic correction, the peak is
+the physical truth.
 
 ### Event-specific context
 
@@ -1613,6 +1697,7 @@ for pause/resume).
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
 | **Pool-truth admission**: admission's `forecast(state)` reads `state.pool_usage.HBM.used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes), never `tier_usage` (which is radix view); if the snapshot lacks `pool_usage.HBM` the daemon halts loudly (sglang too old / misconfigured) | daemon `admission_controller.forecast` |
+| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_τ(occ)` reads `state.tier_holding_cost[τ].h_max_per_byte_sec`, never a constant baked into the daemon.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; operator config sets per-tier `h_max`); the daemon consumes them.  If `link_stats` or `tier_holding_cost` are missing the daemon halts loudly | sglang instrumentation + operator config |
 | **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
 | **Hint table covers every live unit**: sglang seeds a "fresh access just happened" entry on unit birth (`p_hat ≈ 1` for the next event horizon); the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
