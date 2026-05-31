@@ -200,44 +200,24 @@ not a decision-rule concern.
 
   "pool_usage": {                       // ALLOCATOR-TRUTH view; per-subpool
                                          // breakdown.  Each tier carries a
-                                         // `subpools` dict whose keys are
-                                         // model-determined component names
-                                         // (e.g. "full" / "swa" / "mamba"
-                                         //  for a hybrid Mamba+SWA model;
-                                         //  one key "main" for non-hybrid).
-                                         // sglang's UnifiedRadixCache exposes
-                                         // these via its component registry
-                                         // (one component per attention type
-                                         //  per architecture; see sglang
-                                         //  unified_cache_components/).
-    "HBM": {
-      "subpools": {
-        "<name>": {                     // e.g. "main" | "full" | "swa" | "mamba"
-          "used_bytes":      int,
-          "cap_bytes":       int,
-          "available_bytes": int,
-          "evictable_bytes": int
-        }
-      }
-    },
-    "DRAM": {
-      "subpools": {
-        "main": {                       // single subpool by default; HiCache
-                                         // host pool is structurally a single
-                                         //   region
-          "used_bytes": int, "cap_bytes": int,
-          "available_bytes": int, "evictable_bytes": int
-        }
-      }
-    },
-    "DISK": {
-      "subpools": {
-        "main": {                       // mooncake-backed; single region
-          "used_bytes": int, "cap_bytes": int,
-          "available_bytes": int, "evictable_bytes": int
-        }
-      }
-    }
+                                         // `subpools` dict keyed by
+                                         // architecture-determined component
+                                         // names; concrete subpool keys per
+                                         // model class are listed in §12
+                                         // Scenarios.  sglang's UnifiedRadixCache
+                                         // exposes these via its component
+                                         // registry (one component per
+                                         // attention type per architecture;
+                                         // see sglang unified_cache_components/).
+    "HBM":  {"subpools": {"<name>": {"used_bytes": int, "cap_bytes": int,
+                                     "available_bytes": int,
+                                     "evictable_bytes": int}}},
+    "DRAM": {"subpools": {"<name>": {"used_bytes": int, "cap_bytes": int,
+                                     "available_bytes": int,
+                                     "evictable_bytes": int}}},
+    "DISK": {"subpools": {"<name>": {"used_bytes": int, "cap_bytes": int,
+                                     "available_bytes": int,
+                                     "evictable_bytes": int}}}
   },
 
   "per_program_usage": {                // PER-PROGRAM-OWNED view
@@ -288,14 +268,8 @@ not a decision-rule concern.
        "<subpool>": int               // contributes to its current tier.
      },                                // Subpool keys match the tier's
                                         //   pool_usage.<tier>.subpools keys.
-                                        // Non-hybrid model: {"main": N}.
-                                        // SWA-hybrid: {"full": F, "swa": S}
-                                        //   with swa==0 once the unit ages
-                                        //   out of the sliding window.
-                                        // Mamba+attention hybrid: leaf
-                                        //   nodes carry {"full": F, "mamba": M};
-                                        //   intermediate nodes carry only
-                                        //   {"full": F}.
+                                        // Per-architecture concrete shapes
+                                        // are listed in §12 Scenarios.
      "last_access_time": int, "hit_count": int,
      "session_ids": list[str]}
   ],
@@ -662,7 +636,6 @@ class Migrate:
     hash: str                 # u.hash (sglang canonical key)
     target_tier: Tier
     target_subpool: str       # destination subpool key in target_tier.subpools
-                              # (e.g. "main" for non-hybrid DRAM/DISK)
     cost: float               # seconds
     relief: dict[str, int]    # per-HBM-subpool bytes freed at the source
                               # (keys match pool_usage.HBM.subpools)
@@ -1597,21 +1570,13 @@ attention-resident units that are cheap and healthy.
 
 Both phases are **exact 0/1 knapsack** at K ≈ tens of items
 (K_MAX = 256 per §7 top-k cap).  Resource-axis count is
-`|HBM subpools| + |DRAM subpools| + |DISK subpools|`:
-
-* Non-hybrid model (1 HBM subpool, 1 DRAM, 1 DISK): 3 axes
-* SWA-hybrid (full + swa = 2 HBM subpools, 1 DRAM, 1 DISK): 4 axes
-* Mamba+attention hybrid (full + mamba = 2 HBM subpools, 1 DRAM,
-  1 DISK): 4 axes
-* Future Mamba+SWA+full: 5 axes total
+`|HBM subpools| + |DRAM subpools| + |DISK subpools|`, varying
+per architecture (see §12 Scenarios for concrete counts).
 
 Dense table size grows exponentially in axis count; the DP runs
 **sparse** over a `dp` dict (cells reachable from any subset-take).
 On representative candidate sets fewer than ~10⁵ tuples are
-reachable, ≪ dense bound, at any practical axis count.  Both
-phases fit microseconds for current models; for a 5-axis future
-case the sparse-DP cost is still bounded by reachable-cell count,
-not dense-table size.
+reachable, ≪ dense bound, at any practical axis count.
 
 ```python
 def _bk(n, bucket_size):                            # round-down quantisation
@@ -1759,11 +1724,10 @@ def knapsack_max_value_multi(items, budget, bucket_size):
     return chosen
 ```
 
-`Migrate` carries a new field `target_subpool: str` — when sglang's
+`Migrate` carries a `target_subpool: str` field — when sglang's
 unified cache moves a unit's bytes from one tier to another, the
 destination tier's subpool layout determines where each component
-of the unit lands.  For non-hybrid models there's only one
-`target_subpool == "main"` so this collapses.
+of the unit lands.
 
 #### Why exact DP, not greedy
 
@@ -1967,3 +1931,102 @@ already holds.  At-least-once delivery doesn't add information
 to a system where the recipient re-reads the source on every
 handler — the recipient already has at-least-once knowledge of
 state via the pull.
+
+## 12. Scenarios
+
+The framework above is architecture-agnostic: it operates on
+named-subpool dicts (`pool_usage.<tier>.subpools`, `u.n_bytes`,
+`tier_holding_cost`).  Concrete sglang deployments instantiate
+the dicts according to the model's attention / state-space
+component mix.  Each scenario below lists exactly which keys
+appear and how unit bytes split across them; the §7 / §8 / §9
+machinery is unchanged.
+
+### S1 — Single-stack attention (e.g. DeepSeek-V4-Flash / MLA, Llama, Qwen)
+
+One attention component, no SWA, no Mamba.
+
+| field | shape |
+|---|---|
+| `pool_usage.HBM.subpools` | `{"attn": {...}}` |
+| `pool_usage.DRAM.subpools` | `{"attn": {...}}` |
+| `pool_usage.DISK.subpools` | `{"attn": {...}}` |
+| `units[i].n_bytes` | `{"attn": int}` for every unit |
+| `tier_holding_cost.HBM` | `{"attn": h_max}` |
+| §9 DP axis count | 3 (HBM-attn relief + DRAM-attn cap + DISK-attn cap) |
+
+forecast / bytes_needed / capacity_fits each have a single
+`attn` key.  The multi-axis sparse DP reduces to the 3-axis case
+matching the round-6 multi-resource baseline.
+
+### S2 — SWA-hybrid attention (e.g. Mistral, Gemma)
+
+Two attention components: full-attention layers and sliding-window
+layers, with separate sub-pools because SWA layers retain only the
+last N tokens per sequence.
+
+| field | shape |
+|---|---|
+| `pool_usage.HBM.subpools` | `{"full": {...}, "swa": {...}}` |
+| `pool_usage.DRAM.subpools` | `{"full": {...}, "swa": {...}}` |
+| `pool_usage.DISK.subpools` | `{"full": {...}, "swa": {...}}` |
+| `units[i].n_bytes` | `{"full": F, "swa": S}` where `S > 0` only when the unit's tokens are still inside the SWA window; `S == 0` for aged-out units |
+| §9 DP axis count | 5 (full + swa across HBM relief, DRAM cap, DISK cap; plus the same across DRAM and DISK destinations) |
+
+Architecture-specific behaviour: when the SWA window slides past
+a unit's tokens, sglang transitions the unit's `n_bytes.swa`
+from `S` to `0` at the next state-dump.  The unit remains in
+the radix tree (its `full` bytes are still valuable for prefix
+reuse), but its SWA contribution is gone.  No special daemon
+handler is needed; the next `joint_decide` event sees the new
+`n_bytes` shape and re-scores naturally.
+
+### S3 — Mamba+attention hybrid (e.g. Jamba, Zamba)
+
+Mixed transformer layers with attention KV per token, and Mamba
+SSM layers with state vectors snapshotted at radix-tree leaf
+nodes (sglang's `MambaPool` / `hi_mamba_radix_cache.py`).
+
+| field | shape |
+|---|---|
+| `pool_usage.HBM.subpools` | `{"full": {...}, "mamba": {...}}` |
+| `pool_usage.DRAM.subpools` | `{"full": {...}, "mamba": {...}}` |
+| `pool_usage.DISK.subpools` | `{"full": {...}, "mamba": {...}}` |
+| `units[i].n_bytes` for an intermediate node | `{"full": F, "mamba": 0}` (no snapshot) |
+| `units[i].n_bytes` for a **leaf** node | `{"full": F, "mamba": M}` (snapshot present, size determined by `mamba_cache_chunk_size`) |
+| §9 DP axis count | 5 (same shape as S2; subpool keys differ) |
+
+Architecture-specific behaviour: only leaf nodes carry mamba
+bytes (sglang stores exactly one mamba snapshot per leaf).  When
+the radix tree extends a leaf (new tokens commit underneath), the
+ex-leaf becomes intermediate and its mamba bytes either move to
+the new leaf or are freed — sglang manages this transparently;
+the daemon just observes the updated `n_bytes` shape on the next
+state-dump.  In-flight Mamba state grows only at snapshot
+boundaries, so `forecast_inflight_demand[mamba]` is 0 between
+snapshots (§8).
+
+### S4 — Mamba+SWA+full (future hybrid)
+
+Three subpool keys in HBM; not yet observed in production models
+but the framework supports it without modification.
+
+| field | shape |
+|---|---|
+| `pool_usage.HBM.subpools` | `{"full": {...}, "swa": {...}, "mamba": {...}}` |
+| `units[i].n_bytes` | `{"full": F, "swa": S, "mamba": M}` with `S = 0` when aged out of the SWA window and `M = 0` when the unit isn't a Mamba leaf |
+| §9 DP axis count | 7 (3 HBM subpools × {HBM-relief, DRAM-cap, DISK-cap} minus the relief-axis overlap; see §9 axis counting) |
+
+Sparse DP cell count remains the binding factor — at 7 axes the
+dense table is intractable but the reachable-cell count under
+agent workloads (where most candidates touch only 1–2 axes
+nontrivially) stays in the 10⁵ envelope.
+
+### Scenario-independent assertions
+
+Across S1 – S4 the daemon code path is identical: read
+`pool_usage.HBM.subpools.keys()` at state-dump entry, iterate
+over those keys for every per-subpool quantity (`forecast`,
+`bytes_needed`, `cap_left`, `pause_relief`, `re_use`,
+`tier_holding_cost`).  No scenario-specific branch lives in the
+daemon — the keys come from the state-dump, the rest follows.
