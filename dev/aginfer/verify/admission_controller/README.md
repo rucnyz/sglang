@@ -1,17 +1,30 @@
-# T8 — admission_controller (event-driven pause/resume)
+# admission_controller (daemon §8 event-driven pause/resume)
 
-> **NOTE (pre-round-9)**.  `_value_at_current_tier` terminology
-> here is pre-round-9.  DESIGN.md round-9 replaces it with
-> `_value(u, residence, state)` summed over
-> `authoritative_tier(residence)`.  G9 (theta mismatch) is closed
-> by design in round-9 via `GET /aginfer/thresholds` +
-> `PUT /aginfer/thresholds` broadcast; OPEN WORK block below
-> still lists it as gap because code hasn't caught up.  Refresh
-> when round-9 lands.
-
-## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
-
-> See `verify/t9/results/N3_GAPS.md` for the cross-T catalog.
+> **⚠️ STALE post-T33 (2026-05-31).  Does NOT pass against current
+> daemon.**
+>
+> Same staleness as `kv_scheduler_value_rule/`: stub state JSONs
+> use the pre-round-9 `tier_usage` flat shape; assertions reference
+> `u.tier` (single tier; T33 replaced with residence-list) +
+> `_value_at_current_tier` (T33's `_value(u, next_residence, state)`
+> + `authoritative_tier(residence)`).  T33 also reworked
+> `admission_controller.py`'s `_hbm_occ` to per-subpool max;
+> probes that monkey-patch `pool_pressure` need to use
+> `Dict[Tier, Dict[str, float]]` not the old `Dict[Tier, float]`.
+>
+> Running fails on the first stub state with
+> `KeyError: 'pool_usage'`.
+>
+> G9 (theta mismatch between sglang webhook fire and daemon's
+> pause threshold) is closed by DESIGN round-9 via `GET
+> /aginfer/thresholds` + `PUT /aginfer/thresholds` broadcast
+> (PLAN T22).  The G9 OPEN WORK note that was here pre-round-9
+> is therefore moot; tracked under T22.
+>
+> Rewrite tracked as #146 (same task as
+> `kv_scheduler_value_rule/`'s rewrite; the two share fixtures
+> and the rewrite is logically a single piece).  verify.py +
+> regression_probe.py kept as behavioural-spec reference.
 
 * **G1 — # of pauses per real harbor cycle never measured.**
   daemon already logs `program_tracker: paused %s`; never
