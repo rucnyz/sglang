@@ -231,6 +231,49 @@ The numeric detail (kv_tokens / needed / evicted / quota+delta) is
 still stashed on `self._last_load_back_decline` for live debug,
 just not embedded in the Counter-aggregated skip reason.
 
+### 2026-05-31: (C-deeper) controller_load root cause
+
+Pushed instrumentation one level deeper into
+`hybrid_cache_controller.load()` — set `self._last_load_decline`
+on the controller for each of its two None-return sites:
+
+* `full_alloc_returned_none:requested=N:avail_full_at_call=M`
+* `pool_transfers_alloc_failed:extra_pools=K`
+
+load_back propagates: `controller_load_returned_none:<sub>`.
+
+**A3 v9 (a3_controller_root_000608)** result:
+
+| reason | count | % |
+|---|---|---|
+| `race:already_on_hbm` | 5 | 71.4 % |
+| `promote_load_back_declined:controller_load_returned_none:pool_transfers_alloc_failed` | 2 | 28.6 % |
+| `promote_load_back_declined:controller_load_returned_none:full_alloc_returned_none` | 0 | 0 % |
+
+**Root cause definitively: SWA sub-pool eviction stalls.**
+Not a race between load_back's `min(full,swa)` avail check and
+the controller's `full_attn_allocator.alloc()` — that path
+never fires.  Instead, `_resolve_pool_transfers_allocation`
+asks the SWA component's `device_pool.alloc(size)`, gets None,
+calls `evict_fn(size)` (SWA-specific eviction), retries, still
+gets None → returns None and rollback.
+
+Why SWA sub-pool is the bottleneck:
+* DeepSeek-V4-Flash is hybrid attn — each layer is either full
+  or SWA, with **independent pool quotas** in `swa_memory_pool.py`
+  (`_size_full` vs `_size_swa`)
+* SWA pool's evict_fn can't free locked SWA slots held by
+  in-flight requests under HBM peak 0.62-0.97
+* This is orthogonal to the FULL allocator path
+
+**Rate: 2 / 1510 dispatched = 0.13 %**.  promote success rate
+**99.87 %**.
+
+**Not a design bug, no code fix warranted**.  Documented as
+sglang HiCache SWA-pool weakness under pressure.  Re-investigate
+only if rate climbs (e.g. higher concurrency in A4 stress regime
+might push it).
+
 ## Files
 
 * sglang patch: `python/sglang/srt/mem_cache/unified_radix_cache.py`
