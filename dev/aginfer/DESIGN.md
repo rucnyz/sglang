@@ -65,12 +65,14 @@ Three layers, three cadences (none of them periodic).
        │    ▼                                              │
        │  on_event(e):                                     │
        │    state ← fetch /aginfer/state                   │
-       │    D_t   ← decision_set(e.kind)                   │
-       │    a_t   ← kv_scheduler.decide(state, D_t, e)     │
-       │    POST /aginfer/migrate(a_t)                     │
        │    program_tracker.advance(e)                     │
-       │    admission.evaluate(state, e)                   │
-       │      # runs every event (no internal timer)       │
+       │    plan  ← joint_decide(state, e)   # §9          │
+       │      # one knapsack-greedy pass over the union    │
+       │      # action space {unit migrate} ∪ {program     │
+       │      # pause/resume}; selection key V_u/byte      │
+       │    apply(plan):                                   │
+       │      POST /aginfer/migrate for unit actions       │
+       │      proxy.gate for pause/resume                  │
        │                                                   │
        │  program_tracker — REASONING / ACTING / PAUSED   │
        │    state machine, driven from the same events     │
@@ -527,113 +529,70 @@ must exploit beyond a unit's intrinsic state.  Concrete cases:
 invariant.  Per-unit averages are an acceptable input only when no
 per-event signal exists.
 
-## 8. Admission
+## 8. Admission — program-level candidate generator
 
-Admission is a decision function: "given current `(programs,
-HBM pressure, paused queue)`, which active programs should be
-paused and which paused programs resumed?".  It must run on **every
-event whose information could change that answer**, not just on a
-single "pressure crossed" trigger.
+Admission is the **program-level candidate generator** that feeds
+`joint_decide` (§9).  It does not run its own decision loop; the
+loop lives in §9 and consumes its candidates alongside the
+unit-level candidates from §7.
 
-### Triggers
+For each event, the admission generator emits:
 
-| event | why admission's decision can change |
-|---|---|
-| `SESSION_ARRIVAL` | new program enters → expected HBM demand rises; if free capacity < forecast demand, **pre-pause** a low-V_u program before contention starts (proactive) |
-| `LLM_PREFILL` | program-state advances to REASONING; the inputs to `V_u_program` for that program have changed |
-| `TOOL_CALL_START` | program voluntarily idles → **pause cost ≈ 0** at this moment (no reasoning state is being interrupted); the cheapest possible time to free this program's HBM if its V_u is low |
-| `TOOL_CALL_END` | program returns and must reason → reconsider whether any currently-paused program now outranks one of the actives that just came back |
-| `SUB_RETURN` | parent reactivates; child terminates → footprint accounting changes for both, V_u_program rankings shift |
-| `SESSION_END` | program terminates → its footprint is freed; eligible to resume more paused programs |
-| `MEMORY_PRESSURE` | sglang reports allocator at `theta_hi` → reactive pause |
-| `PRESSURE_RESOLVED` | allocator dropped below `theta_lo` → consider resuming paused programs in V_u order |
+* one `Pause(p, cost, relief)` candidate for every ACTIVE program p
+* one `Resume(p, gain, re_use)` candidate for every PAUSED program p
 
-### Decision rule (one definition; reused per trigger)
+where:
 
-```python
-def cost_per_byte(p, state):
-    """V_u lost per HBM byte freed if we pause p — knapsack-greedy key."""
-    relief = marginal_relief_value(p, state)
-    if relief <= 0:
-        return float('inf')          # pausing p frees no HBM → never pick
-    return V_u_program(p) / relief
+```
+cost(pause p, event)   = V_u_program(p) + marginal_pause_cost(p, event)
+relief(pause p, state) = marginal_relief_value(p, state)
 
-def value_per_byte(p, state):
-    """V_u recovered per HBM byte re-occupied if we resume p."""
-    cost = marginal_relief_value(p, state)   # bytes p would re-take
-    if cost <= 0:
-        return float('inf')          # resuming p costs no HBM → trivially OK
-    return V_u_program(p) / cost
-
-def admission_evaluate(event):
-    # Always-fresh state (§10): re-fetch inside the loop because
-    # each pause / resume mutates allocator state.
-    while True:
-        state = fetch_state()
-        if forecast(state) <= theta_hi: break
-        if not active_programs(state): break
-        victim = argmin(active_programs(state), key=lambda p: cost_per_byte(p, state))
-        if marginal_pause_cost(victim, event) > marginal_relief_value(victim, state):
-            break
-        pause(victim)
-
-    while True:
-        state = fetch_state()
-        if forecast(state) >= theta_lo: break
-        if not paused_programs(state): break
-        candidate = argmax(paused_programs(state), key=lambda p: value_per_byte(p, state))
-        if not capacity_fits(candidate, state): break
-        resume(candidate)
+gain(resume p, state)   = V_u_program(p)                  # V_u recovered
+re_use(resume p, state) = marginal_relief_value(p, state) # HBM re-occupied
 ```
 
-The selection key is **V_u-per-byte**, not raw V_u.  Admission is
-a 0/1 knapsack ("free at least `theta_hi → safe` bytes,
-minimising total V_u loss"); LP-relaxation greedy on
-`V_u / relief` is the standard approximation and gives the
-correct ordering when program footprints vary.  Picking by raw
-`argmin V_u` instead would systematically choose the
-smallest-footprint program (smallest contribution to relief),
-then have to pause more programs to reach the byte target — a
-runaway-decode program with huge in-flight bytes but low V_u
-would be left untouched, defeating the point.
+§9 then merges these with §7's unit candidates and sorts the
+union by `cost / relief` ascending (knapsack-greedy).
 
-The `marginal_pause_cost > marginal_relief_value` early-break
-inside the loop is the **per-step trade gate** (don't pause if
-this specific pause does net harm even at the best V_u/relief
-ratio).  Selection key picks the BEST candidate; the gate
-refuses to act when even the best candidate is a bad trade.
+### Component definitions
 
-Component definitions:
-
-* `forecast(state)` = `state.pool_pressure[HBM].token_usage +
-  forecast_inflight_demand(state)`.  The second term is the
-  expected HBM growth before the next reasonable re-evaluation —
-  for REASONING programs, `Σ max_remaining_tokens(p) × bytes_per_token`
-  bounded by the program's `max_completion_tokens` cap; for new
-  programs arriving at SESSION_ARRIVAL, the seed estimate.
-* `marginal_pause_cost(p, event)` — work-loss penalty of pausing
-  p **at this event's moment**.  Near zero when the event is
+* `V_u_program(p) = Σ_{u ∈ p.units} V_u(u)`.  The conditional p_hat
+  from §7 is already a holder-product, so shared-prefix attribution
+  is built in; no `1/|session_ids|` weight is needed.  PAUSED
+  programs' units already contribute 0 to V_u, so PAUSED programs
+  naturally sort to the bottom of resume priority.
+* `marginal_pause_cost(p, event)` — work-loss penalty of pausing p
+  **at this event's moment**.  Near zero when the event is
   `TOOL_CALL_START` for p (p was going off-GPU anyway); positive
   when p is mid-REASONING (interrupting in-flight decode).
 * `marginal_relief_value(p, state)` — HBM bytes pausing p would
-  free or prevent.  Read directly from
-  `state.per_program_usage[p].hbm`:
+  free or prevent.  Read from `state.per_program_usage[p].hbm`:
   * **inflight_bytes** — released when p's current request
     completes / is preempted; the pause prevents the program's
-    NEXT request from re-allocating these
+    NEXT request from re-allocating these.
   * **committed_bytes** — the program's exclusive share of radix
-    nodes; if pausing p drops `len(session_ids)` of a node to 0
-    on this program, the node becomes evictable
-  Together these are the HBM bytes the pause delivers back to
-  the allocator over the next admission re-evaluation window.
-* `capacity_fits(candidate, state)` — true iff resuming candidate
-  would leave `forecast(state)` still ≤ `theta_hi` after
-  re-incorporating candidate's HBM footprint.
-* `V_u_program(p) = Σ_{u ∈ p.units} V_u(u)` — the conditional
-  p_hat from §7 is already a holder-product, so shared-prefix
-  attribution is built in; no `1/|session_ids|` weight is needed.
-  PAUSED programs naturally sort to the bottom of resume priority
-  because their units already contribute 0 to V_u.
+    nodes; if pausing p drops `len(session_ids)` of a node to 0,
+    the node becomes evictable.
+* `capacity_fits(p, state)` — true iff resuming p would leave
+  `forecast(state)` still ≤ `theta_hi` after re-incorporating p's
+  HBM footprint.  Resume candidates failing this gate are omitted
+  by the generator (not in the candidate set).
+* `forecast(state)` — `state.pool_pressure[HBM].token_usage +
+  forecast_inflight_demand(state)`.  The second term is the
+  expected HBM growth before the next event — for REASONING
+  programs, `Σ max_remaining_tokens(p) × bytes_per_token` bounded
+  by `max_completion_tokens`; for SESSION_ARRIVAL, the incoming
+  program's seed estimate.
+
+### Triggers
+
+The candidate set changes on **every event** because at least one
+of (active set, paused set, V_u_program ranking,
+marginal_pause_cost, forecast) shifts.  The §9 loop runs every
+event regardless of kind; the kind only affects what
+candidates appear (e.g. TOOL_CALL_START makes p's pause cheap by
+zeroing marginal_pause_cost; SESSION_END removes p's candidates
+entirely).
 
 ### Threshold parity
 
@@ -642,25 +601,108 @@ admission hysteresis band.  sglang's webhook and the daemon's
 admission controller must read the SAME values; this is launched
 from a single source per the §10 invariant.
 
-## 9. Why two channels (unit migrate + program pause)
+## 9. Joint decision over a union action space
 
-Two distinct levers cover the pressure spectrum:
+Each event triggers ONE decision function over the **union action
+space** `A = {unit-tier migrations} ∪ {program pause/resume}`.
+The two lever types attack different parts of HBM (radix vs
+in-flight) but contribute to the same scalar resource budget, so
+choosing between them must be **joint**, not sequential.
 
-* **unit migrate** *reorganises* existing KV across tiers.  Cost:
-  one H↔D transfer per migrated unit.  Effective when there's
-  *capacity to reorganise into*.
-* **program pause** *throttles inflow*.  Cost: a program waits.
-  Effective when there's no reorganisation that helps because
-  inflow is the source of pressure.
+### Why not sequential migrate-then-pause
 
-Light pressure → unit migrate is enough.  Heavy pressure → migrate
-exhausts options because every tier is full; pause must reduce
-inflow.  The two are non-substitutable; both are needed.
+Sequential decomposition (run kv_scheduler first, then run
+admission on the post-migrate state — what an earlier version of
+this design did) is Gauss-Seidel coordinate descent: optimise
+unit-actions holding pause-set fixed, then optimise pauses
+holding unit-actions fixed.  Two failure modes:
 
-Formally, the action space is the *union*
-`A = {unit-level assignments} ∪ {program pause/resume}`; the MDP is
-one decision problem, not two.  Implementation splits the modules
-purely for code clarity.
+* **Redundant pay**: migrate a unit out of HBM (cost = V_u of that
+  unit), then realise pausing the unit's program would have freed
+  it anyway.  Both lever costs charged, only one needed.
+* **Wrong lever order**: a runaway-decode program with tiny radix
+  footprint but huge in-flight bytes is invisible to unit-migrate
+  (the in-flight bytes aren't in the tree).  Sequential burns
+  migration on small wins, then pauses the big lever later.
+  Joint would pause first and skip the migrations.
+
+These aren't pathological corner cases — they happen whenever a
+single program contributes both migrate candidates and pause
+relief, which is the common case in agent workloads.
+
+### Joint decide
+
+```python
+def joint_decide(state, event):
+    candidates: list[Candidate] = []
+
+    # Unit-level: for each unit in D_t(event), each candidate tier.
+    for u in decision_set(event, state.units):
+        for τ in (HBM, DRAM, DISK, DROP):
+            if τ == u.tier: continue
+            cost   = _value(u, u.tier, state) - _value(u, τ, state)
+            cost  += migration_cost(u, u.tier, τ)
+            cost  += unavailability_cost(u, u.tier, τ)
+            relief = bytes_freed_by_migrate(u, u.tier, τ)
+            if relief > 0:
+                candidates.append(Migrate(u.id, τ, cost, relief))
+
+    # Program-level: each ACTIVE program is a pause candidate;
+    # each PAUSED program is a resume candidate.
+    for p in active_programs(state):
+        cost   = V_u_program(p) + marginal_pause_cost(p, event)
+        relief = marginal_relief_value(p, state)
+        if relief > 0:
+            candidates.append(Pause(p.id, cost, relief))
+    for p in paused_programs(state):
+        if not capacity_fits(p, state): continue
+        gain   = V_u_program(p)                 # value recovered
+        re_use = marginal_relief_value(p, state) # HBM re-occupied
+        candidates.append(Resume(p.id, -gain, -re_use))   # negative-cost item
+
+    # Knapsack-greedy on V_u-per-byte (same key as §7 / §8 A4).
+    candidates.sort(key=lambda c: c.cost / c.relief if c.relief > 0 else math.inf)
+
+    bytes_needed = max(0, forecast(state) - theta_hi * pool_cap(state))
+    plan, freed = [], 0
+    for c in candidates:
+        if c.relief > 0 and freed >= bytes_needed: break
+        plan.append(c); freed += c.relief
+        if c.cost < 0: continue                  # Resume always welcome while capacity_fits
+
+    return plan
+```
+
+The selection criterion is **V_u-per-byte ascending**, identical
+across migration and pause candidates.  Resumes appear as
+negative-cost items (they restore V_u rather than cost it), so
+they sort to the front whenever capacity admits them.
+
+### What collapses out
+
+* **Trade gate**: in the sequential version §8 needed an
+  explicit `if marginal_pause_cost > marginal_relief_value: break`
+  guard to refuse a bad pause.  In the joint version, the
+  sort-by-V_u/byte selection naturally orders bad trades after
+  good ones; the loop's `freed >= bytes_needed` early-out is the
+  only stopping criterion.
+* **Composition order**: there's no "run kv_scheduler first
+  then admission" — the two kinds of action are interleaved by
+  cost/byte ranking.  An admission pause can come BEFORE a
+  migrate in the same plan if it's cheaper per byte.
+* **Per-trigger D_t for admission**: admission considers every
+  active / paused program every event; D_t only constrains the
+  unit-migrate candidate generator.
+
+### Modules vs decisions
+
+`kv_scheduler` and `admission_controller` remain as **candidate
+generators** for the two action classes — the code split is
+honest about responsibility (unit-level scoring vs program-level
+scoring) and lets each be unit-tested.  But the decision happens
+once, by `joint_decide`, not twice.  The action-application step
+still uses the two existing transport surfaces (`POST /aginfer/
+migrate` for unit actions; proxy gate for program pause/resume).
 
 ## 10. Invariants
 
