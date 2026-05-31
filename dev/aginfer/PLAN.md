@@ -281,8 +281,12 @@ Model: DeepSeek-V4-Flash (MLA).
 - 3-axis §9 DP ✓ baseline by construction
 - T9 / T11a / T12 / T13 all land on this scenario today
 
-Output: covered by existing T9 / T11 / T12 / T13 runs (no separate
-verify/ folder needed — this *is* the live benchmark).
+Output: `verify/t17/README.md`.  Specifically verifies the named-
+subpool framework **correctly degenerates to a single subpool**
+(`pool_usage.HBM.subpools` has exactly one entry, no hardcoded
+single-subpool assumption survives in the daemon).  T9 / T11 /
+T12 / T13 run on this scenario but do not check the degeneracy
+explicitly — T17 does.
 
 ### S2 — SWA-hybrid
 
@@ -294,7 +298,7 @@ Model: Mistral / Gemma (any sglang-supported SWA hybrid).
 - Verify pressure on SWA subpool fires `joint_decide` even when
   full-attention subpool is at < theta_hi
 
-Open output: `verify/t17/README.md` (S2 scenario verification).
+Open output: `verify/t18/README.md` (S2 scenario verification).
 
 ### S3 — Mamba+attention hybrid
 
@@ -306,7 +310,7 @@ Model: Jamba / Zamba (any sglang-supported Mamba+attn hybrid).
 - Verify `forecast_inflight_demand["mamba"] == 0` between snapshot
   boundaries
 
-Open output: `verify/t18/README.md` (S3 scenario verification).
+Open output: `verify/t19/README.md` (S3 scenario verification).
 
 ### S5 — Speculative decoding
 
@@ -319,7 +323,7 @@ Model: Medusa / Eagle on any base model.
 - Verify `pause_relief[draft]` for a spec-decoding program is the
   full discarded draft buffer
 
-Open output: `verify/t19/README.md` (S5 scenario verification).
+Open output: `verify/t20/README.md` (S5 scenario verification).
 
 ### Multi-LoRA (out of scope)
 

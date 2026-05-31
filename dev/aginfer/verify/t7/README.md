@@ -1,5 +1,12 @@
 # T7 — kv_scheduler event handlers (paper §4 events → migrations)
 
+> **NOTE (pre-round-9)**.  Migration dispatch here is `(hash,
+> target_tier)`.  DESIGN.md round-9 changes the action shape to
+> residence-set transitions (`(hash, add_tiers, remove_tiers)`),
+> and `_value(u, τ, state)` becomes `_value(u, residence, state)`
+> with `authoritative_tier(residence)` picking the holding-cost
+> tier.  Refresh when round-9 lands in sglang / daemon code.
+
 ## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
 
 > See `verify/t9/results/N3_GAPS.md` for the cross-T catalog.

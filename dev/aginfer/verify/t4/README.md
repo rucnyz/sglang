@@ -1,5 +1,12 @@
 # T4 — aginfer-daemon HTTP proxy + paper §4 event emission
 
+> **NOTE (pre-round-9)**.  Pause gating here is described as a
+> daemon-internal `asyncio.Event` wait.  DESIGN.md round-9 moves
+> `pre_pause_state` to sglang-authoritative storage via
+> `PUT /aginfer/program_paused`, and proxy gate releases on TCP
+> disconnect via `request.is_disconnected()` (round-9 F1).
+> Refresh when those land.
+
 ## WHAT WE PROMISED
 
 **Capability**

@@ -1,5 +1,10 @@
 # T5 — sglang→daemon webhook + daemon event router
 
+> **NOTE (pre-round-9)**.  The webhook kinds listed here are the
+> pre-round-9 set.  DESIGN.md round-9 adds `PRESSURE_CRITICAL` and
+> `APPLY_FAILED` (round-9 B4) as additional kinds the router must
+> dispatch.  Refresh when round-9 lands in sglang / daemon code.
+
 ## WHAT WE PROMISED
 
 **Capability — sglang side**

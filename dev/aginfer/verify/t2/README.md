@@ -1,5 +1,12 @@
 # T2 — `POST /aginfer/migrate`
 
+> **NOTE (pre-round-9)**.  This README describes the pre-round-9
+> payload (`{hash, target_tier}` per action).  DESIGN.md round-9
+> moves to residence-set transitions (`{hash, add_tiers,
+> remove_tiers}`) and adds an `APPLY_FAILED` webhook for failed
+> applies.  Refresh when round-9 lands in sglang code; until then
+> this README is accurate against the live implementation.
+
 ## WHAT WE PROMISED
 
 **Capability**

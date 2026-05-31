@@ -1,5 +1,12 @@
 # T10 — integration / concurrency / recovery / GC
 
+> **NOTE (pre-round-9)**.  The L3 / DISK-wiring plan below is
+> written against the pre-round-9 action model (`target_tier="DISK"`,
+> flat `tier_usage`).  DESIGN.md round-9 replaces this with
+> residence-set transitions (`{add_tiers: ["DISK"], ...}`) against
+> per-subpool pools.  This README needs a substantive rewrite when
+> round-9 lands in sglang code.
+
 ## ⚠️ STATUS (2026-05-29)
 
 **Entire task pending — zero implementation, zero verify steps run.**

@@ -1,5 +1,14 @@
 # T8 — admission_controller (event-driven pause/resume)
 
+> **NOTE (pre-round-9)**.  `_value_at_current_tier` terminology
+> here is pre-round-9.  DESIGN.md round-9 replaces it with
+> `_value(u, residence, state)` summed over
+> `authoritative_tier(residence)`.  G9 (theta mismatch) is closed
+> by design in round-9 via `GET /aginfer/thresholds` +
+> `PUT /aginfer/thresholds` broadcast; OPEN WORK block below
+> still lists it as gap because code hasn't caught up.  Refresh
+> when round-9 lands.
+
 ## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
 
 > See `verify/t9/results/N3_GAPS.md` for the cross-T catalog.

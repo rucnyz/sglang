@@ -1,5 +1,13 @@
 # T1 — `GET /aginfer/state`
 
+> **NOTE (pre-round-9)**.  This README describes the pre-round-9
+> schema (flat `tier_usage` / single-value `unit.tier` / scalar
+> `n_bytes`).  DESIGN.md round-9 introduces
+> `pool_usage.<tier>.subpools`, `unit.residence: list[Tier]`, and
+> nested `n_bytes: {tier: {subpool: int}}`.  This README will be
+> refreshed when round-9 lands in the sglang code; until then it
+> accurately documents the live implementation.
+
 ## WHAT WE PROMISED
 
 **Capability**
