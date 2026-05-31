@@ -12,4 +12,6 @@
 | `parse_matrix.py` | per-cycle wall-time aggregation + Welch t-test |
 | `parse_4arm.py` | 4-arm matrix aggregation |
 | `parse_ttft.py` | per-request TTFT distribution |
-| `methodology.md` | N≥3 protocol, B/O alternation, sample-size math, p-value convention |
+
+Methodology (N≥3 protocol, B/O alternation, acceptance rule) lives in
+[`../../PLAN.md`](../../PLAN.md) §5.

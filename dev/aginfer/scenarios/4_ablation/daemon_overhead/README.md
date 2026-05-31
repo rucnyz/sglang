@@ -19,8 +19,8 @@ of whether the daemon's scheduling actually contributes value.
 `with_daemon` arm is config-identical to `swebench_default/arms/ours_full/`.
 Same workload, same arm — it's reproduced here only so that the
 direct vs with-daemon comparison is a self-contained ablation
-folder.  See D2 in MIGRATION_PLAN.md — we chose physical copy
-over symlink so this ablation has its own re-run space.
+folder (physical copy, not symlink, so this ablation has its own
+re-run space).
 
 ## Result so far
 

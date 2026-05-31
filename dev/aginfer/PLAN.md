@@ -311,6 +311,26 @@ For each `DESIGN §12` scenario, a small verification run that
 confirms the named subpools actually appear in `/aginfer/state`
 and that the decision rule reacts as the scenario claims.
 
+### Methodology (applies to every scenario)
+
+- **N ≥ 3 cycles per arm**, B/O alternation order across cycles
+  (Ours/Baseline/Ours/Baseline/...) to neutralise GPU-thermal /
+  docker-cache / time-of-day drift.
+- **Each cycle from clean slate**: `pkill sglang daemon
+  mooncake_master` → drain zombies → fresh start.
+- **Fixed knobs** within a matrix: `--ak temperature=0.0` (greedy
+  decoding), `--random-seed 42` on sglang, identical
+  `harbor -l N -n N -k 1`, identical `sglang HEAD` (verify
+  `git rev-parse HEAD` matches at every cycle start).
+- **Headline metric**: per-trial wall (`finished_at − started_at`
+  from `harbor_jobs/<run_id>/instance_*/result.json`).  Aggregate:
+  mean ± std per cycle, then across-cycle mean ± std per arm.
+- **Fine metric**: per-turn TTFT from sglang `Prefill batch` log
+  line (prompt_tokens, cached_tokens, ttft_ms).
+- **Acceptance**: `ours_mean + ours_std < baseline_mean −
+  baseline_std` at N=3 → claim significant; if not, do N=6 before
+  abandoning.
+
 ### S1 — Single-stack attention (current benchmark)
 
 Model: DeepSeek-V4-Flash (MLA).

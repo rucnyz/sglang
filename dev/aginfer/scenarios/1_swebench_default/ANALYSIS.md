@@ -148,26 +148,26 @@ exclusively on a single GPU pair (4,7) for at least N=4 each
 We have **not** done this — at the time of writing GPUs 4, 7
 are occupied by other users for an indeterminate window.
 
-Alternative paper-level fix per `N3_GAPS.md` §4: change the
-workload (cap `max_completion_tokens`, shrink KV pool) to push
-the scheduler-driven Δ above the GPU-pair noise; then the
-confound becomes negligible.
+An alternative paper-level fix is to change the workload (cap
+`max_completion_tokens`, shrink KV pool) so the scheduler-driven
+Δ rises above the GPU-pair noise — this is what `2_hbm_pressure/`
+explores.
 
 ### Runaway dominance
 
-Per `N3_ROOT_CAUSE.md`, 1 % of LLM requests under `temperature=0.0`
-run away to 20–64 k completion tokens, consuming 80 % of LLM
-wall time across all configs.  This caps the maximum possible
-scheduler-driven improvement at < 5 % of trial wall in theory;
-the observed 8.7 % spread between OURS_full and LRU is consistent
-with the GPU confound on top of the structural ceiling.
+Under `temperature=0.0`, 1 % of LLM requests run away to 20–64 k
+completion tokens, consuming 80 % of LLM wall time across all
+configs.  This caps the maximum possible scheduler-driven
+improvement at < 5 % of trial wall in theory; the observed 8.7 %
+spread between OURS_full and LRU is consistent with the GPU
+confound on top of the structural ceiling.
 
 ### Hit-rate ceiling
 
-Mean cache hit ratio is 95.5 % across all four arms (see
-`N3_ttft_analysis.md`).  The prefix-reuse story is already
-saturated by inline `ours_greedy_score` alone; further scheduler
-improvement has bounded headroom.  See `N3_GAPS.md` §3.1.
+Mean cache hit ratio is 95.5 % across all four arms.  The
+prefix-reuse story is already saturated by inline
+`ours_greedy_score` alone; further scheduler improvement has
+bounded headroom.
 
 ## Conclusion
 
@@ -177,13 +177,10 @@ improvement has bounded headroom.  See `N3_GAPS.md` §3.1.
 * **N=3 isn't enough** to publish "OURS beats LRU at p < 0.05"
   without either (a) more cycles, (b) GPU-pair cleanup, or
   (c) moving to a workload where the scheduler has more room
-  (e.g., capping `max_completion_tokens` per N3_GAPS §4).
+  (e.g., capping `max_completion_tokens` — `2_hbm_pressure/`).
 
 ## Files
 
 * per-cycle data: `results/run_*_matrix_*_cycleN_*/harbor_jobs/...`
 * sglang logs (per-cycle): same dirs, `sglang_v4flash.log`
-* aggregator: `verify/t9/parse_4arm.py`
-* this SUMMARY: `verify/t9/results/N3_4arm_SUMMARY.md`
-* root cause of slowness: `verify/t9/results/N3_ROOT_CAUSE.md`
-* unmeasured gaps: `verify/t9/results/N3_GAPS.md`
+* aggregator: `../_shared/parse_4arm.py`

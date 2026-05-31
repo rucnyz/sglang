@@ -158,7 +158,7 @@ on the host) instead of sglang directly. Requires
 installed in the `agsched` env and
 [`rucnyz/harbor@aginfer`](https://github.com/rucnyz/harbor/tree/aginfer)
 which mirrors `session_id` into `extra_body.program_id` (with UUID
-fallback). See [NOTES §9](NOTES.md#9-thunderagent-run-g-集成) for details.
+fallback).
 
 ```bash
 # 1. backend (cap 512 K + HiCache ON, identical to Run F)

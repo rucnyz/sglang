@@ -1,17 +1,28 @@
-# experiments_notes — cross-cutting non-experiment docs
+# experiments_notes — raw-data archive
 
-Findings, debugging notes, simulation baselines, and gap catalogs
-that don't belong to one specific scenario.
+Analysis notes that previously lived here have been deleted.  Their
+findings are either:
 
-| file | what |
+- encoded in `dev/aginfer/DESIGN.md` (round-9+ invariants) and
+  `dev/aginfer/PLAN.md` (open work),
+- captured in user-level memory entries (e.g. the
+  "1 % requests = 80 % time" runaway finding), or
+- retrievable from `git log` if a specific historical analysis is
+  ever needed again.
+
+What remains here is **raw measurement data only**, kept because
+re-running the harness is more expensive than the disk it costs:
+
+| Path | What |
 |---|---|
-| [`GAPS.md`](GAPS.md) | catalog of promised-but-untested mechanisms (G1–G11) |
-| [`instrument_chain.md`](instrument_chain.md) | observability scaffold story (structured `aginfer_metric` logging) |
-| [`runaway_tail.md`](runaway_tail.md) | 1 % requests = 80 % wall finding (root cause of weak §8 N=3 signal) |
-| [`ttft_analysis.md`](ttft_analysis.md) | per-request TTFT distribution + cache hit ratio ceiling |
-| [`swa_assert_hypothesis.md`](swa_assert_hypothesis.md) | code-trace hypothesis for the SWA assert (now fixed) |
-| [`controller_decline_root.md`](controller_decline_root.md) | (C-deeper) load_back declines → SWA sub-pool root cause |
-| [`algo_baselines_sim.md`](algo_baselines_sim.md) | paper §8 algorithm simulation: LRU / TA / InferCept / Continuum / KVFlow / Ours under same trace |
+| `instrument_chain/` | per-cycle structured-metric logs from the A3 / J / baseline matrix (2026-05-29 → 30) |
+| `algo_baselines.txt` | output of `python -m baselines.compare` (single-seed) |
+| `algo_baselines_sweep_seeds.txt` | output of `python -m baselines.sweep_seeds` (8-seed) |
 
-Optional: `evidence/` subfolder with the cycle dirs that back
-specific findings (e.g. instrument_chain cycles).
+Regenerate the `algo_baselines*.txt` snapshots:
+
+```bash
+source dev/aginfer/scripts/env.sh
+python -m baselines.compare      > scenarios/experiments_notes/algo_baselines.txt
+python -m baselines.sweep_seeds  > scenarios/experiments_notes/algo_baselines_sweep_seeds.txt
+```

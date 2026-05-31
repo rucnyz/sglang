@@ -40,23 +40,21 @@ Structure of every scenario folder:
 
 | folder | purpose |
 |---|---|
-| [`experiments_notes/`](experiments_notes/) | algo-baseline simulation, GAPS catalog, instrument story, runaway tail finding, ttft analysis |
+| [`experiments_notes/`](experiments_notes/) | raw-data archive (algo-baseline simulation output, instrument-chain cycle logs) |
 | [`_shared/`](_shared/) | scripts + parsers used across scenarios |
 | `_legacy/` | pre-N=3 era cycle data (N=1 sanity, smoke tests) — kept for history, not in git |
 
 ## Recommended reading order
 
 1. [`1_swebench_default/ANALYSIS.md`](1_swebench_default/ANALYSIS.md) — paper §8 4-arm baseline result
-2. [`2_hbm_pressure/PLAN.md`](2_hbm_pressure/PLAN.md) + [`2_hbm_pressure/arms/ours_full/RESULTS.md`](2_hbm_pressure/arms/ours_full/RESULTS.md) — paper §3 promote evidence
-3. [`experiments_notes/runaway_tail.md`](experiments_notes/runaway_tail.md) — why §8 N=3 gain is bounded
-4. [`experiments_notes/GAPS.md`](experiments_notes/GAPS.md) — what's still untested
-5. [`4_ablation/daemon_overhead/ANALYSIS.md`](4_ablation/daemon_overhead/ANALYSIS.md) — daemon's net runtime cost
+2. [`2_hbm_pressure/arms/ours_full/RESULTS.md`](2_hbm_pressure/arms/ours_full/RESULTS.md) — paper §3 promote evidence
+3. [`4_ablation/daemon_overhead/ANALYSIS.md`](4_ablation/daemon_overhead/ANALYSIS.md) — daemon's net runtime cost
 
 ## Methodology
 
-See [`_shared/methodology.md`](_shared/methodology.md) for the
-N≥3 cycle protocol, B/O alternation, Welch t-test convention,
-and same-session re-measurement discipline.
+N≥3 cycle protocol, B/O alternation, fixed knobs, acceptance rule
+— see [`../PLAN.md`](../PLAN.md) §5 "Methodology (applies to every
+scenario)".
 
 ## Adding a new scenario
 
