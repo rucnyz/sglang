@@ -781,9 +781,10 @@ class Pause:
                               # (§8 — each term is itself a per-subpool dict).
                               # Keyed by subpool only (no outer tier key)
                               # because pausing a program never touches
-                              # non-HBM tiers; §9's resource-axis layer
-                              # wraps this into {HBM: relief} when feeding
-                              # the DP.
+                              # non-HBM tiers.  §9's joint_decide rewrites
+                              # this to nested {HBM: relief} before feeding
+                              # the DP so all candidate types share one
+                              # shape.
 
 @dataclass(frozen=True)
 class Resume:
@@ -1731,11 +1732,18 @@ def joint_decide(state, event):
                     for sp in disk_subpools}
         cands  = kv_scheduler.migrate_candidates(state, decision_set(event, state))
         cands += admission.pause_candidates(state, event)
-        cands  = [c for c in cands
-                  if any(b > 0
-                         for sub in (c.relief if isinstance(c, Migrate)
-                                     else {"HBM": c.relief}).values()
-                         for b in sub.values())]
+        # Normalise Pause.relief to the per-(tier, subpool) nested shape
+        # Migrate already uses.  After this rewrite both candidate types
+        # carry `relief: dict[Tier, dict[subpool, int]]` and the DP's
+        # `_relief_at` collapses to a single branch.
+        cands = [
+            replace(c, relief={"HBM": c.relief}) if isinstance(c, Pause) else c
+            for c in cands
+        ]
+        cands = [c for c in cands
+                 if any(b > 0
+                        for sub in c.relief.values()
+                        for b in sub.values())]
         bucket_size = {(tier, sp): state.pool_usage[tier]["subpools"][sp]["page_bytes"]
                        for (tier, sp) in (list(bytes_needed) + list(cap_left))}
         return knapsack_min_cost_multi(
@@ -1799,10 +1807,10 @@ def _dest_cap_axes(cap_left):                       # <= axes (destinations)
     return list(cap_left.keys())                    # [(DRAM, sp), (DISK, sp), ...]
 
 def _relief_at(c, tier, sp):
-    """Bytes the candidate frees on (tier, sp)."""
-    if isinstance(c, Pause):
-        return c.relief.get(tier, {}).get(sp, 0) if isinstance(c.relief.get(tier), dict) \
-               else (c.relief.get(sp, 0) if tier == "HBM" else 0)
+    """Bytes the candidate frees on (tier, sp).  Both Migrate and
+    Pause carry `relief: dict[Tier, dict[subpool, int]]` by the time
+    they reach the DP (joint_decide normalises Pause's flat
+    subpool dict into {HBM: relief} before calling)."""
     return c.relief.get(tier, {}).get(sp, 0)
 
 def _acquire_at(c, tier, sp):
