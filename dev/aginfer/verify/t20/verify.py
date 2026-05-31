@@ -333,6 +333,53 @@ def stage_9_action_id_echo() -> None:
            f"3 action_ids all echoed; reasons={list(seen.values())}")
 
 
+def stage_10_malformed_action_fails_loud() -> None:
+    """Audit D1/D2: missing required action fields must surface as a
+    loud error (HTTP 5xx or 4xx), NOT a silent ``noop_action`` skip.
+
+    Pre-fix: ``apply_aginfer_migrations`` used ``action.get("add_tiers",
+    [])`` etc., so a malformed POST became an action with empty sets
+    that triggered the ``noop_action`` skip branch — sglang returned
+    200 with applied=0, and the daemon's observability would never
+    surface the protocol break.
+
+    Contract: every action MUST carry hash + add_tiers + remove_tiers
+    + action_id (DESIGN §6 wire payload).  Any missing field is a
+    daemon-side bug worth surfacing — either as a 400 from the HTTP
+    envelope or a 500 from the scheduler-side KeyError.  Both are
+    acceptable; the failure mode being tested is "200 OK with a
+    silent noop skip".
+    """
+    # Two malformed variants — each should fail loud.  HTTP layer may
+    # convert KeyError to 500 or validate at envelope and return 400.
+    malformed_variants = [
+        # Missing add_tiers
+        {"hash": "node-9999", "remove_tiers": [], "action_id": "stage10-a"},
+        # Missing remove_tiers
+        {"hash": "node-9999", "add_tiers": [], "action_id": "stage10-b"},
+        # Missing action_id
+        {"hash": "node-9999", "add_tiers": [], "remove_tiers": []},
+    ]
+    for i, bad in enumerate(malformed_variants):
+        r = requests.post(f"{BASE}/aginfer/migrate",
+                          json={"actions": [bad]}, timeout=30)
+        if 200 <= r.status_code < 300:
+            # Inspect: if the body says noop_action, that's the silent
+            # swallow we want to catch.  If the body somehow processed
+            # the action correctly anyway (impossible with missing
+            # required field), still a contract violation.
+            body = r.json()
+            skipped = body.get("skipped", [])
+            reasons = [s.get("reason", "") for s in skipped]
+            raise SchemaMissing(
+                f"stage 10 variant {i} (missing {set(bad).symmetric_difference({'hash', 'add_tiers', 'remove_tiers', 'action_id'})!r}): "
+                f"server returned HTTP {r.status_code} (silent swallow); "
+                f"skip reasons={reasons!r}.  Expected 4xx/5xx so the "
+                f"daemon's malformed POST is loud.")
+    _print("Stage 10", True,
+           "3 malformed payload variants all rejected loud (≥400)")
+
+
 def main() -> int:
     print("=== T20 verify: POST /aginfer/migrate residence-set payload ===")
     print(f"base: {BASE}")
@@ -352,6 +399,7 @@ def main() -> int:
         stage_7_unknown_hash()
         stage_8_disk_in_add()
         stage_9_action_id_echo()
+        stage_10_malformed_action_fails_loud()
     except Exception as exc:
         print()
         print(f"=== T20 FAILED: {type(exc).__name__}: {exc} ===")

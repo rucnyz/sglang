@@ -372,6 +372,11 @@ class UnifiedRadixCache(BasePrefixCache):
             int, tuple[UnifiedTreeNode, Optional[DecLockRefParams]]
         ] = {}
         self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        # T24 — set of (id_a, id_b) hash-collision pairs already logged.
+        # Cached on the instance so a persistent collision doesn't spam
+        # the warning log every batch.  Populated by
+        # apply_aginfer_migrations.
+        self._aginfer_collision_seen: set[tuple[int, int]] = set()
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict = {}
@@ -2294,16 +2299,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 # actually share a key, which is O(1) per node).
                 existing = hash_to_node.get(key)
                 if existing is not None and existing is not node:
-                    # The HASH_COLLISION webhook lands in a follow-up
-                    # T24 commit; for now log the failure mode so
-                    # ops can grep for it.  Both nodes' node.id are
-                    # globally unique so the second one wins; T24
-                    # will replace this with the fatal() webhook.
-                    logger.warning(
-                        "[aginfer] HASH_COLLISION key=%s nodes %d vs %d "
-                        "(both will appear in /aginfer/state; T24 webhook "
-                        "not yet wired)", key, existing.id, node.id,
+                    # T24 follow-up wires the HASH_COLLISION webhook +
+                    # daemon fatal().  For now log once per (id_a, id_b)
+                    # pair so a persistent collision doesn't spam ~36k
+                    # lines/hour at 10 events/s.  Cache lives at
+                    # __init__: `self._aginfer_collision_seen`.
+                    pair = (
+                        (existing.id, node.id) if existing.id < node.id
+                        else (node.id, existing.id)
                     )
+                    if pair not in self._aginfer_collision_seen:
+                        self._aginfer_collision_seen.add(pair)
+                        logger.warning(
+                            "[aginfer] HASH_COLLISION key=%s nodes "
+                            "%d vs %d (T24 webhook pending)",
+                            key, existing.id, node.id,
+                        )
                 hash_to_node[key] = node
             stack.extend(node.children.values())
 
@@ -2326,10 +2337,15 @@ class UnifiedRadixCache(BasePrefixCache):
             skipped.append({"hash": h, "action_id": action_id, "reason": reason})
 
         for action in actions:
+            # Direct subscript: every action is contractually
+            # required to carry hash + add_tiers + remove_tiers +
+            # action_id (DESIGN §6 wire payload; verify/t20 enforces).
+            # Malformed POSTs surface as 500 → ops sees the schema
+            # break instead of silently being coerced to a noop.
             h = action["hash"]
-            action_id = action.get("action_id", "")
-            add_tiers = set(action.get("add_tiers", []))
-            remove_tiers = set(action.get("remove_tiers", []))
+            action_id = action["action_id"]
+            add_tiers = set(action["add_tiers"])
+            remove_tiers = set(action["remove_tiers"])
 
             # Validate tier strings.
             unknown_tiers = (add_tiers | remove_tiers) - _VALID_TIERS

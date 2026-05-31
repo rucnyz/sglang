@@ -708,16 +708,36 @@ async def aginfer_migrate(raw_request: Request):
                 f"{AGINFER_MAX_ACTIONS_PER_BATCH})"
             ),
         )
-    for _a in actions:
-        if isinstance(_a, dict):
-            _h = _a.get("hash")
-            if isinstance(_h, str) and len(_h) > AGINFER_MAX_HASH_LEN:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"hash too long ({len(_h)} > {AGINFER_MAX_HASH_LEN})"
-                    ),
-                )
+    # DESIGN §6 wire payload: each action MUST carry these four
+    # fields.  Validate at the HTTP boundary (where "fail loud" means
+    # 400, not "scheduler subprocess KeyError + crash") so a malformed
+    # daemon POST surfaces to ops without taking sglang down.
+    _AGINFER_REQUIRED_ACTION_FIELDS = (
+        "hash", "add_tiers", "remove_tiers", "action_id",
+    )
+    for _i, _a in enumerate(actions):
+        if not isinstance(_a, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"actions[{_i}] must be a dict, got "
+                       f"{type(_a).__name__}",
+            )
+        _missing = [f for f in _AGINFER_REQUIRED_ACTION_FIELDS
+                    if f not in _a]
+        if _missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"actions[{_i}] missing required field(s): "
+                       f"{_missing!r}",
+            )
+        _h = _a["hash"]
+        if isinstance(_h, str) and len(_h) > AGINFER_MAX_HASH_LEN:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"hash too long ({len(_h)} > {AGINFER_MAX_HASH_LEN})"
+                ),
+            )
     from sglang.srt.managers.io_struct import MigrateAginferReq
 
     responses = await _global_state.tokenizer_manager.migrate_aginfer(

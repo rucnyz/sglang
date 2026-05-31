@@ -150,10 +150,11 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         is identical across ranks (static deployment config); take
         rank-0.  Subpool key set must be identical across ranks
         (sglang's tree_components are TP-shared); ASSERT on mismatch.
-      * link_stats[link].peak_bw_bps: identical across ranks (static
-        deployment); take rank-0.
-      * link_stats[link].recent_throughput_bps: MEAN across ranks
-        (EMAs of independent per-rank links).
+      * link_stats[link].peak_bw_bps: SUM across ranks (DESIGN §6
+        line 731: each rank has its OWN PCIe link / NVMe queue;
+        aggregate peak scales with rank count).
+      * link_stats[link].recent_throughput_bps: SUM across ranks
+        (same reasoning — independent per-rank links).
       * link_stats[link].time_since_last_sample_s: MAX across ranks
         (the LONGEST idle window; admission's bw_free branch keys on
         the worst-case link).
@@ -218,19 +219,26 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         agg_pool[tier] = {"subpools": agg_subpools}
 
     # ---- link_stats ----
+    # DESIGN §6 line 731: peak_bw_bps AND recent_throughput_bps both
+    # SUM across ranks (each rank has its own PCIe/NVMe link;
+    # aggregate scales with rank count).  time_since_last_sample_s
+    # takes the MAX (the longest idle window across ranks; admission's
+    # bw_free branch should treat the link as idle only if EVERY rank
+    # has been idle).
     rank0_links = rank0["link_stats"]
     agg_links: Dict[str, Dict[str, float]] = {}
     for link in rank0_links:
-        peak_bw = int(rank0_links[link]["peak_bw_bps"])
+        total_peak = 0
         total_throughput = 0.0
         max_idle = 0.0
         for rank in per_rank:
             entry = rank["link_stats"][link]
+            total_peak += int(entry["peak_bw_bps"])
             total_throughput += float(entry["recent_throughput_bps"])
             max_idle = max(max_idle, float(entry["time_since_last_sample_s"]))
         agg_links[link] = {
-            "peak_bw_bps": peak_bw,
-            "recent_throughput_bps": total_throughput / len(per_rank),
+            "peak_bw_bps": total_peak,
+            "recent_throughput_bps": total_throughput,
             "time_since_last_sample_s": max_idle,
         }
 
@@ -860,13 +868,16 @@ class KvScheduler:
         # / race:not_in_tree / etc.).  Each line ≈ 1 µs, fires at most
         # `skipped` times per POST.
         for entry in skipped_list:
-            if isinstance(entry, dict):
-                reason = entry.get("reason", "?")
-                # Replace spaces with _ since metric format is space-sep.
-                _m(
-                    "migrate_skipped",
-                    reason=str(reason).replace(" ", "_")[:120],
-                )
+            # Direct subscript: sglang's /aginfer/migrate ALWAYS emits
+            # `reason` per DESIGN §6 + verify/t20 enforcement.  A
+            # missing field is a real protocol regression worth
+            # surfacing, not a silent "?" metric value.
+            reason = entry["reason"]
+            # Replace spaces with _ since metric format is space-sep.
+            _m(
+                "migrate_skipped",
+                reason=reason.replace(" ", "_")[:120],
+            )
 
 
 # ----------------------------------------------------------------- attach
