@@ -84,6 +84,8 @@ designing the fix.
 - Either trigger flips us back into a F3-revisit task to decide
   drop-on-full vs coalesce vs incremental-state.
 
+Open output: `verify/t14/README.md`.
+
 ### Hint table cross-rank divergence (DESIGN §6 "Hint consistency", round-8 H3)
 
 The eventual-consistent hint table is justified by the
@@ -96,14 +98,16 @@ under stale hints.  Test plan:
 - Log per-rank evicted-hash set per state-dump window
 - Compare sets; any divergence breaks the §6 invariant
 
-Open output: `verify/hint_cross_rank/README.md`.
+Open output: `verify/t15/README.md`.
 
-### bytes_at-doesn't-double-count (DESIGN §8 capacity_fits / re_use)
+### Coresidence budget — `re_use` no-double-count (DESIGN §8 capacity_fits / re_use)
 
 Verify post-fix B1: a paused program whose units are still
 HBM-resident (kept alive by other holders) has `re_use[sp] == 0`
 for those units.  Round-9 part 1 fixed the formula; this verifies
 the actual daemon code agrees.
+
+Open output: `verify/t16/README.md`.
 
 ## 3. sglang implementation work
 
@@ -277,6 +281,9 @@ Model: DeepSeek-V4-Flash (MLA).
 - 3-axis §9 DP ✓ baseline by construction
 - T9 / T11a / T12 / T13 all land on this scenario today
 
+Output: covered by existing T9 / T11 / T12 / T13 runs (no separate
+verify/ folder needed — this *is* the live benchmark).
+
 ### S2 — SWA-hybrid
 
 Model: Mistral / Gemma (any sglang-supported SWA hybrid).
@@ -286,6 +293,8 @@ Model: Mistral / Gemma (any sglang-supported SWA hybrid).
   unit's tokens age out of the sliding window
 - Verify pressure on SWA subpool fires `joint_decide` even when
   full-attention subpool is at < theta_hi
+
+Open output: `verify/t17/README.md` (S2 scenario verification).
 
 ### S3 — Mamba+attention hybrid
 
@@ -297,6 +306,8 @@ Model: Jamba / Zamba (any sglang-supported Mamba+attn hybrid).
 - Verify `forecast_inflight_demand["mamba"] == 0` between snapshot
   boundaries
 
+Open output: `verify/t18/README.md` (S3 scenario verification).
+
 ### S5 — Speculative decoding
 
 Model: Medusa / Eagle on any base model.
@@ -307,6 +318,8 @@ Model: Medusa / Eagle on any base model.
   buffer occupancy per program
 - Verify `pause_relief[draft]` for a spec-decoding program is the
   full discarded draft buffer
+
+Open output: `verify/t19/README.md` (S5 scenario verification).
 
 ### Multi-LoRA (out of scope)
 
