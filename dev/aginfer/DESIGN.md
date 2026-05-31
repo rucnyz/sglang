@@ -68,9 +68,9 @@ Three layers, three cadences (none of them periodic).
        │    D_t   ← decision_set(e.kind)                   │
        │    a_t   ← kv_scheduler.decide(state, D_t, e)     │
        │    POST /aginfer/migrate(a_t)                     │
+       │    program_tracker.advance(e)                     │
        │    admission.evaluate(state, e)                   │
-       │      # runs every event — its decision may change │
-       │      # at SESSION_ARRIVAL / TOOL_CALL_* / *PRESSURE* │
+       │      # runs every event (no internal timer)       │
        │                                                   │
        │  program_tracker — REASONING / ACTING / PAUSED   │
        │    state machine, driven from the same events     │
@@ -80,32 +80,35 @@ Three layers, three cadences (none of them periodic).
        ┌──────────────────────────────────────────────────┐
        │  sglang  (V4-Flash, TP=2, HiCache + Mooncake)     │
        │                                                   │
-       │  inline scorer (safety net)                       │
-       │    — runs inside `drive_eviction`                 │
-       │    — uses the same V_u rule with daemon-fed       │
-       │      lambda/p_hat hints if available, otherwise   │
-       │      cached LRU age                               │
+       │  inline scorer — V_u handler for the                │
+       │    sglang-internal alloc-failure event            │
+       │    (drive_eviction).  Same V_u rule as the daemon,│
+       │    uses daemon-fed lambda/p_hat hints when fresh. │
        │                                                   │
        │  admin endpoints:                                 │
        │    GET  /aginfer/state                            │
-      │    POST /aginfer/migrate                          │
+       │    POST /aginfer/migrate                          │
        │                                                   │
        │  outbound webhook (mandatory):                    │
        │    POST <daemon>/aginfer/event                    │
-       │    on every scheduler step, fire when the         │
-       │    allocator-truth HBM occupancy crosses          │
-       │    theta_hi up or back down                       │
+       │    on every scheduler step, fire on               │
+       │    OK↔HIGH (theta_hi) and HIGH↔OK (theta_lo)      │
+       │    transitions of allocator-truth HBM occupancy.  │
        └──────────────────────────────────────────────────┘
 ```
 
-| Layer | Where | Cadence | Decision granularity |
+| Layer | Where | Trigger event | Decision granularity |
 |---|---|---|---|
-| inline scorer | inside sglang's `drive_eviction` | every alloc-failure | eviction heap key for this one evict |
-| kv_scheduler | daemon | one per workload event | batch of `(hash, target_tier)` over D_t |
-| admission_controller | daemon | one per pressure event | per-program pause / resume |
+| inline scorer | inside sglang's `drive_eviction` | sglang-internal alloc-failure | eviction heap key for this one evict |
+| kv_scheduler | daemon | workload events (8 kinds, §4) | batch of `(hash, target_tier)` over D_t |
+| admission_controller | daemon | every workload event | per-program pause / resume |
 
-All three use the **same V_u rule**.  They differ in (a) what they
-can act on, (b) what visibility they have, (c) what triggers them.
+All three use the **same V_u rule**.  They live where they live
+because of **event ownership**, not as fallbacks for each other:
+the alloc-failure event is internal to sglang and not exposed over
+HTTP, so its V_u handler must live in-process; the 8 workload events
+are visible to the daemon's proxy / sglang webhook, so their V_u
+handlers live in the daemon.
 
 ## 4. Events
 
@@ -121,7 +124,7 @@ the system has no internal timer.
 | `SUB_DISPATCH_BLOCKING` | proxy | program dispatches a sync sub-agent |
 | `SUB_DISPATCH_ASYNC` | proxy | program dispatches an async sub-agent |
 | `MEMORY_PRESSURE` | sglang webhook | allocator-truth HBM occupancy crossed `theta_hi` upward |
-| `PRESSURE_RESOLVED` | sglang webhook | crossed `theta_hi` downward |
+| `PRESSURE_RESOLVED` | sglang webhook | allocator-truth HBM occupancy crossed `theta_lo` downward (hysteresis) |
 
 Each event carries (`kind`, `session_id` if applicable, `payload`).
 The payload may include event-specific context the decision rule can
@@ -240,7 +243,7 @@ _value(u, τ, state)     = p_hat × (reload_from_DROP - reload_from_τ)
 | event | D_t |
 |---|---|
 | `SESSION_ARRIVAL` | shared prefix units (preload before first prefill) |
-| `LLM_PREFILL` | ∅ (observation only; refresh program_tracker, no migrate) |
+| `LLM_PREFILL` | ∅ (no migrate; the event still advances `program_tracker` to REASONING and admission re-evaluates) |
 | `TOOL_CALL_START` | session tail units of the caller (demote candidate while idle) |
 | `TOOL_CALL_END` | session tail units of the caller (promote candidate, about to reuse) |
 | `SUB_DISPATCH_BLOCKING` | parent tail + shared prefix |
@@ -250,17 +253,16 @@ _value(u, τ, state)     = p_hat × (reload_from_DROP - reload_from_τ)
 
 ### Inputs to `_net_value`
 
-`_net_value` is parameterised by four quantities.  The ideal
-estimator for each is below; the current implementation uses crude
-proxies and is acknowledged as the highest-value future improvement.
-Replacing them **must not require changing `decide()` or the event /
-D_t contract** — the system is parameterised on these inputs.
+`_net_value` takes four quantities defined below.  The system is
+parameterised on these inputs; any replacement estimator must fit
+this interface without changing `decide()` or the event / D_t
+contract.
 
 #### `p_hat(u, Δt)` — probability u is accessed within Δt
 
-A unit's reuse probability is **conditional on the observable state
-of its holders**, not the output of a stochastic process fit to its
-history.  Per holder s ∈ `u.session_ids`:
+A unit's reuse probability is the **disjunction over its holders'
+access probabilities, each conditional on that holder's observable
+program state**.  Per holder s ∈ `u.session_ids`:
 
 ```
 p_access(u, s, Δt)  depends on s.program_state:
@@ -278,47 +280,62 @@ Aggregated across independent holders:
 p_hat(u, Δt) = 1 - ∏_{s ∈ u.session_ids} (1 - p_access(u, s, Δt))
 ```
 
-Why this beats "fit a Poisson / Hawkes rate":
+Three consequences fall out of this definition:
 
-* PAUSED holders' contribution is *exactly zero* — the admission
-  controller's decisions feed directly into V_u, no warm-up period
+* PAUSED holders contribute exactly zero — admission's decisions
+  feed straight into the next V_u, no warm-up.
 * Shared prefix held by N concurrent programs aggregates correctly
-  via the product (no ad-hoc "1/N weighting") — high |session_ids|
-  → at-least-one-holder probability → near 1 → stays HBM
-* ACTING holders' p depends on the **specific tool's ETA**, not a
-  per-unit static rate — long tool ⇒ low near-term p ⇒ demote
-  becomes profitable
+  via the product — no ad-hoc `1/N` weighting needed.
+* ACTING holders' contribution depends on the **specific tool's
+  ETA**, not a per-unit static rate.
 
-The Poisson formulation collapses all of this into one scalar λ,
-discarding the holder-state information the daemon already has.
-First-principles ideal exploits the observables; the rate-fit is a
-lossy summarisation.
+`Δt` is **the candidate decision's `hold_time`** — the same number
+fed in as the cost-side `hold_time` (below), not a separate input.
 
-| input | ideal | current implementation |
-|---|---|---|
-| `p_hat(u, Δt)` | conditional-on-holder-state product above, with tool ETA from event payload | `min(1.0, hits / age)` proxy |
-| `hold_time` for *this* decision | per-event physical ETA (see "Event-specific context" below) | `1 / λ(u)` per-unit constant |
-| `h_τ(occupancy)` — per-byte holding cost at tier τ | live: marginal cost of a free byte at τ, observable from the allocator's pressure trajectory | static `cost × (1 + occupancy²)` |
-| `bw_free(σ, τ)` — free σ↔τ link bandwidth | live measurement on the actual transfer path | static config default |
+> *Note:* Common stochastic-process formulations (Poisson / Hawkes
+> rate fit) collapse all of the holder-state information into a
+> single λ; this formulation does not because the holder state is
+> directly observable.
+
+#### `hold_time` — duration the candidate decision is being scored over
+
+For a transfer decision the scheduler is right now considering,
+`hold_time` is the **physical time window the unit would stay in
+the candidate tier** before its next likely access.  When an event
+carries a per-decision ETA (e.g. `TOOL_CALL_START` payload includes
+the tool's expected duration), the scheduler **must** use it as
+`hold_time` — the daemon's per-unit average is not a substitute
+when a sharper per-event signal exists.
+
+* short ETA → transfer round-trip > savings → don't demote
+* long ETA → demote profits
+
+#### `h_τ(occupancy)` — per-byte holding cost at tier τ
+
+Cost ∝ marginal value of a free byte at τ, observable from the
+allocator's recent pressure trajectory.  Same allocator-truth view
+the admission controller reads (§5 `pool_usage`).
+
+#### `bw_free(σ, τ)` — free bandwidth on σ↔τ link
+
+Live bytes-per-second idle on the physical transfer path.
 
 ### Event-specific context
 
-Events carry decision-relevant context the rule must use beyond a
-unit's intrinsic state.  Concrete cases:
+The event payload may carry decision-relevant context the rule
+must exploit beyond a unit's intrinsic state.  Concrete cases:
 
 * **`TOOL_CALL_START`** carries the tool's expected duration (tool
-  registry lookup or historical mean per tool name).  This is the
-  `Δt` plugged into `p_hat` *and* the `hold_time` for the demote
-  decision being considered right now.  Short ETA → transfer
-  round-trip > savings → don't demote.  Long ETA → demote profits.
+  registry lookup or historical mean per tool name).  The scheduler
+  plugs this as `hold_time` for every demote decision over the
+  caller's session tail.
 * **`SUB_DISPATCH_*`** carries whether the sub-agent inherits the
   parent's prefix — drives which units in D_t need to stay HBM
   vs are safe to demote.
 
-The principle: `hold_time` is a **per-decision physical quantity**,
-not a per-unit invariant.  Per-unit lambda is the right input only
-in absence of per-event context; when the event carries it, the
-scheduler must use it.
+`hold_time` is a **per-decision physical quantity**, not a per-unit
+invariant.  Per-unit averages are an acceptable input only when no
+per-event signal exists.
 
 ## 8. Admission
 
@@ -328,21 +345,16 @@ paused and which paused programs resumed?".  It must run on **every
 event whose information could change that answer**, not just on a
 single "pressure crossed" trigger.
 
-### Triggers (first-principles)
+### Triggers
 
 | event | why admission's decision can change |
 |---|---|
 | `SESSION_ARRIVAL` | new program enters → expected HBM demand rises; if free capacity < forecast demand, **pre-pause** a low-V_u program before contention starts (proactive) |
+| `LLM_PREFILL` | program-state advances to REASONING; the inputs to `V_u_program` for that program have changed |
 | `TOOL_CALL_START` | program voluntarily idles → **pause cost ≈ 0** at this moment (no reasoning state is being interrupted); the cheapest possible time to free this program's HBM if its V_u is low |
 | `TOOL_CALL_END` | program returns and must reason → reconsider whether any currently-paused program now outranks one of the actives that just came back |
-| `MEMORY_PRESSURE` | sglang reports allocator at `theta_hi` → reactive pause (already late; should be rare if proactive triggers do their job) |
-| `PRESSURE_RESOLVED` | allocator drops below `theta_lo` → consider resuming paused programs in V_u order |
-| `SUB_DISPATCH_*` | sub-agent dispatch changes the dependency structure between programs; may affect pause eligibility |
-
-The four "reactive" triggers (the last four) match what the paper
-specifies.  The two "proactive" triggers (`SESSION_ARRIVAL`,
-`TOOL_CALL_START`) are the first-principles extension: admission's
-decision changes at those moments too, so it must evaluate.
+| `MEMORY_PRESSURE` | sglang reports allocator at `theta_hi` → reactive pause |
+| `PRESSURE_RESOLVED` | allocator dropped below `theta_lo` → consider resuming paused programs in V_u order |
 
 ### Decision rule (one definition; reused per trigger)
 
@@ -374,21 +386,18 @@ def admission_evaluate(state):
   programs' units already contribute 0 to V_u, so PAUSED programs
   naturally sort to the bottom of resume priority.
 
-### Why aggregation isn't `Σ V_u / |session_ids|` anymore
+### Program aggregation
 
-Earlier formulations had a `1/|session_ids|` weight on each unit
-to prevent shared-prefix double-counting across programs.  Under
-the conditional p_hat formulation (§7), this is built in: the
-product over holders already handles attribution correctly.  No
-extra weight needed.
+`V_u_program(p) = Σ_{u ∈ p.units} V_u(u)`.  No `1/|session_ids|`
+weight is needed: the conditional p_hat from §7 is already a
+holder-product, so shared-prefix attribution is built in.
 
 ### Threshold parity
 
-`theta_hi` and `theta_lo` are sglang/daemon-shared constants
-(currently 0.85 / 0.70).  sglang's webhook uses `theta_hi` as its
-OK↔HIGH threshold, so when MEMORY_PRESSURE fires, the daemon
-agrees pressure has actually crossed.  Both ends must be launched
-from the same value — enforced by the launch contract (§10).
+`theta_hi` (up-crossing) and `theta_lo` (down-crossing) form the
+admission hysteresis band.  sglang's webhook and the daemon's
+admission controller must read the SAME values; this is launched
+from a single source per the §10 invariant.
 
 ## 9. Why two channels (unit migrate + program pause)
 
@@ -414,57 +423,11 @@ purely for code clarity.
 
 | invariant | enforced by |
 |---|---|
-| **Single-worker event loop**: handlers serialised; no concurrent migrate races | asyncio queue + single consumer |
+| **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer for any layer (kv_scheduler, admission, forecast refresh) — every recomputation is on event arrival | asyncio queue + single consumer |
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
 | **Idempotent migrate**: re-applying the same action returns 200 with `applied=0` and a `race:*` skip | sglang `apply_aginfer_migrations` |
-| **Threshold parity**: sglang's `--aginfer-theta-hi` and daemon's admission `theta_hi` are launched from the same value (currently 0.85) | launch scripts pass aligned flags |
-| **Webhook mandatory**: sglang's launch scripts always pass `--aginfer-notify-url`; admission's trigger path is not optional | `launch_sglang_v4flash*.sh` |
+| **Threshold parity**: `theta_hi` and `theta_lo` are sourced from a single config; sglang's webhook and daemon's admission controller never read divergent values | launch scripts pass aligned `--aginfer-theta-*` flags |
+| **Webhook mandatory**: sglang's launch contract always passes `--aginfer-notify-url`; the admission trigger path is not optional | `launch_sglang_v4flash*.sh` |
 | **Pool-truth admission**: admission reads `pool_usage.HBM.token_usage`, not `tier_usage` | daemon `admission_controller._hbm_occ` |
 | **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
-| **Inline-scorer safety net**: if the daemon is down or unreachable, sglang's eviction still uses the V_u rule via its inline scorer | `SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:ours_greedy_score` |
-
-## 11. Failure modes
-
-The system is designed so any single failure degrades to a
-well-defined floor:
-
-| failure | system degrades to |
-|---|---|
-| daemon process down | sglang's inline scorer alone (V_u rule, no program-level admission) |
-| daemon up but `/aginfer/state` slow | event handler skips this round (no migrate); next event retries |
-| daemon up but `/aginfer/migrate` 5xx | log + continue; the same hash is re-considered on the next event |
-| webhook POST fails (network) | sglang retries 3× with exponential backoff; eventually drops |
-| sglang scheduler crashes (subprocess exit) | watchdog restarts; daemon detects via /aginfer/state probe and re-syncs |
-| inline scorer module fails to load | sglang halts at startup with a structured `kv_policy_loaded` error line — launch scripts grep and fail loudly |
-| daemon thresholds drift from sglang's | webhook fires at sglang's `theta_hi` but daemon ignores below daemon's `theta_hi`; the launch contract prevents this by sourcing both from the same value |
-
-Every layer is **independently disable-able** without breaking the
-others — admission off + kv_scheduler on, HiCache off + admission
-on, etc.  The composition is multiplicative in win, not in
-correctness; turning a layer off only forfeits its incremental
-contribution.
-
-## 12. Where this design departs from prior work
-
-Beyond the obvious (separate scheduler from engine), three choices
-are non-obvious and intentional:
-
-1. **Two-view occupancy.**  Standard cache schedulers conflate
-   "what's in the cache structure" with "what the allocator says
-   is full".  Agentic workloads diverge sharply between the two
-   because in-flight decode KV inflates allocator pressure without
-   appearing in the prefix tree.  Aginfer keeps both views
-   addressable and routes each consumer to the correct one.
-
-2. **Event-driven, not timer-driven.**  Polling at 5 s (TA-style)
-   adds a configurable knob that always has wrong answers somewhere.
-   Per-event reaction has no knob and lower latency at every load
-   level.  The only event kinds not derivable from proxy state
-   come from sglang via a mandatory webhook.
-
-3. **Per-event decision set.**  The event already names a program
-   and the program's recent state, so D_t doesn't need to scan
-   all units — the event carries the right scope for free.  Plus
-   event-specific context (ETA, sub-agent dispatch type) can
-   inform the decision rule's per-decision parameters, not just
-   which units to score.
+| **Layer-disableable**: kv_scheduler, admission, and HiCache each have an independent enable flag; turning one off forfeits only its contribution, never breaks the others | daemon CLI + sglang flags |
