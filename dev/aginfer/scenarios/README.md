@@ -26,15 +26,15 @@ Structure of every scenario folder:
 
 | folder | workload | status |
 |---|---|---|
-| [`swebench_default/`](swebench_default/) | swebench-pro/terminus-2 + default sglang (no caps, 10 M pool) | DONE — 4-arm N=3 |
-| [`hbm_pressure/`](hbm_pressure/) | + `--max-completion-tokens 4096` + `--max-total-tokens 262144` (256 K KV pool) | PARTIAL — ours_full v3–v9; LRU/TA/ours_inline TODO |
-| [`high_concurrency/`](high_concurrency/) | + bs ≥ 80, `--max-completion-tokens 8192` (TA's own strong-gain regime) | PLAN |
+| [`1_swebench_default/`](1_swebench_default/) | swebench-pro/terminus-2 + default sglang (no caps, 10 M pool) | DONE — 4-arm N=3 |
+| [`2_hbm_pressure/`](2_hbm_pressure/) | + `--max-completion-tokens 4096` + `--max-total-tokens 262144` (256 K KV pool) | PARTIAL — ours_full v3–v9; LRU/TA/ours_inline TODO |
+| [`3_high_concurrency/`](3_high_concurrency/) | + bs ≥ 80, `--max-completion-tokens 8192` (TA's own strong-gain regime) | PLAN |
 
 ### Ablations (config slice within one workload)
 
 | folder | what's varied | status |
 |---|---|---|
-| [`ablation/daemon_overhead/`](ablation/daemon_overhead/) | direct sglang vs OURS_full on `swebench_default` workload | DONE — N=3 each |
+| [`4_ablation/daemon_overhead/`](4_ablation/daemon_overhead/) | direct sglang vs OURS_full on `swebench_default` workload | DONE — N=3 each |
 
 ### Cross-cutting
 
@@ -46,11 +46,11 @@ Structure of every scenario folder:
 
 ## Recommended reading order
 
-1. [`swebench_default/ANALYSIS.md`](swebench_default/ANALYSIS.md) — paper §8 4-arm baseline result
-2. [`hbm_pressure/PLAN.md`](hbm_pressure/PLAN.md) + [`hbm_pressure/arms/ours_full/RESULTS.md`](hbm_pressure/arms/ours_full/RESULTS.md) — paper §3 promote evidence
+1. [`1_swebench_default/ANALYSIS.md`](1_swebench_default/ANALYSIS.md) — paper §8 4-arm baseline result
+2. [`2_hbm_pressure/PLAN.md`](2_hbm_pressure/PLAN.md) + [`2_hbm_pressure/arms/ours_full/RESULTS.md`](2_hbm_pressure/arms/ours_full/RESULTS.md) — paper §3 promote evidence
 3. [`experiments_notes/runaway_tail.md`](experiments_notes/runaway_tail.md) — why §8 N=3 gain is bounded
 4. [`experiments_notes/GAPS.md`](experiments_notes/GAPS.md) — what's still untested
-5. [`ablation/daemon_overhead/ANALYSIS.md`](ablation/daemon_overhead/ANALYSIS.md) — daemon's net runtime cost
+5. [`4_ablation/daemon_overhead/ANALYSIS.md`](4_ablation/daemon_overhead/ANALYSIS.md) — daemon's net runtime cost
 
 ## Methodology
 

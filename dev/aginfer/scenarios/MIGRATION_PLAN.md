@@ -29,10 +29,10 @@ scenarios/
 
 | Old | New | Note |
 |---|---|---|
-| `verify/t9/results/N3_matrix_SUMMARY.md` | `scenarios/swebench_default/_archive/N3_matrix_SUMMARY.md` | superseded by 4arm; keep for history |
-| `verify/t9/results/N3_4arm_SUMMARY.md` | `scenarios/swebench_default/ANALYSIS.md` | becomes canonical |
-| `verify/t9/results/N3_A3_PLAN.md` | `scenarios/hbm_pressure/PLAN.md` | hbm_pressure design rationale |
-| `verify/t9/results/N3_A3_RESULT.md` | `scenarios/hbm_pressure/arms/ours_full/RESULTS.md` | A3 v3-v9 timeline + result |
+| `verify/t9/results/N3_matrix_SUMMARY.md` | `scenarios/1_swebench_default/_archive/N3_matrix_SUMMARY.md` | superseded by 4arm; keep for history |
+| `verify/t9/results/N3_4arm_SUMMARY.md` | `scenarios/1_swebench_default/ANALYSIS.md` | becomes canonical |
+| `verify/t9/results/N3_A3_PLAN.md` | `scenarios/2_hbm_pressure/PLAN.md` | hbm_pressure design rationale |
+| `verify/t9/results/N3_A3_RESULT.md` | `scenarios/2_hbm_pressure/arms/ours_full/RESULTS.md` | A3 v3-v9 timeline + result |
 | `verify/t9/results/N3_A3_ASSERT_HYPOTHESIS.md` | `scenarios/experiments_notes/swa_assert_hypothesis.md` | debug note |
 | `verify/t9/results/N3_GAPS.md` | `scenarios/experiments_notes/GAPS.md` | G-catalog |
 | `verify/t9/results/N3_INSTRUMENT_FINDINGS.md` | `scenarios/experiments_notes/instrument_chain.md` | observability story |
@@ -44,11 +44,11 @@ scenarios/
 | Old | New | Note |
 |---|---|---|
 | `verify/t9/run_k.sh` | `scenarios/_shared/run_k.sh` | core variant runner (used by all scenarios via wrappers) |
-| `verify/t9/run_a3_repeat.sh` | `scenarios/hbm_pressure/repro.sh` | rename to repro.sh |
-| `verify/t9/run_4arm_matrix.sh` | `scenarios/swebench_default/repro.sh` | rename |
+| `verify/t9/run_a3_repeat.sh` | `scenarios/2_hbm_pressure/repro.sh` | rename to repro.sh |
+| `verify/t9/run_4arm_matrix.sh` | `scenarios/1_swebench_default/repro.sh` | rename |
 | `verify/t9/run_thunderagent.sh` | `scenarios/_shared/run_thunderagent.sh` | TA arm launcher |
-| `verify/t9/run_h_prime.sh` | `scenarios/ablation/daemon_overhead/run_direct.sh` | direct sglang arm |
-| `verify/t9/run_h_prime_matrix.sh` | `scenarios/ablation/daemon_overhead/repro.sh` | rename |
+| `verify/t9/run_h_prime.sh` | `scenarios/4_ablation/daemon_overhead/run_direct.sh` | direct sglang arm |
+| `verify/t9/run_h_prime_matrix.sh` | `scenarios/4_ablation/daemon_overhead/repro.sh` | rename |
 | `verify/t9/run_lru.sh` | `scenarios/_shared/run_lru.sh` | LRU arm launcher |
 | `verify/t9/run_matrix.sh` | `scenarios/_shared/run_matrix.sh` | superseded; keep for ref |
 | `verify/t9/run_extend_2cycle.sh` | `scenarios/_shared/run_extend_2cycle.sh` | N-extension helper |
@@ -67,7 +67,7 @@ verification README + the README's "Open work" pointer to
 (`results/run_K_*` etc — not in git, just `mv` and they appear
 untracked in the new path.)
 
-### → `swebench_default/arms/lru/cycles/`
+### → `1_swebench_default/arms/lru/cycles/`
 
 | Old | New |
 |---|---|
@@ -76,7 +76,7 @@ untracked in the new path.)
 | `run_LRU_now_matrix_20260527_204352_cycle5_lru` | `cycle5` |
 | `run_LRU_now_extend_20260529_190235_cycle2_lru` | `extend_cycle2` |
 
-### → `swebench_default/arms/ta/cycles/`
+### → `1_swebench_default/arms/ta/cycles/`
 
 | Old | New |
 |---|---|
@@ -84,7 +84,7 @@ untracked in the new path.)
 | `run_TA_now_matrix_20260527_204352_cycle4_ta` | `cycle4` |
 | `run_TA_now_matrix_20260527_204352_cycle6_ta` | `cycle6` |
 
-### → `swebench_default/arms/ours_full/cycles/`
+### → `1_swebench_default/arms/ours_full/cycles/`
 
 | Old | New |
 |---|---|
@@ -93,7 +93,7 @@ untracked in the new path.)
 | `run_K_full_matrix_20260526_234639_cycle6_ours` | `cycle6` |
 | `run_K_full_extend_20260529_190235_cycle1_ours` | `extend_cycle1` |
 
-### → `swebench_default/arms/ours_inline/cycles/` (kv_off = ours_inline only)
+### → `1_swebench_default/arms/ours_inline/cycles/` (kv_off = ours_inline only)
 
 | Old | New |
 |---|---|
@@ -101,7 +101,7 @@ untracked in the new path.)
 | `run_K_kv_off_matrix_20260526_234639_cycle3_baseline` | `cycle3` |
 | `run_K_kv_off_matrix_20260526_234639_cycle5_baseline` | `cycle5` |
 
-### → `hbm_pressure/arms/ours_full/cycles/`
+### → `2_hbm_pressure/arms/ours_full/cycles/`
 
 | Old | New | Note |
 |---|---|---|
@@ -113,7 +113,7 @@ untracked in the new path.)
 | `run_K_a3_a3_finegrain_231318` | `v8_finegrain_decline` | category-tagged decline |
 | `run_K_a3_a3_controller_root_000608` | `v9_controller_root` | C-deeper bucketing |
 
-### → `ablation/daemon_overhead/arms/direct_sglang/cycles/`
+### → `4_ablation/daemon_overhead/arms/direct_sglang/cycles/`
 
 | Old | New |
 |---|---|
@@ -121,9 +121,9 @@ untracked in the new path.)
 | `run_H_prime_now_matrix_20260527_153233_cycle2` | `cycle2` |
 | `run_H_prime_now_matrix_20260527_153233_cycle3` | `cycle3` |
 
-### → `ablation/daemon_overhead/arms/with_daemon/cycles/`
+### → `4_ablation/daemon_overhead/arms/with_daemon/cycles/`
 
-Symlink to `swebench_default/arms/ours_full/cycles/{cycle2,cycle4,cycle6}`
+Symlink to `1_swebench_default/arms/ours_full/cycles/{cycle2,cycle4,cycle6}`
 (same data, same workload — no duplication).
 
 ### → `experiments_notes/` (data evidence for findings, not cycles)
