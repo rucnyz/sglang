@@ -274,6 +274,90 @@ sglang HiCache SWA-pool weakness under pressure.  Re-investigate
 only if rate climbs (e.g. higher concurrency in A4 stress regime
 might push it).
 
+### 2026-05-31: v10 — G10 fix (allocator-truth pool_usage)
+
+`/aginfer/state` now carries top-level `pool_usage` field that
+mirrors sglang's own `full_token_usage` metric
+(`(pool_size − available − evictable) / pool_size`, with SWA
+hybrid sub-pool aware: `max(full_token_usage, swa_token_usage)`).
+`SchedulerState.pool_pressure[HBM]` plumbs the value through;
+`admission_controller._hbm_occ` prefers it over the radix-tree-
+keyed `tier_usage` (which stays ~0 because in-flight decode KV
+isn't in the tree → root cause of G10).
+
+**Daemon-side HBM visibility, before vs after G10**:
+
+| metric | v3-v9 (pre-G10) | v10 (post-G10) |
+|---|---|---|
+| `state_fetched.occ_hbm` max | **0.000** | **1.000** |
+| `state_fetched.occ_hbm` p50 | 0.000 | **0.431** |
+| samples ≥ 0.70 (sglang pressure threshold) | 0 | 4 218 (23.2 %) |
+| samples ≥ 0.85 (admission threshold) | 0 | 618 (3.4 %) |
+| applied promotes | 1 510 (v9) | **4 999** (3.3 ×) |
+| skip rate | 0.13 % | 0.40 % (still ≤ 1 %) |
+| per-trial mean (n=32) | 1107–1257 (range) | **1 184.8 ± 679.9** s |
+
+The 3.3 × jump in applied promotes is because kv_scheduler's V_u
+sees HBM cost correctly rising/falling now, so it dispatches more
+DRAM→HBM moves when room exists and more HBM→DRAM demotes when
+it doesn't.  Wall-time mean stays within A3 noise — the inline
+scorer already covered the easy wins; daemon's marginal
+contribution is small but consistent.
+
+### Honest reflection on "is G10 the ideal fix?"
+
+The G10 fix is option (a) from `experiments_notes/GAPS.md`: emit
+allocator-truth `pool_usage` alongside the radix-tree `tier_usage`,
+key admission gating on the new field.  The two views serve two
+distinct purposes and **should** stay separate:
+
+| view | use | why |
+|---|---|---|
+| `tier_usage` (radix tree) | V_u migration value scoring (paper §7) | V_u acts on tree nodes; HBM cost should reflect what the daemon CAN migrate, not in-flight decode it can't touch |
+| `pool_usage` (allocator) | admission gating (paper §3 admission controller) | admission decides whether to throttle whole programs — the relevant pressure is real allocator pressure, not tree contents |
+
+Mixing them would either (a) make V_u over-eager (think HBM is
+free when it's actually full with decode) or (b) make admission
+fire on tree size which has nothing to do with whether new
+requests can be admitted.  So the two-view split is the
+**theoretically correct** design, not a workaround.
+
+### 2026-05-31: open — admission STILL not firing (G2/G6, separate bug)
+
+```
+admission_controller pauses          : 0
+admission_controller resumes         : 0
+memory_pressure events received      : 0
+pressure_resolved events received    : 0
+sglang_v4flash.log "memory_pressure" : 0 occurrences
+```
+
+Despite daemon now seeing `occ_hbm = 1.000` at peak and 618 state
+samples ≥ 0.85, **admission never fires**.  Root cause:
+`admission_controller` is bound to sglang's `MEMORY_PRESSURE`
+webhook (event-driven), and **sglang never emits that webhook in
+this workload** (zero matches in sglang log).
+
+This is a separate bug from G10:
+
+| bug | what | status |
+|---|---|---|
+| **G10** | daemon's HBM occ stuck at 0 because read from radix tree | **FIXED** 2026-05-31 (this cycle) |
+| **G2/G6** | sglang's `memory_pressure` webhook doesn't emit | OPEN |
+
+Two paths to close G2/G6:
+
+* **(a) fix sglang webhook firing** — investigate why pressure
+  events aren't emitted even though allocator hits 0.70+ sustained.
+  Closer to the original design (sglang owns pressure detection,
+  pushes to daemon).
+* **(b) add polled trigger on the daemon side** — admission already
+  receives a state-poll occ on every event; let it act when
+  state.pool_pressure[HBM] ≥ theta_hi even without a webhook event.
+  Faster to ship, defensive against sglang webhook churn.
+
+Path TBD with user.
+
 ## Files
 
 * sglang patch: `python/sglang/srt/mem_cache/unified_radix_cache.py`
