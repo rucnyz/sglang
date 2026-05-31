@@ -545,10 +545,14 @@ startup coupling:
    bug; sglang refuses with an explicit error.
 2. **Daemon-side update broadcast.**  When the daemon's threshold
    config changes at runtime (operator restart with new defaults,
-   reload via signal), the daemon `POST`s the new values to
-   sglang's `PUT /aginfer/thresholds` endpoint and waits for ack
-   before considering the change applied.  Sglang updates its
-   cache file atomically.
+   reload via signal), the daemon enqueues a `PUT /aginfer/thresholds`
+   onto its outbound queue (§6 "Fire-and-forget delivery") — handler
+   returns immediately, the outbound worker issues the HTTP.  Sglang
+   updates its cache file atomically on receipt.  Until the broadcast
+   propagates (≪ event interval typically), sglang and daemon may
+   transiently disagree by one update; the next state-fetch reconciles.
+   If the apply fails, sglang fires `APPLY_FAILED` (§4) and the
+   daemon's next handler re-enqueues.
 3. **Mismatch is loud.**  If an operator passes `--aginfer-theta-*`
    to sglang AND the value disagrees with the daemon's view at the
    time of bootstrap fetch, sglang halts.  The daemon's view wins;
