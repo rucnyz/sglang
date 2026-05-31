@@ -1,25 +1,27 @@
-# T6 — program_tracker state machine
+# program_tracker state machine (daemon infra)
 
-## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
-
-> See also `verify/t9/results/N3_GAPS.md` for the cross-T catalog
-> of unmet ideals.
-
-* **No `ENDED` state.**  Tracker has only REASONING / ACTING /
-  PAUSED.  `state(pid)` returns `None` ONLY for never-observed
-  programs; a 200-turn trial that fully completed still shows as
-  ACTING forever.  No `mark_ended(pid)` API.
-* **`EventBus.forget(pid)` is a placeholder.**  Code comment says
-  *"v1 doesn't call this yet"*; called by nothing.
-* **No `SESSION_END` event kind.**  paper §4 has 8 events; we emit
-  6 + sglang webhook 2; there's no end-of-program signal at all.
-* **Consequence for T11a `program-alive` rule**: the rule keys on
-  `state(pid) is not None`, which over-counts dead programs as
-  alive.  Bounded over-estimation by N=trials, but it's a real
-  semantic hole.
-* **Ideal fix**: add `SESSION_END` `EventKind` + harbor / proxy
-  emit on connection close or trial-completion → tracker
-  `mark_ended(pid)` + `EventBus.forget(pid)`.
+> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> task.  Guards `daemon/program_tracker.py` — the per-program FSM
+> consumed by the proxy gate + admission_controller + T33's
+> program-alive rule in `build_paper_state`.
+>
+> **OPEN WORK (T41 dependency):** tracker currently has REASONING /
+> ACTING / PAUSED only; no `ENDED` state.  `state(pid)` returns
+> `None` ONLY for never-observed programs; a 200-turn trial that
+> fully completed still shows as ACTING forever.  Consequence:
+> T33's program-alive rule (`p_hat = 1.0` if `state(pid) is not
+> None`) over-counts dead programs as alive — bounded by N=trials
+> but a real semantic hole.
+>
+> Closing this needs:
+>   - **T31** (PLAN §3) — `SESSION_END` `EventKind` + harbor /
+>     proxy emit on connection close or trial completion.  PENDING.
+>   - **T41** (PLAN §4) — `mark_ended(pid)` API on tracker +
+>     `EventBus.forget(pid)` wired from the SESSION_END handler.
+>     PENDING.
+>
+> When T41 lands, add probes here for the ENDED transition + the
+> `program-alive` rule's correct "no longer alive" classification.
 
 ## WHAT WE PROMISED
 

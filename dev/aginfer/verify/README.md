@@ -63,7 +63,7 @@ Each task lives in its own folder `tN/` with:
 | 1 | T17 | state-dump schema upgrade (DESIGN §5) — was `t1` | [`t17/`](t17/) | **passed** (2026-05-31, all 9 stages + post-audit hardening; aggregate p99 @ 5K nodes = 28.5 ms) |
 | 2 | T20 | `POST /aginfer/migrate` (residence-set) — was `t2` | [`t2/`](t2/) | _pending refresh — slated for #134_ |
 | 3 | (infra) | session_id passthrough into tree nodes | [`session_id_passthrough/`](session_id_passthrough/) | **passed** (2026-05-31 post-T17 schema; 14 verify steps + 3-section regression probe) |
-| **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6/`](t6/) | **passed** (2026-05-26, audit round-1 done, 10 verify steps in ~60 ms) |
+| 4 | (infra) | program_tracker state machine | [`program_tracker/`](program_tracker/) | **passed** (2026-05-31 post-T33; 10 verify steps in 213 ms) |
 | 5 | (infra) | daemon proxy + paper §4 event emission | [`daemon_proxy_events/`](daemon_proxy_events/) | **passed** (2026-05-31 post-T33; 12 steps + 4 recovery probes; proxy overhead p50=1.49 ± 0.01 ms) |
 | 6 | (infra) | sglang→daemon webhook + daemon event router | [`daemon_webhook_router/`](daemon_webhook_router/) | **passed** (2026-05-31 post-T33; Layer A 11 steps; arrival→handler p50=0.80 ± 0.01 ms) |
 | 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | **passed** (2026-05-26, 13 verify steps + 22 bisect probes across 5 audit rounds; ~510 LoC daemon code; build 2.7 ms / decide 1.4 ms @ 1k units) |
