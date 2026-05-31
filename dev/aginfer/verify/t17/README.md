@@ -187,37 +187,81 @@ kill "$SGLANG_PID"
 
 ## RESULTS
 
-**PASSED** — all 9 stages on a fresh Qwen3-0.6B + HiCache launch.
+**PASSED** — all 9 stages on a fresh Qwen3-0.6B + HiCache launch,
+after subagent audit hardened 5 assertions.
 
 * date: 2026-05-31
 * model: Qwen/Qwen3-0.6B, flashinfer backend, HiCache write_through,
   cap 64 K tokens, GPU 5
 * lines added: ~520 in `unified_radix_cache.py` (4 new helpers + dict /
   bytes dump paths split); 20 lines simplified in `scheduler.py`
-  unsupported-cache fallback
-* Stage results:
+  unsupported-cache fallback; ~80 lines of test tightening after audit
+* Stage results (post-audit):
   | Stage | Result |
   |---|---|
   | 0  strict-parser negative | PASS |
   | 1  initial shape | PASS |
   | 2  single-unit attribution | PASS — 1 program, residence ⊇ {HBM} |
-  | 3  residence-set transitions | PASS — saw `[HBM, DRAM]` after write_through |
-  | 4  S1 subpool degeneracy | PASS — `Σ unit.n_bytes ≤ pool_used` per (tier, sp) |
-  | 5  multi-holder 1/holders | PASS — 4-program shared prefix attributed correctly |
-  | 6a perf @ 5 K tree (asserted) | PASS — mean p99 = 45.4 ± 5.3 ms (budget 50 ms) |
-  | 6b perf @ 17 K tree (informational) | p50 = 104 ms, p99 = 127 ms — within Gen-2 GC ceiling |
-  | 7  concurrent stress (5 walkers + 32 chats × 30 s) | PASS — 356 walks, 0 schema failures |
-  | 8  link / holding / ema shape | PASS (throughput_ema = 0 cold-start as expected) |
+  | 3  residence-set transitions | PASS — saw `[HBM, DRAM]` after write_through (HARD-fail if not seen within 3 s) |
+  | 4  S1 subpool degeneracy | PASS — HBM `Σ ≤ pool_used`; DRAM `Σ == pool_used` per (tier, sp) |
+  | 5  multi-holder strict 1/holders | PASS — 4-program shared prefix, all 4 pids attributed within ±n_units·(n_holders-1) byte tolerance |
+  | 6a perf @ 5 K tree (asserted) | PASS — aggregate p99 over n=60 = 28.5 ms (p50 = 25.8 ms; budget 50 ms) |
+  | 6b perf @ 17 K tree (informational) | p50 = 119 ms, p99 = 143 ms — within Gen-2 GC ceiling |
+  | 7  concurrent stress (5 walkers + 32 chats × 30 s) | PASS — 361 walks, 0 schema failures (walker p99 = 774 ms informational) |
+  | 8  link / holding / ema shape | PASS — cold-start `time_since_last_sample_s > LINK_IDLE_SECONDS = 1.0` (the daemon's actual contract) |
 
-* Stage 6a per-cycle p99: `[51.6, 41.7, 43.1]` ms — the GC-tail
-  regression discovered on the first impl pass (single dump 543 ms at
-  21 K units) was eliminated by routing the bytes path through a
+* Stage 6a per-cycle: `(p50, max)` = `[(26.0, 32.2), (25.9, 26.3),
+  (25.6, 26.4)]` ms.  Aggregate p99 over all 60 samples = 28.5 ms.
+  The GC-tail regression from the first impl pass (single dump 543 ms
+  at 21 K units) was killed by routing the bytes path through a
   hand-written `bytearray` writer instead of materialising 10 K
   per-node Python dicts.
-* Stage 7 walker latency under stress: p99 = 751 ms (informational).
+* Stage 7 walker latency under stress: p99 = 774 ms (informational).
   At 17 K-unit dirty tree + 5 concurrent walkers + 32 concurrent
   chats this is expected — T14 instrumentation will capture this in
   production and trigger F3 revisit if it ever happens under real
   workload (per DESIGN §10 trigger condition).
 
-* raw run log: `results/20260531_t17_initial_pass.log`
+### Audit findings + fixes applied
+
+The subagent audit (2026-05-31) found 5 critical issues with the
+initial test, all fixed in this pass:
+
+1. **Stage 3** had a soft-fail when write_through didn't fire (printed
+   PASS with a diagnostic).  Now HARD-fails with `ResidenceInvariant`
+   — the new schema's central claim is residence-as-set, so the
+   stage that exercises it must require seeing dual residence.
+   Timeout dropped from 10 s to 3 s (HiCache write_through completes
+   in well under 1 s in healthy config).
+2. **Stage 4** asserted HBM `Σ ≤ pool_used` for both tiers — but the
+   impl patches `pool_usage.DRAM.subpools[sp].used_bytes` from the
+   walk's per-subpool DRAM sum, so DRAM should be `==`.  Now split:
+   HBM inequality (radix is subset of allocator) + DRAM equality
+   (the patch logic is what we're testing).
+3. **Stage 5** had an escape hatch `got < want * n_holders` that
+   allowed any attribution from 0 to total_bytes to pass — the bug
+   case (no 1/holders divide) slipped through silently.  Rewrote
+   with strict equality (±byte-rounding from integer-divide) and
+   no fall-back clause.
+4. **Stage 6a** averaged per-cycle p99s, which washes out a single
+   bad cycle.  Now aggregates all 60 samples and takes the true p99.
+5. **Stage 8** checked `time_since_last_sample_s > 1e9` — far
+   stricter than the daemon's actual `> LINK_IDLE_SECONDS = 1.0`
+   branch.  Now checks the daemon's contract (any value above 1.0
+   triggers the bw_free idle branch), decoupling the test from the
+   impl's specific placeholder value (1e12 today).
+
+Coverage gaps that the audit flagged as out-of-scope for T17 (each
+is the target of another PLAN.md task):
+
+- D4 chunked-prefill atomicity (mid-prefill chunks not in `units`):
+  PLAN T19 (Atomic unit visibility).
+- Active DROP / empty-residence path: covered by T20 (migrate payload)
+  exercising the empty-residence transition.
+- Multi-subpool degeneracy (S2 SWA, S3 Mamba): PLAN T45/T46.
+- Per-program `inflight` bytes population: PLAN T29 (eviction-scorer
+  plugin) + scheduler in-flight tracking.
+- DISK-only residence: blocked on Mooncake L3 wiring (PLAN T20 covers
+  the migrate payload that lights DISK up).
+
+* raw run log: `results/20260531_t17_post_audit_pass.log`

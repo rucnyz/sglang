@@ -438,16 +438,21 @@ def stage_2_single_unit() -> dict[str, Any]:
 
 
 def stage_3_residence_set() -> dict[str, Any]:
-    """Drive residence transitions: HBM-only → HBM+DRAM (via write_through)."""
-    # The launch script uses --hicache-write-policy write_through so every
-    # successful prefill writes through to host immediately.  We send a
-    # tagged request and look for at least one unit with both HBM + DRAM
-    # in residence.
+    """Drive residence transitions: HBM-only → HBM+DRAM (via write_through).
+
+    HARD assertion: dual residence MUST be observed.  T17's primary new
+    invariant is that residence is a SET, not a tier; if the test
+    never sees a unit with both HBM and DRAM in residence, the test
+    has not exercised the new schema's central claim.  If your launch
+    profile doesn't fire write_through fast enough, fix the launch
+    config — don't pass the test.
+    """
     pid = f"t17-stage3-{uuid.uuid4().hex[:8]}"
     prompt = "Stage 3 residence-set: " + ("foo bar baz qux " * 50)
     chat(prompt, program_id=pid)
-    # Give HiCache write_backup a moment to land.
-    deadline = time.time() + 10.0
+    deadline = time.time() + 3.0  # HiCache write_through completes in well
+                                  # under 1 s in healthy config; longer
+                                  # window only masks regressions.
     saw_dual = False
     state: dict[str, Any] | None = None
     while time.time() < deadline:
@@ -457,7 +462,7 @@ def stage_3_residence_set() -> dict[str, Any]:
         if any(set(u["residence"]) >= {"HBM", "DRAM"} for u in units):
             saw_dual = True
             break
-        time.sleep(0.5)
+        time.sleep(0.2)
 
     assert state is not None
     assert_schema_shape(state)
@@ -465,36 +470,56 @@ def stage_3_residence_set() -> dict[str, Any]:
     assert_reconcile(state)
 
     if not saw_dual:
-        # write_through may not be configured; this is a soft fail with a
-        # diagnostic rather than a hard fail (HiCache flags can vary
-        # between launch profiles).  We still assert residence list shape.
-        _print("Stage 3", True,
-               "no HBM+DRAM dual seen (write_through not active?); "
-               "residence list shape OK")
-    else:
-        _print("Stage 3", True,
-               "saw residence == [HBM, DRAM] after write_through")
+        units = [u for u in state["units"] if pid in u["session_ids"]]
+        raise ResidenceInvariant(
+            f"Stage 3: no HBM+DRAM dual-residence observed within "
+            f"{deadline}-s window — launch must have HiCache active with "
+            f"write_through policy.  Tagged units: "
+            f"{[(u['hash'], u['residence']) for u in units]!r}")
+    _print("Stage 3", True,
+           "saw residence == [HBM, DRAM] after write_through")
     return state
 
 
 def stage_4_subpool_degeneracy(state: dict[str, Any]) -> None:
     """S1 (single-stack attention): pool_usage subpools is the architecture-
-    declared set.  Sum of unit n_bytes per subpool ≤ pool used."""
-    # We don't hardcode the architecture's subpool name (could be "attn" /
-    # "full" / "mla").  We just assert the structural inequality.
-    for tier in ("HBM", "DRAM"):
-        for sp, fields in state["pool_usage"][tier]["subpools"].items():
-            radix_sum = sum(
-                u["n_bytes"][tier].get(sp, 0)
-                for u in state["units"]
-                if tier in u["n_bytes"])
-            if radix_sum > fields["used_bytes"]:
-                raise ResidenceInvariant(
-                    f"{tier}.{sp}: radix Σ unit.n_bytes = {radix_sum} > "
-                    f"pool_usage.used_bytes = {fields['used_bytes']} "
-                    f"(radix is supposed to be a SUBSET of allocator total)")
+    declared set.
+
+    Two inequalities per (tier, subpool):
+
+    - **HBM**: radix sum ≤ pool used (radix-resident is a subset of
+      allocator-resident; the gap is in-flight decode KV not in tree).
+      Additionally, if pool reports used > 0, radix should be > 0 too
+      (in steady-state at least the system-prompt prefix is committed).
+    - **DRAM**: radix sum **EQUALS** pool used.  The impl patches
+      `pool_usage.DRAM.subpools[sp].used_bytes` from the walk's
+      per-subpool DRAM sum, so any divergence here is a bug in the
+      patch logic (not a real allocator/radix asymmetry).
+    """
+    for sp, fields in state["pool_usage"]["HBM"]["subpools"].items():
+        radix_sum = sum(
+            u["n_bytes"]["HBM"].get(sp, 0)
+            for u in state["units"]
+            if "HBM" in u["n_bytes"])
+        if radix_sum > fields["used_bytes"]:
+            raise ResidenceInvariant(
+                f"HBM.{sp}: radix Σ unit.n_bytes = {radix_sum} > "
+                f"pool_usage.used_bytes = {fields['used_bytes']} "
+                f"(radix is supposed to be a SUBSET of allocator total)")
+
+    for sp, fields in state["pool_usage"]["DRAM"]["subpools"].items():
+        radix_sum = sum(
+            u["n_bytes"]["DRAM"].get(sp, 0)
+            for u in state["units"]
+            if "DRAM" in u["n_bytes"])
+        if radix_sum != fields["used_bytes"]:
+            raise ResidenceInvariant(
+                f"DRAM.{sp}: radix Σ unit.n_bytes = {radix_sum} != "
+                f"pool_usage.used_bytes = {fields['used_bytes']} "
+                f"(impl is supposed to patch DRAM used = radix sum; "
+                f"non-equality means the patch logic broke)")
     _print("Stage 4", True,
-           "Σ unit.n_bytes ≤ pool_usage.used_bytes per (tier, subpool)")
+           "HBM Σ ≤ pool_used; DRAM Σ == pool_used per (tier, subpool)")
 
 
 def stage_5_multi_holder() -> None:
@@ -524,31 +549,46 @@ def stage_5_multi_holder() -> None:
                       for b in sp_dict.values())
     expected_per_holder = total_bytes // n_holders
 
-    for pid in pids:
-        if pid not in state["per_program_usage"]:
+    # Strict per-program attribution: each program's `committed[sp]` must
+    # be the SHARED unit's 1/holders share PLUS any tail-unit bytes that
+    # are uniquely this program's.  We compute the expected total per
+    # program by re-aggregating from units[] and assert exact equality
+    # (±1 byte rounding from integer-divide).  No escape hatch.
+    expected: dict[str, dict[str, dict[str, int]]] = {}
+    for unit in state["units"]:
+        for pid_u in unit["session_ids"]:
+            if pid_u not in pids:
+                continue
+            h = len(unit["session_ids"])
+            e = expected.setdefault(pid_u, {"hbm": {}, "dram": {}})
+            for tier, sp_dict in unit["n_bytes"].items():
+                if tier == "DISK":
+                    continue
+                side = "hbm" if tier == "HBM" else "dram"
+                for sp, b in sp_dict.items():
+                    e[side][sp] = e[side].get(sp, 0) + b // h
+
+    for pid_u in pids:
+        if pid_u not in state["per_program_usage"]:
             raise ReconcileInvariant(
-                f"stage 5: per_program_usage[{pid}] missing")
-        e = state["per_program_usage"][pid]
-        # Sum this program's committed bytes for the shared unit's subpool.
-        for tier, sp_dict in u["n_bytes"].items():
-            tier_l = tier.lower()
-            if tier_l == "disk":
-                continue  # DISK committed not in per_program_usage
-            for sp, want_share in sp_dict.items():
-                want = want_share // n_holders
-                got = e[tier_l]["committed"].get(sp, 0)
-                # ±1 byte rounding tolerance (integer-divide)
-                if abs(got - want) > 1 and got < want * n_holders:
-                    # got should reflect THIS unit's share + any other
-                    # unit-uniquely-owned bytes; allow >= want as long as
-                    # not absurdly high.
+                f"stage 5: per_program_usage[{pid_u}] missing")
+        got_e = state["per_program_usage"][pid_u]
+        for side in ("hbm", "dram"):
+            for sp, want in expected.get(pid_u, {}).get(side, {}).items():
+                got = got_e[side]["committed"].get(sp, 0)
+                # Tolerance: per-unit integer-divide can lose up to (h-1)
+                # bytes per unit; with N units owned by this program, the
+                # max drift is N*(h-1).  Compute N from unit_hashes.
+                n_units = len(got_e.get("unit_hashes", []))
+                tol = max(1, n_units * (n_holders - 1))
+                if abs(got - want) > tol:
                     raise AttributionInvariant(
-                        f"stage 5: per_program_usage[{pid}].{tier_l}."
-                        f"committed[{sp}] = {got} but unit-share = {want} "
-                        f"(unit n_bytes total = {total_bytes}, holders = "
-                        f"{n_holders}, expected at least the share)")
+                        f"stage 5: per_program_usage[{pid_u}].{side}."
+                        f"committed[{sp}] = {got} but expected = {want} "
+                        f"(tol ±{tol} from integer-divide; n_units={n_units}, "
+                        f"n_holders={n_holders})")
     _print("Stage 5", True,
-           f"4-holder unit n_bytes/4 reflected in per_program_usage")
+           f"4-holder strict-attribution check passes across {len(pids)} pids")
 
 
 def _drive_distinct_prefixes(target: int, label: str) -> int:
@@ -571,33 +611,38 @@ def stage_6_perf_guard() -> None:
     actual = _drive_distinct_prefixes(STAGE6_TREE_SIZE, "stage6a")
     print(f"[Stage 6a] tree size after drive: {actual} units")
 
-    cycle_p99s = []
+    # Aggregate all samples from N cycles into one sequence and take the
+    # true p99.  Averaging per-cycle p99s washes out a single bad cycle.
+    all_lats: list[float] = []
     for cycle in range(STAGE6_CYCLES):
         lats = []
         for _ in range(STAGE6_DUMPS_PER_CYCLE):
             t0 = time.perf_counter()
             fetch_state()
             lats.append((time.perf_counter() - t0) * 1000)
-        p50 = statistics.median(lats)
-        p99 = max(lats)  # n=20, max ≈ p95-p99
-        cycle_p99s.append(p99)
+        all_lats.extend(lats)
+        p50_c = statistics.median(lats)
+        max_c = max(lats)
         print(f"[Stage 6a] cycle {cycle + 1}/{STAGE6_CYCLES}: "
-              f"p50={p50:.1f}ms p99={p99:.1f}ms")
-        if p99 > STAGE6_MAX_BUDGET_MS:
+              f"p50={p50_c:.1f}ms max={max_c:.1f}ms")
+        if max_c > STAGE6_MAX_BUDGET_MS:
             raise PerfBudget(
                 f"Stage 6a cycle {cycle + 1}: single dump > "
-                f"{STAGE6_MAX_BUDGET_MS} ms (Gen-2 GC sweep?): {p99:.1f} ms")
+                f"{STAGE6_MAX_BUDGET_MS} ms (Gen-2 GC sweep?): {max_c:.1f} ms")
 
-    mean_p99 = statistics.mean(cycle_p99s)
-    std_p99 = statistics.stdev(cycle_p99s) if len(cycle_p99s) > 1 else 0.0
-    if mean_p99 > STAGE6_P99_BUDGET_MS:
+    all_sorted = sorted(all_lats)
+    p99_idx = int(0.99 * (len(all_sorted) - 1))
+    p99_aggregate = all_sorted[p99_idx]
+    p50_aggregate = statistics.median(all_lats)
+    if p99_aggregate > STAGE6_P99_BUDGET_MS:
         raise PerfBudget(
-            f"Stage 6a mean p99 over {STAGE6_CYCLES} cycles = "
-            f"{mean_p99:.1f} ± {std_p99:.1f} ms > "
-            f"{STAGE6_P99_BUDGET_MS} ms budget")
+            f"Stage 6a aggregate p99 over {len(all_lats)} samples = "
+            f"{p99_aggregate:.1f} ms > {STAGE6_P99_BUDGET_MS} ms budget "
+            f"(p50 = {p50_aggregate:.1f} ms)")
     _print("Stage 6a", True,
-           f"mean p99 @ {actual} units = {mean_p99:.1f} ± {std_p99:.1f} ms "
-           f"(budget {STAGE6_P99_BUDGET_MS} ms)")
+           f"aggregate p99 @ {actual} units (n={len(all_lats)}): "
+           f"{p99_aggregate:.1f} ms (p50 {p50_aggregate:.1f} ms; "
+           f"budget {STAGE6_P99_BUDGET_MS} ms)")
 
     # Stage 6b — informational stress at 10 K units.  Records p50/p99
     # so the F3-revisit conversation has a data point if the trigger
@@ -675,15 +720,21 @@ def stage_7_concurrent_stress() -> None:
 
 def stage_8_aux_fields(state_initial: dict[str, Any]) -> None:
     """link_stats cold-start; tier_holding_cost / throughput_ema shape."""
-    # The initial empty-tree state should have:
-    #   - link_stats[*].time_since_last_sample_s == +Inf (cold-start)
-    #   - throughput_ema.prefill_bps == 0 (or very small)
+    # Cold-start link_stats: daemon's bw_free branches on
+    # `time_since_last_sample_s > LINK_IDLE_SECONDS = 1.0` (DESIGN §7).
+    # The TEST asserts the contract the daemon checks — not the impl's
+    # specific placeholder value (1e12 today, but anything > 1.0 is
+    # functionally correct).
+    LINK_IDLE_SECONDS = 1.0
     for link, e in state_initial["link_stats"].items():
         ts = e["time_since_last_sample_s"]
-        if not (ts == math.inf or (isinstance(ts, float) and ts > 1e9)):
+        if not (ts == math.inf or (isinstance(ts, (int, float))
+                                   and ts > LINK_IDLE_SECONDS)):
             raise LinkStatsInvariant(
-                f"link_stats[{link}].time_since_last_sample_s on empty tree "
-                f"must be +Inf (cold-start), got {ts!r}")
+                f"link_stats[{link}].time_since_last_sample_s on empty "
+                f"tree must trip the daemon's bw_free idle branch "
+                f"(> LINK_IDLE_SECONDS = {LINK_IDLE_SECONDS}), "
+                f"got {ts!r}")
 
     # After all our prior stages, prefill_bps should be > 0.
     after = fetch_state()
