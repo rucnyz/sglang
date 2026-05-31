@@ -76,7 +76,9 @@ Three layers, three cadences (none of them periodic).
        │                                                   │
        │  program_tracker — REASONING / ACTING /           │
        │    PAUSED / ENDED state machine, driven from the  │
-       │    same events                                    │
+       │    same events.  Stores `pre_pause_state` on the  │
+       │    REASONING/ACTING → PAUSED transition (consumed │
+       │    by §8 Resume gain counterfactual).             │
        └─────────┬──────────────────────────┬──────────────┘
                  │ proxied requests         │ /aginfer/* admin HTTP
                  ▼                          ▼
@@ -616,20 +618,39 @@ where:
 cost(pause p, event)   = V_u_program(p) + marginal_pause_cost(p, event)
 relief(pause p, state) = marginal_relief_value(p, state)
 
-gain(resume p, state)   = V_u_program(p)                  # V_u recovered
-re_use(resume p, state) = marginal_relief_value(p, state) # HBM re-occupied
+gain(resume p, state)   = V_u_program_if_active(p, state, p.pre_pause_state)
+re_use(resume p, state) = marginal_relief_value(p, state)
 ```
 
-§9 then merges these with §7's unit candidates and sorts the
-union by `cost / relief` ascending (knapsack-greedy).
+The Resume `gain` is a **counterfactual**: "if we resume p, how
+much V_u does p produce?".  Computing `V_u_program(p)` on the
+current state would return 0 because PAUSED holders' contribution
+to every unit's `p_hat` is 0 by §7's conditional formulation —
+all paused programs would tie at 0 and the headroom phase's
+`gain / re_use` ordering would be undefined.
+
+§9 consumes these candidates: pressure phase uses Pauses + §7's
+Migrates; headroom phase uses Resumes.
 
 ### Component definitions
 
-* `V_u_program(p) = Σ_{u ∈ p.units} V_u(u)`.  The conditional p_hat
-  from §7 is already a holder-product, so shared-prefix attribution
-  is built in; no `1/|session_ids|` weight is needed.  PAUSED
-  programs' units already contribute 0 to V_u, so PAUSED programs
-  naturally sort to the bottom of resume priority.
+* `V_u_program(p) = Σ_{u ∈ p.units} V_u(u)` — computed against the
+  current state, used as Pause's cost (the V_u we'd lose if p
+  stops here).  The conditional p_hat from §7 is already a
+  holder-product, so shared-prefix attribution is built in; no
+  `1/|session_ids|` weight is needed.
+* `V_u_program_if_active(p, state, hypothetical_state)` —
+  counterfactual: compute V_u as if p's state field were
+  overridden to `hypothetical_state` (and all other holders'
+  states held fixed).  Used as Resume's gain.  The
+  hypothetical is `p.pre_pause_state` — the state p was in when
+  admission paused it — because resuming p restores exactly that
+  pre-pause activity (a REASONING program that admission paused
+  mid-decode goes back to REASONING; an ACTING program paused
+  while awaiting a tool goes back to ACTING).  If `pre_pause_state`
+  is missing (e.g. daemon restart lost it), the fallback is
+  `REASONING` — the worst case for over-estimating gain, biased
+  toward resuming sooner.
 * `marginal_pause_cost(p, event)` — work-loss penalty of pausing p
   **at this event's moment**.  Near zero when the event is
   `TOOL_CALL_START` for p (p was going off-GPU anyway); positive
@@ -854,6 +875,14 @@ On crash + restart the daemon's recovery sequence is:
      next arrival.  In-flight requests at crash time are
      considered failed (proxy didn't acknowledge); harbor's
      retry hits the gate.
+
+   `pre_pause_state` is **lost** on restart (it was in-process
+   only).  The Resume gain counterfactual (§8) falls back to
+   `REASONING` for any program re-registered as PAUSED without a
+   known pre_pause_state.  This biases toward resuming earlier
+   (REASONING is the higher-V_u counterfactual), which is the
+   safe direction — at worst the program is resumed slightly
+   sooner than ideal; never silently held.
 3. **In-flight migrate retries**: any migrate POSTs that were
    in-flight at crash are not retried — they are idempotent
    (§10), so re-issuing on the next event is harmless and
