@@ -1517,7 +1517,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
-            self._last_load_back_decline = "controller_load_returned_none"
+            sub = (
+                getattr(self.cache_controller, "_last_load_decline", None)
+                or "unknown"
+            )
+            self._last_load_back_decline = (
+                f"controller_load_returned_none:{sub}"
+            )
             return False
 
         # Commit: each component gets only its own transfers
@@ -2415,15 +2421,17 @@ class UnifiedRadixCache(BasePrefixCache):
                         applied_hashes.append(h)
                         acted_node_ids.add(node.id)
                     else:
-                        # load_back returned False without raising. Use only
-                        # the leading category so the daemon's Counter
+                        # load_back returned False without raising. Take
+                        # the two leading categories (load_back-level :
+                        # controller-level) so the daemon's Counter
                         # aggregates cleanly; numeric detail is still on
-                        # self._last_load_back_decline for live debugging.
+                        # self._last_load_back_decline for live debug.
                         detail = (
                             getattr(self, "_last_load_back_decline", None)
                             or "unknown"
                         )
-                        category = detail.split(":", 1)[0]
+                        parts = detail.split(":", 2)
+                        category = ":".join(parts[:2])
                         skipped.append(
                             {
                                 "hash": h,
