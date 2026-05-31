@@ -368,7 +368,9 @@ def create_app(
                 try:
                     await req_ctx.__aexit__(None, None, None)
                 except Exception:  # noqa: BLE001
-                    pass
+                    # Cleanup-path exception: log + continue.  Silent
+                    # swallow would mask connection-pool leaks.
+                    logger.exception("proxy: req_ctx cleanup raised")
                 await _emit_completion()
 
         # Preserve upstream content-type if present (defaults to SSE).

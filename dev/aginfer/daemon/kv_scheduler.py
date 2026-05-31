@@ -720,12 +720,19 @@ class KvScheduler:
             )
             return
         # Parse sglang's response for applied vs skipped counts.
+        # Contract: /aginfer/migrate ALWAYS returns JSON with `applied: int`
+        # and `skipped: list`.  Tight except so a real protocol break
+        # surfaces in the log instead of being silently coerced to -1.
         try:
             resp = r.json()
-            applied = int(resp.get("applied") or 0)
-            skipped_list = resp.get("skipped") or []
+            applied = int(resp["applied"])
+            skipped_list = resp["skipped"]
             skipped = len(skipped_list)
-        except Exception:  # noqa: BLE001
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning(
+                "kv_scheduler: migrate response malformed (%s): body=%s",
+                type(exc).__name__, r.text[:300],
+            )
             applied = -1
             skipped = -1
             skipped_list = []

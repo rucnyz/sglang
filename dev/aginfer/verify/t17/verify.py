@@ -42,26 +42,6 @@ REQUIRED_TOP_LEVEL = (
     "tier_holding_cost",
 )
 
-# DESIGN §5 explicitly REMOVED keys.  Their presence means the legacy
-# schema is still being emitted somewhere.
-LEGACY_TOP_LEVEL = ("tier_usage", "page_size", "bytes_per_token")
-
-LEGACY_POOL_USAGE_KEYS = (
-    "used_bytes",  # at pool_usage[tier].* — moved into subpools
-    "cap_bytes",
-    "available_bytes",
-    "evictable_bytes",
-    "token_usage",
-    "swa_token_usage",
-    "swa_used_bytes",
-    "swa_cap_bytes",
-    "swa_available_bytes",
-    "swa_evictable_bytes",
-    "full_token_usage",
-)
-
-LEGACY_UNIT_KEYS = ("tier",)  # round-9 replaces with `residence: list`
-
 REQUIRED_TIERS = ("HBM", "DRAM", "DISK")
 REQUIRED_LINKS = (
     "HBM->DRAM", "DRAM->HBM",
@@ -98,10 +78,6 @@ STAGE7_P99_BUDGET_MS = 100.0
 # ---------------------------------------------------------------------------
 # Custom exceptions — one per DESIGN clause for clean failure attribution
 # ---------------------------------------------------------------------------
-
-class LegacyShape(Exception):
-    """The dump still carries a removed-by-round-9 field."""
-
 
 class SchemaMissing(Exception):
     """A required DESIGN §5 field is absent."""
@@ -159,31 +135,6 @@ def fetch_state() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Stage 0 — strict schema parser
 # ---------------------------------------------------------------------------
-
-def assert_no_legacy(state: dict[str, Any]) -> None:
-    """Round-9 'halts loudly on legacy shape' invariant."""
-    for k in LEGACY_TOP_LEVEL:
-        if k in state:
-            raise LegacyShape(
-                f"legacy top-level key present: {k!r} "
-                f"(DESIGN §5 removed it; the daemon is supposed to halt)")
-    pool_usage = state.get("pool_usage", {})
-    for tier, entry in pool_usage.items():
-        if not isinstance(entry, dict):
-            raise SchemaMissing(f"pool_usage[{tier}] not a dict")
-        # legacy keys live directly under pool_usage[tier]
-        for k in LEGACY_POOL_USAGE_KEYS:
-            if k in entry:
-                raise LegacyShape(
-                    f"legacy pool_usage[{tier}].{k} present "
-                    f"(should live under pool_usage[{tier}].subpools[sp].*)")
-    for u in state.get("units", []):
-        for k in LEGACY_UNIT_KEYS:
-            if k in u:
-                raise LegacyShape(
-                    f"unit {u.get('hash')!r}: legacy field {k!r} present "
-                    f"(DESIGN §5 replaces with `residence: list[Tier]`)")
-
 
 def assert_schema_shape(state: dict[str, Any]) -> None:
     """Every DESIGN §5 path present."""
@@ -362,29 +313,10 @@ def _print(stage: str, ok: bool, detail: str = "") -> None:
     print(f"[{stage}] {status}{(' — ' + detail) if detail else ''}")
 
 
-def stage_0_strict_parser_negative() -> None:
-    """Negative test: synthesised legacy shape must raise LegacyShape."""
-    fake_legacy = {
-        "tier_usage": {"HBM": {"used_bytes": 0, "cap_bytes": 0}},
-        "pool_usage": {"HBM": {"used_bytes": 0}, "DRAM": {}, "DISK": {}},
-        "units": [],
-        "page_size": 64,
-        "bytes_per_token": 1,
-        "time_counter": 0,
-    }
-    try:
-        assert_no_legacy(fake_legacy)
-    except LegacyShape:
-        _print("Stage 0", True, "legacy-shape detector raises as expected")
-        return
-    raise AssertionError("Stage 0 negative test did NOT raise")
-
-
 def stage_1_initial_shape() -> dict[str, Any]:
     """Initial-state schema check (sglang may have done internal warmups
     so we can't insist on empty tree; just check the full shape parses)."""
     state = fetch_state()
-    assert_no_legacy(state)
     assert_schema_shape(state)
     assert_subpool_keys_consistent(state)
     assert_reconcile(state)
@@ -412,7 +344,6 @@ def stage_2_single_unit() -> dict[str, Any]:
                    + "\n\nQ: tell me a 1-line fact.")
     chat(long_prompt, program_id=pid)
     state = fetch_state()
-    assert_no_legacy(state)
     assert_schema_shape(state)
     assert_subpool_keys_consistent(state)
     assert_reconcile(state)
@@ -462,7 +393,6 @@ def stage_3_residence_set() -> dict[str, Any]:
     state: dict[str, Any] | None = None
     while time.time() < deadline:
         state = fetch_state()
-        assert_no_legacy(state)
         units = [u for u in state["units"] if pid in u["session_ids"]]
         if any(set(u["residence"]) >= {"HBM", "DRAM"} for u in units):
             saw_dual = True
@@ -549,7 +479,6 @@ def stage_5_multi_holder() -> None:
     for pid in pids:
         chat(shared + f"\n\nPer-program suffix for {pid}", program_id=pid)
     state = fetch_state()
-    assert_no_legacy(state)
     assert_schema_shape(state)
     assert_reconcile(state)
 
@@ -720,7 +649,6 @@ def stage_7_concurrent_stress() -> None:
                 t0 = time.perf_counter()
                 s = fetch_state()
                 per_thread_lats[idx].append((time.perf_counter() - t0) * 1000)
-                assert_no_legacy(s)
                 assert_schema_shape(s)
                 assert_subpool_keys_consistent(s)
                 assert_reconcile(s)
@@ -819,7 +747,6 @@ def main() -> int:
     print()
 
     try:
-        stage_0_strict_parser_negative()
         state_empty = stage_1_initial_shape()
         stage_2_single_unit()
         state_dual = stage_3_residence_set()

@@ -155,11 +155,16 @@ class EventRouter:
         except Exception as exc:  # noqa: BLE001
             logger.warning("cold_start_probe: /aginfer/state failed: %s", exc)
             return
-        hbm = state["tier_usage"]["HBM"]
-        used = hbm["used_bytes"]
-        cap = hbm["cap_bytes"]
-        if cap > 0 and (used / cap) > self.theta_hi:
-            occ = used / cap
+        # DESIGN §5: pool_usage.HBM.subpools is the allocator-truth view
+        # admission gates on.  Occupancy = max over subpools (admission
+        # acts when ANY subpool crosses theta_hi, not when the aggregate
+        # does — DESIGN §5 "Why two views" clause).
+        subpools = state["pool_usage"]["HBM"]["subpools"]
+        occ = max(
+            (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
+            for e in subpools.values()
+        ) if subpools else 0.0
+        if occ > self.theta_hi:
             state_label = "HIGH" if occ < self.theta_crit else "CRITICAL"
             logger.info(
                 "cold_start_probe: HBM occ %.3f > theta_hi %.3f; "
