@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import defaultdict
@@ -2495,123 +2496,249 @@ class UnifiedRadixCache(BasePrefixCache):
         self._aginfer_bpt_cache = bpt
         return bpt
 
+    @staticmethod
+    def _aginfer_subpool_name(ct) -> str:
+        """Map a sglang ComponentType to its DESIGN §5 subpool name.
+
+        The aginfer wire format uses architecture-determined component
+        names; sglang's ``ComponentType`` enum is the authoritative
+        source of which subpools a model carries.  Names are
+        lower-case strings (DESIGN §12 examples: "full", "swa",
+        "mamba", "draft", "attn").  We use sglang's own internal
+        names verbatim so the daemon ↔ scheduler vocabularies stay
+        identical and a typo on either side fails loudly.
+        """
+        return str(ct).rsplit(".", 1)[-1].lower()
+
     def _aginfer_pool_usage(self) -> dict:
-        """Allocator-level HBM occupancy for daemon admission gating.
+        """Per-(tier, subpool) allocator-truth occupancy (DESIGN §5).
 
-        Mirrors sglang's own ``full_token_usage`` metric formula
-        (``pool_stats_observer._get_swa_token_info`` /
-        ``_get_token_info``)::
+        Shape::
 
-            num_used    = pool_size - (available + evictable)
-            token_usage = num_used / pool_size
+            {"HBM":  {"subpools": {sp: {used, cap, available,
+                                        evictable, page_bytes}}},
+             "DRAM": {"subpools": {...}},
+             "DISK": {"subpools": {...}}}
 
-        * ``available``  — allocator slots free **right now**, after
-          in-flight decode allocations.
-        * ``evictable``  — radix-tree-shareable nodes that could be
-          freed; subtracted because they are not "real" pressure.
-        * ``token_usage`` — effective pressure (matches sglang's batch
-          log ``full token usage`` line).
+        Each tier carries a ``subpools`` dict keyed by architecture-
+        determined component name.  For S1 (single-stack attention,
+        e.g. DeepSeek-V4-Flash) the HBM dict has exactly one entry
+        keyed by the FULL component's name.  For S2 (SWA-hybrid) the
+        dict has ``{"full", "swa"}``; for S3 (Mamba+attn) it has
+        ``{"full", "mamba"}``.
 
-        This is the AUTHORITATIVE HBM-occupancy signal the daemon's
-        ``admission_controller`` must gate on.  ``tier_usage`` further
-        down in the snapshot is the radix-tree view used for migration
-        value scoring (paper §7 V_u) and is correctly tree-keyed —
-        DON'T confuse the two.  Mixing them causes G10:
-        radix-tree-keyed occupancy is ~0 because in-flight decode KV
-        isn't in the tree, so admission never fired before this field
-        existed.
-
-        For SWA hybrid attention (DeepSeek-V4-Flash et al.) the
-        "HBM" entry reports ``max(full_token_usage, swa_token_usage)``
-        because either sub-pool filling up implies the device can't
-        accept more requests.  Sub-pool detail is preserved in
-        ``swa_*`` / ``full_*`` extra fields for inspection.
+        This is the AUTHORITATIVE pool-occupancy signal the daemon's
+        admission controller and §7 value rule both consume.  The
+        radix-tree-keyed sum of ``units[*].n_bytes[tier][sp]`` is a
+        SUBSET of the allocator total (in-flight decode bytes are
+        not in the tree), so admission must gate on this, not on
+        the radix view.
         """
         pool = self.token_to_kv_pool_allocator
         bpt = self._aginfer_bytes_per_token()
-        if pool is None:
-            return {"HBM": {
+        page_bytes_default = int(self.page_size) * max(1, bpt)
+
+        hbm_subpools: dict = {}
+        dram_subpools: dict = {}
+
+        # Determine the FULL subpool name for this cache instance.
+        # When the cache supports SWA, ``pool`` exposes both
+        # full_available_size() and swa_available_size(); otherwise
+        # only available_size() and size.
+        #
+        # Semantics: ``used_bytes`` = total allocator-occupied bytes
+        # (= cap − available; includes evictable radix-resident bytes).
+        # ``evictable_bytes`` reports how much of `used` could be freed
+        # if pressure demands it.  Admission's `theta_hi` gates on
+        # `used / cap` per subpool so radix-eviction pressure registers;
+        # legacy `pool_size − avail − evictable` (in-flight only) under-
+        # reports occupancy when the radix tree fills the device.
+        full_sp = self._aginfer_subpool_name(BASE_COMPONENT_TYPE)
+        if pool is not None:
+            is_swa = self.supports_swa() and hasattr(pool, "full_available_size")
+            if is_swa:
+                full_size = int(getattr(pool, "size_full", 0)) or int(
+                    getattr(pool, "size", 0)
+                )
+                full_avail = int(pool.full_available_size())
+                full_evictable = int(self.full_evictable_size())
+                full_used = max(0, full_size - full_avail)
+                hbm_subpools[full_sp] = {
+                    "used_bytes": full_used * bpt,
+                    "cap_bytes": full_size * bpt,
+                    "available_bytes": full_avail * bpt,
+                    "evictable_bytes": full_evictable * bpt,
+                    "page_bytes": page_bytes_default,
+                }
+                swa_sp = self._aginfer_subpool_name(ComponentType.SWA)
+                swa_size = int(getattr(pool, "size_swa", 0))
+                swa_avail = int(pool.swa_available_size())
+                swa_evictable = int(self.swa_evictable_size())
+                swa_used = max(0, swa_size - swa_avail)
+                hbm_subpools[swa_sp] = {
+                    "used_bytes": swa_used * bpt,
+                    "cap_bytes": swa_size * bpt,
+                    "available_bytes": swa_avail * bpt,
+                    "evictable_bytes": swa_evictable * bpt,
+                    "page_bytes": page_bytes_default,
+                }
+            else:
+                pool_size = int(getattr(pool, "size", 0))
+                avail = int(pool.available_size())
+                evictable = int(self.evictable_size())
+                num_used = max(0, pool_size - avail)
+                hbm_subpools[full_sp] = {
+                    "used_bytes": num_used * bpt,
+                    "cap_bytes": pool_size * bpt,
+                    "available_bytes": avail * bpt,
+                    "evictable_bytes": evictable * bpt,
+                    "page_bytes": page_bytes_default,
+                }
+        else:
+            hbm_subpools[full_sp] = {
                 "used_bytes": 0, "cap_bytes": 0,
                 "available_bytes": 0, "evictable_bytes": 0,
-                "token_usage": 0.0,
-            }}
-
-        is_swa = self.supports_swa() and hasattr(pool, "full_available_size")
-        if is_swa:
-            full_size = int(getattr(pool, "size_full", 0)) or int(
-                getattr(pool, "size", 0)
-            )
-            full_avail = int(pool.full_available_size())
-            full_evictable = int(self.full_evictable_size())
-            full_num_used = max(0, full_size - full_avail - full_evictable)
-            full_usage = (full_num_used / full_size) if full_size > 0 else 0.0
-
-            swa_size = int(getattr(pool, "size_swa", 0))
-            swa_avail = int(pool.swa_available_size())
-            swa_evictable = int(self.swa_evictable_size())
-            swa_num_used = max(0, swa_size - swa_avail - swa_evictable)
-            swa_usage = (swa_num_used / swa_size) if swa_size > 0 else 0.0
-
-            hbm_token_usage = full_usage if full_usage >= swa_usage else swa_usage
-            return {"HBM": {
-                "used_bytes": full_num_used * bpt,
-                "cap_bytes": full_size * bpt,
-                "available_bytes": full_avail * bpt,
-                "evictable_bytes": full_evictable * bpt,
-                "token_usage": hbm_token_usage,
-                "full_token_usage": full_usage,
-                "swa_token_usage": swa_usage,
-                "swa_used_bytes": swa_num_used * bpt,
-                "swa_cap_bytes": swa_size * bpt,
-                "swa_available_bytes": swa_avail * bpt,
-                "swa_evictable_bytes": swa_evictable * bpt,
-            }}
-
-        pool_size = int(getattr(pool, "size", 0))
-        avail = int(pool.available_size())
-        evictable = int(self.evictable_size())
-        num_used = max(0, pool_size - avail - evictable)
-        usage = (num_used / pool_size) if pool_size > 0 else 0.0
-        return {"HBM": {
-            "used_bytes": num_used * bpt,
-            "cap_bytes": pool_size * bpt,
-            "available_bytes": avail * bpt,
-            "evictable_bytes": evictable * bpt,
-            "token_usage": usage,
-        }}
-
-    def dump_aginfer_state(self) -> dict:
-        """Walk the radix tree once and return a JSON-serialisable snapshot
-        for the aginfer external scheduler.  Read-only, no locks held.
-
-        Schema matches dev/aginfer/DESIGN.md §sglang surface:
-            {
-              "tier_usage": {
-                "HBM":  {"used_bytes": int, "cap_bytes": int},
-                "DRAM": {"used_bytes": int, "cap_bytes": int},
-              },
-              "units": [
-                {"hash": str, "tier": "HBM"|"DRAM",
-                 "n_tokens": int, "n_bytes": int,
-                 "last_access_time": int, "hit_count": int,
-                 "session_ids": list[str]},
-                ...
-              ],
-              "page_size": int,
-              "bytes_per_token": int,
+                "page_bytes": page_bytes_default,
             }
 
-        Bytes are the paper §7 currency: per-unit value rule divides by
-        memory cost in bytes, and tier capacities are inherently byte
-        quantities.  ``n_tokens`` is also kept per unit because the value
-        NUMERATOR (hit_count * tokens_saved) is token-counted.
+        # DRAM (HiCache host pool).  Treated as a single subpool
+        # keyed by the FULL component name — sglang does not split the
+        # host pool by sub-pool today (SWA/Mamba KV write through to
+        # the same host pool).  Subpool refinement is T26-future work.
+        dram_cap = 0
+        if self.cache_controller is not None:
+            host_pool = getattr(self.cache_controller, "host_mem_pool", None)
+            if host_pool is None:
+                host_pool = getattr(self.cache_controller, "host_pool", None)
+            if host_pool is not None:
+                dram_cap = int(getattr(host_pool, "size", 0)) * bpt
+        # DRAM used bytes are filled in by the dump walker; pool_usage
+        # itself doesn't have a fast aggregate.  Caller patches in.
+        dram_subpools[full_sp] = {
+            "used_bytes": 0,           # patched in by dump_aginfer_state_impl
+            "cap_bytes": dram_cap,
+            "available_bytes": dram_cap,  # patched
+            "evictable_bytes": 0,         # patched
+            "page_bytes": page_bytes_default,
+        }
 
-        ``bytes_per_token`` is queried from the device KV pool once per
-        scheduler lifetime (the layout never changes); zero if the pool
-        doesn't expose the per-token size.  Per-tier ``cap_bytes`` for DRAM
-        is taken from the cache controller's host pool when HiCache is on,
-        otherwise 0.  ``session_ids`` is populated by the T3 passthrough
-        (empty when not yet wired in).
+        # DISK — Mooncake/SSD spill not yet wired (apply_aginfer_migrations
+        # returns "disk_tier_not_yet_wired"); emit a single placeholder
+        # subpool so the schema's tier+subpool key set is consistent.
+        disk_subpools = {full_sp: {
+            "used_bytes": 0, "cap_bytes": 0,
+            "available_bytes": 0, "evictable_bytes": 0,
+            "page_bytes": page_bytes_default,
+        }}
+
+        return {
+            "HBM":  {"subpools": hbm_subpools},
+            "DRAM": {"subpools": dram_subpools},
+            "DISK": {"subpools": disk_subpools},
+        }
+
+    def _aginfer_link_stats(self) -> dict:
+        """Cold-start link_stats; T26 fills `recent_throughput_bps` /
+        `time_since_last_sample_s` via HiCache + Mooncake instrumentation.
+
+        Daemon's §7 bw_free branches on
+        ``time_since_last_sample_s > LINK_IDLE_SECONDS`` to choose
+        peak vs measured throughput; ``+Inf`` on cold-start so the
+        peak path is taken (correct — an unused link IS idle by
+        definition).
+
+        Peak values are realistic defaults for a B300 box with PCIe
+        gen5 x16 + NVMe; T26 calibration replaces them with the
+        operator-provided / device-probed numbers.
+
+        ``time_since_last_sample_s`` uses 1e9 (≈ 31 years) as the
+        cold-start sentinel instead of ``math.inf`` because orjson
+        rejects non-finite floats as invalid JSON.  Daemon's bw_free
+        branch is ``> LINK_IDLE_SECONDS = 1.0`` so any value above
+        the threshold takes the peak path.
+        """
+        PEAK_HBM_DRAM = 64 * 1024 * 1024 * 1024 * 8   # ~64 GB/s PCIe 5.0 x16
+        PEAK_DRAM_DISK = 12 * 1024 * 1024 * 1024 * 8  # ~12 GB/s NVMe
+        return {
+            "HBM->DRAM": {"peak_bw_bps": PEAK_HBM_DRAM,
+                          "recent_throughput_bps": 0,
+                          "time_since_last_sample_s": 1.0e12},
+            "DRAM->HBM": {"peak_bw_bps": PEAK_HBM_DRAM,
+                          "recent_throughput_bps": 0,
+                          "time_since_last_sample_s": 1.0e12},
+            "DRAM->DISK": {"peak_bw_bps": PEAK_DRAM_DISK,
+                           "recent_throughput_bps": 0,
+                           "time_since_last_sample_s": 1.0e12},
+            "DISK->DRAM": {"peak_bw_bps": PEAK_DRAM_DISK,
+                           "recent_throughput_bps": 0,
+                           "time_since_last_sample_s": 1.0e12},
+        }
+
+    def _aginfer_tier_holding_cost(self, pool_usage: dict) -> dict:
+        """Per-(tier, subpool) h_max_per_byte_sec placeholder.
+
+        T12 calibrates the shape; T17 just exposes the field with
+        a static placeholder per (tier, subpool) declared in
+        pool_usage.  Subpool key set matches pool_usage by
+        construction.
+        """
+        # Placeholder: linear holding cost per byte per second.
+        # T12 calibration replaces these.
+        H = 0.0
+        out: dict = {}
+        for tier, entry in pool_usage.items():
+            out[tier] = {
+                sp: {"h_max_per_byte_sec": H}
+                for sp in entry["subpools"].keys()
+            }
+        return out
+
+    def _aginfer_throughput_ema(self) -> dict:
+        """Cold-start throughput_ema.  T26/T29 wire actual measurement.
+
+        Daemon's §7 marginal_pause_cost (prefill) and §8
+        forecast_inflight_demand (decode) read these; zero
+        cold-start means the formulas degenerate to their
+        no-throughput-signal branches until measurement starts.
+        """
+        return {
+            "prefill_bps": 0.0,
+            "decode_per_program": {},
+        }
+
+    def dump_aginfer_state(self) -> dict:
+        """Walk the radix tree once and return the DESIGN §5 snapshot
+        for the aginfer external scheduler.  Read-only, no locks held.
+
+        Top-level shape (full schema in `dev/aginfer/DESIGN.md` §5)::
+
+            {
+              "time_counter":      int,
+              "throughput_ema":    {prefill_bps, decode_per_program},
+              "pool_usage":        {tier: {subpools: {sp: {...}}}},
+              "per_program_usage": {pid: {hbm, dram, state,
+                                          pre_pause_state, unit_hashes}},
+              "units":             [{hash, residence: [tier, ...],
+                                     n_tokens,
+                                     n_bytes: {tier: {sp: int}},
+                                     last_access_time, hit_count,
+                                     session_ids}],
+              "link_stats":        {"σ->τ": {...}},
+              "tier_holding_cost": {tier: {sp: {h_max_per_byte_sec}}},
+            }
+
+        Residence is a SET per unit (a post-write_through unit lives in
+        both HBM and DRAM simultaneously); n_bytes is nested per
+        (tier, subpool) to feed the §9 multi-axis DP.
+
+        Subpool keys are derived from the cache's component types
+        (``ComponentType.FULL`` → "full", etc.).  S1 single-stack
+        attention has exactly one subpool; SWA-hybrid / Mamba-hybrid
+        / spec-decoding add more (DESIGN §12).
+
+        ``link_stats`` / ``tier_holding_cost`` / ``throughput_ema``
+        are emitted with cold-start defaults; T26 / T29 wire actual
+        instrumentation.  See the per-helper docstrings.
         """
         return self._dump_aginfer_state_impl(want_bytes=False)
 
@@ -2630,49 +2757,39 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._dump_aginfer_state_impl(want_bytes=True)
 
     def _dump_aginfer_state_impl(self, want_bytes: bool):
-        # Hot path.
-        #
-        # We have two consumers:
-        #   * fast path (``want_bytes=True``): the scheduler emits JSON bytes
-        #     directly; we never materialise a Python dict per unit, so the
-        #     per-dump allocation rate stays low enough that the scheduler
-        #     process does NOT trip a Gen-2 cyclic GC sweep from this work
-        #     alone (empirically a Gen-2 sweep on the live radix tree +
-        #     KV-pool state is a ~500 ms stall — the main p99 tail).
-        #   * legacy path (``want_bytes=False``, ``dump_aginfer_state``):
-        #     build the dict-of-lists for in-process callers that need a
-        #     Python object.  This is no longer on the HTTP hot path.
-        root = self.root_node
-        base_ct = BASE_COMPONENT_TYPE
-        hbm_used = 0
-        dram_used = 0
+        """Build the DESIGN §5 snapshot.
 
-        # Compute tier caps once (root-level state, identical between paths).
-        hbm_cap_tokens = 0
-        if self.token_to_kv_pool_allocator is not None:
-            hbm_cap_tokens = int(
-                getattr(self.token_to_kv_pool_allocator, "size", 0)
-            )
-        dram_cap_tokens = 0
-        if self.cache_controller is not None:
-            host_pool = getattr(self.cache_controller, "host_mem_pool", None)
-            if host_pool is None:
-                host_pool = getattr(self.cache_controller, "host_pool", None)
-            if host_pool is not None:
-                dram_cap_tokens = int(getattr(host_pool, "size", 0))
-        page_size = int(self.page_size)
+        Two paths to keep per-dump GC pressure bounded:
+
+        * ``want_bytes=True`` (HTTP hot path): single walk that writes
+          units directly into a ``bytearray`` and aggregates
+          per_program_usage / DRAM-used into small dicts.  No per-
+          node Python dict allocated for the units list, so a 10 k-node
+          dump does not trip the scheduler's Gen-2 cyclic GC sweep
+          (empirically ~500 ms stall — the dominant p99 tail).
+          Final assembly orjson-encodes the small auxiliary dicts
+          once.
+
+        * ``want_bytes=False`` (in-process callers / tests): same walk
+          but builds Python dicts per unit.  Convenient, not allocation-
+          bounded; not on the HTTP hot path.
+        """
         bytes_per_token = self._aginfer_bytes_per_token()
-        hbm_cap = hbm_cap_tokens * bytes_per_token
-        dram_cap = dram_cap_tokens * bytes_per_token
-
+        sp_full = self._aginfer_subpool_name(BASE_COMPONENT_TYPE)
         if want_bytes:
-            return self._dump_aginfer_state_bytes_inner(
-                root, base_ct, hbm_cap, dram_cap, page_size, bytes_per_token
-            )
+            return self._dump_aginfer_state_bytes(bytes_per_token, sp_full)
+        return self._dump_aginfer_state_dict(bytes_per_token, sp_full)
 
-        # Legacy dict path.
+    def _dump_aginfer_state_dict(self, bytes_per_token: int, sp_full: str) -> dict:
+        """Dict-path snapshot.  Convenient for in-process callers; not
+        on the HTTP hot path so per-unit Python dict allocations are
+        acceptable."""
+        # Walk: collect units + per-subpool DRAM aggregates.
         units: list = []
         units_append = units.append
+        dram_used_by_sp: dict[str, int] = {sp_full: 0}
+        root = self.root_node
+        base_ct = BASE_COMPONENT_TYPE
         stack = [root]
         stack_pop = stack.pop
         stack_extend = stack.extend
@@ -2683,113 +2800,117 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             cd = node.component_data[base_ct]
             v = cd.value
-            if v is not None and len(v) > 0:
-                n_tokens = len(v)
-                hbm_used += n_tokens
-                tier = "HBM"
-            else:
-                hv = cd.host_value
-                if hv is not None and len(hv) > 0:
-                    n_tokens = len(hv)
-                    dram_used += n_tokens
-                    tier = "DRAM"
-                else:
-                    continue
+            n_tokens_hbm = len(v) if v is not None else 0
+            hv = cd.host_value
+            n_tokens_dram = len(hv) if hv is not None else 0
+            n_bytes: dict[str, dict[str, int]] = {}
+            if n_tokens_hbm > 0:
+                n_bytes["HBM"] = {sp_full: n_tokens_hbm * bytes_per_token}
+            if n_tokens_dram > 0:
+                n_bytes["DRAM"] = {sp_full: n_tokens_dram * bytes_per_token}
+                dram_used_by_sp[sp_full] += n_tokens_dram * bytes_per_token
+            if not n_bytes:
+                continue
+            residence = list(n_bytes.keys())
+            n_tokens = max(n_tokens_hbm, n_tokens_dram)
             hv_list = node.hash_value
             if hv_list:
                 unit_hash = hv_list[-1]
                 if type(unit_hash) is not str:
                     unit_hash = str(unit_hash)
             else:
-                # Fallback for transient (pre-HiCache-backup) nodes.
-                # UnifiedTreeNode.counter strictly increases, so this name is
-                # stable for the daemon's lifetime (no id-recycle aliasing).
                 unit_hash = f"node-{node.id}"
             try:
                 sids = node.session_ids
             except AttributeError:
                 sids = None
-            units_append(
-                {
-                    "hash": unit_hash,
-                    "tier": tier,
-                    "n_tokens": n_tokens,
-                    "n_bytes": n_tokens * bytes_per_token,
-                    "last_access_time": int(node.last_access_time),
-                    "hit_count": node.hit_count,
-                    "session_ids": sorted(sids) if sids else [],
-                }
-            )
+            units_append({
+                "hash": unit_hash,
+                "residence": residence,
+                "n_tokens": n_tokens,
+                "n_bytes": n_bytes,
+                "last_access_time": int(node.last_access_time),
+                "hit_count": int(node.hit_count),
+                "session_ids": sorted(sids) if sids else [],
+            })
+
+        pool_usage = self._aginfer_pool_usage()
+        self._aginfer_patch_dram_used(pool_usage, dram_used_by_sp)
+
+        # Per-program post-walk aggregation (1/holders attribution).
+        per_program: dict[str, dict] = {}
+        for u in units:
+            sids = u["session_ids"]
+            if not sids:
+                continue
+            n_holders = len(sids)
+            for pid in sids:
+                e = per_program.setdefault(pid, {
+                    "hbm":  {"committed": {}, "inflight": {}},
+                    "dram": {"committed": {}},
+                    "state": "REASONING",
+                    "pre_pause_state": None,
+                    "unit_hashes": [],
+                })
+                e["unit_hashes"].append(u["hash"])
+                for tier, sp_dict in u["n_bytes"].items():
+                    if tier == "DISK":
+                        continue
+                    side = "hbm" if tier == "HBM" else "dram"
+                    bucket = e[side]["committed"]
+                    for sp, bytes_total in sp_dict.items():
+                        bucket[sp] = bucket.get(sp, 0) + bytes_total // n_holders
 
         return {
-            "tier_usage": {
-                "HBM": {
-                    "used_bytes": hbm_used * bytes_per_token,
-                    "cap_bytes": hbm_cap,
-                },
-                "DRAM": {
-                    "used_bytes": dram_used * bytes_per_token,
-                    "cap_bytes": dram_cap,
-                },
-                # DISK placeholder — Mooncake/SSD spill is not yet wired
-                # (see migrate handler's "disk_tier_not_yet_wired" branch).
-                # Emit a stable zero so the daemon can do `state["tier_usage"]
-                # ["DISK"]` without a fallback; once Mooncake lands, populate
-                # used_bytes / cap_bytes with the host-pool's disk metrics.
-                "DISK": {"used_bytes": 0, "cap_bytes": 0},
-            },
-            # G10 fix (2026-05-31): allocator-truth HBM occupancy for
-            # admission gating.  See _aginfer_pool_usage() docstring;
-            # tier_usage above is radix-tree-keyed (for migration V_u)
-            # and reads ~0 even under real pressure because in-flight
-            # decode KV isn't in the tree.
-            "pool_usage": self._aginfer_pool_usage(),
-            "units": units,
-            "page_size": page_size,
-            "bytes_per_token": bytes_per_token,
-            # Monotonic access-tick counter; daemon computes unit age
-            # as `time_counter - last_access_time`.  Same scale as the
-            # counter that stamps each node's last_access_time.
             "time_counter": int(peek_time_counter()),
+            "throughput_ema": self._aginfer_throughput_ema(),
+            "pool_usage": pool_usage,
+            "per_program_usage": per_program,
+            "units": units,
+            "link_stats": self._aginfer_link_stats(),
+            "tier_holding_cost": self._aginfer_tier_holding_cost(pool_usage),
         }
 
-    def _dump_aginfer_state_bytes_inner(
-        self,
-        root,
-        base_ct: int,
-        hbm_cap: int,
-        dram_cap: int,
-        page_size: int,
-        bytes_per_token: int,
-    ) -> bytes:
-        """Allocation-light JSON builder for the daemon snapshot.
+    def _aginfer_patch_dram_used(self, pool_usage: dict,
+                                 dram_used_by_sp: dict) -> None:
+        """Post-walk DRAM-used patch on pool_usage."""
+        for sp, used in dram_used_by_sp.items():
+            if sp in pool_usage["DRAM"]["subpools"]:
+                e = pool_usage["DRAM"]["subpools"][sp]
+                e["used_bytes"] = used
+                e["available_bytes"] = max(0, e["cap_bytes"] - used)
+                e["evictable_bytes"] = used
 
-        Every node contributes a fixed-shape unit object; we write them
-        directly into a ``bytearray`` instead of materialising one Python
-        dict per node.  Hash strings are hex SHA-256 (alnum, JSON-safe);
-        session_ids are escaped via ``orjson`` only on the rare non-empty
-        path.  All numeric fields are coerced to ints before formatting so
-        we never emit numpy scalars or floats into the wire JSON.
+    def _dump_aginfer_state_bytes(self, bytes_per_token: int,
+                                  sp_full: str) -> bytes:
+        """Allocation-light bytes-path snapshot.
+
+        Hot loop writes each unit's JSON directly into a ``bytearray``
+        instead of building a per-unit Python dict.  Per-program
+        accumulators are small (one dict-of-dicts per program) so
+        their post-walk orjson encode is cheap.
+
+        Wire JSON is byte-equivalent to the dict path's
+        ``orjson.dumps(_dump_aginfer_state_dict(...))`` output up to
+        key ordering — daemon parses by key, not by position.
         """
-        # Pre-bind locals: removing the LOAD_ATTR / LOAD_GLOBAL per node is
-        # the single biggest per-node speedup in CPython.
-        # We accumulate the units-list bytes during the walk and assemble
-        # the final response (with tier_usage in its original slot) at the
-        # end.  Order matches the legacy dict iteration order so the wire
-        # JSON is byte-stable.
-        hbm_used = 0
-        dram_used = 0
+        # Pre-bind locals for inner-loop speed.
+        base_ct = BASE_COMPONENT_TYPE
+        root = self.root_node
+
+        # Per-program accumulators (built during the walk so we don't
+        # have to re-iterate units after).
+        # pid → {"hbm_committed": {sp: int}, "dram_committed": {sp: int},
+        #        "unit_hashes": [hash, ...]}
+        pp: dict[str, dict] = {}
+        dram_used_by_sp: dict[str, int] = {sp_full: 0}
+
         units_buf = bytearray()
-        buf_extend = units_buf.extend
         first = True
 
         stack = [root]
         stack_pop = stack.pop
         stack_extend = stack.extend
-        # Local import: orjson string-encode is only needed on the rare
-        # non-empty session_ids branch; keep it out of the global path so the
-        # import doesn't happen unless we need it.
-        _orjson_dumps = None
         while stack:
             node = stack_pop()
             stack_extend(node.children.values())
@@ -2797,90 +2918,133 @@ class UnifiedRadixCache(BasePrefixCache):
                 continue
             cd = node.component_data[base_ct]
             v = cd.value
-            if v is not None and len(v) > 0:
-                n_tokens = len(v)
-                hbm_used += n_tokens
-                tier_lit = b'"HBM"'
-            else:
-                hv = cd.host_value
-                if hv is not None and len(hv) > 0:
-                    n_tokens = len(hv)
-                    dram_used += n_tokens
-                    tier_lit = b'"DRAM"'
-                else:
-                    continue
+            n_tokens_hbm = len(v) if v is not None else 0
+            hv = cd.host_value
+            n_tokens_dram = len(hv) if hv is not None else 0
+            if n_tokens_hbm == 0 and n_tokens_dram == 0:
+                continue
+            hbm_bytes = n_tokens_hbm * bytes_per_token if n_tokens_hbm else 0
+            dram_bytes = (n_tokens_dram * bytes_per_token
+                          if n_tokens_dram else 0)
+            if dram_bytes:
+                dram_used_by_sp[sp_full] += dram_bytes
+
             hv_list = node.hash_value
             if hv_list:
                 unit_hash = hv_list[-1]
                 if type(unit_hash) is not str:
                     unit_hash = str(unit_hash)
             else:
-                # Fallback for transient (pre-HiCache-backup) nodes.
-                # UnifiedTreeNode.counter strictly increases, so the
-                # name stays stable for the daemon's lifetime.
                 unit_hash = f"node-{node.id}"
             try:
                 sids = node.session_ids
             except AttributeError:
                 sids = None
+            sids_sorted = sorted(sids) if sids else None
 
+            # ---- write the unit JSON directly into units_buf ----
             if first:
                 first = False
             else:
-                units_buf += b","
-            units_buf += b'{"hash":"'
-            # Hash bytes (hex SHA-256 or numeric str) are JSON-safe ASCII;
-            # the radix never emits "/", "\\" or control chars.
-            buf_extend(unit_hash.encode("ascii", "backslashreplace"))
-            units_buf += b'","tier":'
-            units_buf += tier_lit
-            units_buf += b',"n_tokens":'
-            buf_extend(str(n_tokens).encode("ascii"))
-            units_buf += b',"n_bytes":'
-            buf_extend(str(n_tokens * bytes_per_token).encode("ascii"))
-            units_buf += b',"last_access_time":'
-            # last_access_time may be numpy.float64; coerce once.
-            buf_extend(str(int(node.last_access_time)).encode("ascii"))
-            units_buf += b',"hit_count":'
-            buf_extend(str(int(node.hit_count)).encode("ascii"))
-            if sids:
-                units_buf += b',"session_ids":'
-                if _orjson_dumps is None:
-                    import orjson  # noqa: WPS433
-                    _orjson_dumps = orjson.dumps
-                buf_extend(_orjson_dumps(sorted(sids)))
+                units_buf.append(0x2C)  # ','
+            # {"hash":"<hash>","residence":[...],"n_tokens":N,
+            #  "n_bytes":{...},"last_access_time":N,"hit_count":N,
+            #  "session_ids":[...]}
+            units_buf.extend(b'{"hash":"')
+            units_buf.extend(unit_hash.encode("ascii", "backslashreplace"))
+            units_buf.extend(b'","residence":[')
+            if hbm_bytes and dram_bytes:
+                units_buf.extend(b'"HBM","DRAM"')
+            elif hbm_bytes:
+                units_buf.extend(b'"HBM"')
             else:
-                units_buf += b',"session_ids":[]'
-            units_buf += b"}"
+                units_buf.extend(b'"DRAM"')
+            units_buf.extend(b'],"n_tokens":')
+            units_buf.extend(str(max(n_tokens_hbm, n_tokens_dram))
+                             .encode("ascii"))
+            units_buf.extend(b',"n_bytes":{')
+            n_bytes_pieces = []
+            if hbm_bytes:
+                n_bytes_pieces.append(
+                    b'"HBM":{"' + sp_full.encode("ascii") + b'":'
+                    + str(hbm_bytes).encode("ascii") + b'}')
+            if dram_bytes:
+                n_bytes_pieces.append(
+                    b'"DRAM":{"' + sp_full.encode("ascii") + b'":'
+                    + str(dram_bytes).encode("ascii") + b'}')
+            units_buf.extend(b",".join(n_bytes_pieces))
+            units_buf.extend(b'},"last_access_time":')
+            units_buf.extend(str(int(node.last_access_time)).encode("ascii"))
+            units_buf.extend(b',"hit_count":')
+            units_buf.extend(str(int(node.hit_count)).encode("ascii"))
+            if sids_sorted:
+                # orjson on the rare non-empty branch (~free vs json.dumps).
+                import orjson as _o
+                units_buf.extend(b',"session_ids":')
+                units_buf.extend(_o.dumps(sids_sorted))
+            else:
+                units_buf.extend(b',"session_ids":[]')
+            units_buf.extend(b"}")
 
-        # Assemble: tier_usage first, then pool_usage (G10), then
-        # units, then page_size, then bytes_per_token — matches the
-        # order of the legacy dict so wire JSON stays byte-stable.
-        # pool_usage is built as a Python dict by _aginfer_pool_usage()
-        # then JSON-encoded once; per-snapshot cost is tiny (~6 ints).
+            # ---- per-program accumulator (single dict-of-dicts per pid) ----
+            if sids_sorted:
+                n_holders = len(sids_sorted)
+                hbm_share = hbm_bytes // n_holders if hbm_bytes else 0
+                dram_share = dram_bytes // n_holders if dram_bytes else 0
+                for pid in sids_sorted:
+                    e = pp.get(pid)
+                    if e is None:
+                        e = {
+                            "hbm_committed": {},
+                            "dram_committed": {},
+                            "unit_hashes": [],
+                        }
+                        pp[pid] = e
+                    e["unit_hashes"].append(unit_hash)
+                    if hbm_share:
+                        c = e["hbm_committed"]
+                        c[sp_full] = c.get(sp_full, 0) + hbm_share
+                    if dram_share:
+                        c = e["dram_committed"]
+                        c[sp_full] = c.get(sp_full, 0) + dram_share
+
+        # ---- finalise pool_usage / aux fields (small dicts) ----
+        pool_usage = self._aginfer_pool_usage()
+        self._aginfer_patch_dram_used(pool_usage, dram_used_by_sp)
+        link_stats = self._aginfer_link_stats()
+        tier_holding_cost = self._aginfer_tier_holding_cost(pool_usage)
+        throughput_ema = self._aginfer_throughput_ema()
+
+        # Reshape per_program accumulators into DESIGN §5 form.
+        per_program = {
+            pid: {
+                "hbm":  {"committed": e["hbm_committed"], "inflight": {}},
+                "dram": {"committed": e["dram_committed"]},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": e["unit_hashes"],
+            }
+            for pid, e in pp.items()
+        }
+
+        # ---- assemble final wire JSON ----
+        import orjson
         out = bytearray()
-        out += b'{"tier_usage":{"HBM":{"used_bytes":'
-        out += str(hbm_used * bytes_per_token).encode("ascii")
-        out += b',"cap_bytes":'
-        out += str(hbm_cap).encode("ascii")
-        out += b'},"DRAM":{"used_bytes":'
-        out += str(dram_used * bytes_per_token).encode("ascii")
-        out += b',"cap_bytes":'
-        out += str(dram_cap).encode("ascii")
-        # DISK placeholder — Mooncake/SSD spill not yet wired; emit zero so
-        # the daemon can read state["tier_usage"]["DISK"] without a fallback.
-        out += b'},"DISK":{"used_bytes":0,"cap_bytes":0}},"pool_usage":'
-        import orjson as _orjson  # local import: already imported above for sids
-        out += _orjson.dumps(self._aginfer_pool_usage())
-        out += b',"units":['
-        out += units_buf
-        out += b'],"page_size":'
-        out += str(page_size).encode("ascii")
-        out += b',"bytes_per_token":'
-        out += str(bytes_per_token).encode("ascii")
-        out += b',"time_counter":'
-        out += str(int(peek_time_counter())).encode("ascii")
-        out += b"}"
+        out.extend(b'{"time_counter":')
+        out.extend(str(int(peek_time_counter())).encode("ascii"))
+        out.extend(b',"throughput_ema":')
+        out.extend(orjson.dumps(throughput_ema))
+        out.extend(b',"pool_usage":')
+        out.extend(orjson.dumps(pool_usage))
+        out.extend(b',"per_program_usage":')
+        out.extend(orjson.dumps(per_program))
+        out.extend(b',"units":[')
+        out.extend(units_buf)
+        out.extend(b'],"link_stats":')
+        out.extend(orjson.dumps(link_stats))
+        out.extend(b',"tier_holding_cost":')
+        out.extend(orjson.dumps(tier_holding_cost))
+        out.extend(b'}')
         return bytes(out)
 
     def ready_to_load_host_cache(self) -> int:

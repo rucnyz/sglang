@@ -3400,23 +3400,14 @@ class Scheduler(
         dump = getattr(self.tree_cache, "dump_aginfer_state", None)
         if dump is None:
             # Tree cache doesn't expose the aginfer state schema (e.g.,
-            # non-Unified tree).  Return a wire-contract-compatible
-            # empty payload so the daemon's strict accessors don't
-            # KeyError -- daemon sees zero occupancy on every tier and
-            # makes no decisions.  The ``unsupported_tree_cache``
-            # marker lets the daemon log a one-shot warning.
+            # non-Unified tree).  DESIGN §5: "Daemon halts loudly on this
+            # — running aginfer against an incompatible cache is a
+            # deployment bug."  We return only the marker; the daemon
+            # is supposed to fatal() on receipt rather than continue
+            # with a synthesised empty snapshot.
             return GetAginferStateReqOutput(
                 state={
                     "unsupported_tree_cache": type(self.tree_cache).__name__,
-                    "tier_usage": {
-                        "HBM": {"used_bytes": 0, "cap_bytes": 0},
-                        "DRAM": {"used_bytes": 0, "cap_bytes": 0},
-                        "DISK": {"used_bytes": 0, "cap_bytes": 0},
-                    },
-                    "units": [],
-                    "page_size": int(getattr(self.tree_cache, "page_size", 0)),
-                    "bytes_per_token": 0,
-                    "time_counter": 0,
                 }
             )
         return GetAginferStateReqOutput(state=dump())

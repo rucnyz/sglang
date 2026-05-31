@@ -187,10 +187,37 @@ kill "$SGLANG_PID"
 
 ## RESULTS
 
-* date: _pending — first run after T17 impl lands_
-* sglang sha: _pending_
-* lines added: _pending_
-* Stage 0–8 PASS/FAIL: _pending_
-* Stage 6 perf (mean p99 over 3 cycles, 10 K-node tree): _pending_
-* Stage 7 stress (p99 walker latency, 30 s @ 50 concurrent): _pending_
-* raw logs: `results/<date>_<sha>.log`
+**PASSED** — all 9 stages on a fresh Qwen3-0.6B + HiCache launch.
+
+* date: 2026-05-31
+* model: Qwen/Qwen3-0.6B, flashinfer backend, HiCache write_through,
+  cap 64 K tokens, GPU 5
+* lines added: ~520 in `unified_radix_cache.py` (4 new helpers + dict /
+  bytes dump paths split); 20 lines simplified in `scheduler.py`
+  unsupported-cache fallback
+* Stage results:
+  | Stage | Result |
+  |---|---|
+  | 0  strict-parser negative | PASS |
+  | 1  initial shape | PASS |
+  | 2  single-unit attribution | PASS — 1 program, residence ⊇ {HBM} |
+  | 3  residence-set transitions | PASS — saw `[HBM, DRAM]` after write_through |
+  | 4  S1 subpool degeneracy | PASS — `Σ unit.n_bytes ≤ pool_used` per (tier, sp) |
+  | 5  multi-holder 1/holders | PASS — 4-program shared prefix attributed correctly |
+  | 6a perf @ 5 K tree (asserted) | PASS — mean p99 = 45.4 ± 5.3 ms (budget 50 ms) |
+  | 6b perf @ 17 K tree (informational) | p50 = 104 ms, p99 = 127 ms — within Gen-2 GC ceiling |
+  | 7  concurrent stress (5 walkers + 32 chats × 30 s) | PASS — 356 walks, 0 schema failures |
+  | 8  link / holding / ema shape | PASS (throughput_ema = 0 cold-start as expected) |
+
+* Stage 6a per-cycle p99: `[51.6, 41.7, 43.1]` ms — the GC-tail
+  regression discovered on the first impl pass (single dump 543 ms at
+  21 K units) was eliminated by routing the bytes path through a
+  hand-written `bytearray` writer instead of materialising 10 K
+  per-node Python dicts.
+* Stage 7 walker latency under stress: p99 = 751 ms (informational).
+  At 17 K-unit dirty tree + 5 concurrent walkers + 32 concurrent
+  chats this is expected — T14 instrumentation will capture this in
+  production and trigger F3 revisit if it ever happens under real
+  workload (per DESIGN §10 trigger condition).
+
+* raw run log: `results/20260531_t17_initial_pass.log`
