@@ -187,6 +187,50 @@ to claim any perf effect.  Conclusion: SWA-assert fix is a
 measurable performance change** — the 28-448 assertions were
 on broken-chain nodes that promote couldn't help anyway.
 
+### 2026-05-31: (C) fine-grained decline reason
+
+Routed `load_back` decline path through a per-cache attribute
+`self._last_load_back_decline` set at each early-return False:
+
+* `no_cache_controller` — HiCache off (unreachable in A3)
+* `below_threshold:kv_tokens=X<thr=Y` — full-KV too small AND no aux components
+* `exceeds_mem_quota:kv_tokens=X>quota=Y+delta=Z` — quota arg violated (G11 passes None so unreachable)
+* `evict_short:needed=X>evicted=Y` — couldn't make HBM space
+* `controller_load_returned_none` — sglang `cache_controller.load()` H→D copy failed
+
+`apply_aginfer_migrations` reads the attribute and emits
+`promote_load_back_declined:<category>` so daemon's Counter
+buckets cleanly without numeric tails fragmenting the histogram.
+
+**A3 v8 (a3_finegrain_231318)** result:
+
+| reason | count | % |
+|---|---|---|
+| `promote_load_back_declined:controller_load_returned_none` | 6 | 54.5 % |
+| `race:already_on_hbm` | 5 | 45.5 % |
+| **total skipped** | **11** | / 1391 attempts (0.79 %) |
+
+Per-trial mean: 1150.6 ± 661.4 s (n=32), within A3 noise band.
+
+**Surprising finding**: every single load_back decline is
+`controller_load_returned_none` — i.e. the sglang HiCache
+controller's async H→D copy itself failed.  Zero
+`evict_short`, zero `below_threshold`, zero `exceeds_mem_quota`.
+
+Implications:
+1. **HBM pressure is NOT the bottleneck for the rare promote
+   declines.**  We're not failing to evict.  At HBM peak 0.62-0.97
+   on A3 the eviction subsystem has slack.
+2. **The remaining failures are async controller-level**: host
+   page allocation, transfer queue, or controller load racing
+   with another op.  Worth investigating only if rate climbs.
+3. **At 0.79 % decline rate** the daemon's promote is effectively
+   reliable; no design change warranted.
+
+The numeric detail (kv_tokens / needed / evicted / quota+delta) is
+still stashed on `self._last_load_back_decline` for live debug,
+just not embedded in the Counter-aggregated skip reason.
+
 ## Files
 
 * sglang patch: `python/sglang/srt/mem_cache/unified_radix_cache.py`
