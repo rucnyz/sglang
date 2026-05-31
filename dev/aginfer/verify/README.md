@@ -69,7 +69,7 @@ Each task lives in its own folder `tN/` with:
 | 7 | (infra) | kv_scheduler value rule | [`kv_scheduler_value_rule/`](kv_scheduler_value_rule/) | ⚠️ **STALE post-T33** — pre-round-9 API; full rewrite tracked as #146 |
 | 8 | (infra) | admission_controller | [`admission_controller/`](admission_controller/) | ⚠️ **STALE post-T33** — pre-round-9 API; rewrite tracked as #146 (shared with kv_scheduler_value_rule) |
 | 9 | (moved) | Run K + K-a + J ablation | see [`scenarios/`](../scenarios/) | moved 2026-05-31; old verify/t9 README deleted (was redirect-only + dead links to N3_GAPS.md) |
-| 10 | T10 | integration / concurrency / restart / GC + forced-fault verifies + daemon-controlled L3 (DISK) tier via Mooncake (paper §3 4-tier completion) | [`t10/`](t10/) | pending |
+| 10 | (pending) | integration stress (6 stress flavors A–F) | — | not yet started; tracked as #147 (B partially covered by `verify/t17/` Stage 7) |
 | **11** | **T11** | **empirical p_hat / scoring (replace paper §7 hits/age proxy)** | [`t11/`](t11/) | **T11a daemon-side DONE & N=3-tested 2026-05-26: no significant Δ. T11a inline-side and T11b residual estimator deferred — no empirical signal under current settings (runaway generation dominates), kept as future-work theoretical motivation per `todo-empirical-phat` memory.** |
 
 Per-task `tN/results/` directories hold raw outputs (logs, JSON, harbor
