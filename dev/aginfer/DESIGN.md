@@ -1,175 +1,185 @@
-# aginfer daemon — design (v3, pure reactive)
+# aginfer — design
 
-> **Δ from v2.** Polling is gone. The daemon has no timer / no tick loop.
-> All decisions are triggered by events:
-> - 6 of paper §4's 8 event kinds come from the daemon's proxy
->   (session_arrival, llm_prefill, tool_call_start, tool_call_end,
->   sub_dispatch, sub_return).
-> - The remaining 2 (`memory_pressure`, `pressure_resolved` — the
->   tier-3-occupancy-watermark transitions) come from sglang via a
->   `POST /aginfer/event` webhook fired by sglang's own scheduler step.
->
-> Tightness ratio vs ThunderAgent: TA polls every 5 s → average reaction
-> time 2.5 s, worst case 5 s. Our reactive design reacts within one
-> sglang scheduler step (≈ 10–50 ms) of the actual cache state changing.
+External KV-cache scheduler for sglang serving multi-turn agentic
+workloads.  This document specifies *what the system should be*, not
+the path that got us here.  Where the implementation is a simplification
+of what's described, the simplification is called out explicitly.
 
-## Layered architecture
+## 1. What it is
+
+A daemon-side scheduler that decides, on every workload-relevant
+event:
+
+* which cache **units** belong in which **tier** (HBM / DRAM / Disk / Drop)
+* which **programs** should be paused or resumed under memory pressure
+
+The mechanism is **event-driven**, **per-unit value-based**, and
+**externalised from sglang** so the inference engine stays general
+while scheduling policy is free to iterate.
+
+## 2. Workload model (the hard physical facts)
+
+aginfer assumes the workload is multi-turn agentic inference:
+
+* programs run tool-bound reasoning loops (typically tens of turns)
+* each program accumulates KV state across turns; turn-tail value
+  decays but isn't zero
+* programs concurrently share large prefix material (system prompt,
+  tool documentation, sub-agent context)
+* tool execution puts a program off-GPU for 50 ms-30 s — its KV
+  occupies HBM but is *idle* during that window
+* program runtimes are heterogeneous (5x-100x dynamic range)
+
+Three facts follow that drive every design choice:
+
+1. **Per-unit KV value is highly non-uniform.**  Shared prefix used
+   by 32 concurrent programs ≫ a 30-turn-old intermediate scratch
+   from one program.  LRU treats them the same and gets it backwards.
+
+2. **Cache value lives on a continuum, not binary keep/evict.**
+   "1% chance of future reuse" doesn't deserve HBM but isn't worth
+   dropping either.  Hardware exposes a tier hierarchy (HBM ≫ DRAM
+   ≫ Disk in $/bandwidth); the decision space must match.
+
+3. **KV is owned by programs.**  Per-unit micro-management can't
+   express "pause this whole program because its tools are slow and
+   its current value is below another program's".  A scheduler that
+   can only evict bytes can't free coherent program slots.
+
+## 3. Architecture
+
+Three layers, three cadences (none of them periodic).
 
 ```
-                harbor (terminus-2 trial containers)
-                  │
-                  ▼  OpenAI-compat HTTP
-       ┌───────────────────────────────────────────────────┐
-       │  aginfer-daemon (pure reactive)                   │
+              harbor (agent trial containers)
+                 │  OpenAI HTTP, extra_body.program_id
+                 ▼
+       ┌──────────────────────────────────────────────────┐
+       │  aginfer-daemon                                   │
        │                                                   │
-       │  /v1/chat/completions       /aginfer/event        │
-       │       │                          │                │
-       │       │ proxy emits 6 paper §4   │ sglang pushes  │
-       │       │ events: session_arrival, │ memory_pressure│
-       │       │ tool_call_*, sub_*       │ pressure_resolved│
-       │       │                          │                │
-       │       └──────────┬───────────────┘                │
-       │                  ▼                                │
-       │           single-worker event_queue (asyncio)     │
-       │                  │ serialised, idempotent         │
-       │                  ▼                                │
-       │           on_event(e):                            │
-       │            1. fetch_state()  (always fresh)       │
-       │            2. dispatch to kv_scheduler /          │
-       │               admission_controller based on e.kind│
-       │            3. action -> migrate / pause / resume  │
+       │  proxy ── emits per-program lifecycle events ──┐  │
+       │                                                ▼  │
+       │  event_router (single-worker asyncio queue,       │
+       │    serialised, idempotent)                        │
+       │    │                                              │
+       │    ▼                                              │
+       │  on_event(e):                                     │
+       │    state ← fetch /aginfer/state                   │
+       │    D_t   ← decision_set(e.kind)                   │
+       │    a_t   ← kv_scheduler.decide(state, D_t)        │
+       │    POST /aginfer/migrate(a_t)                     │
+       │    if e.kind ∈ {MEMORY_PRESSURE, PRESSURE_RESOLVED}: │
+       │        admission.act(state)                       │
        │                                                   │
-       │       program_tracker (REASONING/ACTING/PAUSED)   │
-       │       state machine, also event-driven from proxy │
-       └─────────┬──────────────────────────────┬──────────┘
-                 │ proxied requests             │ /aginfer/* admin HTTP
-                 ▼                              ▼
-       ┌───────────────────────────────────────────────────┐
+       │  program_tracker — REASONING / ACTING / PAUSED   │
+       │    state machine, driven from the same events     │
+       └─────────┬──────────────────────────┬──────────────┘
+                 │ proxied requests         │ /aginfer/* admin HTTP
+                 ▼                          ▼
+       ┌──────────────────────────────────────────────────┐
        │  sglang  (V4-Flash, TP=2, HiCache + Mooncake)     │
        │                                                   │
-       │   UnifiedRadixCache.FullComponent.drive_eviction  │
-       │     SGLANG_KV_POLICY_MODULE=baselines.sglang_     │
-       │     adapter:ours_greedy_score  (inline scorer)    │
+       │  inline scorer (safety net)                       │
+       │    — runs inside `drive_eviction`                 │
+       │    — uses the same V_u rule with daemon-fed       │
+       │      lambda/p_hat hints if available, otherwise   │
+       │      cached LRU age                               │
        │                                                   │
-       │   Admin endpoints (read + write):                 │
-       │     GET  /aginfer/state                           │
-       │     POST /aginfer/migrate                         │
+       │  admin endpoints:                                 │
+       │    GET  /aginfer/state                            │
+      │    POST /aginfer/migrate                          │
        │                                                   │
-       │   Outbound webhook:                               │
-       │     on every scheduler step, detect HBM occ       │
-       │     state ∈ {OK, HIGH, CRITICAL}. Fire             │
-       │     fire-and-forget POST                          │
-       │       --aginfer-notify-url/aginfer/event          │
-       │     when (a) state transitions, OR                │
-       │     (b) state ∈ {HIGH, CRITICAL} AND               │
-       │         last_fire was >= 5 s ago (heartbeat).     │
-       │     Payload {kind: memory_pressure |              │
-       │     pressure_resolved | still_high, occ, used}.   │
-       │                                                   │
-       │   session_id passthrough -> UnifiedTreeNode       │
-       │     .session_ids: set[str]                         │
-       └───────────────────────────────────────────────────┘
+       │  outbound webhook (mandatory):                    │
+       │    POST <daemon>/aginfer/event                    │
+       │    on every scheduler step, fire when the         │
+       │    allocator-truth HBM occupancy crosses          │
+       │    theta_hi up or back down                       │
+       └──────────────────────────────────────────────────┘
 ```
 
-Three layers, three cadences (none of them periodic):
-
-| Layer | Where | When it fires | What it decides |
+| Layer | Where | Cadence | Decision granularity |
 |---|---|---|---|
-| inline scorer | inside sglang's `drive_eviction` | every alloc-failure | eviction heap key for THIS evict |
-| kv_scheduler | aginfer-daemon | on each paper §4 event (proxy or sglang-pushed) | batch of `(hash, target_tier)` for `D_t` of that event |
-| admission_controller | aginfer-daemon | on `memory_pressure` / `pressure_resolved` events | pause / resume per program at proxy |
+| inline scorer | inside sglang's `drive_eviction` | every alloc-failure | eviction heap key for this one evict |
+| kv_scheduler | daemon | one per workload event | batch of `(hash, target_tier)` over D_t |
+| admission_controller | daemon | one per pressure event | per-program pause / resume |
 
-All three use the **same paper §7 value rule** (`baselines/ours_greedy.py`),
-just with different action vocabularies, different state visibilities, and
-different *event kinds* feeding `OursGreedyPolicy.decide(state)`. No new
-`decide_periodic()` method; we always invoke `decide()` with an
-`event_kind` and a `decision_set` per paper §4.
+All three use the **same V_u rule**.  They differ in (a) what they
+can act on, (b) what visibility they have, (c) what triggers them.
 
-## Why pure reactive
+## 4. Events
 
-| | 5 s polling (TA-style) | pure reactive (this design) |
+Eight event kinds.  The daemon is **strictly reactive** to events;
+the system has no internal timer.
+
+| kind | emitted by | semantic |
 |---|---|---|
-| reaction latency for `memory_pressure` | 0–5 s (avg 2.5 s) | ≤ 1 sglang scheduler step (~10-50 ms) |
-| daemon idle CPU | non-zero (timer + fetch every 5 s) | zero (event-driven) |
-| interval tuning knob | yes (5 s is a guess) | none |
-| matches paper §4 directly | partial (memory_pressure faked from polling) | yes (all 8 event kinds are real events) |
-| "we subsume TA" narrative | "we mirror TA" | **"we react faster than TA, with paper §4 events"** |
+| `SESSION_ARRIVAL` | proxy | first request of a new program |
+| `LLM_PREFILL` | proxy | every chat completion call (state observation) |
+| `TOOL_CALL_START` | proxy | program goes off-GPU to wait on a tool |
+| `TOOL_CALL_END` | proxy | tool returned, program resuming |
+| `SUB_DISPATCH_BLOCKING` | proxy | program dispatches a sync sub-agent |
+| `SUB_DISPATCH_ASYNC` | proxy | program dispatches an async sub-agent |
+| `MEMORY_PRESSURE` | sglang webhook | allocator-truth HBM occupancy crossed `theta_hi` upward |
+| `PRESSURE_RESOLVED` | sglang webhook | crossed `theta_hi` downward |
 
-## Reliability — explicit failure modes & mitigations
+Each event carries (`kind`, `session_id` if applicable, `payload`).
+The payload may include event-specific context the decision rule can
+exploit (see §7).
 
-These are real risks of going fully reactive. Each verify file checks the mitigation.
-
-| Risk | Mitigation | Verified in |
-|---|---|---|
-| `POST /aginfer/event` fails over network | sglang retries 3× with exponential backoff; handler is idempotent | T5 |
-| State drift (event payload is stale by the time daemon reads it) | every event handler re-`fetch_state()` at entry; never trust event payload's snapshot | T6, T7, T8 |
-| Concurrent event handlers race on migrate | single asyncio worker via `asyncio.Queue`; handlers serialised | T5 |
-| sglang webhook fire path itself crashes | fire-and-forget `asyncio.create_task` + `try/except` wrapper; sglang scheduler never blocks on send | T5 |
-| Daemon cold start: unknown initial cache state | daemon does a single `/aginfer/state` fetch at startup; from then on reactive | T5 |
-| Missed event (e.g. daemon restarted mid-flight) | on startup, daemon scans `tier_usage` once; if `HBM_occ > θ_hi` synthesise a `memory_pressure` event locally | T5 |
-| Debounce: state oscillates around θ_hi | sglang fires webhook on `OK↔HIGH↔CRITICAL` transitions; in `HIGH` or `CRITICAL` it ALSO fires a heartbeat at `interval=5 s` so the daemon can re-evaluate pause victims during plateau (matches TA's polling cadence at the only point it matters) | T5 |
-| Inline scorer module fails to load (ImportError) | sglang logs a structured `kv_policy_loaded={module}` line at startup; T9 / T10 grep that line and fail the run if the configured module is not loaded | T9 |
-
-## sglang surface — final, ≈ 350 lines after T1/T2 reality
-
-| Endpoint | Direction | Purpose | LoC |
-|---|---|---|---|
-| `GET /aginfer/state` | sglang ← daemon | snapshot `s_t` (per-unit + per-tier) | ~160 |
-| `POST /aginfer/migrate` | sglang ← daemon | apply `a_t = {(u, τ_target)}` | ~170 |
-| `POST <notify_url>/aginfer/event` | sglang → daemon | webhook on watermark transition | ~30 |
-| `session_id` passthrough to `UnifiedTreeNode.session_ids` | internal | wire `extra_body.program_id` into tree node | ~20 |
-
-(T1 ≈ 150 LoC, T2 ≈ 170 LoC after the duplicate-batch defensive set and
-the depth-audit additions; the ≈ 130 budget was pre-audit, re-baselined.)
-No new core algorithms in sglang. The inline scorer is already shipped
-on commit `c784e51ee`. Webhook is fire-and-forget; never blocks sglang's
-scheduler step.
-
-### `/aginfer/state` schema (paper §3 state s_t)
+## 5. State surface — `/aginfer/state`
 
 ```json
 {
-  "page_size": 1,
-  "bytes_per_token": 576,
-  "time_counter": int,
-  "tier_usage": {
+  "page_size": int,
+  "bytes_per_token": int,
+  "time_counter": int,                   // monotonic access tick
+
+  "tier_usage": {                        // RADIX-TREE view
     "HBM":  {"used_bytes": int, "cap_bytes": int},
     "DRAM": {"used_bytes": int, "cap_bytes": int},
     "DISK": {"used_bytes": int, "cap_bytes": int}
   },
+
+  "pool_usage": {                        // ALLOCATOR-TRUTH view
+    "HBM": {
+      "used_bytes":      int,
+      "cap_bytes":       int,
+      "available_bytes": int,
+      "evictable_bytes": int,
+      "token_usage":     float           // = (cap - avail - evictable) / cap
+                                          // matches sglang full_token_usage,
+                                          // i.e. real pressure after eviction
+    }
+  },
+
   "units": [
     {"hash": str, "tier": "HBM"|"DRAM",
      "n_tokens": int, "n_bytes": int,
      "last_access_time": int, "hit_count": int,
      "session_ids": list[str]}
-  ],
-  "unsupported_tree_cache": "<ClassName>"   // optional; only set when
-                                              // sglang launched with a
-                                              // tree cache that lacks
-                                              // dump_aginfer_state
+  ]
 }
 ```
 
-DISK is **always present** in `tier_usage` (round-3.5 cleanup); v1
-sglang emits `{used_bytes: 0, cap_bytes: 0}` as a placeholder until
-Mooncake / HiCache L3 is wired (T10).  Daemon reads `tier_usage["DISK"]`
-unconditionally — no `.get()` fallback.
+### Why two occupancy views
 
-`time_counter` is sglang's monotonic access tick (used for unit-age
-arithmetic).  Always emitted.
+The radix tree contains **only committed prefix-shareable units**.
+In-flight decode KV is allocator-owned but **not** in the tree.
 
-Bytes are the paper §7 currency: per-unit value rule divides by
-memory cost in bytes, and tier capacities are inherently byte
-quantities. `n_tokens` is also kept per unit because the value
-NUMERATOR (hit_count × tokens_saved) is token-counted.
+* `tier_usage` (radix view) is the right input for **V_u migration
+  value scoring** — V_u can only act on tree nodes, so the relevant
+  cost is "how full is the tree's slice of HBM".
+* `pool_usage` (allocator view) is the right input for **admission
+  gating** — admission throttles whole programs, so the relevant
+  pressure is "is the allocator running out of pages for new
+  requests", which includes in-flight decode.
 
-`hash` is hex SHA-256 of the radix node's committed KV when HiCache
-backup has populated it; otherwise the fallback `node-<id>` where
-`id` is `UnifiedTreeNode.counter`, a class-level **monotonic** integer
-that never recycles within a scheduler process. After scheduler
-process restart the counter resets — T10's restart story handles this.
+Mixing them either makes V_u over-eager (thinks HBM is empty when
+it's actually decode-full) or makes admission asleep at the wheel
+(thinks HBM is empty when it's actually pressured).  Two views,
+two consumers, no overlap.
 
-### `/aginfer/migrate` schema (paper §4 action a_t)
+## 6. Action surface — `/aginfer/migrate`
 
 Request:
 ```json
@@ -178,318 +188,207 @@ Request:
 
 Response:
 ```json
-{"applied": int, "applied_hashes": [str, ...], "skipped": [{"hash": str, "reason": str}, ...]}
+{"applied": int, "applied_hashes": [str, ...],
+ "skipped": [{"hash": str, "reason": str}, ...]}
 ```
 
-`applied_hashes` lets the daemon's idempotent retry loop prune its
-retry set in O(applied) without re-walking `/aginfer/state`. T5/T7/T8
-all consume it. Cost is O(applied) per call, dominated by JSON
-serialisation; gate with `with_applied_hashes: bool = True` request
-flag only if a profile shows it dominates.
+### Skip-reason classes
 
-### Migrate skip-reason taxonomy
+* **`race:*`** — time-window race between daemon's state fetch and
+  apply; tree mutated by concurrent evict / request.  Retryable.
+  Daemon re-issues on the next event.
+* **`promote_load_back_declined:<category>`** — `load_back()`
+  declined cleanly, with `<category>` distinguishing the sub-cause
+  (full-allocator alloc fail, SWA sub-pool evict short, etc.).
+  Usually transient; surface for diagnosis.
+* **`promote_raised:<exc>:<loc>:<msg>`** — load_back threw.
+  Indicates an invariant break; investigate.
+* **`unknown_target_tier:...`** / **`unsupported_tree_cache:...`** —
+  contract violations; daemon misbehavior.  Halt loudly.
 
-`POST /aginfer/migrate` returns `applied_hashes` + `skipped[{hash, reason}]`.
-Daemon's handling depends on the reason **class**, not the literal
-string.  Only ONE class is "soft" (retryable); everything else is
-either a hard error or a not-yet-wired feature.
+The daemon's retry / debug loop dispatches on the **class prefix**,
+not the literal string.
 
-**Class `race:*` — time-window race, retryable.**
-Daemon read state at `t0`; tree mutated by inline scorer / a concurrent
-request between `t0` and write.  Re-issue on the next event.  All
-reasons here use the `race:` prefix so log grep is trivial.
+## 7. Decision rule
 
-| reason | what raced |
-|---|---|
-| `race:not_in_tree` | unit evicted between read and write |
-| `race:no_data` | `value` and `host_value` both nil at write time |
-| `race:not_a_leaf` | new child appeared under the target node |
-| `race:demote_requires_existing_host_backup` | HiCache backup thread hadn't caught up |
-| `race:already_on_dram` | another demote landed first |
-| `race:already_on_hbm` | unit already promoted |
-
-**Class `error` — daemon bug or deployment misconfig; raise/exit.**
-NOT a bucket to silently retry.  These reasons should be **impossible**
-under a correctly-built daemon + correctly-launched sglang; if any of
-them ever appears in a response, the daemon raises (or `sys.exit(1)`
-at startup, for the deployment-misconfig case).  "Soft warning" is
-explicitly rejected — we want every encounter to surface as a bug to
-fix, not as a stat in a dashboard.
-
-| reason | source |
-|---|---|
-| `already_acted_this_batch` | daemon sent the same hash twice in one batch (must dedupe upfront) |
-| `unknown_target_tier:'<X>'` | daemon emitted a tier string not in `{HBM, DRAM, DISK, DROP}` (must validate upfront) |
-| `unsupported_tree_cache:<ClassName>` | sglang launched with a non-Unified tree cache; aginfer requires `UnifiedRadixCache` |
-
-**Class `deferred` — v1 not-yet-wired, accept silently.**
-Will transition into `race:*` once the underlying feature lands (T10).
-
-| reason | becomes available in |
-|---|---|
-| `promote_not_yet_wired` | T10 (explicit DRAM→HBM promote) |
-| `disk_tier_not_yet_wired` | T10 (Mooncake L3) |
-
-**v1 status (2026-05-26):** the daemon currently observes skip reasons
-but does NOT yet implement a retry loop OR the error-class raises.
-Round-1 framing-only commit lays down the naming convention so when
-Run K runs we can grep logs for `race:` vs raw reasons (any raw means
-daemon bug surfaced as `error`-class).  Retry loop + error-class raise
-land in T9.
-
-### Cost characteristics and HTTP caps
-
-Measured (verify/t2 round-3, Qwen3-0.6B + flashinfer + UnifiedRadixCache):
-
-* Slow path (real DROP, mutates tree): ≈ 0.04 ms/action
-* Fast path (`not_in_tree` rejection, dict miss): ≈ 0.01 ms/action
-
-`apply_aginfer_migrations` blocks the scheduler thread for the duration
-of a call. The daemon picks its own batch size to fit its per-event
-latency budget (see "Acknowledged costs"). sglang does NOT prescribe.
-
-HTTP guard rails:
-
-* `MAX_ACTIONS_PER_BATCH = 100_000` — over-cap requests return HTTP 400.
-* `MAX_HASH_LEN = 1024` chars — covers hex SHA-256 (64) + `node-N` (~12)
-  with generous slack; rejects pathological 1 MB hash strings that
-  would dominate the `hash_to_node` dict-build cost.
-
-The caps exist purely as DoS guards. A 100 k batch is legal but blocks
-the scheduler thread for seconds; whether that's acceptable is the
-daemon's call, not sglang's.
-
-### Startup invariants (T9 verification target)
-
-Two classes of invariants — universal (every Run) vs Run-specific.
-
-**Universal** (every Run J / K / K-a; halts the run if missing):
-
-* `tree_cache=UnifiedRadixCache` — `apply_aginfer_migrations` is only
-  defined on this class. T9's startup-log grep MUST fail the run if
-  the configured tree cache is not `UnifiedRadixCache`; otherwise
-  every migrate skips with `unsupported_tree_cache:<X>`, which is a
-  silent functional regression that the v1 daemon's retry loop
-  cannot detect.
-* `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1` — required env to opt into
-  the unified radix code path. T9 reads the configured value and
-  asserts the loaded tree cache class matches.
-* `kv_policy_loaded=<module>` — the inline scorer module name; T9
-  greps this line and fails the run if not loaded (see Reliability
-  table row above for the existing requirement).
-
-**Run-specific**:
-
-* **Run K only**: `--enable-hierarchical-cache` MUST be active. The
-  daemon does NOT hard-require HiCache (Run J explicitly runs without
-  it), but Run K's paper-figure-relevance depends on the 4-tier
-  coordination story. T9's Run-K-config grep halts if HiCache is not
-  on.
-* **Run J only**: `--enable-hierarchical-cache` MUST be OFF. Verifies
-  the daemon's §9 deployment claim that the three layers work without
-  HiCache. T9's Run-J-config grep halts if HiCache is on (would
-  invalidate the ablation).
-
-## Daemon entry points
+Per event, the daemon constructs a **decision set** `D_t ⊆ units`
+and runs `kv_scheduler.decide(state, D_t)`:
 
 ```python
-# Proxy → emits 6 of paper §4's 8 events
-@app.post("/v1/chat/completions")
-async def chat(req):
-    pid = extract_program_id(req)
-    await program_tracker.wait_if_paused(pid)
-    if pid not in known_programs:
-        await event_queue.put(Event("session_arrival", session=pid))
-    await event_queue.put(Event("llm_prefill", session=pid))
-    program_tracker.observe_arrival(pid)
-    # forward to sglang; on response stream end emit tool_call_start
-    async for chunk in proxy_stream(req):
-        yield chunk
-    await event_queue.put(Event("tool_call_start", session=pid))
-    program_tracker.observe_completion(pid)
+def decide(state, D_t):
+    plan = []
+    for u in D_t:
+        best_tier, best_score = u.tier, _net_value(u, u.tier, state)
+        for τ in (HBM, DRAM, DISK, DROP):
+            if τ == u.tier: continue
+            if capacity_left[τ] < u.n_bytes: continue
+            score = _net_value(u, τ, state)
+            if score > best_score:
+                best_score, best_tier = score, τ
+        if best_tier != u.tier:
+            plan.append((u.id, best_tier))
+    return plan
 
-# Webhook from sglang → emits the remaining 2 events
-@app.post("/aginfer/event")
-async def on_sglang_event(payload):
-    await event_queue.put(Event(payload.kind, payload))
-
-# Single-worker handler, idempotent
-async def event_worker():
-    while True:
-        e = await event_queue.get()
-        async with action_lock:                   # serialise
-            state = await client.fetch_state()     # always fresh
-            if e.kind == "memory_pressure":
-                action = policy.decide(state, e.kind, decision_set=top_k_by_regret(state))
-                await client.migrate(action.assignments)
-                admission.on_pressure(state)
-            elif e.kind == "pressure_resolved":
-                admission.maybe_resume(state)
-            elif e.kind in ("session_arrival", "llm_prefill",
-                            "tool_call_start", "tool_call_end", ...):
-                action = policy.decide(state, e.kind, decision_set=paper_§4_table(e))
-                await client.migrate(action.assignments)
+_net_value(u, τ, state) = _value(u, τ, state) - migration_cost(u, u.tier, τ)
+_value(u, τ, state)     = p_hat × (reload_from_DROP - reload_from_τ)
+                          - h_τ(occupancy_of_τ) × bytes × hold_time
 ```
 
-The `decision_set` per event kind is exactly paper §4's table. No
-`decide_periodic`, no new policy entry point.
+### D_t per event kind
 
-## Worst-case argument (final)
+| event | D_t |
+|---|---|
+| `SESSION_ARRIVAL` | shared prefix units (preload before first prefill) |
+| `LLM_PREFILL` | ∅ (observation only; refresh program_tracker, no migrate) |
+| `TOOL_CALL_START` | session tail units of the caller (demote candidate while idle) |
+| `TOOL_CALL_END` | session tail units of the caller (promote candidate, about to reuse) |
+| `SUB_DISPATCH_BLOCKING` | parent tail + shared prefix |
+| `SUB_DISPATCH_ASYNC` | shared prefix only |
+| `MEMORY_PRESSURE` | top-k by regret across all units |
+| `PRESSURE_RESOLVED` | top-k by regret across all units |
 
-O_TA = observable behaviors from { proxy queue gating, sglang's
-default LRU eviction, 5 s polling latency }.
+### Inputs to `_net_value`
 
-O_us = observable behaviors from { proxy queue gating, paper §7
-per-unit migration via `/aginfer/migrate`, paper §7 reactive eviction
-order via inline scorer, sub-50 ms reaction via webhook }.
+`_net_value` is parameterised by four quantities.  The ideal estimator
+for each is:
 
-O_TA ⊊ O_us pointwise *and* with better latency on the shared
-behaviors. Floor argument holds.
-
-## Acknowledged costs
-
-| Cost | Estimate | Verified by |
+| input | ideal estimator | current implementation |
 |---|---|---|
-| Extra HTTP hop on each request (proxy) | +0.5-2 ms/req | T4 |
-| Daemon idle CPU (no traffic) | < 1 % of one core | T5 |
-| Daemon event-handler latency | < 80 ms p99 from event arrival to migrate POST | T5, T7 |
-| sglang webhook fire overhead | < 50 μs per scheduler step (state check + occasional POST) | T5 |
-| sglang `/aginfer/state` walk | < 10 ms @ 10 k tree nodes | T1 |
-| `/aginfer/migrate` per action | best-effort; HiCache backup is async; ack via re-poll | T2 |
-| Code added to sglang | ≈ 130 lines incl. webhook; inline scorer already shipped | T1+T2+T3+T5 git diff |
+| `p_hat(u)` — future reuse probability of unit u | online Bayesian update from observed accesses; bursty workloads use Hawkes (self-exciting) | `min(1.0, hits / age)` proxy — coarse |
+| `λ(u)` — reuse rate (1 / expected reuse interval) | empirical Poisson / Hawkes fit per unit class | calibrated floor per program state (ACTING / REASONING) |
+| `h_τ(occupancy)` — per-byte holding cost at tier τ as a function of how loaded τ is | live measurement: cost ∝ marginal value of a free byte at τ, observable from the allocator's recent pressure trajectory | static `cost × (1 + occupancy²)` |
+| `bw_free(σ, τ)` — free bandwidth on σ↔τ link | live measurement: bytes/sec idle on the actual transfer path | static config default |
 
-## Aggregation correctness (from v2 audit)
+Inputs are crude proxies today; replacing them with the ideal
+estimators is the highest-value scheduler improvement and **must
+not require changing the decide() algorithm or the event/D_t
+contract** — the system is parameterised on these inputs.
 
-`admission_controller` aggregates `V_u` over a program to pick pause victims.
-Naive `sum(V_u for u ∈ program.units)` **double-counts** terminus-2's
-shared system prompt (which lives in every program's session_ids set).
-Fix: weight each unit by `1 / len(unit.session_ids)` when aggregating
-to program p, so a shared 32-way-owned unit contributes 1/32 to each
-program's score. Equivalent to summing the unit's marginal value to
-program p. Verified in T8.
+### Event-specific context
 
-**PAUSED holders are included in the denominator** (audit #13). A unit
-held by 30 active + 2 paused programs has `|session_ids| = 32` for
-weighting purposes — pausing one active program would not free the bytes
-the unit occupies (the 2 paused holders still hold it), so each active
-program's marginal benefit from pausing remains 1/32, not 1/30. This
-matches the semantics in `OursGreedyPolicy._net_value`.
+Events may carry decision-relevant context the rule can use beyond
+the unit's intrinsic state.  Concrete case: `TOOL_CALL_START`
+ideally carries the **tool's expected duration** (looked up from
+the tool registry or historical mean) so `hold_time` for THIS
+demote decision is the actual ETA — not the unit's global lambda.
 
-## Done = Run K narrows the gap to TA (revised per audit)
+* short ETA → demote not worth (transfer round-trip > savings)
+* long ETA → demote profitable
 
-> ⚠️ **2026-05-29: numerical acceptance targets in this section
-> predate the setting-drift discovery.**  Historical Run G 666 s
-> / Run H' 885 s / Run F' 873 s were measured under sglang default
-> sampling.  Current matrix runs use `temperature=0.0 seed=42`
-> which deterministically triggers runaway generation; those
-> historical baselines do not transfer.
->
-> Authoritative results: `verify/t9/results/N3_matrix_SUMMARY.md`
-> (N=3, baseline 1389±40 s vs ours 1344±55 s, Δ not significant)
-> and `verify/t9/results/N3_ROOT_CAUSE.md` (why historical
-> baselines aren't comparable).  Architectural design below is
-> unchanged; the numerical targets need re-derivation under
-> current settings (typically by capping `max_completion_tokens`
-> to suppress runaway).
+This is the right model because hold_time is a per-decision physical
+quantity, not a per-unit invariant.  When the event carries the
+information, the scheduler must use it.
 
-Realistic acceptance — pre-committed before the run:
+## 8. Admission
 
-* `K.successful ≥ 28`
-* `K.mean < 716 s` ( = Run G 666 s + 50 s slack — narrows the
-  gap to TA, doesn't have to beat it)
-* `K.p99 < 1336 s` ( = Run H' p99; tail-latency property preserved)
-* zero sglang crashes / scheduler-subprocess exits
-* startup-log invariant: sglang logs `kv_policy_loaded=…` and daemon
-  logs `kv_scheduler=enabled, admission_controller=enabled`. If
-  either is missing, **halt the run** (audit #11).
-* **Run K specifically requires HiCache enabled.** The daemon as a
-  whole does NOT hard-require HiCache (see Run J below), but Run K's
-  startup invariant grep MUST find HiCache in the active config.
+Triggered by `MEMORY_PRESSURE` (after kv_scheduler's per-unit
+migrate has had a chance to relieve pressure).
 
-Stretch:
-* `K.mean < 666 s` (beat TA on mean — aspirational, expected 720-790 s
-  per audit prediction).
-* `K.std < 280 s` (= Run H' std).
+```python
+def admission_on_pressure(state):
+    occ = state.pool_pressure[HBM]              # allocator truth
+    if occ < theta_hi: return                   # kv_scheduler handled it
+    while occ > theta_hi:
+        victim = argmin_program(V_u_program(p) for p in active_programs)
+        pause(victim)
+        occ = recompute(state, paused={victim})
+```
 
-Ablations:
-* **Run J — daemon without HiCache** (validates the §9 deployment
-  architecture claim that the three daemon layers are independent
-  of HiCache). All three daemon layers active; `--enable-hierarchical-
-  cache` OFF; same V4-Flash workload as Run K. The kv_scheduler
-  degrades to DROP-only (DRAM/HBM tier transitions skip with their
-  v1 reasons), but admission_controller and proxy continue to drive
-  program-level back-pressure exactly as in Run K.
-  - Acceptance: `J.mean < H' 885 s` — strict improvement over inline
-    scorer alone, proving the daemon's program-level admission has
-    independent value.
-  - Expectation: `J.mean ≈ G 666 s ± 50 s` — matches TA's program-
-    level pause mechanism using paper §7 value-based victim selection
-    instead of TA's BFD-by-token-count.
-  - Stretch: `J.mean < G` — paper §7 value-based admission beats TA's
-    BFD heuristic.
-  - Rationale: paper §9 claims the daemon architecture is deployable
-    without HiCache. Even if the resulting performance band is
-    similar to TA (not novel), the ablation is required to substantiate
-    that claim — claims need evidence, regardless of novelty.
-* **Run K-a — kv_scheduler ON, admission_controller OFF, HiCache ON.**
-  Expected ≈ Run H' (885 s); shows the value rule alone (decoupled
-  from admission). With HiCache on, kv_scheduler can demote/drop;
-  without admission, no program back-pressure.
-* ~~Run K-b~~ **dropped** per v2 audit: replicating TA's pause-victim
-  selection inside our admission_controller requires either a token-
-  count BFD fallback or duplicating TA's heuristic. We already have
-  Run G as a real TA measurement; use that directly rather than
-  rebuild TA inside our daemon.
-* **Run K** (full): all three layers active + HiCache. Target < 666 s.
+```python
+def admission_on_resolved(state):
+    while paused and state.pool_pressure[HBM] < theta_lo:
+        candidate = oldest_paused_program
+        if room_for(candidate, state):
+            resume(candidate)
+```
 
-## TODO (revised)
+`V_u_program(p) = Σ_{u ∈ p.units} (V_u(u) / |u.session_ids|)`.
 
-| ID | Task | Verify | Estimate |
-|---|---|---|---|
-Implementation order (revised per audit #16: T6 must precede T4 because
-T4's verify uses `program_tracker.pause/resume`):
+The `1 / |session_ids|` weight prevents shared prefix from being
+double-counted across programs that reference it.  PAUSED programs
+remain in the denominator because pausing one active program doesn't
+free a unit still held by paused ones.
 
-| ID | Task | Verify | Estimate |
-|---|---|---|---|
-| T1 | `GET /aginfer/state` | [verify/t1/](verify/t1/) | 2-3 h |
-| T2 | `POST /aginfer/migrate` | [verify/t2/](verify/t2/) | 2-3 h |
-| T3 | session_id passthrough | [verify/t3/](verify/t3/) | 1 h |
-| **T6** | program_tracker state machine *(moved up — T4 depends on it)* | [verify/t6/](verify/t6/) | 2-3 h |
-| T4 | daemon proxy + emits 6 paper §4 events | [verify/t4/](verify/t4/) | half day |
-| T5 | sglang→daemon webhook (transition + 5 s heartbeat in HIGH/CRITICAL) + daemon event router | [verify/t5/](verify/t5/) | 3-4 h |
-| T7 | kv_scheduler event handlers | [verify/t7/](verify/t7/) | 2-3 h |
-| T8 | admission_controller event handlers + correct aggregation | [verify/t8/](verify/t8/) | 2-3 h |
-| T9 | Run K + K-a + J ablation (J validates daemon's §9 deployment claim w/o HiCache) | [verify/t9/](verify/t9/) | half day + 1h Run J |
-| T10 | integration / concurrency / restart / GC + forced-fault verifies | [verify/t10/](verify/t10/) | half day |
+`theta_hi` and `theta_lo` are sglang/daemon-shared constants
+(currently 0.85 / 0.70).  The sglang webhook uses `theta_hi` as
+its OK↔HIGH threshold so the two systems agree on when admission
+should be triggered.
 
-Total: ~2.5 days.
+## 9. Why two channels (unit migrate + program pause)
 
-## Pre-committed worst-case floor
+Two distinct levers cover the pressure spectrum:
 
-> ⚠️ **2026-05-29: floor numbers below predate setting-drift
-> discovery; not directly comparable to current matrix.**
-> Under current `temperature=0.0 seed=42` settings, the empirical
-> N=3 baseline (no daemon scheduling, inline ours_greedy only) is
-> 1389 ± 40 s — see `verify/t9/results/N3_matrix_SUMMARY.md`.
-> The Run F'/H' floors below were measured under a different
-> sampling regime and don't anchor the current run.  Architectural
-> floors (`degrades to inline-only`, etc.) are still correct as
-> the mechanism story.
+* **unit migrate** *reorganises* existing KV across tiers.  Cost:
+  one H↔D transfer per migrated unit.  Effective when there's
+  *capacity to reorganise into*.
+* **program pause** *throttles inflow*.  Cost: a program waits.
+  Effective when there's no reorganisation that helps because
+  inflow is the source of pressure.
 
-Every verify file (T1-T10) has a **WORST CASE (forced)** section that
-*actually injects* the failure mode and asserts the system stays
-within the documented floor. Headline floors:
+Light pressure → unit migrate is enough.  Heavy pressure → migrate
+exhausts options because every tier is full; pause must reduce
+inflow.  The two are non-substitutable; both are needed.
 
-| layer fails | system degrades to | floor (per-trial mean) |
-|---|---|---|
-| kv_scheduler stuck | inline scorer only | ≈ Run H' 885 s |
-| admission_controller off | no program back-pressure | ≈ Run F' 873 s |
-| daemon crashes | sglang alone with inline scorer | ≈ Run H' 885 s |
-| inline scorer crashes (and daemon survives) | LRU + daemon migrate hints | ≈ Run F' to Run H' band |
-| HiCache disabled at startup | daemon's kv_scheduler degrades to DROP-only; admission_controller + proxy continue | ≈ Run J target band (H' to G) |
-| **all three layers fail** | bare sglang LRU | ≈ Run F' 873 s |
+Formally, the action space is the *union*
+`A = {unit-level assignments} ∪ {program pause/resume}`; the MDP is
+one decision problem, not two.  Implementation splits the modules
+purely for code clarity.
 
-So Run K's absolute worst case (if every daemon-side mechanism is
-broken) is bounded **above** at Run F' 873 s. Any number worse than
-that indicates a regression in the inline scorer path — independently
-verified by Run H' as the pre-existing baseline.
+## 10. Invariants
+
+| invariant | enforced by |
+|---|---|
+| **Single-worker event loop**: handlers serialised; no concurrent migrate races | asyncio queue + single consumer |
+| **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
+| **Idempotent migrate**: re-applying the same action returns 200 with `applied=0` and a `race:*` skip | sglang `apply_aginfer_migrations` |
+| **Threshold parity**: sglang's `--aginfer-theta-hi` and daemon's admission `theta_hi` are launched from the same value (currently 0.85) | launch scripts pass aligned flags |
+| **Webhook mandatory**: sglang's launch scripts always pass `--aginfer-notify-url`; admission's trigger path is not optional | `launch_sglang_v4flash*.sh` |
+| **Pool-truth admission**: admission reads `pool_usage.HBM.token_usage`, not `tier_usage` | daemon `admission_controller._hbm_occ` |
+| **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
+| **Inline-scorer safety net**: if the daemon is down or unreachable, sglang's eviction still uses the V_u rule via its inline scorer | `SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:ours_greedy_score` |
+
+## 11. Failure modes
+
+The system is designed so any single failure degrades to a
+well-defined floor:
+
+| failure | system degrades to |
+|---|---|
+| daemon process down | sglang's inline scorer alone (V_u rule, no program-level admission) |
+| daemon up but `/aginfer/state` slow | event handler skips this round (no migrate); next event retries |
+| daemon up but `/aginfer/migrate` 5xx | log + continue; the same hash is re-considered on the next event |
+| webhook POST fails (network) | sglang retries 3× with exponential backoff; eventually drops |
+| sglang scheduler crashes (subprocess exit) | watchdog restarts; daemon detects via /aginfer/state probe and re-syncs |
+| inline scorer module fails to load | sglang halts at startup with a structured `kv_policy_loaded` error line — launch scripts grep and fail loudly |
+| daemon thresholds drift from sglang's | webhook fires at sglang's `theta_hi` but daemon ignores below daemon's `theta_hi`; the launch contract prevents this by sourcing both from the same value |
+
+Every layer is **independently disable-able** without breaking the
+others — admission off + kv_scheduler on, HiCache off + admission
+on, etc.  The composition is multiplicative in win, not in
+correctness; turning a layer off only forfeits its incremental
+contribution.
+
+## 12. Where this design departs from prior work
+
+Beyond the obvious (separate scheduler from engine), three choices
+are non-obvious and intentional:
+
+1. **Two-view occupancy.**  Standard cache schedulers conflate
+   "what's in the cache structure" with "what the allocator says
+   is full".  Agentic workloads diverge sharply between the two
+   because in-flight decode KV inflates allocator pressure without
+   appearing in the prefix tree.  Aginfer keeps both views
+   addressable and routes each consumer to the correct one.
+
+2. **Event-driven, not timer-driven.**  Polling at 5 s (TA-style)
+   adds a configurable knob that always has wrong answers somewhere.
+   Per-event reaction has no knob and lower latency at every load
+   level.  The only event kinds not derivable from proxy state
+   come from sglang via a mandatory webhook.
+
+3. **Per-event decision set.**  The event already names a program
+   and the program's recent state, so D_t doesn't need to scan
+   all units — the event carries the right scope for free.  Plus
+   event-specific context (ETA, sub-agent dispatch type) can
+   inform the decision rule's per-decision parameters, not just
+   which units to score.
