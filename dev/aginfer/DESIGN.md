@@ -237,12 +237,6 @@ not a decision-rule concern.
 {
   "time_counter": int,                  // monotonic access tick
 
-  "tier_usage": {                       // RADIX-TREE view; aggregate per tier
-    "HBM":  {"used_bytes": int, "cap_bytes": int},
-    "DRAM": {"used_bytes": int, "cap_bytes": int},
-    "DISK": {"used_bytes": int, "cap_bytes": int}    // zero-stub until L3 wired
-  },
-
   "pool_usage": {                       // ALLOCATOR-TRUTH view; per-subpool
                                          // breakdown.  Each tier carries a
                                          // `subpools` dict keyed by
@@ -290,7 +284,9 @@ not a decision-rule concern.
                                          //   attention KV inflight growth.
       },
       "dram": {
-        "committed": {"main": int}      // host pool share, same attribution
+        "committed": {"<subpool>": int} // host pool share, same attribution;
+                                         //   subpool keys mirror
+                                         //   pool_usage.DRAM.subpools per §12
       },
       "state": "REASONING"|"ACTING"|"PAUSED"|"ENDED",
                                          // sglang derives REASONING/ACTING
@@ -380,8 +376,8 @@ not a decision-rule concern.
                                                      //   declared in
                                                      //   pool_usage.HBM
     },
-    "DRAM": {"main": {"h_max_per_byte_sec": float}},
-    "DISK": {"main": {"h_max_per_byte_sec": float}}
+    "DRAM": {"<subpool>": {"h_max_per_byte_sec": float}},
+    "DISK": {"<subpool>": {"h_max_per_byte_sec": float}}
   },
 
   // Diagnostic: emitted by sglang only when the loaded tree cache
@@ -392,19 +388,19 @@ not a decision-rule concern.
 }
 ```
 
-### Why three views
+### Why two views
 
 The radix tree contains **only committed prefix-shareable units**;
 in-flight decode KV is allocator-owned but **not** in the tree.
-Three distinct consumers in §7 / §8 need three distinct slices:
+Two distinct consumers in §7 / §8 need two distinct slices:
 
-* `tier_usage` (radix view) — input for **V_u migration value
-  scoring**.  V_u acts on tree nodes; the relevant cost is "how
-  full is the tree's slice of HBM".
-* `pool_usage` (allocator view, **per-subpool**) — input for
-  **admission's pressure trigger**.  Admission acts when **any**
-  HBM subpool crosses its `theta_hi` threshold, not when the
-  aggregate does — a Mamba snapshot pool at 95% with attention
+* `pool_usage` (allocator view, **per-subpool**) — input for both
+  **V_u migration value scoring** (the `h_(τ, sp)(occ)` term in §7
+  reads `pool_usage[τ].subpools[sp]` directly so holding cost
+  reflects actual allocator pressure, not just the radix tree's
+  slice) and **admission's pressure trigger**.  Admission acts when
+  **any** HBM subpool crosses its `theta_hi` threshold, not when
+  the aggregate does — a Mamba snapshot pool at 95% with attention
   at 60% is the failure mode an aggregate view hides.
 * `per_program_usage` (program view) — input for **admission's
   victim selection**.  Pausing a program frees its committed
@@ -412,19 +408,17 @@ Three distinct consumers in §7 / §8 need three distinct slices:
   per-program footprint to know **which** pause yields the most
   HBM bytes per unit V_u_program lost.
 
-A two-view design (only `tier_usage` + `pool_usage`) is
-under-determined: admission knows the pool is pressured but has
-no principled way to compare candidate victims by HBM relief.
-Walking `units` + `session_ids` and summing only counts the
-committed share, so a runaway-decode program with 80 K in-flight
-bytes but 6 K committed prefix looks *smaller* than a quiet
-program with 8 K cold prefix — exactly the wrong victim.
+A one-view design (only `pool_usage`) is under-determined:
+admission knows the pool is pressured but has no principled way
+to compare candidate victims by HBM relief.  Walking `units` +
+`session_ids` and summing only counts the committed share, so a
+runaway-decode program with 80 K in-flight bytes but 6 K committed
+prefix looks *smaller* than a quiet program with 8 K cold prefix —
+exactly the wrong victim.
 
-Mixing any two also breaks: V_u over-eager (decode-full HBM
-looks empty in tree view), admission asleep (allocator-pressured
-HBM looks empty in tree view), or admission picks the wrong
-victim (sees committed share, not real footprint).  **Three
-views, three consumers, no overlap.**
+Mixing the two also breaks: admission picks the wrong victim
+(sees committed share, not real footprint).  **Two views, two
+consumers, no overlap.**
 
 ### Why pull (per-event re-fetch), not push-mirror
 
@@ -655,7 +649,7 @@ happens inside sglang.
 
 | parallelism | per-rank HBM holds | daemon's view | actions |
 |---|---|---|---|
-| TP > 1 | same logical unit's **different head-dim slice** on each rank | sglang's tokenizer-server fans `/aginfer/state` / `migrate` / `hints` out to all rank schedulers; the snapshot returned to the daemon is aggregated across ranks (`tier_usage`, `pool_usage`, `per_program_usage` summed) | every action is **all-rank atomic by semantic requirement** — see below |
+| TP > 1 | same logical unit's **different head-dim slice** on each rank | sglang's tokenizer-server fans `/aginfer/state` / `migrate` / `hints` out to all rank schedulers; the snapshot returned to the daemon is aggregated across ranks (`pool_usage`, `per_program_usage` summed) | every action is **all-rank atomic by semantic requirement** — see below |
 | EP > 1 | prefix KV mirrored across ranks (same as TP); only the MoE expert weights / activations differ per rank | same as TP from the daemon's perspective — expert weights aren't in the daemon's scheduling scope | same as TP |
 | DP > 1 | each DP replica has its own independent KV pool serving its own program subset | each DP replica is a **separate sglang endpoint** with its own daemon-sglang pairing; no cross-replica daemon coordination | independent per replica |
 
@@ -754,7 +748,7 @@ because the constraint is a one-sided byte threshold.
 | `transfer_time(σ, τ)` | seconds | `transfer_bytes / bw_free` |
 | `page_bytes(τ, sp)` | bytes | per-(tier, subpool) DP quantisation granularity, read from `state.pool_usage[τ].subpools[sp].page_bytes`.  §9's multi-axis DP uses each axis's own bucket size — no global LCM/min collapse |
 | `cost`, `gain`, `V_u`, `V_u_program` | seconds | net value at the same time-axis |
-| `relief`, `re_use`, `bytes_moved`, `bytes_needed` | bytes | HBM-resource axis |
+| `relief`, `re_use`, `acquired`, `bytes_needed` | per-(tier, subpool) bytes-dict | HBM-resource axes (and destination-tier consumption for `acquired`); see §9 |
 | `forecast(state)` | dict[subpool, bytes] | per-HBM-subpool predicted bytes at the next event arrival if no scheduling action is taken: `pool_usage.HBM.subpools[sp].used_bytes + forecast_inflight_demand(state)[sp]`.  Compare each entry against `theta_hi × subpools[sp].cap_bytes`.  Horizon = `forecast_horizon(state)`, see §8 |
 | `forecast_horizon(state)` | seconds | expected time to next event: `min(heartbeat_s, 1 / recent_event_rate)`.  Bounded above by webhook heartbeat under HIGH/CRITICAL pressure (≈ 5 s) and below by typical event interval under normal load (≈ 10 ms) |
 | `decode_throughput(p)` | tokens/sec | sglang-observed decode rate for p, used to cap `E[remaining_tokens]` by `horizon × throughput` |
@@ -784,14 +778,22 @@ class Pause:
     cost: float               # seconds (V_u_program + marginal_pause_cost)
     relief: dict[str, int]    # per-HBM-subpool bytes
                               # = snapshot_relief + future_inflight_savings
-                              # (§8 — each term is itself a per-subpool dict)
+                              # (§8 — each term is itself a per-subpool dict).
+                              # Keyed by subpool only (no outer tier key)
+                              # because pausing a program never touches
+                              # non-HBM tiers; §9's resource-axis layer
+                              # wraps this into {HBM: relief} when feeding
+                              # the DP.
 
 @dataclass(frozen=True)
 class Resume:
     program_id: str
     gain: float               # seconds (V_u_program_if_active)
     re_use: dict[str, int]    # per-HBM-subpool bytes
-                              # = expected_peak_hbm_after_resume (§8)
+                              # = expected_peak_hbm_after_resume (§8).
+                              # Same shape convention as Pause.relief —
+                              # subpool-keyed because Resume only affects
+                              # the HBM tier.
 ```
 
 ### kv_scheduler is a candidate generator
@@ -1077,8 +1079,11 @@ regret(u, state) = _value(u, set(u.residence), state)
 `k` is sized so the joint knapsack stays microsecond-scale:
 
 ```
-bytes_needed(state)   = max(0, forecast(state) - theta_hi × cap_total)
-                        # = same scalar §9 computes; reused here
+bytes_needed_total(state) =
+    Σ_sp max(0, forecast(state)[sp]
+                - theta_hi × pool_usage.HBM.subpools[sp].cap_bytes)
+                        # summed across HBM subpools; §9 keeps the per-axis
+                        # breakdown but top-k sizing only needs the total
 mean_unit_bytes(state) = (Σ_{u ∈ state.units}
                             sum(bytes_at(u, τ) for τ in u.residence))
                        / |state.units|
@@ -1086,7 +1091,8 @@ mean_unit_bytes(state) = (Σ_{u ∈ state.units}
 
 top_k_pressure(state) =
     min(K_MAX,
-        max(K_MIN, bytes_needed(state) / mean_unit_bytes(state) × K_SAFETY))
+        max(K_MIN, bytes_needed_total(state) / mean_unit_bytes(state)
+                    × K_SAFETY))
 ```
 
 Defaults: `K_MAX = 256`, `K_MIN = 16`, `K_SAFETY = 4`.  These are
@@ -1669,10 +1675,11 @@ relief, which is the common case in agent workloads.
 ### Joint decide
 
 Two phases, each is a **0/1 knapsack solved by exact DP**.  The
-pressure phase is genuinely multi-resource because items consume
-bytes from *different* tier budgets (HBM-relief, DRAM-room, DISK-room),
-so the DP enumerates over a 4-dimensional state.  The headroom
-phase is single-resource (HBM-room only).
+pressure phase is multi-axis because items consume bytes from
+*different* (tier, subpool) budgets — every HBM subpool's relief
+plus every DRAM/DISK subpool's destination capacity.  The headroom
+phase is single-tier (HBM only) but still multi-axis: one resource
+axis per HBM subpool.
 
 The decision rule is **event-priority-agnostic**: `PRESSURE_CRITICAL`
 takes the same code path as `MEMORY_PRESSURE`.  Urgency enters
@@ -1683,15 +1690,18 @@ The CRITICAL-specific behaviour lives in the event router (§4) —
 CRITICAL events preempt the queue, they don't change the decision
 function.
 
-* **Pressure phase** runs when `forecast > theta_hi × cap_bytes`.
-  Items: Pause programs + Migrate-HBM-out units.  Resources:
-  HBM-relief budget + per-destination tier-room budgets (DRAM,
-  DISK).  Goal: free at least `bytes_needed` HBM **while not
-  overflowing destination tiers**, minimising total V_u cost.
-* **Headroom phase** runs when `forecast < theta_lo × cap_bytes`.
-  Items: Resume paused programs.  Resource: HBM-room available
-  before crossing `theta_hi` again.  Goal: maximise total V_u
-  gain subject to bytes-reclaimed ≤ free_room.
+* **Pressure phase** runs when **any** HBM subpool's `forecast[sp]`
+  crosses `theta_hi × subpools[sp].cap_bytes`.  Items: Pause
+  programs + Migrate-HBM-out units.  Resources: per-HBM-subpool
+  relief budget + per-(DRAM|DISK, subpool) destination capacity.
+  Goal: free at least `bytes_needed[sp]` from each pressured HBM
+  subpool **while not overflowing destination subpools**,
+  minimising total V_u cost.
+* **Headroom phase** runs when **every** HBM subpool's
+  `forecast[sp]` falls below `theta_lo × subpools[sp].cap_bytes`.
+  Items: Resume paused programs.  Resources: per-HBM-subpool
+  free room.  Goal: maximise total V_u gain subject to per-subpool
+  bytes-reclaimed ≤ `free_room[sp]`.
 
 The two phases are mutually exclusive per event (forecast is
 either too high or too low; in between is the hysteresis band
@@ -1927,10 +1937,10 @@ def knapsack_max_value_multi(items, budget, bucket_size):
     return chosen
 ```
 
-`Migrate` carries a `target_subpool: str` field — when sglang's
-unified cache moves a unit's bytes from one tier to another, the
-destination tier's subpool layout determines where each component
-of the unit lands.
+`Migrate.acquired` is itself a per-(tier, subpool) dict — sglang's
+apply path reads `acquired.keys()` directly to decide which
+destination subpools absorb which bytes of the unit, without
+needing a separate `target_subpool` field.
 
 #### Why exact DP, not greedy
 
@@ -2028,13 +2038,14 @@ for pause/resume).
 | **Proxy gate releases on client disconnect**: a request held in the proxy gate awaits BOTH the gate condition AND `request.is_disconnected()`; whichever fires first wins.  TCP disconnect deterministically signals the client gave up — no timer, no fallback.  On disconnect the proxy releases the gated request locally, the daemon's `program_tracker.client_disconnected(p)` enqueues `PUT /aginfer/program_paused {transition: END, ...}` onto the outbound queue, and `p`'s residence is reaped at the next state-dump | daemon proxy gate |
 | **Observability for state-dump cost**: every `GET /aginfer/state` records its wall-clock latency on the sglang side, and the daemon logs (a) latency-per-fetch and (b) event-queue depth at handler entry.  No backpressure mechanism is wired (drop-on-full / coalescing) — these are kept off the spec until measured evidence shows the queue grows unboundedly.  The logs are the first-class signal for when to revisit | sglang dump path + daemon event_router metrics |
 | **Atomic unit visibility**: units appear in `/aginfer/state.units` **only after sglang commits the chunk to the radix tree** (page-aligned commit boundary).  Partial-prefill chunks under chunked prefill do not appear as units; the daemon does not observe in-progress prefill state, only the post-commit snapshot.  This eliminates a class of "what's the p_hat of a half-written unit" questions by construction — half-written units don't exist in the spec's data model | sglang radix-tree commit path |
+| **Subpool key consistency**: for every unit `u` and every tier `τ ∈ u.residence`, `u.n_bytes[τ].keys() ⊆ state.pool_usage[τ].subpools.keys()`.  Sglang's UnifiedRadixCache component registry guarantees this on commit; §7's `_value` holding-cost loop iterates `u.n_bytes[τ]` and looks up `pool_usage[τ].subpools[sp]` directly without any defensive `.get(...)` — a missing key is a deployment bug | sglang component registry |
 | **Preemption transparency**: sglang's continuous-batching preempt-and-resume of in-flight requests changes `per_program_usage[p].hbm.inflight` between events without any daemon action.  The daemon does not track inflight state across events (cf. always-fresh invariant); each handler re-fetches state, so a preempted-then-resumed program is indistinguishable from one that never preempted.  Forecast / `bytes_needed` / pause_relief are computed on the live snapshot, so they always reflect post-preemption truth | always-fresh state + §5 per_program_usage |
 | **State-dump internal consistency**: a single `/aginfer/state` response is a snapshot taken under a single read-side lock on sglang's tree cache + allocator + per-program tables.  `units[*]`, `per_program_usage[*].unit_hashes`, and `pool_usage` always refer to the same logical timestamp; `state.units[h]` is safe to dereference for every `h ∈ per_program_usage[p].unit_hashes` | sglang `dump_aginfer_state` |
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
-| **Pool-truth admission, per subpool**: admission's `forecast(state)` returns a dict over HBM subpools, each reading `state.pool_usage.HBM.subpools[sp].used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes), never `tier_usage` (radix view).  Pressure fires when **any** subpool's forecast crosses `theta_hi`; this prevents the failure mode where a Mamba snapshot subpool at 95 % is hidden by an attention subpool at 60 %.  If the snapshot lacks `pool_usage.HBM.subpools` the daemon halts loudly | daemon `admission_controller.forecast` |
+| **Pool-truth admission, per subpool**: admission's `forecast(state)` returns a dict over HBM subpools, each reading `state.pool_usage.HBM.subpools[sp].used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes).  Pressure fires when **any** subpool's forecast crosses `theta_hi`; this prevents the failure mode where a Mamba snapshot subpool at 95 % is hidden by an attention subpool at 60 %.  If the snapshot lacks `pool_usage.HBM.subpools` the daemon halts loudly | daemon `admission_controller.forecast` |
 | **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_τ(occ)` reads `state.tier_holding_cost[τ].h_max_per_byte_sec`, never a constant baked into the daemon.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; operator config sets per-tier `h_max`); the daemon consumes them.  If `link_stats` or `tier_holding_cost` are missing the daemon halts loudly | sglang instrumentation + operator config |
-| **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
+| **Pool-truth V_u**: V_u's `h_(τ, sp)(occ)` term reads `pool_usage[τ].subpools[sp]` (the per-subpool allocator-truth view) so holding cost reflects real pressure, not an inferred radix-tree slice | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
 | **Hint table covers every live unit**: sglang seeds a "fresh access just happened" entry on unit birth (`p_hat ≈ 1` for the next event horizon); the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
 | **Hint atomicity**: the inline scorer's read of a hint entry and the daemon's `PUT` of a new entry are atomic per-key (read-modify-write would race a daemon update against an in-flight eviction).  Per-key seqlock or compare-and-swap suffices; full RW lock is overkill at 10²/s | sglang hint-table data structure |
@@ -2060,7 +2071,7 @@ proxy process) and the `migrate` retry queue.
 On crash + restart the daemon's recovery sequence is:
 
 1. `GET /aginfer/state` — pulls the authoritative snapshot of
-   `tier_usage`, `pool_usage`, `per_program_usage` (including
+   `pool_usage`, `per_program_usage` (including
    `state` and `pre_pause_state`), and `units`.  The daemon
    rebuilds its `program_tracker` cache by walking
    `per_program_usage`: each entry's `state` becomes the
