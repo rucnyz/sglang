@@ -141,8 +141,9 @@ system has no internal timer.
 | `SUB_DISPATCH_ASYNC` | proxy | program dispatches an async sub-agent |
 | `SUB_RETURN` | proxy | sub-agent terminated (parent tail becomes a promote candidate; child output may become a new shared `subagent_ctx` unit) |
 | `SESSION_END` | proxy | program terminated (no more arrivals); its session-scoped units become demote/drop candidates and contribute 0 to future `p_hat` |
-| `MEMORY_PRESSURE` | sglang webhook | allocator-truth HBM occupancy crossed `theta_hi` upward; while occupancy stays above `theta_hi`, sglang re-fires every `heartbeat_s` (default 5 s) so the daemon stays caught up if it missed earlier events |
-| `PRESSURE_RESOLVED` | sglang webhook | allocator-truth HBM occupancy crossed `theta_lo` downward (hysteresis) |
+| `MEMORY_PRESSURE` | sglang webhook | allocator-truth HBM occupancy crossed `theta_hi` upward (HIGH band); while in HIGH or CRITICAL, sglang re-fires every `heartbeat_s` (default 5 s) so the daemon stays caught up if it missed earlier events |
+| `PRESSURE_CRITICAL` | sglang webhook | allocator-truth HBM occupancy crossed `theta_crit` upward (above HIGH); same payload shape as `MEMORY_PRESSURE`, signals the daemon to escalate (skip headroom-only optimisations, prefer Pause over migrate even at higher V_u cost) |
+| `PRESSURE_RESOLVED` | sglang webhook | allocator-truth HBM occupancy crossed `theta_lo` downward (back to OK band, hysteresis) |
 
 Each event carries (`kind`, `session_id` if applicable, `payload`).
 The payload may include event-specific context the decision rule can
@@ -210,7 +211,7 @@ knob).
   },
 
   "units": [
-    {"hash": str, "tier": "HBM"|"DRAM",
+    {"hash": str, "tier": "HBM"|"DRAM"|"DISK",
      "n_tokens": int, "n_bytes": int,
      "last_access_time": int, "hit_count": int,
      "session_ids": list[str]}
@@ -526,7 +527,7 @@ resource axis; the generator here would gate on each axis.
 cost evaluates to 0** — see Transfer-window semantics below.  The
 term is kept in the formula so the math stays correct when the
 underlying write policy changes (zero-copy moves, non-write-through
-caches, etc.) without rewriting `_net_value`.
+caches, etc.) without rewriting `_value`.
 
 ### Transfer-window semantics
 
@@ -547,7 +548,7 @@ dominates the alternatives:
 (C) requires σ to remain valid throughout the transfer window —
 guaranteed by the write-through write policy.  Under (C):
 `P(serve-from-σ fails) = 0`, so `unavailability_cost = 0` in
-every term of `_net_value`.
+every term of `_value`.
 
 > **Planned (sglang code lag).**  Today sglang's `match_prefix`
 > path takes the host-only segment via `init_load_back`, which
@@ -565,13 +566,15 @@ during transfer (e.g. zero-copy move), `P(serve-from-σ fails) =
 1` and the unavailability term kicks in fully — without any
 change to the decision rule.
 
-### `decision_set(event, units)` — D_t per event kind
+### `decision_set(event, state)` — D_t per event kind
 
 ```python
-def decision_set(event, units):
+def decision_set(event, state):
     """The unit subset for which §9 will solve a knapsack on this event.
-    Matches paper §4 table."""
-    e, sid = event.kind, event.session_id
+    Matches paper §4 table.  Takes `state` (not just `units`) because
+    the pressure-event branch needs regret + top-k sizing, both of
+    which read from `state`."""
+    e, sid, units = event.kind, event.session_id, state.units
     match e:
         case SESSION_ARRIVAL:        return shared_prefix_units(units)
         case LLM_PREFILL:            return frozenset()
@@ -582,7 +585,7 @@ def decision_set(event, units):
         case SUB_RETURN:             return session_tail(units, sid) | {child_output_unit(event)}
         case SESSION_END:            return session_scoped_units(units, sid)
         case MEMORY_PRESSURE | PRESSURE_RESOLVED:
-            return top_k_by_regret(units, k=top_k_pressure(state))
+            return top_k_by_regret(units, state, k=top_k_pressure(state))
 ```
 
 | event | rationale |
@@ -612,6 +615,11 @@ regret(u, state) = _value(u, u.tier, state)
 `k` is sized so the joint knapsack stays microsecond-scale:
 
 ```
+bytes_needed(state)   = max(0, forecast(state) - theta_hi × cap_total)
+                        # = same scalar §9 computes; reused here
+mean_unit_bytes(state) = (Σ_{u ∈ state.units} u.n_bytes) / |state.units|
+                        # arithmetic mean across all units in HBM+DRAM+DISK
+
 top_k_pressure(state) =
     min(K_MAX,
         max(K_MIN, bytes_needed(state) / mean_unit_bytes(state) × K_SAFETY))
@@ -620,6 +628,8 @@ top_k_pressure(state) =
 Defaults: `K_MAX = 256`, `K_MIN = 16`, `K_SAFETY = 4`.  These are
 deployment constants, not workload tuning knobs — they bound the
 DP table size (§9), not the optimality of the chosen subset.
+`V_u(u)` is the shorthand for `_value(u, u.tier, state)` —
+the unit's value at its current tier under the live state.
 
 `TOOL_CALL_START` carries the tool's expected duration; the
 scheduler schedules the promote-back action for `T_start +
@@ -627,9 +637,9 @@ tool_ETA - load_back_latency` so the unit is ready exactly when
 the next prefill arrives.  Waiting until `TOOL_CALL_END` to start
 the promote means the prefill races the in-flight transfer.
 
-### Inputs to `_net_value`
+### Inputs to `_value`
 
-`_net_value` takes five quantities defined below.  The system is
+`_value` takes five quantities defined below.  The system is
 parameterised on these inputs; any replacement estimator must fit
 this interface without changing the candidate-generator contract.
 
@@ -791,7 +801,7 @@ would have been better-off born elsewhere — accepted as
 overhead until measurement shows it matters.
 
 > **Planned (future opportunity).**  The ideal would have the
-> scheduler pick initial tier via the same `_net_value` argmin
+> scheduler pick initial tier via the same `_value` argmin
 > on the candidate's predicted p_hat at birth time — same
 > formula as a migration decision, just applied before
 > allocation.  Realising this requires extending sglang's
@@ -815,12 +825,30 @@ For each event, the admission generator emits:
 
 where:
 
-```
-cost(pause p, event)   = V_u_program(p) + marginal_pause_cost(p, event)
-relief(pause p, state) = marginal_relief_value(p, state)
+```python
+def pause_candidates(state, event):
+    return [
+        Pause(
+            program_id = p.id,
+            cost       = V_u_program(p)                       # work-loss (seconds)
+                       + marginal_pause_cost(p, event),
+            relief     = marginal_relief_value(p, state),     # HBM bytes (≥ 0)
+        )
+        for p in state.programs if p.state != PAUSED
+    ]
 
-gain(resume p, state)   = V_u_program_if_active(p, state, p.pre_pause_state)
-re_use(resume p, state) = marginal_relief_value(p, state)
+def resume_candidates(state):
+    return [
+        Resume(
+            program_id = p.id,
+            gain       = V_u_program_if_active(                # counterfactual seconds
+                             p, state, p.pre_pause_state),
+            re_use     = marginal_relief_value(p, state),     # HBM bytes p will reclaim
+        )
+        for p in state.programs
+        if p.state == PAUSED
+        and capacity_fits(p, state)                            # see §8 Component defs
+    ]
 ```
 
 The Resume `gain` is a **counterfactual**: "if we resume p, how
@@ -972,6 +1000,18 @@ either too high or too low; in between is the hysteresis band
 where neither phase has anything to do).
 
 ```python
+def capacity_left_bytes(state, τ):
+    """Bytes free in destination tier τ.  Pool view, not radix view —
+    we want to know whether the τ allocator can actually accept
+    `bytes_moved` more bytes, not whether the radix tree's slice of τ
+    has room."""
+    if τ in state.pool_usage:
+        return (state.pool_usage[τ]["cap_bytes"]
+              - state.pool_usage[τ]["used_bytes"])
+    # DRAM / DISK tiers may only expose tier_usage:
+    return (state.tier_usage[τ]["cap_bytes"]
+          - state.tier_usage[τ]["used_bytes"])
+
 def joint_decide(state, event):
     cap_total = state.pool_usage["HBM"]["cap_bytes"]
     cap_left  = {τ: capacity_left_bytes(state, τ)
@@ -980,7 +1020,7 @@ def joint_decide(state, event):
     # ----- pressure phase: min-cost knapsack subject to relief >= bytes_needed -----
     bytes_needed = max(0, forecast(state) - theta_hi * cap_total)
     if bytes_needed > 0:
-        cands  = kv_scheduler.migrate_candidates(state, decision_set(event, state.units))
+        cands  = kv_scheduler.migrate_candidates(state, decision_set(event, state))
         cands += admission.pause_candidates(state, event)
         cands  = [c for c in cands if c.relief > 0
                   and (not isinstance(c, Migrate) or cap_left[c.target_tier] >= c.bytes_moved)]
@@ -1023,6 +1063,11 @@ def knapsack_min_cost(items, bytes_needed, bucket_size):
             if picked < dp[k][w]:
                 dp[k][w] = picked
                 take[k][w] = True
+    # Infeasibility: even taking everything doesn't reach bytes_needed.
+    # Return the all-take subset (best HBM we can free this event); the
+    # next sglang webhook re-fire will surface the residual pressure.
+    if dp[K][W] == INF:
+        return list(items)
     # Reconstruct.
     chosen, w = [], W
     for k in range(K, 0, -1):
@@ -1094,8 +1139,12 @@ its knapsack from scratch.
   optimal subset if it reduces total cost relative to the next-
   best subset achieving the same relief.  Any subset dominated
   by a cheaper one is rejected by construction — there's no
-  need for the explicit `if marginal_pause_cost > marginal_relief_value:
-  break` guard a sequential greedy would require.
+  need for the explicit `if pause.cost > pause.relief × (best alt
+  cost/byte): break` guard a sequential greedy would require
+  (which itself only type-checks once both sides are expressed in
+  seconds/byte; cost is seconds, relief is bytes, so the gate
+  collapses out at the DP's level rather than as a scalar
+  comparison).
 * **Composition order**: the DP enumerates subsets implicitly
   across the union; there's no "run kv_scheduler first then
   admission".  A Pause and a Migrate can both appear in the
