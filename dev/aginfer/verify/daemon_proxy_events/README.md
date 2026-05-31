@@ -1,11 +1,31 @@
-# T4 — aginfer-daemon HTTP proxy + paper §4 event emission
+# daemon proxy + paper §4 event emission (daemon I/O surface)
 
-> **NOTE (pre-round-9)**.  Pause gating here is described as a
-> daemon-internal `asyncio.Event` wait.  DESIGN.md round-9 moves
-> `pre_pause_state` to sglang-authoritative storage via
-> `PUT /aginfer/program_paused`, and proxy gate releases on TCP
-> disconnect via `request.is_disconnected()` (round-9 F1).
-> Refresh when those land.
+> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> task.  Guards the daemon proxy's two jobs:
+>
+> 1. **Pass-through of `/v1/chat/completions`** to sglang (transparent
+>    forwarding; streaming SSE preserved).
+> 2. **Event emission** to the daemon's event bus: session_arrival /
+>    llm_prefill / tool_call_start / tool_call_end on each request,
+>    plus the program-gate (pause/resume) handling on the request
+>    path.
+>
+> Pause gating is currently daemon-internal (`tracker.pause()` →
+> `program_tracker._states[pid] = PAUSED` + `asyncio.Event` wait
+> inside the proxy).  Two follow-up Tn extend it:
+>   - **T21** (PLAN §3) — sglang-side `PUT /aginfer/program_paused`
+>     so `per_program_usage[p].state` is authoritative.  PENDING.
+>   - **T39** (PLAN §4) — proxy gate awaits BOTH the pause condition
+>     AND `request.is_disconnected()`, releasing on TCP disconnect
+>     with HTTP 499 + transition the program to ENDED.  PENDING.
+>
+> When those Tn land, the corresponding probes will be added here
+> (or split into a sibling verify dir).
+>
+> Webhook-driven event kinds (memory_pressure, PRESSURE_CRITICAL,
+> APPLY_FAILED, HASH_COLLISION, SESSION_END) are covered by the
+> webhook-router verify (rename of old t5; see #137 cleanup).  This
+> verify covers the 4 request-path event kinds only.
 
 ## WHAT WE PROMISED
 

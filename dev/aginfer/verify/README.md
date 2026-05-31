@@ -64,7 +64,7 @@ Each task lives in its own folder `tN/` with:
 | 2 | T20 | `POST /aginfer/migrate` (residence-set) — was `t2` | [`t2/`](t2/) | _pending refresh — slated for #134_ |
 | 3 | (infra) | session_id passthrough into tree nodes | [`session_id_passthrough/`](session_id_passthrough/) | **passed** (2026-05-31 post-T17 schema; 14 verify steps + 3-section regression probe) |
 | **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6/`](t6/) | **passed** (2026-05-26, audit round-1 done, 10 verify steps in ~60 ms) |
-| 5 | T4 | daemon HTTP proxy + paper §4 event emission | [`t4/`](t4/) | **passed** (2026-05-26, audit round-1 done, 12 verify steps + 5-run latency, ~370 LoC) |
+| 5 | (infra) | daemon proxy + paper §4 event emission | [`daemon_proxy_events/`](daemon_proxy_events/) | **passed** (2026-05-31 post-T33; 12 steps + 4 recovery probes; proxy overhead p50=1.49 ± 0.01 ms) |
 | 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | **passed** (2026-05-26, audit round-1 done; Layer A 10 steps + Layer B real-GPU watermark test) |
 | 7 | T7 | kv_scheduler event handlers + ACTING-λ calibration | [`t7/`](t7/) | **passed** (2026-05-26, 13 verify steps + 22 bisect probes across 5 audit rounds; ~510 LoC daemon code; build 2.7 ms / decide 1.4 ms @ 1k units) |
 | 8 | T8 | admission_controller (event-driven pause/resume) | [`t8/`](t8/) | **passed** (2026-05-26, 12 verify steps + 5 bisect probes across 2 audit rounds; ~315 LoC daemon code; single-pause 4 ms @ 32 programs) |

@@ -1,0 +1,174 @@
+=== T4 verify: aginfer-daemon HTTP proxy ===
+
+[0] _sanitize_program_id + _extract_program_id unit checks ✓
+[1] non-streaming response equivalence ✓
+[2] streaming chunks pass-through; terminator preserved ✓
+[2b] audit round-3 N2 fix: Authorization / traceparent / x-request-id forwarded to upstream sglang ✓
+[3] event sequence: arrival emits SESSION_ARRIVAL + LLM_PREFILL + TOOL_CALL_START; second turn emits TOOL_CALL_END + LLM_PREFILL + TOOL_CALL_START ✓
+[4] pause back-pressure: request blocks on pause, resumes < 1 s ✓
+[5] WORST CASE: 8 malformed program_id shapes all forward cleanly (no 5xx) ✓
+[6] WORST CASE: 50 concurrent requests same pid; exactly 1 SESSION_ARRIVAL, 50 LLM_PREFILL, 50 TOOL_CALL_START ✓
+    run 1/5: direct p50=1.18 p99=1.26; proxy p50=2.66 p99=3.04; overhead p50=+1.49 p99=+1.77
+    run 2/5: direct p50=1.18 p99=1.74; proxy p50=2.68 p99=3.33; overhead p50=+1.50 p99=+1.59
+    run 3/5: direct p50=1.18 p99=1.26; proxy p50=2.67 p99=3.04; overhead p50=+1.49 p99=+1.77
+    run 4/5: direct p50=1.17 p99=1.23; proxy p50=2.66 p99=3.05; overhead p50=+1.48 p99=+1.82
+    run 5/5: direct p50=1.18 p99=1.27; proxy p50=2.67 p99=3.04; overhead p50=+1.49 p99=+1.77
+
+    SUMMARY (5 runs × 50 reqs/run):
+      direct p50:   1.18 ± 0.00 ms
+      direct p99:   1.35 ± 0.22 ms
+      proxy  p50:   2.67 ± 0.01 ms
+      proxy  p99:   3.10 ± 0.13 ms
+      overhead p50: +1.49 ± 0.01 ms
+      overhead p99: +1.75 ± 0.09 ms
+[7] COST: proxy overhead within budget (5-run mean ± std) ✓
+cold_start_probe: /aginfer/state failed: All connection attempts failed
+[8] WORST CASE: upstream sglang dead -> 502; daemon stays up; program_tracker recovers ✓
+cold_start_probe: /aginfer/state failed: Client error '404 Not Found' for url 'http://127.0.0.1:45533/aginfer/state'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[9] BLOCKER 1 fix: non-JSON upstream body passes through verbatim (not double-encoded) ✓
+cold_start_probe: /aginfer/state failed: All connection attempts failed
+[10] BLOCKER 2 fix: streaming with dead upstream -> real 502, not 200 with in-band error frame ✓
+ERROR:    Exception in ASGI application
+  + Exception Group Traceback (most recent call last):
+  |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_utils.py", line 81, in collapse_excgroups
+  |     yield
+  |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/responses.py", line 274, in __call__
+  |     async with anyio.create_task_group() as task_group:
+  |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/anyio/_backends/_asyncio.py", line 799, in __aexit__
+  |     raise BaseExceptionGroup(
+  | ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)
+  +-+---------------- 1 ----------------
+    | Traceback (most recent call last):
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 415, in run_asgi
+    |     result = await app(  # type: ignore[func-returns-value]
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 56, in __call__
+    |     return await self.app(scope, receive, send)
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/fastapi/applications.py", line 1159, in __call__
+    |     await super().__call__(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/applications.py", line 90, in __call__
+    |     await self.middleware_stack(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    |     raise exc
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    |     await self.app(scope, receive, _send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    |     await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    |     raise exc
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    |     await app(scope, receive, sender)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    |     await self.app(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/routing.py", line 660, in __call__
+    |     await self.middleware_stack(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/routing.py", line 680, in app
+    |     await route.handle(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/routing.py", line 276, in handle
+    |     await self.app(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/fastapi/routing.py", line 134, in app
+    |     await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    |     raise exc
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    |     await app(scope, receive, sender)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/fastapi/routing.py", line 121, in app
+    |     await response(scope, receive, send)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/responses.py", line 273, in __call__
+    |     with collapse_excgroups():
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/contextlib.py", line 155, in __exit__
+    |     self.gen.throw(value)
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_utils.py", line 87, in collapse_excgroups
+    |     raise exc
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/responses.py", line 277, in wrap
+    |     await func()
+    |   File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/responses.py", line 250, in stream_response
+    |     async for chunk in self.body_iterator:
+    |   File "/scratch/yuzhou/projects/sglang/dev/aginfer/verify/daemon_proxy_events/verify.py", line 595, in _gen
+    |     raise RuntimeError("simulated mid-stream upstream break")
+    | RuntimeError: simulated mid-stream upstream break
+    +------------------------------------
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/uvicorn/protocols/http/h11_impl.py", line 415, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/uvicorn/middleware/proxy_headers.py", line 56, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/fastapi/applications.py", line 1159, in __call__
+    await super().__call__(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/applications.py", line 90, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/middleware/errors.py", line 186, in __call__
+    raise exc
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/middleware/errors.py", line 164, in __call__
+    await self.app(scope, receive, _send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/middleware/exceptions.py", line 63, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py", line 18, in __call__
+    await self.app(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/routing.py", line 660, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/routing.py", line 680, in app
+    await route.handle(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/routing.py", line 276, in handle
+    await self.app(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/fastapi/routing.py", line 134, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/fastapi/routing.py", line 121, in app
+    await response(scope, receive, send)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/responses.py", line 273, in __call__
+    with collapse_excgroups():
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/contextlib.py", line 155, in __exit__
+    self.gen.throw(value)
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/_utils.py", line 87, in collapse_excgroups
+    raise exc
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/responses.py", line 277, in wrap
+    await func()
+  File "/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/starlette/responses.py", line 250, in stream_response
+    async for chunk in self.body_iterator:
+  File "/scratch/yuzhou/projects/sglang/dev/aginfer/verify/daemon_proxy_events/verify.py", line 595, in _gen
+    raise RuntimeError("simulated mid-stream upstream break")
+RuntimeError: simulated mid-stream upstream break
+[10b] audit round-3 M1 fix: mid-stream upstream break -> in-band SSE error frame + [DONE]; tracker recovers ✓
+[10c] audit round-3 N5 fix: client disconnect mid-stream -> generator finally runs _emit_completion; tracker recovers ✓
+stream connect raised; returning 502
+Traceback (most recent call last):
+  File "/scratch/yuzhou/projects/sglang/dev/aginfer/daemon/proxy.py", line 332, in chat_completions
+    upstream_resp = await req_ctx.__aenter__()
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/scratch/yuzhou/projects/sglang/dev/aginfer/verify/daemon_proxy_events/verify.py", line 702, in __aenter__
+    raise _StubError("simulated stream connect failure")
+step_streaming_connect_non_request_error_recovers.<locals>._StubError: simulated stream connect failure
+[10d] audit round-3 N1 fix: stream-connect path catches non-RequestError exceptions; 502 + tracker recovers ✓
+unary forwarding raised; returning 502 and recovering program_tracker
+Traceback (most recent call last):
+  File "/scratch/yuzhou/projects/sglang/dev/aginfer/daemon/proxy.py", line 281, in chat_completions
+    resp = await client.post(
+           ^^^^^^^^^^^^^^^^^^
+  File "/scratch/yuzhou/projects/sglang/dev/aginfer/verify/daemon_proxy_events/verify.py", line 547, in _bad_post
+    raise _StubError("simulated non-RequestError")
+step_unary_non_request_error_recovers.<locals>._StubError: simulated non-RequestError
+[11a] round-1 MAJOR fix: unary path catches non-RequestError exceptions, tracker recovers (no stuck-in-REASONING) ✓
+cold_start_probe: /aginfer/state failed: Client error '404 Not Found' for url 'http://127.0.0.1:45839/aginfer/state'
+For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/404
+[11] MINOR fix: stream="false" (string, truthy) does NOT trigger streaming branch ✓
+
+Latency summary (record in RESULTS):
+  proxy overhead p50 = 1.49 ± 0.01 ms   (N=5 runs × 50 reqs)
+  proxy overhead p99 = 1.75 ± 0.09 ms
+
+=== T4 PASSED ===
