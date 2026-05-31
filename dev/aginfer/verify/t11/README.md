@@ -1,8 +1,16 @@
-# T11 — Empirical p_hat / scoring function (replace paper §7 1-step greedy)
+# T11 — Empirical p_hat estimator (PLAN §1)
 
-## ⚠️ OPEN WORK (ideal not yet achieved)
+PLAN.md §1 calibration task.  Replace `OursGreedyPolicy._value`'s
+`p_hat = min(1, hits/age)` proxy with a workload-agnostic estimator
+(histogram / per-program-bucket / Hawkes fit) per the
+[todo-empirical-phat] memory entry.  Session state (REASONING /
+ACTING / PAUSED / ENDED) is a feature INPUT to the estimator, not a
+switch (per feedback-workload-agnostic-phat memory).
 
-> Per-T cross-catalog: `verify/t9/results/N3_GAPS.md`.
+> ⚠️ **Status: OPEN WORK / not started.**  Calibration task, not
+> code refactor — deliverable is a model selection + residual report
+> under `results/` rather than a verify.py.  No automated test
+> harness yet.
 
 * **T11a inline-side** (`baselines/sglang_adapter.py:_node_to_unit`)
   — deliberately NOT implemented; daemon-side already shows no
