@@ -1,15 +1,34 @@
-# T7 — kv_scheduler event handlers (paper §4 events → migrations)
+# kv_scheduler value rule (daemon §7 V_u)
 
-> **NOTE (pre-round-9)**.  Migration dispatch here is `(hash,
-> target_tier)`.  DESIGN.md round-9 changes the action shape to
-> residence-set transitions (`(hash, add_tiers, remove_tiers)`),
-> and `_value(u, τ, state)` becomes `_value(u, residence, state)`
-> with `authoritative_tier(residence)` picking the holding-cost
-> tier.  Refresh when round-9 lands in sglang / daemon code.
-
-## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
-
-> See `verify/t9/results/N3_GAPS.md` for the cross-T catalog.
+> **⚠️ STALE post-T33 (2026-05-31).  Does NOT pass against current
+> daemon.**
+>
+> This verify (~3300 LoC verify.py + regression_probe.py combined)
+> tests the pre-round-9 kv_scheduler API:
+>
+>   - `_value(u, tier: Tier, state)`  — T33 changed to
+>     `_value(u, next_residence: List[Tier], state)`.
+>   - `Action.assignments` as `(unit_id, Tier)` — T33 changed to
+>     `(unit_id, add_tiers, remove_tiers)`.
+>   - `state["tier_usage"]` flat dict — T17 replaced with
+>     `state["pool_usage"][tier]["subpools"][sp]` nested.
+>   - migrate POST payload `{hash, target_tier}` — T20 replaced
+>     with `{hash, add_tiers, remove_tiers, action_id}`.
+>
+> Running it post-T33 fails on the very first stub state JSON
+> (`KeyError: 'pool_usage'`) because the stubs still emit the
+> legacy `tier_usage` shape.
+>
+> A full rewrite for the post-T33 contract is its own substantial
+> task (T33's daemon-side schema + Action surface is already
+> covered by `verify/t17/` and `verify/t20/`; what this verify
+> needs to add on top is the `_value` rule's BEHAVIOR — tier
+> ordering, ACTING-floor λ clamping, program-alive p_hat rule,
+> shared-aware aggregation, top-k regret demote candidates).
+> Tracked separately so the cleanup-queue can move forward.
+>
+> verify.py + regression_probe.py kept in this dir as the
+> behavioural-spec reference for the rewrite; do not delete.
 
 * **G3 — migrate POST counts never observed in production runs.**
   Verify pins the daemon emits a `/aginfer/migrate` body on each
