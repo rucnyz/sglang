@@ -958,11 +958,13 @@ always-fresh invariant (§10) is satisfied at the event boundary:
 the next event's joint_decide will refetch state and re-solve
 its knapsack from scratch.
 
-> **Planned (implementation).**  The implementation may use the
-> greedy form instead of exact DP for simplicity.  Worst-case
-> 2× cost gap is bounded; the daemon's `decide_latency` metric
-> reports the chosen algorithm and (if greedy) the post-hoc cost
-> gap against a periodic DP recomputation so drift is observable.
+> **Planned (code lag).**  The daemon's current `joint_decide`
+> implementation uses the greedy `cost/relief` ordering instead
+> of exact DP.  This is a pure code lag — exact DP at K ≈ 30,
+> W ≈ 100 buckets runs in microseconds, the same order as
+> greedy, so there is no efficiency reason to keep the
+> approximation.  Replace with `knapsack_min_cost` /
+> `knapsack_max_value` per the pseudo-code above.
 
 ### What collapses out
 
