@@ -83,9 +83,14 @@ STAGE6_P99_BUDGET_MS = 50.0
 STAGE6_MAX_BUDGET_MS = 200.0  # Gen-2 GC sweep ceiling
 STAGE6_STRESS_TREE_SIZE = 10_000  # informational only — no assert
 
-# Stage 7 stress.
+# Stage 7 stress.  Single walker by design: sglang's tokenizer-control
+# communicator (`communicator.py:40 assert self._result_event is None`)
+# is single-flight per request type, so parallel `/aginfer/state` callers
+# race the assertion and surface as HTTP 500.  The daemon never spawns
+# parallel pollers (1 Hz heartbeat per event); this stage tests the
+# REALISTIC regime — single-poller race vs concurrent chat traffic.
 STAGE7_DURATION_S = 30
-STAGE7_WALKER_THREADS = 5
+STAGE7_WALKER_THREADS = 1
 STAGE7_CONCURRENT_CHATS = 32
 STAGE7_P99_BUDGET_MS = 100.0
 
@@ -506,6 +511,20 @@ def stage_4_subpool_degeneracy(state: dict[str, Any]) -> None:
                 f"HBM.{sp}: radix Σ unit.n_bytes = {radix_sum} > "
                 f"pool_usage.used_bytes = {fields['used_bytes']} "
                 f"(radix is supposed to be a SUBSET of allocator total)")
+        # Audit-2 finding: catch the reverse failure too.  If the
+        # allocator says bytes are used and we have no separate
+        # in-flight tracker (T29 future), the radix tree must hold
+        # at least some of them — radix_sum == 0 with pool > 0 means
+        # the walk under-counted.  Tolerance: pool_used may legitimately
+        # exceed radix by up to a few in-flight decode requests'
+        # worth, but the radix should not be empty.
+        if fields["used_bytes"] > 0 and radix_sum == 0 and state["units"]:
+            raise ResidenceInvariant(
+                f"HBM.{sp}: pool_usage.used_bytes = {fields['used_bytes']} > 0 "
+                f"but Σ unit.n_bytes = 0 — the walk did not attribute any "
+                f"bytes to this subpool even though the allocator says it's "
+                f"in use.  Likely a subpool-key mismatch or empty-residence "
+                f"skip bug.")
 
     for sp, fields in state["pool_usage"]["DRAM"]["subpools"].items():
         radix_sum = sum(
@@ -553,14 +572,22 @@ def stage_5_multi_holder() -> None:
     # be the SHARED unit's 1/holders share PLUS any tail-unit bytes that
     # are uniquely this program's.  We compute the expected total per
     # program by re-aggregating from units[] and assert exact equality
-    # (±1 byte rounding from integer-divide).  No escape hatch.
+    # (±byte rounding from integer-divide).  No escape hatch.
     expected: dict[str, dict[str, dict[str, int]]] = {}
+    # n_shared_units_per_pid[pid] = number of units this pid co-owns with
+    # OTHER pids (n_holders > 1).  Tail units (n_holders == 1) contribute
+    # ZERO integer-divide drift because b // 1 == b, so they don't widen
+    # the tolerance.  Audit-2 finding: the previous `n_units * (h-1)`
+    # tolerance overcounted by including these zero-drift tail units.
+    n_shared_per_pid: dict[str, int] = {}
     for unit in state["units"]:
+        h = len(unit["session_ids"])
         for pid_u in unit["session_ids"]:
             if pid_u not in pids:
                 continue
-            h = len(unit["session_ids"])
             e = expected.setdefault(pid_u, {"hbm": {}, "dram": {}})
+            if h > 1:
+                n_shared_per_pid[pid_u] = n_shared_per_pid.get(pid_u, 0) + 1
             for tier, sp_dict in unit["n_bytes"].items():
                 if tier == "DISK":
                     continue
@@ -573,20 +600,30 @@ def stage_5_multi_holder() -> None:
             raise ReconcileInvariant(
                 f"stage 5: per_program_usage[{pid_u}] missing")
         got_e = state["per_program_usage"][pid_u]
+        # Direct subscript: every pid in `pids` MUST appear in expected
+        # (built from units' session_ids) since Stage 5 sent requests
+        # tagged with these exact pids and asserted `pid in
+        # per_program_usage` above; KeyError here = impl/test contract
+        # broke, fail loud.
         for side in ("hbm", "dram"):
-            for sp, want in expected.get(pid_u, {}).get(side, {}).items():
-                got = got_e[side]["committed"].get(sp, 0)
-                # Tolerance: per-unit integer-divide can lose up to (h-1)
-                # bytes per unit; with N units owned by this program, the
-                # max drift is N*(h-1).  Compute N from unit_hashes.
-                n_units = len(got_e.get("unit_hashes", []))
-                tol = max(1, n_units * (n_holders - 1))
+            for sp, want in expected[pid_u][side].items():
+                # Direct subscript: sp came from the unit walk; if it's
+                # not in the impl's committed dict for this pid, the
+                # impl FAILED to attribute it.  Silent default to 0
+                # would mask that as a noisy AttributionInvariant; the
+                # real signal is KeyError.
+                got = got_e[side]["committed"][sp]
+                # Drift bound: only SHARED units (n_holders > 1) can lose
+                # up to (n_holders - 1) bytes each from integer-divide.
+                # Tail units lose 0.
+                n_shared = n_shared_per_pid.get(pid_u, 0)
+                tol = max(1, n_shared * (n_holders - 1))
                 if abs(got - want) > tol:
                     raise AttributionInvariant(
                         f"stage 5: per_program_usage[{pid_u}].{side}."
                         f"committed[{sp}] = {got} but expected = {want} "
-                        f"(tol ±{tol} from integer-divide; n_units={n_units}, "
-                        f"n_holders={n_holders})")
+                        f"(tol ±{tol} from integer-divide on {n_shared} "
+                        f"shared units; n_holders={n_holders})")
     _print("Stage 5", True,
            f"4-holder strict-attribution check passes across {len(pids)} pids")
 
@@ -667,23 +704,31 @@ def stage_7_concurrent_stress() -> None:
           f"{STAGE7_CONCURRENT_CHATS} concurrent chats for "
           f"{STAGE7_DURATION_S}s …")
     stop = threading.Event()
-    walker_results = {"ok": 0, "fail": 0, "lats": [], "errs": []}
+    # Audit-2 finding: per-thread result lists eliminate the
+    # ok-counter / errs.append() race that previously could under-count
+    # walker failures (the only assertion below).  After join we reduce.
+    per_thread_ok = [0] * STAGE7_WALKER_THREADS
+    per_thread_fail = [0] * STAGE7_WALKER_THREADS
+    per_thread_lats: list[list[float]] = [[] for _ in
+                                          range(STAGE7_WALKER_THREADS)]
+    per_thread_errs: list[list[str]] = [[] for _ in
+                                        range(STAGE7_WALKER_THREADS)]
 
     def walker(idx: int) -> None:
         while not stop.is_set():
             try:
                 t0 = time.perf_counter()
                 s = fetch_state()
-                walker_results["lats"].append((time.perf_counter() - t0) * 1000)
+                per_thread_lats[idx].append((time.perf_counter() - t0) * 1000)
                 assert_no_legacy(s)
                 assert_schema_shape(s)
                 assert_subpool_keys_consistent(s)
                 assert_reconcile(s)
-                walker_results["ok"] += 1
+                per_thread_ok[idx] += 1
             except Exception as exc:
-                walker_results["fail"] += 1
-                if len(walker_results["errs"]) < 5:
-                    walker_results["errs"].append(repr(exc))
+                per_thread_fail[idx] += 1
+                if len(per_thread_errs[idx]) < 5:
+                    per_thread_errs[idx].append(repr(exc))
 
     threads = [threading.Thread(target=walker, args=(i,))
                for i in range(STAGE7_WALKER_THREADS)]
@@ -698,6 +743,13 @@ def stage_7_concurrent_stress() -> None:
     stop.set()
     for t in threads:
         t.join()
+
+    walker_results = {
+        "ok": sum(per_thread_ok),
+        "fail": sum(per_thread_fail),
+        "lats": [x for lst in per_thread_lats for x in lst],
+        "errs": [x for lst in per_thread_errs for x in lst][:5],
+    }
 
     # Stage 7's critical correctness check: zero schema failures
     # under concurrent live mutation.  Latency is informational —

@@ -306,24 +306,40 @@ def main() -> None:
     # ---- [6] WORST CASE: bogus program_id shapes (must NOT crash) ----
     print("\n[6] WORST CASE: bogus program_id shapes (must not 5xx)")
     bogus_cases = [
-        {"oh": "no"},            # dict
-        42,                        # int
-        "x" * 10_000,             # very long string -> truncated to 64
-        ["a", "b"],               # list
-        True,                      # bool
+        {"oh": "no"},              # dict
+        42,                          # int
+        "x" * 10_000,               # very long string -> truncated to 64
+        ["a", "b"],                 # list
+        True,                        # bool
+        # Audit-2 adds (cover README WORST CASE "whitespace-only / empty"
+        # + the sanitizer comment "leading None doesn't kill later"):
+        "",                          # empty
+        "   ",                       # whitespace-only
+        [None, "later-valid"],       # list with leading None
+        ("tuple-elem",),             # tuple (schedule_batch.py:637 accepts)
     ]
     for bogus in bogus_cases:
-        # Just confirm the request doesn't 5xx.  The sanitizer turns the
-        # input into either None or a ≤64-char string.
         chat(f"Bogus pid case {type(bogus).__name__}: hello.",
              program_id=bogus,
-             system_text=None)  # no shared prefix; avoid mixing with above
+             system_text=None)
     state = fetch_state()
     # Sanitizer truncation: assert no session_id exceeds 64 chars.
     for u in state["units"]:
         for sid in u["session_ids"]:
             assert len(sid) <= 64, f"sid not truncated: len={len(sid)}: {sid[:80]}"
-    print("    5 bogus shapes handled cleanly; all session_ids <= 64 chars")
+    # Audit-2: pin EXACT truncation slice direction.  A regression from
+    # `[:64]` to `[-64:]` or `[:32]` would still satisfy "<= 64" but
+    # break the daemon's program-id namespace contract.
+    from sglang.srt.managers.schedule_batch import _sanitize_program_id
+    LONG = "abcdefghij" * 10  # 100 chars; ascii so byte-len == char-len
+    trunc = _sanitize_program_id(LONG)
+    assert isinstance(trunc, str), f"long-string sanitizer returned {trunc!r}"
+    assert len(trunc) == 64, f"truncation length wrong: {len(trunc)} != 64"
+    assert trunc == LONG[:64], (
+        f"truncation slice direction wrong: got {trunc!r}, "
+        f"expected {LONG[:64]!r} (first-64 prefix)")
+    print(f"    {len(bogus_cases)} bogus shapes handled cleanly; "
+          f"all session_ids <= 64 chars; truncation slice [:64] verified")
 
     # ---- [7] Sanitizer microbench: pure _sanitize_program_id cost ----
     #
@@ -376,23 +392,37 @@ def main() -> None:
         f"10 µs ceiling (mean={mean_us:.2f}, std={std_us:.2f})"
     )
 
-    # ---- [8] Retro-tagging: untagged then tagged on the same prefix ----
-    # Order matters in implementations that "skip if node already exists"
-    # might miss the tag. The contract is set-additive: the tagged
-    # request adds its pid to the previously-untagged ancestor.
-    print("\n[8] retro-tagging: untagged-first then tagged on shared prefix")
-    RETRO_SYS = "Retro-tag system prompt: " + ("alpha beta gamma. " * 40)
-    chat("retro untagged seed", program_id=None, system_text=RETRO_SYS)
-    state_before = fetch_state()
-    chat("retro tagged after", program_id="prog-RETRO", system_text=RETRO_SYS)
+    # ---- [8] Retro-tagging: BOTH directions on the same shared prefix ----
+    # Audit-2 finding: the previous test only covered untagged-first
+    # then tagged.  The reverse direction — tagged-first then untagged —
+    # is the worst case: a buggy `_insert_helper` that OVERWRITES the
+    # session_ids set on cache hit (instead of `|=`) would silently drop
+    # the original tag and pass the forward-direction test.
+    print("\n[8] retro-tagging: BOTH directions on shared prefix")
+
+    # 8a. untagged first, then tagged
+    RETRO_A = "Retro-tag system prompt A: " + ("alpha beta gamma. " * 40)
+    chat("retro untagged seed", program_id=None, system_text=RETRO_A)
+    chat("retro tagged after", program_id="prog-RETRO", system_text=RETRO_A)
     state_after = fetch_state()
-    retro_units = units_with(state_after, "prog-RETRO")
-    assert retro_units, "tagged request after untagged did NOT tag the shared ancestor"
-    # And the ancestor's session_ids set must STILL contain the RETRO tag --
-    # not get blown away by the second insert.
-    multi_tag_node = max(retro_units, key=lambda u: len(u["session_ids"]))
-    assert "prog-RETRO" in multi_tag_node["session_ids"]
-    print(f"    retro-tag landed on {len(retro_units)} shared-prefix nodes ✓")
+    retro_a_units = units_with(state_after, "prog-RETRO")
+    assert retro_a_units, ("8a: tagged-after-untagged did NOT tag the "
+                           "shared ancestor")
+    print(f"    8a (untagged → tagged): {len(retro_a_units)} nodes tagged ✓")
+
+    # 8b. tagged first, then untagged — the survival test
+    RETRO_B = "Retro-tag system prompt B: " + ("delta epsilon zeta. " * 40)
+    chat("retro tagged seed", program_id="prog-RETRO-B", system_text=RETRO_B)
+    pre_count = len(units_with(fetch_state(), "prog-RETRO-B"))
+    chat("retro untagged after", program_id=None, system_text=RETRO_B)
+    state_after_b = fetch_state()
+    post_count = len(units_with(state_after_b, "prog-RETRO-B"))
+    assert post_count >= pre_count, (
+        f"8b: untagged-after-tagged STRIPPED the tag — "
+        f"pre={pre_count} post={post_count} (set-add must be additive, "
+        f"not overwrite)")
+    print(f"    8b (tagged → untagged): {pre_count} pre / {post_count} "
+          f"post; tag survived ✓")
 
     # ---- [9] Chunked prefill: tagged request whose prompt > 1 chunk ----
     # The request's prompt must EXCEED the server's --chunked-prefill-size
@@ -575,6 +605,34 @@ def main() -> None:
         "string reached session_ids"
     )
     print(f"    server stayed up; depth-{depth} -> tag dropped (cap hit) ✓")
+
+    # Audit-2 finding: depth=20 is comfortably above cap=8 but doesn't
+    # probe the BOUNDARY.  A regression that lifts the cap from 8 to
+    # e.g. 16 would still drop depth-20 — invisible to the test.
+    # Add a depth-9 probe (cap + 1) to pin the boundary directly.
+    print("    boundary probe: depth-9 (cap + 1) should also drop")
+    depth_boundary = 9
+    boundary_payload = (
+        b'{"text":"recursion-bomb boundary"'
+        b',"sampling_params":{"max_new_tokens":4,"temperature":0.0}'
+        b',"program_id":'
+        + b"[" * depth_boundary
+        + b'"boundary-buried"' + b"]" * depth_boundary
+        + b"}"
+    )
+    bresp = requests.post(
+        f"{BASE}/generate", data=boundary_payload,
+        headers={"Content-Type": "application/json"}, timeout=60)
+    assert bresp.status_code == 200, (
+        f"depth-{depth_boundary} request returned "
+        f"{bresp.status_code}; sanitizer not reached")
+    state = fetch_state()
+    assert not units_with(state, "boundary-buried"), (
+        f"depth-{depth_boundary} (= cap + 1) tag survived — recursion "
+        f"cap regressed above {depth_boundary - 1}; this is the precise "
+        f"boundary the test pins")
+    print(f"    depth-{depth_boundary} -> tag dropped (cap == "
+          f"{depth_boundary - 1} confirmed) ✓")
 
     # ---- [13] Pydantic regression: model_config.extra must NOT be 'allow' ----
     # Round-3 NIT: the negative ``extra_body`` test in step [3] depends
