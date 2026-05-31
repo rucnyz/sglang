@@ -55,6 +55,7 @@ from baselines.base import (
 from baselines.costs import default_costs
 from baselines.ours_greedy import OursGreedyPolicy
 
+from ._fatal import fatal
 from .events import Event, EventKind
 from .program_tracker import ProgramTracker, State
 
@@ -184,7 +185,9 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         return state_json
     per_rank: List[Dict[str, Any]] = state_json["per_rank"]
     if not per_rank:
-        raise ValueError("per_rank list is empty")
+        # Deployment bug: sglang reported per_rank shape with empty list.
+        # A correct multi-rank deployment dumps at least rank-0.
+        fatal("per_rank_empty", state=state_json)
 
     # ---- pool_usage: per-(tier, subpool) sum across ranks ----
     rank0 = per_rank[0]
@@ -205,10 +208,16 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         for rank in per_rank:
             rank_subpools = rank["pool_usage"][tier]["subpools"]
             if set(rank_subpools.keys()) != sp_keys:
-                raise ValueError(
-                    f"per-rank pool_usage[{tier}].subpools key mismatch: "
-                    f"rank-0 has {sp_keys}, this rank has "
-                    f"{set(rank_subpools.keys())}")
+                # DESIGN §6 line 737: every rank runs the same architecture,
+                # so the subpool key set is structurally identical; a
+                # mismatch is a deployment bug, not a workload reality.
+                fatal(
+                    "subpool_key_mismatch_across_ranks",
+                    tier=tier,
+                    rank0_keys=sorted(sp_keys),
+                    this_rank_keys=sorted(rank_subpools.keys()),
+                    state=state_json,
+                )
             for sp, fields in rank_subpools.items():
                 agg_subpools[sp]["used_bytes"] += int(fields["used_bytes"])
                 agg_subpools[sp]["cap_bytes"] += int(fields["cap_bytes"])
@@ -378,13 +387,28 @@ def build_paper_state(
     """
     # Halt-loudly on unsupported tree cache (DESIGN §5 invariant).
     if "unsupported_tree_cache" in state_json:
-        raise ValueError(
-            f"sglang reported unsupported_tree_cache="
-            f"{state_json['unsupported_tree_cache']!r}; daemon refuses to "
-            f"run against a non-UnifiedRadixCache deployment per DESIGN §5")
+        fatal(
+            "unsupported_tree_cache",
+            reported_kind=state_json["unsupported_tree_cache"],
+            state=state_json,
+        )
 
     # Multi-rank aggregation: DESIGN §6 per-field table.
     state_json = _flatten_per_rank(state_json)
+
+    # DESIGN §10 "Required positivity" + "Missing fields ... deployment
+    # bugs → fatal()".  Every consumer below assumes these blocks
+    # exist; failing fast with a forensic dump is strictly better than
+    # a KeyError at line 420.
+    for field in ("pool_usage", "link_stats", "tier_holding_cost",
+                  "throughput_ema", "per_program_usage", "units",
+                  "time_counter"):
+        if field not in state_json:
+            fatal(
+                "missing_state_field",
+                missing=field,
+                state=state_json,
+            )
 
     # ---- TierUsage: per-(tier, subpool) view from pool_usage ----
     raw_pool = state_json["pool_usage"]
@@ -421,6 +445,18 @@ def build_paper_state(
     for (src, dst), link_label in _LINK_PAIRS:
         entry = raw_links[link_label]
         peak = float(entry["peak_bw_bps"])
+        if peak <= 0.0:
+            # DESIGN §10 "Required positivity: peak_bw_bps > 0".  A
+            # non-positive peak means either sglang hasn't measured the
+            # link yet (mid-startup race) or the operator misconfigured
+            # the deployment; either way the daemon cannot compute
+            # bw_free and the policy's bw-bound bucket collapses.
+            fatal(
+                "peak_bw_bps_non_positive",
+                link=link_label,
+                peak_bw_bps=peak,
+                state=state_json,
+            )
         recent = float(entry["recent_throughput_bps"])
         idle = float(entry["time_since_last_sample_s"])
         # DESIGN §7: if link is cold-idle (idle > 1.0 s), assume peak
