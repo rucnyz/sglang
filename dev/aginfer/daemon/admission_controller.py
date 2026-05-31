@@ -99,13 +99,16 @@ def _value_at_current_tier(
     circuited to 0, silently dropping the holding-tax term and
     making admission's score = ``p_hat * saved_prefill`` only).
     """
+    tier = u.authoritative_tier
     save_prefill = u.p_hat * (
         reload_cost(u, Tier.DROP, costs, pi_u)
-        - reload_cost(u, u.tier, costs, pi_u)
+        - reload_cost(u, tier, costs, pi_u)
     )
-    used = state.tier_usage.used_bytes.get(u.tier, 0)
-    cap = state.tier_usage.capacity_bytes.get(u.tier, 0)
-    h = holding_unit_cost(u.tier, used, cap, costs)
+    # Max-over-subpools occupancy at the authoritative tier; matches
+    # OursGreedyPolicy._value (post-T33 phase 2) and DESIGN §5
+    # 'admission acts when ANY subpool crosses theta_hi'.
+    occ = state.tier_usage.occupancy_ratio(tier)
+    h = holding_unit_cost(tier, occ, costs)
     hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
     return save_prefill - h * u.n_bytes * hold_time
 
@@ -344,28 +347,19 @@ class AdmissionController:
     def _hbm_occ(state: SchedulerState) -> float:
         """Effective HBM pressure for admission gating.
 
-        G10 fix (2026-05-31): prefer allocator-truth ``pool_pressure``
-        (matches sglang's ``full_token_usage`` metric that fires the
-        ``memory_pressure`` webhook).  Falls back to radix-tree
-        ``tier_usage.occupancy_ratio`` only if pool_pressure is empty
-        (older sglang without the pool_usage field), which is the old
-        always-~0 behavior — fine as a fallback because we never want
-        to FALSELY say HBM is pressured.
+        DESIGN §5: admission acts when ANY HBM subpool crosses
+        theta_hi, not when the aggregate does (a Mamba pool at 95 %
+        with attention at 60 % is the failure mode the aggregate
+        view hides).  Max-over-subpools is the right occupancy signal.
 
-        DO NOT use tier_usage for admission: under in-flight decode
-        bursts the radix-tree-keyed used_bytes can be ~0 while the
-        allocator is at 0.95.  Admission would never fire.  See
-        unified_radix_cache.py::_aginfer_pool_usage docstring.
+        Direct subscript: pool_pressure is populated by
+        build_paper_state from sglang's allocator-truth pool_usage;
+        a missing tier entry is a schema-contract violation worth
+        surfacing.  (If sglang doesn't expose pool_usage post-T17,
+        kv_scheduler.build_paper_state raises before we get here.)
         """
-        if state.pool_pressure:
-            occ = state.pool_pressure.get(Tier.HBM)
-            if occ is not None:
-                return float(occ)
-        cap = state.tier_usage.capacity_bytes.get(Tier.HBM, 0)
-        if cap == 0:
-            return 0.0
-        used = state.tier_usage.used_bytes.get(Tier.HBM, 0)
-        return used / cap
+        per_subpool = state.pool_pressure[Tier.HBM]
+        return max(per_subpool.values(), default=0.0)
 
 
 # ----------------------------------------------------------------- attach
