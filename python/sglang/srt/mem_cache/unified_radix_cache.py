@@ -2244,211 +2244,266 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- aginfer daemon migrate (paper §4 action a_t) ----
     def apply_aginfer_migrations(self, actions: list[dict]) -> dict:
-        """Apply a batch of paper §4 ``(u, τ_target)`` actions.
+        """Apply a batch of DESIGN §6 residence-set migrate actions.
+
+        Each action: ``{"hash", "add_tiers": [...], "remove_tiers": [...],
+                        "action_id": "<correlator>"}``.  See verify/t20/
+        README.md for the full per-tier semantics + skip-reason table.
 
         Returns ``{"applied": int, "applied_hashes": [...],
-                    "skipped": [{"hash":..., "reason":...}]}``.
-        ``applied_hashes`` lists the input hashes that actually mutated state,
-        so the daemon can prune its retry set without re-walking the tree.
-        Unresolved actions never raise — the daemon re-issues idempotently
-        on the next event.
+                    "skipped": [{"hash", "action_id", "reason"}, ...]}``.
 
-        Semantics per target tier:
-          DROP  : clear all KV (device+host), remove leaf from tree.
-                  Internal nodes (with children) skipped to keep prefix
-                  matching consistent — daemon should drop bottom-up.
-          DRAM  : demote HBM→DRAM. Works when the node has both device
-                  and host data (= write_through_selective already backed
-                  it up). Without an existing host backup we skip; the
-                  daemon can retry once HiCache's backup_thread catches
-                  up, or fall back to DROP.
-          HBM   : promote DRAM→HBM. Wired to ``load_back`` (the same
-                  host→device path the cache-hit fast-path uses). Fails
-                  (returns ``promote_load_back_declined``) when device
-                  pool can't fit the transfer or load_back's internal
-                  thresholds reject — daemon idempotently retries on
-                  next event. (G11 fix, 2026-05-30; prior behaviour
-                  was an unconditional ``promote_not_yet_wired`` stub.)
-          DISK  : Mooncake/SSD spill. v1: not exposed. Returns
-                  "disk_tier_not_yet_wired".
+        Order within one action: ``add_tiers`` applied first, then
+        ``remove_tiers``.  Synthesise the new copy BEFORE freeing the
+        old one so the ``{HBM} → {DRAM}`` path doesn't drop data
+        between write_through and the device evict.
+
+        Per-tier dispatch:
+          add HBM   → ``load_back`` (host→device promote)
+          add DRAM  → ``write_backup`` (device→host backup)
+          add DISK  → ``disk_tier_not_yet_wired`` (Mooncake L3 future-task)
+          remove HBM   → ``evict_component(target=DEVICE)``
+          remove DRAM  → ``evict_component(target=HOST)``
+          remove DISK  → noop (DISK currently never populated)
+          remove all current tiers → DROP (full evict + tree leaf removal)
         """
-        # Build hash → node lookup with one DFS (O(N), same cost as state walk).
-        # Two hash schemes: HiCache-finalised nodes have a real hash_value
-        # (hex SHA-256); transient nodes fall back to ``node-<id>`` where
-        # ``id`` is a class-level monotonic counter that is NEVER recycled
-        # (UnifiedTreeNode.counter strictly increases), so the fallback name
-        # is also stable for the daemon's lifetime.
-        hash_to_node = {}
+        # Build hash → node lookup with one DFS (O(N), same cost as
+        # state walk).  Two hash schemes: HiCache-finalised nodes have
+        # a real hash_value (hex SHA-256); transient nodes fall back
+        # to ``node-<id>`` where ``id`` is a class-level monotonic
+        # counter that is NEVER recycled (UnifiedTreeNode.counter
+        # strictly increases), so the fallback name is also stable
+        # for the daemon's lifetime.
+        #
+        # T24 (DESIGN §10) HASH_COLLISION detection lives here: if two
+        # distinct radix nodes ever map to the same hash key, fire the
+        # HASH_COLLISION webhook.  Probability is < 10⁻²² at any tree
+        # size aginfer encounters, but the check is amortised free
+        # (one extra dict-membership test per node).
+        hash_to_node: dict[str, UnifiedTreeNode] = {}
         stack = [self.root_node]
         root = self.root_node
         while stack:
             node = stack.pop()
             if node is not root:
                 if node.hash_value:
-                    hash_to_node[str(node.hash_value[-1])] = node
+                    key = str(node.hash_value[-1])
                 else:
-                    hash_to_node[f"node-{node.id}"] = node
+                    key = f"node-{node.id}"
+                # T24 collision check (lazy: only checks pairs that
+                # actually share a key, which is O(1) per node).
+                existing = hash_to_node.get(key)
+                if existing is not None and existing is not node:
+                    # The HASH_COLLISION webhook lands in a follow-up
+                    # T24 commit; for now log the failure mode so
+                    # ops can grep for it.  Both nodes' node.id are
+                    # globally unique so the second one wins; T24
+                    # will replace this with the fatal() webhook.
+                    logger.warning(
+                        "[aginfer] HASH_COLLISION key=%s nodes %d vs %d "
+                        "(both will appear in /aginfer/state; T24 webhook "
+                        "not yet wired)", key, existing.id, node.id,
+                    )
+                hash_to_node[key] = node
             stack.extend(node.children.values())
 
         applied = 0
         applied_hashes: list[str] = []
         skipped: list[dict] = []
-        # Tracks nodes we've already mutated in this batch.  Without this,
-        # a duplicate hash in `actions` would re-enter the DROP / DRAM code
-        # with a stale view of the node (cd.value is left dangling because
-        # FullComponent.evict_component DEFERS the ``cd.value = None`` to a
-        # later trigger -- see _cascade_evict line ~1114).  The second pass
-        # would then crash inside _remove_leaf_from_parent (assert v == node
-        # after a no-op pop) or double-free the device buffer.
+        # Tracks nodes we've already mutated in this batch.  A duplicate
+        # hash in `actions` would re-enter the DROP / evict code with
+        # a stale view of the node (cd.value is left dangling because
+        # FullComponent.evict_component DEFERS the ``cd.value = None``
+        # to a later trigger -- see _cascade_evict).  The second pass
+        # would then crash inside _remove_leaf_from_parent or double-
+        # free the device buffer.
         acted_node_ids: set[int] = set()
         components = self._components_tuple
         base = BASE_COMPONENT_TYPE
-        new_tracker = lambda: {ct: 0 for ct in self.tree_components}
+        _VALID_TIERS = {"HBM", "DRAM", "DISK"}
+
+        def _skip(h, action_id, reason):
+            skipped.append({"hash": h, "action_id": action_id, "reason": reason})
 
         for action in actions:
-            h = action.get("hash")
-            target = (action.get("target_tier") or "").upper()
+            h = action["hash"]
+            action_id = action.get("action_id", "")
+            add_tiers = set(action.get("add_tiers", []))
+            remove_tiers = set(action.get("remove_tiers", []))
+
+            # Validate tier strings.
+            unknown_tiers = (add_tiers | remove_tiers) - _VALID_TIERS
+            if unknown_tiers:
+                _skip(h, action_id,
+                      f"unknown_tier:{','.join(sorted(unknown_tiers))}")
+                continue
+
+            # Resolve hash.
             node = hash_to_node.get(h)
             if node is None:
-                # race: tree mutated between daemon's state-read and
-                # this write — unit no longer indexed in our tree.
-                skipped.append({"hash": h, "reason": "race:not_in_tree"})
+                _skip(h, action_id, "not_in_tree")
                 continue
             if node.id in acted_node_ids:
-                # Defensive: duplicate (or aliasing) action against the same
-                # node would crash on the stale cd.value pointer. See comment
-                # at acted_node_ids initialisation.
-                skipped.append({"hash": h, "reason": "already_acted_this_batch"})
+                _skip(h, action_id, "already_acted_this_batch")
                 continue
+
+            # No-op action: refuse rather than silently apply nothing.
+            if not add_tiers and not remove_tiers:
+                _skip(h, action_id, "noop_action")
+                continue
+
+            # Compute current residence from component_data.
             cd = node.component_data[base]
             has_device = cd.value is not None and len(cd.value) > 0
             has_host = cd.host_value is not None and len(cd.host_value) > 0
-            is_leaf = len(node.children) == 0
+            current: set[str] = set()
+            if has_device:
+                current.add("HBM")
+            if has_host:
+                current.add("DRAM")
+            # DISK is never in current_residence — Mooncake L3 not wired.
 
-            if target == "DROP":
-                if not (has_device or has_host):
-                    # race: data evicted between daemon's read and this write.
-                    skipped.append({"hash": h, "reason": "race:no_data"})
-                    continue
-                if not is_leaf:
-                    # race: tree mutated — a child appeared under this node
-                    # since daemon's state-read.  Internal nodes can't be
-                    # dropped (breaks prefix matching); daemon must drop
-                    # descendants first.
-                    skipped.append({"hash": h, "reason": "race:not_a_leaf"})
-                    continue
-                tracker = new_tracker()
-                for comp in components:
-                    self._evict_component_and_detach_lru(
-                        node, comp, target=EvictLayer.ALL, tracker=tracker
-                    )
-                self.evictable_device_leaves.discard(node)
-                self.evictable_host_leaves.discard(node)
-                self._remove_leaf_from_parent(node)
-                self._iteratively_delete_tombstone_leaf(node, tracker)
-                applied += 1
-                applied_hashes.append(h)
-                acted_node_ids.add(node.id)
-            elif target == "DRAM":
-                if has_device and has_host:
-                    tracker = new_tracker()
-                    for comp in components:
-                        self._evict_component_and_detach_lru(
-                            node, comp, target=EvictLayer.DEVICE, tracker=tracker
-                        )
-                    self._update_evictable_leaf_sets(node)
-                    applied += 1
-                    applied_hashes.append(h)
-                    acted_node_ids.add(node.id)
-                elif has_host:
-                    # race: already demoted by inline scorer / prior daemon
-                    # call between daemon's read and this write.
-                    skipped.append({"hash": h, "reason": "race:already_on_dram"})
-                elif has_device:
-                    # race: HiCache backup_thread hadn't caught up at the
-                    # moment daemon decided to demote; retry on next event.
-                    skipped.append(
-                        {"hash": h, "reason": "race:demote_requires_existing_host_backup"}
-                    )
+            # Validate add: tiers must not already be in residence.
+            already_in = add_tiers & current
+            if already_in:
+                _skip(h, action_id,
+                      f"add_already_present:{','.join(sorted(already_in))}")
+                continue
+
+            # Validate remove: tiers must be in current residence.
+            # (DISK in remove is always 'absent' since current never
+            # has DISK; we allow it as a noop so the daemon can
+            # speculatively remove DISK during a transition without
+            # tripping this check.)
+            missing = remove_tiers - current - {"DISK"}
+            if missing:
+                _skip(h, action_id,
+                      f"remove_already_absent:{','.join(sorted(missing))}")
+                continue
+
+            # DISK in add → not implemented.
+            if "DISK" in add_tiers:
+                _skip(h, action_id, "disk_tier_not_yet_wired")
+                continue
+
+            # Will the unit be fully removed (post-add residence ⊆ remove)?
+            post_residence = (current | add_tiers) - remove_tiers
+            is_full_drop = not post_residence
+            is_leaf = len(node.children) == 0
+            if is_full_drop and not is_leaf:
+                _skip(h, action_id, "remove_not_leaf")
+                continue
+
+            # ---- Apply adds first ----
+            skip_this = False
+
+            if "DRAM" in add_tiers:
+                # write_through HBM → DRAM via cache_controller.
+                if self.cache_controller is None:
+                    _skip(h, action_id, "write_through_declined:no_hicache")
+                    skip_this = True
                 else:
-                    skipped.append({"hash": h, "reason": "race:no_data"})
-            elif target == "HBM":
-                if has_device:
-                    # race: already on HBM (state was stale).
-                    skipped.append({"hash": h, "reason": "race:already_on_hbm"})
-                elif has_host:
-                    # Promote DRAM → HBM via the same `load_back` path
-                    # the cache-hit fast-path uses (line ~1446).
-                    # Failure modes mapped to skip reasons:
-                    #   * load_back returns False → device pool too
-                    #     full + couldn't evict enough, or transfer
-                    #     below load_back_threshold, or lock contention
-                    #   * load_back raises → defensive: don't crash the
-                    #     /aginfer/migrate handler on a single bad action.
-                    #     Include exc message + last traceback frame
-                    #     (file:line:funcname) so daemon's
-                    #     migrate_skipped log is actionable for bare
-                    #     `assert <expr>` statements with empty msg.
                     try:
-                        ok = self.load_back(node)
+                        n_written = self.write_backup(node)
                     except Exception as exc:  # noqa: BLE001
                         import traceback as _tb
                         msg = str(exc) or "<empty>"
-                        # Find deepest frame inside our codebase so the
-                        # reason points at the failing assert, not at
-                        # this except handler.
                         loc = "?"
-                        try:
-                            stack = _tb.extract_tb(exc.__traceback__)
-                            if stack:
-                                last = stack[-1]
-                                fname = last.filename.rsplit("/", 1)[-1]
-                                loc = f"{fname}:{last.lineno}:{last.name}"
-                        except Exception:  # noqa: BLE001
-                            pass
+                        st = _tb.extract_tb(exc.__traceback__)
+                        if st:
+                            last = st[-1]
+                            fname = last.filename.rsplit("/", 1)[-1]
+                            loc = f"{fname}:{last.lineno}:{last.name}"
                         short = "_".join(msg.split())[:60]
-                        skipped.append(
-                            {
-                                "hash": h,
-                                "reason": (
-                                    f"promote_raised:"
-                                    f"{type(exc).__name__}:{loc}:{short}"
-                                ),
-                            }
-                        )
-                        continue
-                    if ok:
-                        applied += 1
-                        applied_hashes.append(h)
-                        acted_node_ids.add(node.id)
+                        _skip(h, action_id,
+                              f"write_through_raised:"
+                              f"{type(exc).__name__}:{loc}:{short}")
+                        skip_this = True
                     else:
-                        # load_back returned False without raising. Take
-                        # the two leading categories (load_back-level :
-                        # controller-level) so the daemon's Counter
-                        # aggregates cleanly; numeric detail is still on
-                        # self._last_load_back_decline for live debug.
+                        if n_written == 0:
+                            _skip(h, action_id,
+                                  "write_through_declined:zero_tokens")
+                            skip_this = True
+            if skip_this:
+                continue
+
+            if "HBM" in add_tiers:
+                # load_back DRAM → HBM via the same path the cache-hit
+                # fast-path uses.
+                try:
+                    ok = self.load_back(node)
+                except Exception as exc:  # noqa: BLE001
+                    import traceback as _tb
+                    msg = str(exc) or "<empty>"
+                    loc = "?"
+                    st = _tb.extract_tb(exc.__traceback__)
+                    if st:
+                        last = st[-1]
+                        fname = last.filename.rsplit("/", 1)[-1]
+                        loc = f"{fname}:{last.lineno}:{last.name}"
+                    short = "_".join(msg.split())[:60]
+                    _skip(h, action_id,
+                          f"promote_raised:"
+                          f"{type(exc).__name__}:{loc}:{short}")
+                    skip_this = True
+                else:
+                    if not ok:
                         detail = (
                             getattr(self, "_last_load_back_decline", None)
                             or "unknown"
                         )
-                        parts = detail.split(":", 2)
-                        category = ":".join(parts[:2])
-                        skipped.append(
-                            {
-                                "hash": h,
-                                "reason": f"promote_load_back_declined:{category}",
-                            }
-                        )
-                else:
-                    skipped.append({"hash": h, "reason": "race:no_data"})
-            elif target == "DISK":
-                skipped.append({"hash": h, "reason": "disk_tier_not_yet_wired"})
-            else:
-                skipped.append(
-                    {"hash": h, "reason": f"unknown_target_tier:{target!r}"}
-                )
+                        category = ":".join(detail.split(":", 2)[:2])
+                        _skip(h, action_id,
+                              f"promote_load_back_declined:{category}")
+                        skip_this = True
+            if skip_this:
+                continue
 
-        return {"applied": applied, "applied_hashes": applied_hashes, "skipped": skipped}
+            # ---- Apply removes ----
+            tracker = {ct: 0 for ct in self.tree_components}
+            base_comp = self.components[BASE_COMPONENT_TYPE]
+            if is_full_drop:
+                # Full evict + remove leaf from tree.
+                for comp in components:
+                    self._evict_component_and_detach_lru(
+                        node, comp, target=EvictLayer.ALL, tracker=tracker)
+                self.evictable_device_leaves.discard(node)
+                self.evictable_host_leaves.discard(node)
+                self._remove_leaf_from_parent(node)
+                self._iteratively_delete_tombstone_leaf(node, tracker)
+            else:
+                if "HBM" in remove_tiers:
+                    # Device eviction: evict_component frees the buffer
+                    # but DEFERS `cd.value = None` (SWA's free_swa still
+                    # reads Full.value).  _cascade_evict performs that
+                    # tombstone AND walks lower-priority components so
+                    # the post-state dump correctly reflects HBM ∉
+                    # residence.  Without the cascade, cd.value stays
+                    # non-empty and `/aginfer/state` would lie.
+                    self._evict_component_and_detach_lru(
+                        node, base_comp, target=EvictLayer.DEVICE,
+                        tracker=tracker)
+                    self._cascade_evict(
+                        node, base_comp, tracker, target=EvictLayer.DEVICE)
+                if "DRAM" in remove_tiers:
+                    # Host eviction: evict_component sets cd.host_value
+                    # = None inline (no defer; SWA doesn't pin host
+                    # state).  Cascade still needed so aux components'
+                    # host state is consistent.
+                    self._evict_component_and_detach_lru(
+                        node, base_comp, target=EvictLayer.HOST,
+                        tracker=tracker)
+                    self._cascade_evict(
+                        node, base_comp, tracker, target=EvictLayer.HOST)
+                # DISK in remove is a noop (never populated).
+                self._update_evictable_leaf_sets(node)
+
+            applied += 1
+            applied_hashes.append(h)
+            acted_node_ids.add(node.id)
+
+        return {"applied": applied, "applied_hashes": applied_hashes,
+                "skipped": skipped}
 
     # ---- aginfer daemon snapshot (paper §3 state s_t) ----
     def _aginfer_bytes_per_token(self) -> int:

@@ -673,11 +673,16 @@ async def aginfer_state():
     return ORJSONResponse({"per_rank": per_rank})
 
 
-# POST /aginfer/migrate -- apply paper §4 (u, τ_target) actions in batch.
-# Body: {"actions": [{"hash": str, "target_tier": "HBM"|"DRAM"|"DISK"|"DROP"}, ...]}
-# Response: {"applied": int, "applied_hashes": [...], "skipped": [{"hash":..., "reason":...}, ...]}
-# Unresolved or unsupported actions are listed in `skipped` rather than
-# raised, so the daemon's idempotent re-issue loop stays simple.
+# POST /aginfer/migrate -- apply paper §6 residence-set transitions.
+# Body: {"actions": [{"hash": str,
+#                     "add_tiers":    ["HBM"|"DRAM"|"DISK", ...],
+#                     "remove_tiers": ["HBM"|"DRAM"|"DISK", ...],
+#                     "action_id":    "<opaque correlator>"}, ...]}
+# Response: {"applied": int, "applied_hashes": [...],
+#            "skipped": [{"hash":..., "action_id":..., "reason":...}, ...]}
+# Skip reasons per DESIGN §6 + verify/t20/README.md table.
+# Unresolved actions are listed in `skipped` rather than raised, so the
+# daemon's idempotent re-issue loop stays simple.
 @app.post("/aginfer/migrate")
 async def aginfer_migrate(raw_request: Request):
     try:
