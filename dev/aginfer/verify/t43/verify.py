@@ -419,6 +419,148 @@ def stage_7_unsupported_tree_cache() -> None:
         )
 
 
+def stage_9_h_max_per_byte_sec_non_positive() -> None:
+    """DESIGN §10 line 2319 positivity invariant: every
+    ``tier_holding_cost[τ][sp].h_max_per_byte_sec > 0``.  Zero is a
+    deployment bug (operator forgot to set ``h_max`` for a subpool)."""
+    state = _seed_valid_state()
+    state["tier_holding_cost"]["HBM"]["attn"]["h_max_per_byte_sec"] = 0.0
+    with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
+        data_dir = Path(td)
+        result = _run_build_paper_state(state, data_dir=data_dir)
+        if result.returncode != 1:
+            raise StageFail(
+                f"expected exit=1 on h_max=0; got {result.returncode}; "
+                f"stderr={result.stderr}"
+            )
+        if "UNEXPECTED-SUCCESS" in result.stderr:
+            raise StageFail("build_paper_state did not raise/fatal")
+        _assert_forensic_file(
+            data_dir, "holding_cost_non_positive", result.stderr,
+        )
+    # Negative is also a deployment bug (and must not regress to
+    # ``>=0`` silently if someone tightens the check later).
+    state["tier_holding_cost"]["HBM"]["attn"]["h_max_per_byte_sec"] = -1.0e-9
+    with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
+        data_dir = Path(td)
+        result = _run_build_paper_state(state, data_dir=data_dir)
+        if result.returncode != 1:
+            raise StageFail(
+                f"expected exit=1 on h_max=-1e-9; got {result.returncode}"
+            )
+        _assert_forensic_file(
+            data_dir, "holding_cost_non_positive", result.stderr,
+        )
+
+
+def stage_10_prefill_bps_positivity_conditional() -> None:
+    """DESIGN §10 line 2319: ``prefill_bps > 0`` ONCE ANY PREFILL HAS
+    RUN.  Three sub-cases:
+
+      (a) prefill_bps == 0 + no units + time_counter == 0
+          → startup; NO fatal.
+      (b) prefill_bps < 0 → fatal regardless (negative throughput is
+          structurally nonsense; can never be a startup state).
+      (c) prefill_bps == 0 + units present → fatal (we have evidence
+          that prefill has run because there are committed units,
+          but the EMA reports zero throughput → bug).
+    """
+    # (a) startup: prefill_bps=0 + no units → NO fatal
+    state_a = _seed_valid_state()
+    state_a["throughput_ema"]["prefill_bps"] = 0.0
+    # seed already has units=[] and time_counter=0
+    with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
+        data_dir = Path(td)
+        result = _run_build_paper_state(state_a, data_dir=data_dir)
+        if result.returncode != 0:
+            raise StageFail(
+                f"(a) startup: expected exit=0; got {result.returncode}; "
+                f"stderr={result.stderr}"
+            )
+
+    # (b) negative: unconditional fatal
+    state_b = _seed_valid_state()
+    state_b["throughput_ema"]["prefill_bps"] = -1.0
+    with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
+        data_dir = Path(td)
+        result = _run_build_paper_state(state_b, data_dir=data_dir)
+        if result.returncode != 1:
+            raise StageFail(
+                f"(b) negative: expected exit=1; got {result.returncode}; "
+                f"stderr={result.stderr}"
+            )
+        _assert_forensic_file(
+            data_dir, "prefill_bps_non_positive_with_traffic", result.stderr,
+        )
+
+    # (c) zero with units present: fatal
+    state_c = _seed_valid_state()
+    state_c["throughput_ema"]["prefill_bps"] = 0.0
+    state_c["units"] = [{
+        "hash": "node-1",
+        "residence": ["HBM"],
+        "n_tokens": 256,
+        "n_bytes": {"HBM": {"attn": 4096}},
+        "last_access_time": 0,
+        "hit_count": 1,
+        "session_ids": [],
+    }]
+    state_c["time_counter"] = 1
+    with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
+        data_dir = Path(td)
+        result = _run_build_paper_state(state_c, data_dir=data_dir)
+        if result.returncode != 1:
+            raise StageFail(
+                f"(c) zero+units: expected exit=1; got {result.returncode}; "
+                f"stderr={result.stderr}"
+            )
+        _assert_forensic_file(
+            data_dir, "prefill_bps_non_positive_with_traffic", result.stderr,
+        )
+
+
+def stage_11_cross_rank_n_bytes_disagreement() -> None:
+    """DESIGN §6 line 736: ``units[i].n_bytes[τ][sp]`` is identical
+    across ranks (derived from architecture); cross-rank disagreement
+    is a deployment bug → fatal().
+
+    Pre-T43 ``_flatten_per_rank`` took ``max(rank0, rank1)`` over
+    disagreeing values, silently absorbing the bug.  This stage feeds
+    a 2-rank state where the same hash reports
+    ``n_bytes[HBM][attn] = 4096`` on rank-0 and ``8192`` on rank-1
+    and asserts fatal."""
+    rank0 = _seed_valid_state()
+    rank0["units"] = [{
+        "hash": "node-replica",
+        "residence": ["HBM"],
+        "n_tokens": 256,
+        "n_bytes": {"HBM": {"attn": 4096}},
+        "last_access_time": 0,
+        "hit_count": 1,
+        "session_ids": [],
+    }]
+    rank0["time_counter"] = 1
+    rank1 = copy.deepcopy(rank0)
+    rank1["units"][0]["n_bytes"]["HBM"]["attn"] = 8192  # disagrees
+    multi_rank = {"per_rank": [rank0, rank1]}
+    with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
+        data_dir = Path(td)
+        result = _run_build_paper_state(multi_rank, data_dir=data_dir)
+        if result.returncode != 1:
+            raise StageFail(
+                f"expected exit=1 on n_bytes disagreement; "
+                f"got {result.returncode}; stderr={result.stderr}"
+            )
+        if "UNEXPECTED-SUCCESS" in result.stderr:
+            raise StageFail(
+                "build_paper_state silently absorbed a cross-rank "
+                "n_bytes disagreement instead of fataling"
+            )
+        _assert_forensic_file(
+            data_dir, "n_bytes_disagreement_across_ranks", result.stderr,
+        )
+
+
 def stage_8_happy_path_does_not_fatal() -> None:
     """Sanity: the seed-valid state does NOT trigger fatal() — i.e. we
     have not over-tightened the new checks into the green path."""
@@ -452,6 +594,12 @@ _STAGES = [
     ("5  missing throughput_ema field",       stage_5_missing_throughput_ema),
     ("6  per_rank empty list",                stage_6_per_rank_empty),
     ("7  unsupported_tree_cache field",       stage_7_unsupported_tree_cache),
+    ("9  h_max_per_byte_sec non-positive (DESIGN §10 positivity)",
+                                              stage_9_h_max_per_byte_sec_non_positive),
+    ("10 prefill_bps positivity (conditional on prefill having run)",
+                                              stage_10_prefill_bps_positivity_conditional),
+    ("11 cross-rank n_bytes disagreement (DESIGN §6 L736)",
+                                              stage_11_cross_rank_n_bytes_disagreement),
     ("8  happy-path sanity (no fatal)",       stage_8_happy_path_does_not_fatal),
 ]
 

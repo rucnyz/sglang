@@ -313,18 +313,39 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 existing = agg_units[hash_to_idx[uhash]]
                 merged_residence = sorted(
                     set(existing["residence"]) | set(u["residence"]))
-                # n_bytes: max across ranks per (tier, subpool) — same
-                # logical unit, ranks should agree, take max to absorb
-                # mid-migration race.
+                # n_bytes: DESIGN §6 L736 — identical across ranks
+                # (derived from architecture).  When the SAME
+                # (tier, subpool) key is present on both ranks for the
+                # same hash, the values MUST agree.  A "max to absorb
+                # mid-migration race" fallback would silently mask a
+                # deployment bug; DESIGN explicitly classifies this as
+                # bug-class → fatal().  Tier-keys present on only one
+                # rank are fine (one rank may be mid-migration with
+                # the unit in DRAM while another rank still has HBM).
                 merged_nb: Dict[str, Dict[str, int]] = {}
                 for tier in set(existing["n_bytes"]) | set(u["n_bytes"]):
                     merged_nb[tier] = {}
-                    for sp in set(existing["n_bytes"].get(tier, {})) | set(
-                            u["n_bytes"].get(tier, {})):
-                        merged_nb[tier][sp] = max(
-                            int(existing["n_bytes"].get(tier, {}).get(sp, 0)),
-                            int(u["n_bytes"].get(tier, {}).get(sp, 0)),
-                        )
+                    e_tier = existing["n_bytes"].get(tier, {})
+                    u_tier = u["n_bytes"].get(tier, {})
+                    for sp in set(e_tier) | set(u_tier):
+                        e_val = e_tier.get(sp)
+                        u_val = u_tier.get(sp)
+                        if e_val is not None and u_val is not None:
+                            if int(e_val) != int(u_val):
+                                fatal(
+                                    "n_bytes_disagreement_across_ranks",
+                                    hash=uhash,
+                                    tier=tier,
+                                    subpool=sp,
+                                    rank_a_n_bytes=int(e_val),
+                                    rank_b_n_bytes=int(u_val),
+                                    state=state_json,
+                                )
+                            merged_nb[tier][sp] = int(e_val)
+                        elif e_val is not None:
+                            merged_nb[tier][sp] = int(e_val)
+                        else:
+                            merged_nb[tier][sp] = int(u_val)
                 existing["residence"] = merged_residence
                 existing["n_bytes"] = merged_nb
                 continue
@@ -409,6 +430,46 @@ def build_paper_state(
                 missing=field,
                 state=state_json,
             )
+
+    # DESIGN §10 line 2319 positivity invariant #2:
+    #   h_max_per_byte_sec > 0 for every (tier, subpool).
+    # Zero means operator forgot to configure h_max for a subpool —
+    # the holding-tax term in V_u silently collapses to zero, the
+    # policy decisions go off-paper, no log.
+    for tier_label, subpools in state_json["tier_holding_cost"].items():
+        for sp, fields in subpools.items():
+            h_max = float(fields["h_max_per_byte_sec"])
+            if h_max <= 0.0:
+                fatal(
+                    "holding_cost_non_positive",
+                    tier=tier_label,
+                    subpool=sp,
+                    h_max_per_byte_sec=h_max,
+                    state=state_json,
+                )
+
+    # DESIGN §10 line 2319 positivity invariant #3:
+    #   prefill_bps > 0 ONCE ANY PREFILL HAS RUN.
+    # Three cases:
+    #   - negative: always fatal (negative throughput is structurally
+    #     nonsense; can never be a startup state)
+    #   - zero + no units + time_counter == 0: startup; not a bug
+    #   - zero + (units OR time_counter > 0): fatal — we have
+    #     evidence prefill has run (units only appear post-commit;
+    #     time_counter increments per prefill) but the EMA reports
+    #     zero throughput.
+    prefill_bps = float(state_json["throughput_ema"]["prefill_bps"])
+    has_traffic = (
+        bool(state_json["units"]) or int(state_json["time_counter"]) > 0
+    )
+    if prefill_bps < 0.0 or (prefill_bps == 0.0 and has_traffic):
+        fatal(
+            "prefill_bps_non_positive_with_traffic",
+            prefill_bps=prefill_bps,
+            units_count=len(state_json["units"]),
+            time_counter=int(state_json["time_counter"]),
+            state=state_json,
+        )
 
     # ---- TierUsage: per-(tier, subpool) view from pool_usage ----
     raw_pool = state_json["pool_usage"]

@@ -72,9 +72,12 @@ introduce them):
 |---|---|---|
 | `_flatten_per_rank` — empty `per_rank` list          | `per_rank_empty`                   | ✓ T43 |
 | `_flatten_per_rank` — cross-rank subpool key mismatch | `subpool_key_mismatch_across_ranks` | ✓ T43 |
+| `_flatten_per_rank` — cross-rank `n_bytes` disagreement (DESIGN §6 L736) | `n_bytes_disagreement_across_ranks` | ✓ T43 (audit-driven) |
 | `build_paper_state` — `unsupported_tree_cache`       | `unsupported_tree_cache`           | ✓ T43 |
 | `build_paper_state` — missing required field          | `missing_state_field`              | ✓ T43 |
 | `build_paper_state` — `peak_bw_bps ≤ 0`               | `peak_bw_bps_non_positive`         | ✓ T43 |
+| `build_paper_state` — `h_max_per_byte_sec ≤ 0` (DESIGN §10 L2319) | `holding_cost_non_positive`        | ✓ T43 (audit-driven) |
+| `build_paper_state` — `prefill_bps ≤ 0` once prefill has run (DESIGN §10 L2319) | `prefill_bps_non_positive_with_traffic` | ✓ T43 (audit-driven) |
 | `joint_decide` infeasibility                          | `joint_decide_infeasible`          | T34 (#156) |
 | `bytes_at(τ)` — τ not in residence                    | `bytes_at_tier_not_in_residence`   | T34 (#156) |
 | `HASH_COLLISION` webhook receipt                      | `hash_collision`                   | T23+T37 (#153) |
@@ -139,6 +142,26 @@ Stage 8  happy-path sanity (no fatal)
          completion with exit=0 and no forensic file written.
          Catches the over-tightening regression: the new checks
          must not bleed into the green path.
+
+Stage 9  h_max_per_byte_sec non-positive (audit-driven)
+         tier_holding_cost.HBM.attn.h_max_per_byte_sec = 0 → fatal
+         (sub-stage: -1e-9 also → fatal, defends ``>= 0`` regression).
+
+Stage 10 prefill_bps positivity (conditional, audit-driven)
+         Three sub-cases proving the "(once any prefill has run)"
+         qualifier from DESIGN §10:
+         (a) startup (prefill_bps=0, units=[], time_counter=0) →
+             NO fatal (legitimate cold-start state).
+         (b) prefill_bps=-1 (negative) → fatal regardless
+             (negative throughput is structurally nonsense).
+         (c) prefill_bps=0 + units present + time_counter>0 → fatal
+             (we have evidence prefill ran; EMA reporting 0 is a bug).
+
+Stage 11 cross-rank n_bytes disagreement (DESIGN §6 L736, audit-driven)
+         Two-rank state, same hash, n_bytes[HBM][attn]=4096 on
+         rank-0 vs 8192 on rank-1 → fatal.  Pre-audit T43 took
+         max() over disagreeing values, silently absorbing the bug;
+         DESIGN explicitly flags this as bug-class.
 ```
 
 ## REPRODUCING
@@ -155,13 +178,15 @@ run via Python subprocesses.
 
 ## RESULTS
 
-**PASSED** — all 9 stages.
+**PASSED** — all 12 stages (initial 9 + audit-driven 3 for DESIGN
+§10 / §6 alignment).
 
 * date: 2026-05-31
-* lines: ~190 in new `daemon/_fatal.py`; ~35 net in
+* lines: ~190 in new `daemon/_fatal.py`; ~95 net in
   `daemon/kv_scheduler.py` (3 `raise ValueError` → `fatal(...)`
-  conversions + 2 new checks: per-link `peak_bw_bps > 0`, top-level
-  field-presence guard).
+  conversions + 5 new checks: per-link `peak_bw_bps > 0`, top-level
+  field-presence guard, h_max positivity, prefill_bps positivity,
+  cross-rank n_bytes equality).
 
 | Stage | Result |
 |---|---|
@@ -174,8 +199,12 @@ run via Python subprocesses.
 | 6  per_rank empty list | PASS — `per_rank_empty` |
 | 7  unsupported_tree_cache field | PASS — `unsupported_tree_cache` |
 | 8  happy-path sanity (no fatal) | PASS — exit=0, no forensic file |
+| 9  h_max_per_byte_sec non-positive | PASS — `holding_cost_non_positive` (0 AND -1e-9 both fatal) |
+| 10 prefill_bps positivity (conditional) | PASS — (a) startup exits 0, (b) -1 fatals, (c) 0+units fatals |
+| 11 cross-rank n_bytes disagreement | PASS — `n_bytes_disagreement_across_ranks` |
 
-* raw run log: `results/20260531_t43_initial_pass.log`
+* raw run log: `results/20260531_t43_initial_pass.log` (initial 9)
+* audit re-run log: `results/20260531_t43_audit_aligned_pass.log` (12 stages)
 
 ### Known stale-test impact
 
