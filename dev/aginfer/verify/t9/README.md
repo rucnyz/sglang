@@ -1,5 +1,18 @@
 # T9 — Run K e2e + K-a + J ablations
 
+> 🔀 **2026-05-31 redirect**: experiment results, scripts, parsers,
+> and cycle data have moved to
+> [`dev/aginfer/scenarios/`](../../scenarios/).  This README is now
+> the **T9 acceptance-criteria history**.
+>
+> Index:
+> * Workload + arm matrices: [`scenarios/swebench_default/`](../../scenarios/swebench_default/), [`scenarios/hbm_pressure/`](../../scenarios/hbm_pressure/), [`scenarios/high_concurrency/`](../../scenarios/high_concurrency/)
+> * Ablations: [`scenarios/ablation/daemon_overhead/`](../../scenarios/ablation/daemon_overhead/)
+> * Findings (GAPS, runaway tail, instrument story, etc.): [`scenarios/experiments_notes/`](../../scenarios/experiments_notes/)
+> * Shared scripts + parsers: [`scenarios/_shared/`](../../scenarios/_shared/)
+>
+> The `results/N3_*.md` paths referenced below now live under those folders.
+
 ## ⚠️ OPEN WORK (ideal not yet achieved, 2026-05-29)
 
 The full catalog lives in `results/N3_GAPS.md`; this section
