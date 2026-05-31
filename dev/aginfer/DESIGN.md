@@ -354,10 +354,50 @@ def decide(state, D_t):
             plan.append((u.id, best_tier))
     return plan
 
-_net_value(u, τ, state) = _value(u, τ, state) - migration_cost(u, u.tier, τ)
+_net_value(u, τ, state) = _value(u, τ, state)
+                          - migration_cost(u, u.tier, τ)
+                          - unavailability_cost(u, u.tier, τ)
+
 _value(u, τ, state)     = p_hat × (reload_from_DROP - reload_from_τ)
                           - h_τ(occupancy_of_τ) × bytes × hold_time
+
+unavailability_cost(u, σ, τ) =
+    p_hat(u, transfer_time(σ, τ))           # access lands during transfer
+  × P(serve-from-σ fails | σ-write-policy)  # 0 under write-through
+  × (reload_from_σ - 0)                     # penalty if it does fail
 ```
+
+**Under our write-through HiCache semantic the unavailability
+cost evaluates to 0** — see Transfer-window semantics below.  The
+term is kept in the formula so the math stays correct when the
+underlying write policy changes (zero-copy moves, non-write-through
+caches, etc.) without rewriting `_net_value`.
+
+### Transfer-window semantics
+
+When unit u is mid-migrate σ → τ and an access to u arrives, the
+lookup MUST serve from σ; the in-flight σ → τ transfer continues
+uninterrupted and the access pays `σ_latency` (not `τ_latency`).
+The next access — after transfer completes — pays `τ_latency`.
+
+This is option **(C) race-serve-from-source**, and it strictly
+dominates the alternatives:
+
+| | this access | next access | bytes wasted |
+|---|---|---|---|
+| (A) wait for transfer | σ_latency + transfer_time | τ_latency | 0 |
+| (B) cancel transfer | σ_latency | σ_latency | partial transfer |
+| **(C) race** | σ_latency | τ_latency | 0 |
+
+(C) requires σ to remain valid throughout the transfer window —
+guaranteed by the write-through write policy.  Under (C):
+`P(serve-from-σ fails) = 0`, so `unavailability_cost = 0` in
+every term of `_net_value`.
+
+If the write policy ever changes such that σ is invalidated
+during transfer (e.g. zero-copy move), `P(serve-from-σ fails) =
+1` and the unavailability term kicks in fully — without any
+change to the decision rule.
 
 ### D_t per event kind
 
