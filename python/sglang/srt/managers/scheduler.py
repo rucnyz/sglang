@@ -465,13 +465,15 @@ class Scheduler(
                 notify_url=server_args.aginfer_notify_url,
                 heartbeat_s=getattr(server_args, "aginfer_heartbeat_s", 5.0),
                 theta_hi=getattr(server_args, "aginfer_theta_hi", 0.7),
+                theta_lo=getattr(server_args, "aginfer_theta_lo", 0.55),
                 theta_crit=getattr(server_args, "aginfer_theta_crit", 0.9),
             )
             logger.info(
-                "aginfer webhook armed: url=%s heartbeat_s=%.1f theta_hi=%.2f theta_crit=%.2f",
+                "aginfer webhook armed: url=%s heartbeat_s=%.1f theta_hi=%.2f theta_lo=%.2f theta_crit=%.2f",
                 server_args.aginfer_notify_url,
                 self.aginfer_webhook.heartbeat_s,
                 self.aginfer_webhook.theta_hi,
+                self.aginfer_webhook.theta_lo,
                 self.aginfer_webhook.theta_crit,
             )
 
@@ -1558,16 +1560,18 @@ class Scheduler(
             self.last_batch = batch
 
             # aginfer T5: fire webhook on watermark transition / heartbeat.
+            # Use the SAME occupancy view the daemon reads
+            # (/aginfer/state.pool_usage.HBM.token_usage) so sglang and
+            # daemon never disagree about pressure.  The old
+            # `pool.size_full - pool.available_size()` formula inflated
+            # "used" under SWA because available_size() = min(full,swa).
             if self.aginfer_webhook is not None:
                 try:
-                    pool = self.token_to_kv_pool_allocator
-                    used = (
-                        pool.size_full - pool.available_size()
-                        if pool is not None
-                        else 0
-                    )
-                    cap = pool.size_full if pool is not None else 0
-                    self.aginfer_webhook.maybe_fire(used, cap)
+                    occ = 0.0
+                    pu = getattr(self.tree_cache, "_aginfer_pool_usage", None)
+                    if pu is not None:
+                        occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
+                    self.aginfer_webhook.maybe_fire(occ=occ)
                 except Exception:
                     logger.exception("aginfer webhook check raised")
 
@@ -1627,16 +1631,18 @@ class Scheduler(
             self.last_batch = batch
 
             # aginfer T5: fire webhook on watermark transition / heartbeat.
+            # Use the SAME occupancy view the daemon reads
+            # (/aginfer/state.pool_usage.HBM.token_usage) so sglang and
+            # daemon never disagree about pressure.  The old
+            # `pool.size_full - pool.available_size()` formula inflated
+            # "used" under SWA because available_size() = min(full,swa).
             if self.aginfer_webhook is not None:
                 try:
-                    pool = self.token_to_kv_pool_allocator
-                    used = (
-                        pool.size_full - pool.available_size()
-                        if pool is not None
-                        else 0
-                    )
-                    cap = pool.size_full if pool is not None else 0
-                    self.aginfer_webhook.maybe_fire(used, cap)
+                    occ = 0.0
+                    pu = getattr(self.tree_cache, "_aginfer_pool_usage", None)
+                    if pu is not None:
+                        occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
+                    self.aginfer_webhook.maybe_fire(occ=occ)
                 except Exception:
                     logger.exception("aginfer webhook check raised")
 

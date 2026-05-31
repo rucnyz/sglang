@@ -60,13 +60,34 @@ class WebhookPayload:
     ts_monotonic: float
 
 
-def classify(occ: float, theta_hi: float, theta_crit: float) -> WatermarkState:
-    """Map HBM occupancy ∈ [0, 1] to a watermark state."""
-    if occ >= theta_crit:
-        return WatermarkState.CRITICAL
-    if occ >= theta_hi:
+def classify(
+    occ: float,
+    prev: WatermarkState,
+    theta_hi: float,
+    theta_lo: float,
+    theta_crit: float,
+) -> WatermarkState:
+    """Hysteretic mapping HBM occupancy ∈ [0, 1] → watermark state.
+
+    Up-crossings use ``theta_hi`` / ``theta_crit``; down-crossings
+    use ``theta_lo`` (HIGH↔OK) and ``theta_hi`` (CRITICAL↔HIGH).
+    Without hysteresis the previous version could leave the daemon
+    stuck in HIGH while admission's pause had already cleared
+    pressure — no PRESSURE_RESOLVED ever fired, paused programs
+    never resumed.
+    """
+    if prev == WatermarkState.OK:
+        if occ >= theta_crit: return WatermarkState.CRITICAL
+        if occ >= theta_hi:   return WatermarkState.HIGH
+        return WatermarkState.OK
+    if prev == WatermarkState.HIGH:
+        if occ >= theta_crit: return WatermarkState.CRITICAL
+        if occ <  theta_lo:   return WatermarkState.OK
         return WatermarkState.HIGH
-    return WatermarkState.OK
+    # prev == CRITICAL
+    if occ <  theta_lo:   return WatermarkState.OK
+    if occ <  theta_hi:   return WatermarkState.HIGH
+    return WatermarkState.CRITICAL
 
 
 def derive_kind(prev: WatermarkState, cur: WatermarkState) -> Optional[str]:
@@ -109,6 +130,7 @@ class AginferWebhookFirer:
         notify_url: str,
         heartbeat_s: float = 5.0,
         theta_hi: float = 0.7,
+        theta_lo: float = 0.55,
         theta_crit: float = 0.9,
     ) -> None:
         # Append the event path if the user passed a bare base URL.
@@ -120,6 +142,7 @@ class AginferWebhookFirer:
         self.notify_url = url
         self.heartbeat_s = float(heartbeat_s)
         self.theta_hi = float(theta_hi)
+        self.theta_lo = float(theta_lo)
         self.theta_crit = float(theta_crit)
         # Detector state.
         self._last_state: WatermarkState = WatermarkState.OK
@@ -133,16 +156,18 @@ class AginferWebhookFirer:
 
     # ---- public API ----
 
-    def maybe_fire(self, used_tokens: int, cap_tokens: int) -> Optional[str]:
-        """Called once per scheduler step.  Returns the kind that was
-        fired (for telemetry / tests), or None if no fire happened.
+    def maybe_fire(self, occ: float) -> Optional[str]:
+        """Called once per scheduler step with an occupancy ratio
+        sourced from the same view the daemon reads (typically the
+        radix cache's `_aginfer_pool_usage()['HBM']['token_usage']`
+        — see scheduler.py for the callsite).
 
-        Never raises; any error is logged.
+        Returns the kind that was fired (for telemetry / tests), or
+        None if no fire happened.  Never raises; any error is logged.
         """
-        if cap_tokens <= 0:
-            return None
-        occ = used_tokens / cap_tokens
-        cur = classify(occ, self.theta_hi, self.theta_crit)
+        cur = classify(
+            occ, self._last_state, self.theta_hi, self.theta_lo, self.theta_crit
+        )
         now = time.monotonic()
 
         kind: Optional[str] = derive_kind(self._last_state, cur)
@@ -165,9 +190,9 @@ class AginferWebhookFirer:
             kind=kind,
             state=cur.value,
             prev_state=self._last_state.value,
-            occ=occ,
-            used_tokens=int(used_tokens),
-            cap_tokens=int(cap_tokens),
+            occ=float(occ),
+            used_tokens=0,        # kept for wire compat; sglang no longer
+            cap_tokens=0,         # tracks (used, cap) at this site
             ts=time.time(),
             ts_monotonic=now,
         )

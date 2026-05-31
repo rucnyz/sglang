@@ -66,6 +66,7 @@ AGINFER_NOTIFY_URL="${AGINFER_NOTIFY_URL-http://127.0.0.1:9100}"
 # admission_controller theta_hi / theta_lo for the design's
 # "sglang fires → daemon acts" handshake to be consistent.
 AGINFER_THETA_HI="${AGINFER_THETA_HI:-0.85}"
+AGINFER_THETA_LO="${AGINFER_THETA_LO:-0.70}"
 AGINFER_THETA_CRIT="${AGINFER_THETA_CRIT:-0.95}"
 AGINFER_HEARTBEAT_S="${AGINFER_HEARTBEAT_S:-5.0}"
 
@@ -76,6 +77,7 @@ if [[ -n "$AGINFER_NOTIFY_URL" ]]; then
     AGINFER_FLAGS=(
         --aginfer-notify-url "$AGINFER_NOTIFY_URL"
         --aginfer-theta-hi "$AGINFER_THETA_HI"
+        --aginfer-theta-lo "$AGINFER_THETA_LO"
         --aginfer-theta-crit "$AGINFER_THETA_CRIT"
         --aginfer-heartbeat-s "$AGINFER_HEARTBEAT_S"
     )

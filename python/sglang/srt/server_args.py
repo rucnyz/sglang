@@ -400,6 +400,7 @@ class ServerArgs:
     aginfer_notify_url: Optional[str] = None
     aginfer_heartbeat_s: float = 5.0
     aginfer_theta_hi: float = 0.7
+    aginfer_theta_lo: float = 0.55
     aginfer_theta_crit: float = 0.9
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
@@ -4562,7 +4563,15 @@ class ServerArgs:
             "--aginfer-theta-hi",
             type=float,
             default=ServerArgs.aginfer_theta_hi,
-            help="aginfer: HBM occupancy threshold for OK -> HIGH (default 0.7).",
+            help="aginfer: HBM occupancy upward threshold OK -> HIGH (default 0.7).",
+        )
+        parser.add_argument(
+            "--aginfer-theta-lo",
+            type=float,
+            default=ServerArgs.aginfer_theta_lo,
+            help="aginfer: HBM occupancy downward threshold HIGH -> OK (hysteresis; default 0.55). "
+                 "MUST be < theta_hi.  When admission's pause has cleared pressure, the down-crossing "
+                 "of this threshold is what fires the daemon's PRESSURE_RESOLVED → resume.",
         )
         parser.add_argument(
             "--aginfer-theta-crit",
