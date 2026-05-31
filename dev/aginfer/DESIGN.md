@@ -504,13 +504,51 @@ rank 1's HBM space for rank 0's units" operation.
 ### Hint consistency across ranks
 
 When `PUT /aginfer/hints` fans out, ranks may apply with slight
-skew (one rank in CUDA graph capture, etc.).  This is
-**eventual-consistent by design**: an inline scorer using a
-stale hint may make a slightly sub-optimal eviction; the worst
-case is one missed unit recoverable via re-prefill.  No strong
-consistency / global lock — at hint update rate (≤ event rate ≈
-10²/s), the daemon's next push will reach the lagging rank
-within milliseconds.
+skew (one rank in CUDA graph capture, etc.).  Hint propagation
+is **per-rank atomic** (the §10 hint-atomicity invariant) but
+**not cross-rank atomic**: rank 0 may see hint version `k` while
+rank 1 still sees version `k-1` during the propagation window.
+
+The semantic argument that this is the right model — not a
+performance compromise:
+
+* The inline scorer's input is a **value estimate**, not a
+  ground-truth observation.  The "true" `p_hat` for a unit is
+  unobservable (it depends on agent decisions outside aginfer's
+  control).  Every hint is already an estimate of an unobservable;
+  cross-rank temporal alignment of estimates doesn't add
+  information.
+* The same logical unit's KV bytes are mirrored across TP ranks
+  (§6 multi-rank table).  An eviction on rank 0 invalidates the
+  unit globally — the eviction itself is the cross-rank
+  synchronisation point.  A per-rank scorer disagreement on
+  *which* unit to evict next is resolved by whichever rank's
+  eviction commits first; the others observe the eviction and
+  rescore.
+* A global synchronous PUT-barrier (wait for every rank to ack
+  before considering the hint applied) would synchronise hint
+  *propagation* but not the scorer's evaluation timing — ranks
+  still evaluate the heap at slightly different wall-clock
+  moments.  The barrier moves the inconsistency window without
+  closing it.
+
+**Risk this argument doesn't cover**: if two ranks score the same
+heap at near-simultaneous wall-clock and pick **different** units
+to evict because they're reading different hint versions, the
+allocator may free unit A on rank 0 and unit B on rank 1, leaving
+the logical KV in an inconsistent split.  Whether this can happen
+depends on sglang's per-rank eviction commit protocol — the
+all-rank atomicity is asserted by §6's "every action is all-rank
+atomic by semantic requirement", but it's the cross-rank
+coordination layer (tokenizer-server fanout) that enforces it,
+not the hint table.
+
+**Empirical question (T11+ workload).**  Verify the risk is
+actually zero in T11 tests: run a workload with high hint churn
+under TP > 1 and compare the set of evicted hashes seen by each
+rank.  If a divergence is ever observed (rank 0 evicts hash X
+that rank 1 didn't pick), the all-rank atomicity invariant is
+broken and the design needs a stronger primitive.
 
 ## 7. Decision rule
 
@@ -906,30 +944,42 @@ radix tree — concretely on `LLM_PREFILL` commit (prefill output),
 on decode-step commit, and on `SUB_RETURN` when the child's
 output materialises as a `subagent_ctx` unit.
 
-**Policy: new units are born in HBM** by sglang's allocator
-semantics, with no per-unit scheduler decision.  The hint table
-seed (§6) marks the unit as freshly accessed (`p_hat ≈ 1` for the
-next event horizon) so the inline scorer's eviction heap doesn't
-evict it before its first joint_decide evaluation.
+**Spec: initial tier is `_value`-argmin** over `{HBM, DRAM, DISK}`,
+using the same formula §7 uses for migration scoring, with the
+birth-time predicted `p_hat` as input.  This is symmetric with
+every other tier transition — there is no special case for
+allocation.  Birth-time `p_hat` comes from event-payload context
+when available (e.g. `SUB_DISPATCH_ASYNC` flag pointing at an
+async child whose output won't be consumed in the next event
+horizon → low `p_hat` → `_value` argmin picks DRAM directly,
+skipping the H→D transfer entirely) and falls back to the
+session-state-conditional estimate otherwise.
 
-The first joint_decide event that includes the unit in D_t may
-immediately demote it (e.g. `SUB_DISPATCH_ASYNC` payload + parent
-ACTING with a long tool ETA → low `p_hat` for the new
-`subagent_ctx` → demote to DRAM).  Worst-case cost of this
-"born-HBM-then-demote" path is one H→D transfer per unit that
-would have been better-off born elsewhere — accepted as
-overhead until measurement shows it matters.
+> **Planned (sglang code lag).**  Today sglang's allocator only
+> allocates in HBM (`alloc()` returns an HBM-backed buffer), so
+> the daemon's `_value`-argmin is recovered after-the-fact by the
+> first `joint_decide` event that includes the unit in D_t — a
+> born-HBM-then-demote round-trip.  Closing the gap requires
+> extending the allocator API with `alloc_at_tier(σ)` and routing
+> birth events to the daemon synchronously enough to score them
+> before allocation.  The design is unchanged either way: the
+> formula for picking initial tier is the same `_value` argmin.
 
-> **Planned (future opportunity).**  The ideal would have the
-> scheduler pick initial tier via the same `_value` argmin
-> on the candidate's predicted p_hat at birth time — same
-> formula as a migration decision, just applied before
-> allocation.  Realising this requires extending sglang's
-> allocator API with `alloc_at_tier(σ)`.  Not pursued until a
-> workload demonstrates the born-HBM-then-demote overhead is
-> material; on busy agent workloads where almost every newborn
-> is about to be consumed by an in-flight request, HBM-default
-> is correct anyway.
+**Empirical question (T11+ workload).**  We don't yet know which
+workload regimes make this code-lag materially expensive.  The
+born-HBM-then-demote round-trip is one H→D transfer per
+"wrong-born" unit; on workloads where almost every newborn is
+consumed by an in-flight request before the next joint_decide
+(common in busy agent loops), HBM-default is correct by accident
+and the gap is zero-cost.  Workloads to target in T11 tests:
+heavy `SUB_DISPATCH_ASYNC` (children that won't be consumed for
+seconds), long-tail `subagent_ctx` units that materialise but
+aren't accessed in the parent's near-tail, and prefill-heavy
+arrivals where the new prefix is *known* to be cold (rare-class
+prompts).  Measurement should report (i) fraction of newborns
+demoted within one event horizon and (ii) cumulative H→D
+bandwidth burned on these demotions vs the same workload under a
+hypothetical `alloc_at_tier`-aware run.
 
 ## 8. Admission — program-level candidate generator
 
@@ -1548,16 +1598,29 @@ the first 200 after a failure:
 ### sglang's webhook fire-and-forget contract
 
 If sglang fires a webhook while the daemon is down, the event is
-**lost**.  This is acceptable because:
+**lost** — and that's by construction the correct behaviour, not
+a trade-off.
 
-* admission's decision is event-driven by **any** of 10 event
-  kinds; the next proxy event (any chat completion) re-evaluates.
-* sglang continues firing on subsequent transitions (and
-  heartbeats while in HIGH / CRITICAL), so the daemon picks up
-  the next webhook within `heartbeat_s` ≈ 5 s.
+The first-principles argument: an event in aginfer is **the
+derivative of state**, and state is authoritative in sglang
+(§5).  Every daemon handler re-fetches `/aginfer/state` at entry
+(the always-fresh invariant, §10), so the handler's input is the
+live state regardless of whether any specific event payload was
+delivered.  A "lost" webhook just means the daemon never woke up
+for that specific transition; the next event of any kind will
+wake it, it re-fetches state, and the state already reflects
+the missed transition.  In particular:
 
-No webhook persistence / replay is needed.  This is design, not
-trade-off: a queue or WAL between sglang and daemon would add
-mid-stream consistency to honour a single dropped event, at the
-cost of a recoverable storage subsystem that complicates every
-deployment.
+* sglang continues firing on subsequent transitions and on
+  heartbeats while in HIGH / CRITICAL, so within `heartbeat_s` ≈
+  5 s the daemon receives another webhook and re-fetches the
+  state that already accounts for the missed event.
+* Any chat-completion through the proxy also produces an event;
+  on event rates of 10²/s the next wake-up is sub-second.
+
+A persistent queue or WAL between sglang and daemon would be a
+*duplicate authoritative store* for the same state sglang
+already holds.  At-least-once delivery doesn't add information
+to a system where the recipient re-reads the source on every
+handler — the recipient already has at-least-once knowledge of
+state via the pull.
