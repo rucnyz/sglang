@@ -180,6 +180,23 @@ knob).
     }
   },
 
+  "per_program_usage": {                // PER-PROGRAM-OWNED view
+    "<program_id>": {
+      "hbm": {
+        "committed_bytes": int,         // share of radix nodes attributed to
+                                         // this program, with 1/holders weight
+                                         // for nodes shared across programs
+        "inflight_bytes":  int          // bytes of in-flight decode KV
+                                         // (request-owned, not yet committed
+                                         //  to the radix tree)
+      },
+      "dram": {
+        "committed_bytes": int          // host pool share, same attribution
+      },
+      "state": "REASONING"|"ACTING"|"PAUSED"|"ENDED"
+    }
+  },
+
   "units": [
     {"hash": str, "tier": "HBM"|"DRAM",
      "n_tokens": int, "n_bytes": int,
@@ -195,23 +212,38 @@ knob).
 }
 ```
 
-### Why two occupancy views
+### Why three views
 
-The radix tree contains **only committed prefix-shareable units**.
-In-flight decode KV is allocator-owned but **not** in the tree.
+The radix tree contains **only committed prefix-shareable units**;
+in-flight decode KV is allocator-owned but **not** in the tree.
+Three distinct consumers in §7 / §8 need three distinct slices:
 
-* `tier_usage` (radix view) is the right input for **V_u migration
-  value scoring** — V_u can only act on tree nodes, so the relevant
-  cost is "how full is the tree's slice of HBM".
-* `pool_usage` (allocator view) is the right input for **admission
-  gating** — admission throttles whole programs, so the relevant
-  pressure is "is the allocator running out of pages for new
-  requests", which includes in-flight decode.
+* `tier_usage` (radix view) — input for **V_u migration value
+  scoring**.  V_u acts on tree nodes; the relevant cost is "how
+  full is the tree's slice of HBM".
+* `pool_usage` (allocator view) — input for **admission's
+  pressure trigger**.  Admission decides whether to act based on
+  total HBM pressure (including in-flight decode the radix view
+  misses).
+* `per_program_usage` (program view) — input for **admission's
+  victim selection**.  Pausing a program frees its committed
+  share + prevents its future in-flight growth; admission needs
+  per-program footprint to know **which** pause yields the most
+  HBM bytes per unit V_u_program lost.
 
-Mixing them either makes V_u over-eager (thinks HBM is empty when
-it's actually decode-full) or makes admission asleep at the wheel
-(thinks HBM is empty when it's actually pressured).  Two views,
-two consumers, no overlap.
+A two-view design (only `tier_usage` + `pool_usage`) is
+under-determined: admission knows the pool is pressured but has
+no principled way to compare candidate victims by HBM relief.
+Walking `units` + `session_ids` and summing only counts the
+committed share, so a runaway-decode program with 80 K in-flight
+bytes but 6 K committed prefix looks *smaller* than a quiet
+program with 8 K cold prefix — exactly the wrong victim.
+
+Mixing any two also breaks: V_u over-eager (decode-full HBM
+looks empty in tree view), admission asleep (allocator-pressured
+HBM looks empty in tree view), or admission picks the wrong
+victim (sees committed share, not real footprint).  **Three
+views, three consumers, no overlap.**
 
 ### Why pull (per-event re-fetch), not push-mirror
 
@@ -501,10 +533,17 @@ Component definitions:
   p **at this event's moment**.  Near zero when the event is
   `TOOL_CALL_START` for p (p was going off-GPU anyway); positive
   when p is mid-REASONING (interrupting in-flight decode).
-* `marginal_relief_value(p, state)` — HBM bytes freed by pausing
-  p; for ACTING p with HiCache write-through, this is its full
-  HBM footprint; for REASONING p, this is the unfinished decode
-  KV that the next eviction pass would have to drop.
+* `marginal_relief_value(p, state)` — HBM bytes pausing p would
+  free or prevent.  Read directly from
+  `state.per_program_usage[p].hbm`:
+  * **inflight_bytes** — released when p's current request
+    completes / is preempted; the pause prevents the program's
+    NEXT request from re-allocating these
+  * **committed_bytes** — the program's exclusive share of radix
+    nodes; if pausing p drops `len(session_ids)` of a node to 0
+    on this program, the node becomes evictable
+  Together these are the HBM bytes the pause delivers back to
+  the allocator over the next admission re-evaluation window.
 * `capacity_fits(candidate, state)` — true iff resuming candidate
   would leave `forecast(state)` still ≤ `theta_hi` after
   re-incorporating candidate's HBM footprint.
