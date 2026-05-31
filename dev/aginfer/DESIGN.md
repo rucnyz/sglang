@@ -353,7 +353,7 @@ happens inside sglang.
 | EP > 1 | prefix KV mirrored across ranks (same as TP); only the MoE expert weights / activations differ per rank | same as TP from the daemon's perspective — expert weights aren't in the daemon's scheduling scope | same as TP |
 | DP > 1 | each DP replica has its own independent KV pool serving its own program subset | each DP replica is a **separate sglang endpoint** with its own daemon-sglang pairing; no cross-replica daemon coordination | independent per replica |
 
-### Why TP forces all-rank-atomic actions (not a v1 simplification)
+### Why TP forces all-rank-atomic actions
 
 TP attention computes `softmax(QK^T)V` with each rank handling
 `1/N` of the heads.  Every rank must have the unit's KV slice in
@@ -812,10 +812,10 @@ choosing between them must be **joint**, not sequential.
 ### Why not sequential migrate-then-pause
 
 Sequential decomposition (run kv_scheduler first, then run
-admission on the post-migrate state — what an earlier version of
-this design did) is Gauss-Seidel coordinate descent: optimise
-unit-actions holding pause-set fixed, then optimise pauses
-holding unit-actions fixed.  Two failure modes:
+admission on the post-migrate state) is a Gauss-Seidel
+coordinate descent: optimise unit-actions holding pause-set
+fixed, then optimise pauses holding unit-actions fixed.  Two
+failure modes:
 
 * **Redundant pay**: migrate a unit out of HBM (cost = V_u of that
   unit), then realise pausing the unit's program would have freed
@@ -958,11 +958,11 @@ always-fresh invariant (§10) is satisfied at the event boundary:
 the next event's joint_decide will refetch state and re-solve
 its knapsack from scratch.
 
-> **Planned (implementation).**  v1 may implement the greedy form
-> instead of exact DP for simplicity.  Worst-case 2× cost gap is
-> bounded; the daemon's `decide_latency` metric should report
-> the chosen algorithm and (if greedy) the post-hoc cost gap vs
-> a periodic DP audit so drift is observable.
+> **Planned (implementation).**  The implementation may use the
+> greedy form instead of exact DP for simplicity.  Worst-case
+> 2× cost gap is bounded; the daemon's `decide_latency` metric
+> reports the chosen algorithm and (if greedy) the post-hoc cost
+> gap against a periodic DP recomputation so drift is observable.
 
 ### What collapses out
 
