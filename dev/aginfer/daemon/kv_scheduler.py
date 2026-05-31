@@ -169,6 +169,15 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         "DRAM": {"used_bytes": 0, "cap_bytes": 0},
         "DISK": {"used_bytes": 0, "cap_bytes": 0},
     }
+    # G10 fix: aggregate allocator-level pool_usage across ranks.
+    # token_usage is recomputed at the end from summed used/cap; the
+    # max-of-sub-pools convention (full vs swa) is preserved per rank
+    # then SUMMED across ranks (a rank under pressure raises the max).
+    agg_pool: Dict[str, Dict[str, int]] = {
+        "HBM": {"used_bytes": 0, "cap_bytes": 0,
+                "available_bytes": 0, "evictable_bytes": 0},
+    }
+    pool_present = False
     # Track each hash's index in agg_units so we can update on tier
     # disagreement (audit round-5 MINOR: mid-migration race where
     # rank-0 still reports HBM while rank-1 already reports DRAM —
@@ -185,6 +194,14 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
             sub = rank_tu[label]
             agg_tu[label]["used_bytes"] += int(sub["used_bytes"])
             agg_tu[label]["cap_bytes"] += int(sub["cap_bytes"])
+        rank_pool = rank.get("pool_usage")
+        if rank_pool and "HBM" in rank_pool:
+            pool_present = True
+            sub = rank_pool["HBM"]
+            agg_pool["HBM"]["used_bytes"] += int(sub.get("used_bytes", 0))
+            agg_pool["HBM"]["cap_bytes"] += int(sub.get("cap_bytes", 0))
+            agg_pool["HBM"]["available_bytes"] += int(sub.get("available_bytes", 0))
+            agg_pool["HBM"]["evictable_bytes"] += int(sub.get("evictable_bytes", 0))
         for u in rank["units"]:
             uhash = str(u["hash"])
             if uhash in hash_to_idx:
@@ -200,11 +217,17 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
             hash_to_idx[uhash] = len(agg_units)
             agg_units.append(dict(u))
         agg_time = max(agg_time, int(rank["time_counter"]))
-    return {
+    out: Dict[str, Any] = {
         "tier_usage": agg_tu,
         "units": agg_units,
         "time_counter": agg_time,
     }
+    if pool_present:
+        hbm = agg_pool["HBM"]
+        cap = hbm["cap_bytes"]
+        hbm["token_usage"] = (hbm["used_bytes"] / cap) if cap > 0 else 0.0
+        out["pool_usage"] = agg_pool
+    return out
 
 
 def _log_unknown_tier_once(label: str, seen: set) -> None:
@@ -278,6 +301,17 @@ def build_paper_state(
     # bw_free defaults: use the full per-pair BW from costs config.
     # Production T8 / measurement layer can plumb live bw_free in here.
     tier_usage.bw_free = dict(default_costs().bw)
+
+    # G10 fix: extract allocator-truth pool_pressure for admission gating.
+    # Missing key (older sglang) is acceptable — pool_pressure stays empty
+    # and admission falls back to tier_usage.occupancy_ratio (the old,
+    # always-~0 behavior).  Log once if seen so ops notice the rollback.
+    pool_pressure: Dict[Tier, float] = {}
+    raw_pool = state_json.get("pool_usage")
+    if raw_pool:
+        hbm_sub = raw_pool.get("HBM")
+        if hbm_sub and "token_usage" in hbm_sub:
+            pool_pressure[Tier.HBM] = float(hbm_sub["token_usage"])
 
     units_raw = state_json["units"]
     now_counter = int(state_json["time_counter"])
@@ -381,6 +415,7 @@ def build_paper_state(
         event_kind=event.kind.value,
         event_session_id=event.session,
         decision_set=decision_set,
+        pool_pressure=pool_pressure,
     )
 
 
@@ -581,12 +616,23 @@ class KvScheduler:
         # raw data behind T9 G5 (HBM occ trajectory).
         from ._metrics import m as _m
         try:
-            tu = (_flatten_per_rank(state_json)).get("tier_usage") or {}
+            flat = _flatten_per_rank(state_json)
+            tu = flat.get("tier_usage") or {}
             hbm = tu.get("HBM", {})
             dram = tu.get("DRAM", {})
-            occ_hbm = (
+            # G10: tree_occ_hbm = radix-tree view (matches tier_usage
+            # field used by V_u migration scoring; near-zero under
+            # in-flight decode pressure).  pool_occ_hbm = allocator
+            # truth (matches sglang's `full_token_usage`, what
+            # admission gates on).  Emit BOTH so the trajectory parse
+            # can see the divergence in the cycle log.
+            tree_occ_hbm = (
                 int(hbm.get("used_bytes", 0)) / max(int(hbm.get("cap_bytes", 1)), 1)
             )
+            pool_occ_hbm = tree_occ_hbm
+            pool_hbm = (flat.get("pool_usage") or {}).get("HBM") or {}
+            if "token_usage" in pool_hbm:
+                pool_occ_hbm = float(pool_hbm["token_usage"])
             occ_dram = (
                 int(dram.get("used_bytes", 0)) / max(int(dram.get("cap_bytes", 1)), 1)
             )
@@ -594,7 +640,8 @@ class KvScheduler:
             _m(
                 "state_fetched",
                 kind=event.kind.value,
-                occ_hbm=occ_hbm,
+                occ_hbm=pool_occ_hbm,         # AUTHORITATIVE pressure
+                tree_occ_hbm=tree_occ_hbm,    # radix view for debug
                 occ_dram=occ_dram,
                 units=n_units,
             )

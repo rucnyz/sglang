@@ -76,6 +76,15 @@ class SchedulerState:
     event_session_id: Optional[str] = None
     # The decision subset D_t the engine is asking the policy to act on.
     decision_set: List[str] = field(default_factory=list)
+    # G10 fix (2026-05-31): allocator-truth HBM/DRAM pressure.
+    # Populated from /aginfer/state["pool_usage"][tier]["token_usage"]
+    # which mirrors sglang's `full_token_usage` metric (the same number
+    # that fires sglang's memory_pressure webhook).  None on tiers that
+    # the snapshot doesn't expose.  admission_controller.gate keys on
+    # this; tier_usage above stays the radix-tree view used by V_u
+    # migration value scoring (paper §7).  See unified_radix_cache.py
+    # ::_aginfer_pool_usage docstring for why the two views diverge.
+    pool_pressure: Dict[Tier, float] = field(default_factory=dict)
 
 
 @dataclass

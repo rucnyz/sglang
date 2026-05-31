@@ -2495,6 +2495,91 @@ class UnifiedRadixCache(BasePrefixCache):
         self._aginfer_bpt_cache = bpt
         return bpt
 
+    def _aginfer_pool_usage(self) -> dict:
+        """Allocator-level HBM occupancy for daemon admission gating.
+
+        Mirrors sglang's own ``full_token_usage`` metric formula
+        (``pool_stats_observer._get_swa_token_info`` /
+        ``_get_token_info``)::
+
+            num_used    = pool_size - (available + evictable)
+            token_usage = num_used / pool_size
+
+        * ``available``  — allocator slots free **right now**, after
+          in-flight decode allocations.
+        * ``evictable``  — radix-tree-shareable nodes that could be
+          freed; subtracted because they are not "real" pressure.
+        * ``token_usage`` — effective pressure (matches sglang's batch
+          log ``full token usage`` line).
+
+        This is the AUTHORITATIVE HBM-occupancy signal the daemon's
+        ``admission_controller`` must gate on.  ``tier_usage`` further
+        down in the snapshot is the radix-tree view used for migration
+        value scoring (paper §7 V_u) and is correctly tree-keyed —
+        DON'T confuse the two.  Mixing them causes G10:
+        radix-tree-keyed occupancy is ~0 because in-flight decode KV
+        isn't in the tree, so admission never fired before this field
+        existed.
+
+        For SWA hybrid attention (DeepSeek-V4-Flash et al.) the
+        "HBM" entry reports ``max(full_token_usage, swa_token_usage)``
+        because either sub-pool filling up implies the device can't
+        accept more requests.  Sub-pool detail is preserved in
+        ``swa_*`` / ``full_*`` extra fields for inspection.
+        """
+        pool = self.token_to_kv_pool_allocator
+        bpt = self._aginfer_bytes_per_token()
+        if pool is None:
+            return {"HBM": {
+                "used_bytes": 0, "cap_bytes": 0,
+                "available_bytes": 0, "evictable_bytes": 0,
+                "token_usage": 0.0,
+            }}
+
+        is_swa = self.supports_swa() and hasattr(pool, "full_available_size")
+        if is_swa:
+            full_size = int(getattr(pool, "size_full", 0)) or int(
+                getattr(pool, "size", 0)
+            )
+            full_avail = int(pool.full_available_size())
+            full_evictable = int(self.full_evictable_size())
+            full_num_used = max(0, full_size - full_avail - full_evictable)
+            full_usage = (full_num_used / full_size) if full_size > 0 else 0.0
+
+            swa_size = int(getattr(pool, "size_swa", 0))
+            swa_avail = int(pool.swa_available_size())
+            swa_evictable = int(self.swa_evictable_size())
+            swa_num_used = max(0, swa_size - swa_avail - swa_evictable)
+            swa_usage = (swa_num_used / swa_size) if swa_size > 0 else 0.0
+
+            hbm_token_usage = full_usage if full_usage >= swa_usage else swa_usage
+            return {"HBM": {
+                "used_bytes": full_num_used * bpt,
+                "cap_bytes": full_size * bpt,
+                "available_bytes": full_avail * bpt,
+                "evictable_bytes": full_evictable * bpt,
+                "token_usage": hbm_token_usage,
+                "full_token_usage": full_usage,
+                "swa_token_usage": swa_usage,
+                "swa_used_bytes": swa_num_used * bpt,
+                "swa_cap_bytes": swa_size * bpt,
+                "swa_available_bytes": swa_avail * bpt,
+                "swa_evictable_bytes": swa_evictable * bpt,
+            }}
+
+        pool_size = int(getattr(pool, "size", 0))
+        avail = int(pool.available_size())
+        evictable = int(self.evictable_size())
+        num_used = max(0, pool_size - avail - evictable)
+        usage = (num_used / pool_size) if pool_size > 0 else 0.0
+        return {"HBM": {
+            "used_bytes": num_used * bpt,
+            "cap_bytes": pool_size * bpt,
+            "available_bytes": avail * bpt,
+            "evictable_bytes": evictable * bpt,
+            "token_usage": usage,
+        }}
+
     def dump_aginfer_state(self) -> dict:
         """Walk the radix tree once and return a JSON-serialisable snapshot
         for the aginfer external scheduler.  Read-only, no locks held.
@@ -2653,6 +2738,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 # used_bytes / cap_bytes with the host-pool's disk metrics.
                 "DISK": {"used_bytes": 0, "cap_bytes": 0},
             },
+            # G10 fix (2026-05-31): allocator-truth HBM occupancy for
+            # admission gating.  See _aginfer_pool_usage() docstring;
+            # tier_usage above is radix-tree-keyed (for migration V_u)
+            # and reads ~0 even under real pressure because in-flight
+            # decode KV isn't in the tree.
+            "pool_usage": self._aginfer_pool_usage(),
             "units": units,
             "page_size": page_size,
             "bytes_per_token": bytes_per_token,
@@ -2762,9 +2853,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 units_buf += b',"session_ids":[]'
             units_buf += b"}"
 
-        # Assemble: tier_usage first, then units, then page_size, then
-        # bytes_per_token — matches the order of the legacy dict so wire
-        # JSON stays byte-stable.
+        # Assemble: tier_usage first, then pool_usage (G10), then
+        # units, then page_size, then bytes_per_token — matches the
+        # order of the legacy dict so wire JSON stays byte-stable.
+        # pool_usage is built as a Python dict by _aginfer_pool_usage()
+        # then JSON-encoded once; per-snapshot cost is tiny (~6 ints).
         out = bytearray()
         out += b'{"tier_usage":{"HBM":{"used_bytes":'
         out += str(hbm_used * bytes_per_token).encode("ascii")
@@ -2776,7 +2869,10 @@ class UnifiedRadixCache(BasePrefixCache):
         out += str(dram_cap).encode("ascii")
         # DISK placeholder — Mooncake/SSD spill not yet wired; emit zero so
         # the daemon can read state["tier_usage"]["DISK"] without a fallback.
-        out += b'},"DISK":{"used_bytes":0,"cap_bytes":0}},"units":['
+        out += b'},"DISK":{"used_bytes":0,"cap_bytes":0}},"pool_usage":'
+        import orjson as _orjson  # local import: already imported above for sids
+        out += _orjson.dumps(self._aginfer_pool_usage())
+        out += b',"units":['
         out += units_buf
         out += b'],"page_size":'
         out += str(page_size).encode("ascii")

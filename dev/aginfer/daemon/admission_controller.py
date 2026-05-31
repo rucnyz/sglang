@@ -342,6 +342,25 @@ class AdmissionController:
 
     @staticmethod
     def _hbm_occ(state: SchedulerState) -> float:
+        """Effective HBM pressure for admission gating.
+
+        G10 fix (2026-05-31): prefer allocator-truth ``pool_pressure``
+        (matches sglang's ``full_token_usage`` metric that fires the
+        ``memory_pressure`` webhook).  Falls back to radix-tree
+        ``tier_usage.occupancy_ratio`` only if pool_pressure is empty
+        (older sglang without the pool_usage field), which is the old
+        always-~0 behavior — fine as a fallback because we never want
+        to FALSELY say HBM is pressured.
+
+        DO NOT use tier_usage for admission: under in-flight decode
+        bursts the radix-tree-keyed used_bytes can be ~0 while the
+        allocator is at 0.95.  Admission would never fire.  See
+        unified_radix_cache.py::_aginfer_pool_usage docstring.
+        """
+        if state.pool_pressure:
+            occ = state.pool_pressure.get(Tier.HBM)
+            if occ is not None:
+                return float(occ)
         cap = state.tier_usage.capacity_bytes.get(Tier.HBM, 0)
         if cap == 0:
             return 0.0
