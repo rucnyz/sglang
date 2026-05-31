@@ -173,14 +173,18 @@ Order roughly by dependency.
    - on action apply failure, sglang fires this webhook back to
      daemon with `{endpoint, action_id, reason}`
 
-8. **`HASH_COLLISION` webhook + content verification at insert**
-   (DESIGN §4 + §10 round-15/16):
-   - on every radix-tree hash-bucket insertion: compare the
-     incoming token sequence against the existing node's sequence
-     (sglang's `match_prefix` already does this walk; reuse it)
-   - mismatch fires the `HASH_COLLISION` webhook with payload
-     `{hash, existing_node_summary, incoming_node_summary}`
+8. **`HASH_COLLISION` webhook + detection in `apply_aginfer_migrations`**
+   (DESIGN §4 + §10 round-15/16/17):
+   - `apply_aginfer_migrations` already builds a `{hash → node}` map
+     via a single DFS over the radix tree (`unified_radix_cache.py`
+     around line 2280) — extend it to detect collision at that point
+   - on collision: fire the `HASH_COLLISION` webhook with payload
+     `{hash, node_a_summary, node_b_summary}`
    - daemon `fatal()`s on receipt — deployment-bug class
+   - cost is one extra comparison per node in an already-O(N) DFS;
+     hash computation (`compute_node_hash_values`) is already done
+     lazily upstream when KV-event emission or migrate-action
+     processing requires it
 
 9. **All action endpoints idempotent** (DESIGN §10 R2):
    - re-applying the same action returns 200 with `applied=0`
@@ -188,44 +192,44 @@ Order roughly by dependency.
 
 ### Instrumentation hooks
 
-9. **HiCache + Mooncake throughput EMA** (DESIGN §7 bw_free, M4a):
+10. **HiCache + Mooncake throughput EMA** (DESIGN §7 bw_free, M4a):
    - HBM↔DRAM: CUDA-event bracket each `write_backup` / `load_back`
      pair; maintain EMA per direction
    - DRAM↔DISK: wall-clock bracket each Mooncake `put` / `get`;
      maintain EMA per direction
    - Expose via `state.link_stats`
 
-10. **Hint clear ordering** (DESIGN §10 R3):
+11. **Hint clear ordering** (DESIGN §10 R3):
     - scorer's heap-iteration read happens-before eviction commit
       happens-before hint clear
 
-11. **`should_write_through(node)` plugin point** (DESIGN §3
+12. **`should_write_through(node)` plugin point** (DESIGN §3
     superset framing):
     - factor out the `hit_count >= write_through_threshold` check
       into a pluggable hook
     - default implementation preserves current behaviour
     - aginfer registers a V_u-aware version when daemon is attached
 
-12. **`SGLANG_KV_POLICY_MODULE` eviction scorer plugin**
+13. **`SGLANG_KV_POLICY_MODULE` eviction scorer plugin**
     (DESIGN §3 superset framing — partially exists):
     - default module: LRU-equivalent V_u (last_access as p_hat
       surrogate) so baseline runs match historical behaviour
     - aginfer registers its hint-table-aware V_u
 
-13. **Proxy gate disconnect awareness** (DESIGN §10 F1):
+14. **Proxy gate disconnect awareness** (DESIGN §10 F1):
     - daemon's proxy gate awaits BOTH gate condition AND
       `request.is_disconnected()`
     - on disconnect: release gate, respond 499, transition program
       to ENDED via outbound queue
 
-14. **`harbor /aginfer/session_end` endpoint** (DESIGN §4):
+15. **`harbor /aginfer/session_end` endpoint** (DESIGN §4):
     - out-of-band signal channel the client uses to declare
       "session done"
     - lives outside sglang, on the harbor / agent client side
 
 ### Multi-rank correctness
 
-15. **All-rank atomic actions** (DESIGN §6 multi-rank): every
+16. **All-rank atomic actions** (DESIGN §6 multi-rank): every
     `migrate` / `program_paused` / `hints` action is applied
     atomically across TP/EP ranks via the existing
     tokenizer-server fanout
