@@ -1,4 +1,19 @@
-# T3 — session_id passthrough → `UnifiedTreeNode.session_ids`
+# session_id passthrough → `UnifiedTreeNode.session_ids`
+
+> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> task.  Guards the wire path that POPULATES `unit.session_ids`, which
+> is read by T17's `/aginfer/state` schema and consumed by per-program
+> attribution.  The mechanism was implemented before the round-9
+> design audit and is stable; this verify exists so the input pipeline
+> doesn't silently regress (sanitizer / chunked prefill /
+> Session.create_req forwarding / recursion DoS / Pydantic extra="allow"
+> guard).
+>
+> Reproduce command in this README and the verify.py preflight have
+> been updated for the DESIGN §5 (post-T17) schema keys.  The
+> capability + worst-case content below is unchanged from the
+> 2026-05-26 audit-round-5 PASS — the input pipeline contract did not
+> change in the schema upgrade.
 
 ## WHAT WE PROMISED
 
@@ -49,7 +64,7 @@ documentation:
 1. **HiCache `prefetch_from_storage` (`unified_radix_cache._insert_helper_host`)** — host-side nodes from a tagged prefetch land with empty `session_ids` until the device-side insert tags them. v1 limitation; T9 Run K will exercise the race window.
 2. **`StreamingSession.try_cache_*`** — requests bound to a streaming session bypass `_insert_helper` entirely. v1 simply doesn't tag streaming-session reqs.
 3. **EPD-disaggregation** (`encode_receiver.create_req`) — FIXED in audit-round-2; tag forwards through the encode-prefill-decode path.
-4. **Session multi-turn** (`Session.create_req`) — FIXED in audit-round-3; tag forwards through `session.create_req` for requests that reuse a session_id. Demonstrated by `verify/t3/regression_probe.py [A]`: pre-fix tagged 0 nodes, post-fix tags 4.
+4. **Session multi-turn** (`Session.create_req`) — FIXED in audit-round-3; tag forwards through `session.create_req` for requests that reuse a session_id. Demonstrated by `verify/session_id_passthrough/regression_probe.py [A]`: pre-fix tagged 0 nodes, post-fix tags 4.
 5. **OpenAI chat handler does NOT forward `session_params`** to the underlying GenerateReqInput. So the multi-turn session path is only reachable via sglang's native `/generate` endpoint. The OpenAI-API surface goes through the non-session branch in scheduler.py (which already plumbs `program_id` correctly). Documented because future maintainers may want to wire `session_params` into the OpenAI handler.
 6. **Multi-DP / `per_rank` aggregation** — when DP > 1, `/aginfer/state` returns `{"per_rank": [...]}` with each rank's units separately. Each rank's tree is independent; same `program_id` may appear on different rank-local hashes. v1 verify only tests single-DP; daemon (T6/T7) is responsible for merging the per-rank view. Per-rank `node-<id>` names use a process-local counter — id collisions ACROSS ranks are expected and the daemon namespace must include rank.
 7. **HBM ↔ DRAM tier transition** — `_evict_to_host` keeps the same Python node object; `session_ids` survives the tier flip automatically. No verify pinned for this (requires HiCache); T9 / T10 will exercise.
@@ -117,7 +132,7 @@ Concrete risk during v1 development:
 
 ## HOW WE VERIFY
 
-Mechanism. `verify/t3_session_passthrough.py`:
+Mechanism. `verify/session_id_passthrough/verify.py`:
 
 ```
 1. Launch sglang. Issue request A with extra_body.program_id="prog-A"
@@ -176,7 +191,7 @@ until grep -q "Uvicorn running on http://127.0.0.1:30001" logs/sglang_t3.log; do
 # the round-4 audit's regression-class for fake-chunked).
 AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
 AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
-  python verify/t3/verify.py
+  python verify/session_id_passthrough/verify.py
 # expected last line: "=== T3 PASSED (post-audit round 3) ==="
 
 # Bisect regression probe (round-3 audit BLOCKERs):
@@ -185,11 +200,11 @@ AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
 #   [A] Session.create_req forwards program_id
 #   [B] sanitizer recursion cap
 # This is the "first prove the bug exists, then prove the fix works"
-# demo.  Pre-fix logs (in verify/t3/results/*PREFIX*.log) show both
+# demo.  Pre-fix logs (in verify/session_id_passthrough/results/*PREFIX*.log) show both
 # FAIL; post-fix logs show both PASS.
 AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
 AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
-  python verify/t3/regression_probe.py
+  python verify/session_id_passthrough/regression_probe.py
 # expected last lines: "PASS  Session.create_req forwards program_id"
 #                      "PASS  sanitizer recursion cap"
 

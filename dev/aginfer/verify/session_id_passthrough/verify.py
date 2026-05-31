@@ -117,11 +117,15 @@ def main() -> None:
             f"without SGLANG_ENABLE_UNIFIED_RADIX_TREE=1, or the radix cache "
             f"isn't UnifiedRadixCache."
         )
-    for k in ("units", "tier_usage", "page_size", "bytes_per_token"):
+    # DESIGN §5 (post-T17) schema preflight.  Legacy `tier_usage` /
+    # `page_size` / `bytes_per_token` top-level keys have been removed.
+    for k in ("units", "pool_usage", "per_program_usage", "link_stats",
+              "tier_holding_cost", "throughput_ema"):
         assert k in state_probe, (
             f"/aginfer/state missing key {k!r}; schema mismatch suggests "
-            f"sglang was not launched with SGLANG_ENABLE_UNIFIED_RADIX_TREE=1. "
-            f"Got keys: {sorted(state_probe)}"
+            f"sglang was not launched with SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
+            f"or the pre-T17 schema is still in place.  Got keys: "
+            f"{sorted(state_probe)}"
         )
 
     # Flush so any residue tag from prior runs of regression_probe or

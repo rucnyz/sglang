@@ -60,9 +60,9 @@ Each task lives in its own folder `tN/` with:
 
 | order | TODO | Component | Folder | Status |
 |---|---|---|---|---|
-| 1 | T1 | `GET /aginfer/state` | [`t1/`](t1/) | **passed** (2026-05-25 perf opt; 2026-05-26 bytes-schema rewrite; current head `2416701fa1`) |
-| 2 | T2 | `POST /aginfer/migrate` | [`t2/`](t2/) | **passed** (2026-05-25 initial; 2026-05-26 depth+round-3 audits, 21 steps) |
-| 3 | T3 | session_id passthrough into tree nodes | [`t3/`](t3/) | **passed** (2026-05-26, audit round-5 done, 14 verify steps + 3-section regression probe) |
+| 1 | T17 | state-dump schema upgrade (DESIGN §5) — was `t1` | [`t17/`](t17/) | **passed** (2026-05-31, all 9 stages + post-audit hardening; aggregate p99 @ 5K nodes = 28.5 ms) |
+| 2 | T20 | `POST /aginfer/migrate` (residence-set) — was `t2` | [`t2/`](t2/) | _pending refresh — slated for #134_ |
+| 3 | (infra) | session_id passthrough into tree nodes | [`session_id_passthrough/`](session_id_passthrough/) | **passed** (2026-05-31 post-T17 schema; 14 verify steps + 3-section regression probe) |
 | **4** | **T6** | program_tracker state machine (moved up — T4 depends on it) | [`t6/`](t6/) | **passed** (2026-05-26, audit round-1 done, 10 verify steps in ~60 ms) |
 | 5 | T4 | daemon HTTP proxy + paper §4 event emission | [`t4/`](t4/) | **passed** (2026-05-26, audit round-1 done, 12 verify steps + 5-run latency, ~370 LoC) |
 | 6 | T5 | sglang→daemon webhook (transition + 5 s plateau heartbeat) + daemon event router | [`t5/`](t5/) | **passed** (2026-05-26, audit round-1 done; Layer A 10 steps + Layer B real-GPU watermark test) |
