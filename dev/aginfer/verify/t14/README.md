@@ -106,6 +106,15 @@ B3  bytes-path /aginfer/state must report last_dump_bytes > 0 (never
 
 Phase B is skipped (soft-pass) if the env var is unset.
 
+**Stress probe** (`stress_probe.py`, opt-in, ~90 s of GPU load): not
+part of `verify.py`'s pass/fail set; produces a 10-column TSV
+``(t_s, units, hbm%, dram%, p50_ms, p95_ms, p99_ms, max_ms,
+dump_bytes, n_recorded_total)`` per 150 ms sample and a final
+summary block.  Exits 1 if peak p99 crosses the PLAN F3-revisit
+threshold (default 50 ms) so CI can flag the trigger.  This is the
+report that answers "does PLAN T14 fire under real load?" — Phase B
+just confirms the instrumentation reads numbers.
+
 ## REPRODUCING
 
 Phase A only (no sglang):
@@ -136,18 +145,35 @@ SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=6 \
   > /tmp/sglang_t14.log 2>&1 &
 until grep -q "fired up" /tmp/sglang_t14.log; do sleep 5; done; sleep 8
 
-# 2. verify
+# 2. verify (contract checks; <10 s)
 AGINFER_VERIFY_BASE=http://127.0.0.1:30002 \
   python dev/aginfer/verify/t14/verify.py
 
-# 3. shutdown
+# 3. stress probe (the headline measurement; ~90 s of GPU load)
+AGINFER_VERIFY_BASE=http://127.0.0.1:30002 \
+  python dev/aginfer/verify/t14/stress_probe.py \
+    --concurrency 32 --duration 90 --max-tokens 200 \
+    --prefix-min-tokens 256 --prefix-max-tokens 512 \
+    --out dev/aginfer/verify/t14/results/<date>_t14_stress_samples.tsv
+
+# 4. shutdown
 pkill -9 -f sglang.launch_server
 ```
 
+The stress probe exits 1 (intentionally) when `peak_p99_ms >=
+--threshold-ms` so CI can pick up the PLAN T14 F3-revisit trigger
+without having to grep TSV.
+
 ## RESULTS
 
-**PASSED** — all 9 stages (5 Phase A + 4 Phase B against live sglang
-on Qwen3-0.6B / GPU 6 / max-total-tokens 65 536 / HiCache write_through).
+**Instrumentation: PASSED** — all 9 verify.py stages green (5 Phase A
++ 4 Phase B against live sglang on Qwen3-0.6B / GPU 6 / max-total-
+tokens 65 536 / HiCache write_through).
+
+**PLAN T14 trigger condition (`p99 > 50 ms` under load): FIRED.**
+The stress probe (32 concurrent unique-prefix chats × 90 s on the
+same setup) recorded peak p99 = 321.94 ms — see "Stress measurement"
+below.  F3-revisit task opened as #160.
 
 * date: 2026-05-31
 * lines: ~85 in new `_StateDumpMetrics` class + 8 LoC threading the
@@ -168,7 +194,8 @@ on Qwen3-0.6B / GPU 6 / max-total-tokens 65 536 / HiCache write_through).
 | B2 live quantile monotonicity | PASS — n_samples≥20 after 40 polls; ordering holds |
 | B3 bytes-path positive | PASS — last_dump_bytes > 0 (live: 1894 bytes for empty tree) |
 
-**Live measurement** on cold tree (no chat traffic, idle scheduler):
+**Live measurement** on cold tree (no chat traffic, idle scheduler) —
+trivial workload, just to confirm the instrumentation reads numbers:
 
 ```json
 {
@@ -187,8 +214,57 @@ on Qwen3-0.6B / GPU 6 / max-total-tokens 65 536 / HiCache write_through).
 ```
 
 Cold-tree p99 = **0.20 ms** — three orders of magnitude under PLAN's
-50 ms F3-revisit threshold.  Live-traffic numbers will be higher
-(more units to serialise) but the threshold is generous.
+50 ms F3-revisit threshold.  But cold-tree p99 is not the question
+PLAN T14 is asking.
 
-* raw log: `results/20260531_t14_initial_pass.log` (includes the
-  live state_dump_metrics snapshot above)
+### Stress measurement (the headline number)
+
+PLAN T14's threshold is about state-dump cost UNDER REAL LOAD.
+`stress_probe.py` (see "REPRODUCING" → stress probe) drives 32
+concurrent `/v1/chat/completions` with per-chat unique long prefixes
+(forcing tree growth instead of all chats sharing one system prompt)
+while polling `/aginfer/state` every 150 ms.  After 90 s on
+Qwen3-0.6B + HiCache write_through + GPU 6 + max-total-tokens 65 536:
+
+| sample      | t=10 s | t=20 s  | t=46 s   | t=85 s   |
+|---|---|---|---|---|
+| units       | 164    | 164     | 166      | 161      |
+| HBM used    | 99.6 % | 98.3 %  | 98.3 %   | 99.7 %   |
+| p50_ms      | 1.55   | 2.37    | 3.67     | 5.54     |
+| p95_ms      | 3.33   | 3.48    | 5.65     | 9.64     |
+| **p99_ms**  | 3.67   | 3.67    | **289**  | **322**  |
+| max_ms      | 3.67   | **395** | 395      | 395      |
+
+Reading the picture:
+1. **p50 / p95 stay tame** — typical state-dump under load is 5–10 ms.
+2. **A single 395 ms outlier appears at ~20 s** (likely a GC stall or
+   contention with the scheduler's prefill/decode while the cache is
+   at HBM-saturation).
+3. **By t=46 s enough outliers (~1 % of window) have accumulated** to
+   pull the 99th percentile up to ~290 ms; the tail stays there for
+   the rest of the run as the 1024-entry ring slowly fills with
+   spikes.
+
+**Peak p99 = 321.94 ms — 6.4× over the 50 ms PLAN T14 F3-revisit
+threshold.**  Per PLAN: the trigger fires, and we open the F3-revisit
+task to decide drop-on-full vs coalesce vs incremental-state.
+Tracked as #160.
+
+Two ancillary findings from the stress probe (not blocking T14):
+* `peak_dram_used_frac = 0.0` throughout despite `--hicache-write-policy
+  write_through` — the HiCache backup pipeline appears not to be
+  populating DRAM during the 90 s run.  Possibly a sglang HiCache
+  config bug that masks the design's read-back path; investigate
+  alongside #160.
+* `peak_units = 187` is far below the ~10⁴-unit working-set the
+  paper assumes.  The 395 ms outlier therefore is NOT walk-cost-
+  driven; it's contention/GC-driven.  An incremental-state path
+  (F3) would not help; drop-on-full or coalesce would.
+
+### Raw logs
+
+* `results/20260531_t14_initial_pass.log` — Phase A + Phase B 9-stage
+  verify run (cold tree).
+* `results/20260531_t14_stress_samples.tsv` — 470 samples × 10
+  columns from the 90 s × 32 concurrent stress probe (the headline
+  data above is a sub-sampling).
