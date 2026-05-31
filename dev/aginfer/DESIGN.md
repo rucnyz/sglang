@@ -574,7 +574,10 @@ because the constraint is a one-sided byte threshold.
 | `page_bytes` | bytes | DP quantisation granularity = `state.page_size × state.bytes_per_token` |
 | `cost`, `gain`, `V_u`, `V_u_program` | seconds | net value at the same time-axis |
 | `relief`, `re_use`, `bytes_moved`, `bytes_needed` | bytes | HBM-resource axis |
-| `forecast(state)` | bytes | predicted HBM bytes occupied during the inter-event interval if no scheduling action is taken: `pool_usage.HBM.used_bytes + forecast_inflight_demand(state)`.  Compare against `theta_hi × cap_bytes` / `theta_lo × cap_bytes`, both also in bytes |
+| `forecast(state)` | bytes | predicted HBM bytes occupied at the next event arrival if no scheduling action is taken: `pool_usage.HBM.used_bytes + forecast_inflight_demand(state)`.  Compare against `theta_hi × cap_bytes` / `theta_lo × cap_bytes`, both also in bytes.  Horizon = `forecast_horizon(state)`, see §8 |
+| `forecast_horizon(state)` | seconds | expected time to next event: `min(heartbeat_s, 1 / recent_event_rate)`.  Bounded above by webhook heartbeat under HIGH/CRITICAL pressure (≈ 5 s) and below by typical event interval under normal load (≈ 10 ms) |
+| `decode_throughput(p)` | tokens/sec | sglang-observed decode rate for p, used to cap `E[remaining_tokens]` by `horizon × throughput` |
+| `prefill_throughput(state)` | bytes/sec | sglang-observed prefill rate, used to convert `inflight_bytes` to a re-prefill seconds-cost in `marginal_pause_cost` |
 
 ### Candidate types
 
@@ -757,6 +760,39 @@ def decision_set(event, state):
 | `SUB_RETURN` | parent tail (promote candidate) + the child's output that just materialised as a new `subagent_ctx` unit (decide initial tier) |
 | `SESSION_END` | session-scoped units of the ending program (demote or drop, depending on remaining holders) |
 | `MEMORY_PRESSURE`, `PRESSURE_CRITICAL`, `PRESSURE_RESOLVED` | top-k by regret across all units |
+
+#### Helper definitions
+
+```python
+def shared_prefix_units(units):
+    """Units held by ≥ 2 programs.  These are the cross-program
+    prefix nodes whose V_u benefits from high p_hat aggregated
+    over multiple holders (§7 conditional p_hat formulation)."""
+    return frozenset(u for u in units if len(u.session_ids) >= 2)
+
+def session_tail(units, sid):
+    """The session's currently-held units, ordered by last access
+    descending.  These are the demote candidates while p is
+    ACTING (tool-bound) and the promote candidates ahead of p's
+    next prefill.  No fixed-K cap — the joint knapsack (§9) will
+    pick a subset under its byte budget."""
+    return frozenset(u for u in units if sid in u.session_ids)
+
+def session_scoped_units(units, sid):
+    """Units held ONLY by this session — `session_ids == {sid}`.
+    Used at SESSION_END: these units have no other holder, so
+    after END they're either evicted (if all V_u<0) or demoted to
+    the cheapest tier that still offers nonzero `p_hat` from the
+    workload-prior (next program with this prefix shape will
+    benefit from a warm DRAM/Disk copy)."""
+    return frozenset(u for u in units if u.session_ids == {sid})
+
+def child_output_unit(event):
+    """The unit materialised by SUB_RETURN — the child sub-agent's
+    final output, freshly committed to the radix tree as a new
+    `subagent_ctx` unit.  Event payload carries its hash."""
+    return event.payload["child_output_hash"]
+```
 
 #### `regret(u, state)` and `top_k_pressure(state)`
 
@@ -1073,10 +1109,34 @@ Migrates; headroom phase uses Resumes.
   is authoritatively stored in sglang's `per_program_usage`
   (written via `PUT /aginfer/program_paused`, §6) so daemon
   restarts never lose it.
-* `marginal_pause_cost(p, event)` — work-loss penalty of pausing p
-  **at this event's moment**.  Near zero when the event is
-  `TOOL_CALL_START` for p (p was going off-GPU anyway); positive
-  when p is mid-REASONING (interrupting in-flight decode).
+* `marginal_pause_cost(p, state)` — work lost if we pause p now
+  vs at the next natural off-GPU boundary.  The lost work is
+  exactly p's current in-flight decode: the tokens decoded so
+  far on the current request will be discarded and re-prefilled
+  on resume.
+
+  ```
+  marginal_pause_cost(p, state) =
+      state.per_program_usage[p].hbm.inflight_bytes
+    / prefill_throughput(state)            # bytes/sec on the
+                                            # prefill path
+  ```
+
+  This formulation is **event-independent** — `inflight_bytes`
+  already encodes whether p is mid-decode.  Implications fall out
+  naturally:
+
+  * `TOOL_CALL_START`: at the instant of the event, p's request
+    is completing; on the immediately-following event,
+    `inflight_bytes ≈ 0` for p → pause cost ≈ 0.  Matches the
+    physical intuition: p was going off-GPU anyway.
+  * `LLM_PREFILL` for p mid-decode: `inflight_bytes > 0` → pause
+    cost > 0 proportional to bytes-decoded-so-far.
+  * `MEMORY_PRESSURE` / `PRESSURE_CRITICAL`: cost is whatever p's
+    current `inflight_bytes` happens to be at that moment;
+    nothing special about the pressure event.
+  * Resumed-but-no-request (F4): `inflight_bytes == 0` → pause
+    cost == 0 (pausing an idle program loses nothing).
 * `pause_relief(p, state)` — total HBM bytes pausing p saves the
   scheduler from holding, **including future-inflight savings the
   pause prevents**:
@@ -1109,31 +1169,32 @@ Migrates; headroom phase uses Resumes.
     already paused by the tool).  Symmetric to forecast: if
     forecast drops by X bytes when we pause p, that X is what
     Pause is actually relieving.
-* `expected_peak_hbm_after_resume(p, state)` — bytes p will be
-  occupying in HBM by the time its first post-resume prefill +
-  decode reaches steady state.  This is **not** equal to p's
-  current `committed_bytes`: while paused, p's units may have
-  been evicted by §9 Migrate decisions or by allocator pressure,
-  so the resumed program will re-prefill those evicted tail units
-  before getting back to where it was.
+* `expected_peak_hbm_after_resume(p, state)` — **incremental**
+  HBM bytes p will allocate when resumed.  Only count bytes
+  **not already in HBM**: a paused program whose units are still
+  resident (because another holder kept them alive) consumes
+  zero new HBM on resume.
 
   ```
   expected_peak_hbm_after_resume(p, state) =
-      Σ_{h ∈ p.unit_hashes} ( bytes_in_HBM_for(h, state)
-                            + reload_bytes_for(h, state) )
-    + E[remaining_tokens(p)] × bytes_per_token         # inflight after resume
-
-  bytes_in_HBM_for(h, state) = u.n_bytes if state.units[h].tier == HBM else 0
-  reload_bytes_for(h, state) = u.n_bytes if state.units[h].tier != HBM
-                                else 0                  # comes back from DRAM/DISK
-                                                        # or re-prefilled from DROP
+      Σ_{h ∈ p.unit_hashes}
+          (u.n_bytes if state.units[h].tier != HBM else 0)
+                                                # only count units
+                                                # not currently in HBM —
+                                                # demoted, dropped, or
+                                                # absent ones
+    + E[remaining_tokens(p)] × bytes_per_token  # inflight allocation
+                                                # after first post-resume
+                                                # decode begins
   ```
 
-  The reload term covers the systematic under-count the audit
-  flagged: if a unit was demoted to DRAM during the pause, its
-  bytes will reappear in HBM on resume; if it was dropped, the
-  same bytes will be re-allocated by the resumed prefill.  Either
-  way the bytes-budget impact is the unit's size.
+  Why "not already in HBM" is the correct filter: HBM bytes for a
+  unit already resident are accounted in `pool_usage.used_bytes`
+  (the first term of `forecast`).  `capacity_fits` checks
+  `forecast + re_use ≤ theta_hi × cap_bytes` — re-adding those
+  bytes via `re_use` would double-count them and over-reject
+  Resume candidates whose units are all kept alive by other
+  holders.
 
 * `capacity_fits(p, state)` — true iff resuming p would leave
   `forecast(state) + expected_peak_hbm_after_resume(p, state)`
@@ -1146,12 +1207,44 @@ Migrates; headroom phase uses Resumes.
   `bytes_per_token` and the §9 budget is byte-denominated.
 
   The second term is the **expected** HBM growth before the next
-  event, summed over programs that will still be allocating:
+  event, summed over programs that **are actively decoding right
+  now**:
 
   ```
   forecast_inflight_demand(state) =
-    Σ_{p ∈ REASONING} E[remaining_tokens(p)] × bytes_per_token
+    Σ_p min(E[remaining_tokens(p)],
+            forecast_horizon(state) × decode_throughput(p))
+        × bytes_per_token
+    for p in state.per_program_usage
+    if p.hbm.inflight_bytes > 0
   ```
+
+  Two refinements over the naive `Σ_{p ∈ REASONING} E[remaining]`:
+
+  * **`inflight_bytes > 0` filter, not `state == REASONING`.**  A
+    program can be REASONING but have no in-flight request
+    (e.g. just-resumed but client hasn't retried yet) — those
+    don't contribute to near-term HBM growth.  REASONING is a
+    semantic label about what the program is trying to do; the
+    physical question "is HBM growing for p RIGHT NOW" is
+    answered by `inflight_bytes`.
+  * **Capped by `forecast_horizon`.**  We forecast only as far as
+    the next decision opportunity; beyond that, a new
+    `joint_decide` will re-evaluate.  `E[remaining_tokens(p)]` is
+    the full residual decode (can be thousands of tokens, many
+    seconds), but the horizon is set by the next event arrival,
+    so we cap at `horizon × decode_throughput(p)` tokens.
+
+  ```
+  forecast_horizon(state) =
+      min(heartbeat_s,                     # bounded by webhook re-fire
+          1.0 / recent_event_rate(state))  # typical when active
+  ```
+
+  Under HIGH/CRITICAL pressure, sglang re-fires every
+  `heartbeat_s` (≈ 5 s default), so the horizon is at most that.
+  Under normal load (10²/s event rate), the horizon shrinks to
+  ~10 ms — well-aligned to the cadence of intra-decode growth.
 
   `E[remaining_tokens(p)]` is the expected residual decode length
   conditional on p's observable state.  Estimator priority:
@@ -1515,7 +1608,9 @@ for pause/resume).
 |---|---|
 | **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer anywhere — kv_scheduler, admission, forecast refresh, program_tracker, and the proxy all recompute only on event arrival.  SESSION_END is signalled by the client explicitly (§4); there is no time-based fallback | asyncio queue + single consumer |
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
-| **Idempotent migrate**: re-applying the same action returns 200 with `applied=0` and a `race:*` skip | sglang `apply_aginfer_migrations` |
+| **Idempotent daemon→sglang actions**: every endpoint accepts re-application — migrate (a no-op `applied=0` with a `race:*` skip when the target tier already matches), pause/resume (200 with `applied:false` when the program is already in the requested state), hint PUT (overwrite-by-stamp).  Same reasoning across all of them: the daemon may emit the same action twice across consecutive event handlers because state-dump propagation lags the daemon's just-emitted action; the sglang side must absorb this without error | sglang endpoints |
+| **State-dump internal consistency**: a single `/aginfer/state` response is a snapshot taken under a single read-side lock on sglang's tree cache + allocator + per-program tables.  `units[*]`, `per_program_usage[*].unit_hashes`, and `pool_usage` always refer to the same logical timestamp; `state.units[h]` is safe to dereference for every `h ∈ per_program_usage[p].unit_hashes` | sglang `dump_aginfer_state` |
+| **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
 | **Pool-truth admission**: admission's `forecast(state)` reads `state.pool_usage.HBM.used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes), never `tier_usage` (which is radix view); if the snapshot lacks `pool_usage.HBM` the daemon halts loudly (sglang too old / misconfigured) | daemon `admission_controller.forecast` |
 | **Tree-view V_u**: V_u migration scoring reads `tier_usage`, never `pool_usage` | daemon `OursGreedyPolicy._value` |
