@@ -333,6 +333,63 @@ def stage_9_action_id_echo() -> None:
            f"3 action_ids all echoed; reasons={list(seen.values())}")
 
 
+def stage_11_combined_add_remove_no_scheduler_crash() -> None:
+    """Combined add+remove in ONE action (`{HBM} → {DRAM}` = the
+    canonical migrate transition the policy emits routinely) must
+    NOT crash the scheduler.
+
+    The bug this stage was added to catch: write_backup is ASYNC
+    (enqueues D→H copy on cache_controller's background thread,
+    records pending lock in ongoing_write_through).  Pre-fix, T20
+    immediately evicted the device while the copy was still in
+    flight — freeing the buffer being read.  sglang's
+    invariant_checker tripped on the categories-no-longer-disjoint
+    state and crashed the scheduler.
+
+    Discovered by the T33+T20 e2e smoke (see verify/e2e_smoke/);
+    captured here as a single-stage assertion + verified by
+    /health 200 post-action.
+    """
+    h = _seed_unit("11")
+    state = fetch_state()
+    u = find_unit(state, h)
+    assert u is not None
+    # Pre-condition: bring to HBM-only.
+    if "DRAM" in u["residence"]:
+        post_migrate([_action(h, [], ["DRAM"])])
+        u = find_unit(fetch_state(), h)
+        if u is None or "HBM" not in u["residence"]:
+            raise AssertionError(
+                f"stage 11 setup: failed to reach HBM-only; "
+                f"residence={u['residence'] if u else None!r}")
+    aid = "stage11-combined"
+    resp = post_migrate([_action(h, ["DRAM"], ["HBM"], aid)])
+    assert_envelope_shape(resp)
+    if resp["applied"] != 1:
+        raise SchemaMissing(
+            f"stage 11: expected applied=1, got {resp['applied']}; "
+            f"skipped={resp['skipped']!r}")
+    # Verify scheduler still alive (not crashed by pool-leak invariant).
+    health = requests.get(f"{BASE}/health", timeout=10)
+    if health.status_code != 200:
+        raise SchemaMissing(
+            f"stage 11: scheduler unhealthy after combined add+remove "
+            f"({health.status_code}); the async write_backup + sync "
+            f"evict race tripped sglang's invariant_checker")
+    u_post = find_unit(fetch_state(), h)
+    if u_post is None:
+        raise WrongResidence(
+            f"stage 11: unit {h} dropped — combined action should "
+            f"have kept DRAM copy")
+    if set(u_post["residence"]) != {"DRAM"}:
+        raise WrongResidence(
+            f"stage 11: post-state residence = {u_post['residence']!r}, "
+            f"expected [DRAM]")
+    _print("Stage 11", True,
+           "{HBM} → {DRAM} combined action: scheduler healthy, "
+           "residence == [DRAM]")
+
+
 def stage_10_malformed_action_fails_loud() -> None:
     """Audit D1/D2: missing required action fields must surface as a
     loud error (HTTP 5xx or 4xx), NOT a silent ``noop_action`` skip.
@@ -400,6 +457,7 @@ def main() -> int:
         stage_8_disk_in_add()
         stage_9_action_id_echo()
         stage_10_malformed_action_fails_loud()
+        stage_11_combined_add_remove_no_scheduler_crash()
     except Exception as exc:
         print()
         print(f"=== T20 FAILED: {type(exc).__name__}: {exc} ===")

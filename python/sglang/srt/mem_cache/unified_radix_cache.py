@@ -2409,6 +2409,20 @@ class UnifiedRadixCache(BasePrefixCache):
             if is_full_drop and not is_leaf:
                 _skip(h, action_id, "remove_not_leaf")
                 continue
+            # Per-tier leaf invariant: sglang's `inc_lock_ref` walks
+            # from a backed-up node up to root and asserts every
+            # ancestor has cd.value (DEVICE).  If we device-evict a
+            # non-leaf node, any later write_backup on that node's
+            # descendants trips the assert + crashes the scheduler.
+            # Same logic for HOST evict on a host-non-leaf.  Daemon's
+            # policy SHOULD only emit migrate actions for leaves —
+            # this is a defense-in-depth guard.
+            if "HBM" in remove_tiers and not self._is_device_leaf(node):
+                _skip(h, action_id, "remove_hbm_not_device_leaf")
+                continue
+            if "DRAM" in remove_tiers and not self._is_host_leaf(node):
+                _skip(h, action_id, "remove_dram_not_host_leaf")
+                continue
 
             # ---- Apply adds first ----
             skip_this = False
@@ -2475,6 +2489,24 @@ class UnifiedRadixCache(BasePrefixCache):
             if skip_this:
                 continue
 
+            # ---- Drain pending write_through before removes ----
+            # write_backup (add=DRAM path) is ASYNC: it enqueues the
+            # D→H copy on cache_controller's background thread and
+            # records the pending lock in ongoing_write_through.  If
+            # we now evict the device buffer (remove=HBM), the copy
+            # would be reading freed memory + sglang's
+            # invariant_checker would trip on the categories-no-
+            # longer-disjoint state.
+            #
+            # writing_check(write_back=True) synchronizes ALL pending
+            # write_through events (sees `finish_event.synchronize()`
+            # per ack queue entry) AND properly releases locks via
+            # dec_lock_ref(node, params).  Called only when this
+            # action's adds actually produced async work (i.e.
+            # DRAM was in add_tiers and write_backup returned > 0).
+            if add_tiers and remove_tiers and self.cache_controller is not None:
+                self.writing_check(write_back=True)
+
             # ---- Apply removes ----
             tracker = {ct: 0 for ct in self.tree_components}
             base_comp = self.components[BASE_COMPONENT_TYPE]
@@ -2489,18 +2521,26 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._iteratively_delete_tombstone_leaf(node, tracker)
             else:
                 if "HBM" in remove_tiers:
-                    # Device eviction: evict_component frees the buffer
-                    # but DEFERS `cd.value = None` (SWA's free_swa still
-                    # reads Full.value).  _cascade_evict performs that
-                    # tombstone AND walks lower-priority components so
-                    # the post-state dump correctly reflects HBM ∉
-                    # residence.  Without the cascade, cd.value stays
-                    # non-empty and `/aginfer/state` would lie.
-                    self._evict_component_and_detach_lru(
-                        node, base_comp, target=EvictLayer.DEVICE,
-                        tracker=tracker)
-                    self._cascade_evict(
-                        node, base_comp, tracker, target=EvictLayer.DEVICE)
+                    # Use the existing `_evict_to_host` helper rather
+                    # than rolling our own evict + cascade.  It does
+                    # FOUR things in the right order:
+                    #   1. evict_component_and_detach_lru DEVICE
+                    #      (frees the buffer + detaches from device LRU)
+                    #   2. _cascade_evict (nulls cd.value via tombstone
+                    #      since SWA's free_swa needed it earlier,
+                    #      then re-leaf-set the node)
+                    #   3. _for_each_component_lru insert_mru HOST
+                    #      (the node now has only host data → belongs
+                    #      in host LRU so future host-pressure can
+                    #      evict it)
+                    #   4. _update_evictable_leaf_sets(node.parent)
+                    #      (parent may now be a leaf again after
+                    #      child's tier transition)
+                    # Steps 3 + 4 were missing from the previous T20
+                    # impl, causing pool-accounting drift across
+                    # multiple migrates that triggered sglang's
+                    # invariant_checker (e2e_smoke 1st run).
+                    self._evict_to_host(node, tracker=tracker)
                 if "DRAM" in remove_tiers:
                     # Host eviction: evict_component sets cd.host_value
                     # = None inline (no defer; SWA doesn't pin host

@@ -8,7 +8,30 @@
 
 ## RESULTS
 
-### 2026-05-31 — T33+T20 e2e smoke (1st)
+### 2026-05-31 (2nd run, post #157 fix) — GREEN
+
+After fix `e7e... + leaf-check` landed:
+- 32 concurrent chats through daemon proxy → daemon emits ~7
+  migrate POSTs to sglang.
+- Each POST: typically `applied=1 skipped=1` (one device-leaf unit
+  applied; one non-device-leaf rejected with `remove_hbm_not_device_leaf`).
+- **sglang scheduler stays alive throughout** — no
+  `Scheduler hit an exception`, `/health` returns 200 after.
+
+The pool-leak signature from the 1st run is gone.  Two changes
+needed:
+1. `writing_check(write_back=True)` drain between async
+   write_backup and sync device evict (within one action).
+2. Leaf-invariant guard: skip with `remove_hbm_not_device_leaf` /
+   `remove_dram_not_host_leaf` when policy emits a non-leaf
+   migration.  sglang's `inc_lock_ref` walks the prefix chain to
+   root and asserts every ancestor has `cd.value`; device-evicting
+   a non-leaf would break later write_backup calls on its
+   descendants.
+
+Raw logs: `results/20260531_smoke_post_T157_GREEN.{daemon,sglang}.log`.
+
+### 2026-05-31 (1st run) — FAILED
 
 **FAILED.**  Caught a real bug in T20's combined add+remove path.
 

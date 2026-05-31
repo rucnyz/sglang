@@ -197,6 +197,8 @@ kill "$SGLANG_PID"
 | 7  unknown hash | PASS — `not_in_tree` |
 | 8  add=[DISK] | PASS — `disk_tier_not_yet_wired` |
 | 9  action_id echo | PASS — 3 distinct action_ids all returned |
+| 10 malformed payload | PASS — 3 missing-field variants all 400 |
+| 11 `{HBM} → {DRAM}` combined add+remove | PASS — scheduler healthy post-action; residence == [DRAM] (added 2026-05-31 #157 RED-then-GREEN) |
 
 ### Implementation notes worth keeping
 
