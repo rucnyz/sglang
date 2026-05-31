@@ -162,6 +162,42 @@ Stage 11 cross-rank n_bytes disagreement (DESIGN §6 L736, audit-driven)
          rank-0 vs 8192 on rank-1 → fatal.  Pre-audit T43 took
          max() over disagreeing values, silently absorbing the bug;
          DESIGN explicitly flags this as bug-class.
+
+Stage 12 exception-context traceback (B-block audit-driven)
+         fatal() inside an `except` block must capture the active
+         exception's traceback via sys.exc_info(), not just the
+         no-exception format_stack().  Asserts payload.traceback
+         contains both 'RuntimeError', the message, AND the
+         raising frame name.
+
+Stage 13 full context contract round-trip (B-block audit-driven)
+         DESIGN §10 L2302 enumerates four contract keys: event,
+         state, candidates, dp_inputs.  Feeds a real Event (frozen
+         dataclass with EventKind Enum), nested state dict, list of
+         dataclass candidates, numeric dp_inputs dict.  Asserts
+         every field round-trips through _to_jsonable (Enum→.value,
+         dataclass→asdict, deep nested dict, dataclass list-asdict).
+
+Stage 14 unwritable data dir degraded path (B-block audit-driven)
+         AGINFER_DATA_DIR=/proc/cmdline (a file, not a directory)
+         → mkdir raises NotADirectoryError → fatal() falls back to
+         the degraded-log branch.  Asserts exit=1, stderr contains
+         the reason AND the 'no forensic file written' marker AND
+         the supplied note kwarg (proving the payload was actually
+         emitted in the fallback log line).
+
+Stage 15 concurrent fatals no clobber (B-block audit-driven)
+         Two subprocesses spawn simultaneously with the same
+         AGINFER_DATA_DIR; assert both exit 1, both forensic files
+         land with distinct names, and the payloads carry distinct
+         pids.  Defends the <ns>_<pid> suffix design against a
+         regression that simplifies to just <ts>.
+
+All payload assertions also cover (B-block audit-driven):
+- payload.pid is a positive int
+- payload.timestamp_iso matches YYYY-MM-DDTHH:MM:SS
+- payload.timestamp_unix present
+(applied uniformly via the _assert_forensic_file helper).
 ```
 
 ## REPRODUCING
@@ -178,8 +214,8 @@ run via Python subprocesses.
 
 ## RESULTS
 
-**PASSED** — all 12 stages (initial 9 + audit-driven 3 for DESIGN
-§10 / §6 alignment).
+**PASSED** — all 16 stages (initial 9 + audit-driven 3 DESIGN §10/§6
+alignment + audit-driven 4 B-block test-depth).
 
 * date: 2026-05-31
 * lines: ~190 in new `daemon/_fatal.py`; ~95 net in
@@ -202,9 +238,14 @@ run via Python subprocesses.
 | 9  h_max_per_byte_sec non-positive | PASS — `holding_cost_non_positive` (0 AND -1e-9 both fatal) |
 | 10 prefill_bps positivity (conditional) | PASS — (a) startup exits 0, (b) -1 fatals, (c) 0+units fatals |
 | 11 cross-rank n_bytes disagreement | PASS — `n_bytes_disagreement_across_ranks` |
+| 12 exception-context traceback | PASS — `RuntimeError: boom-from-test` + `the_raising_frame` in payload.traceback |
+| 13 full context contract round-trip | PASS — Event/state/candidates/dp_inputs all round-trip with Enum→value and dataclass→asdict |
+| 14 unwritable data dir degraded path | PASS — `AGINFER_DATA_DIR=/proc/cmdline` → degraded log + exit 1 + payload-in-stderr |
+| 15 concurrent fatals no clobber | PASS — 2 subprocesses → 2 distinct files with distinct pids |
 
 * raw run log: `results/20260531_t43_initial_pass.log` (initial 9)
-* audit re-run log: `results/20260531_t43_audit_aligned_pass.log` (12 stages)
+* audit re-run log: `results/20260531_t43_audit_aligned_pass.log` (12)
+* B-block re-run log: `results/20260531_t43_audit_B_pass.log` (16 stages)
 
 ### Known stale-test impact
 
