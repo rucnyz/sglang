@@ -158,12 +158,22 @@ class EventRouter:
         # DESIGN §5: pool_usage.HBM.subpools is the allocator-truth view
         # admission gates on.  Occupancy = max over subpools (admission
         # acts when ANY subpool crosses theta_hi, not when the aggregate
-        # does — DESIGN §5 "Why two views" clause).
+        # does — DESIGN §5 "Why two views" clause).  used/cap report
+        # the SUMS across subpools (the tier-aggregate view), for the
+        # synth payload's informational fields.
         subpools = state["pool_usage"]["HBM"]["subpools"]
-        occ = max(
-            (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
-            for e in subpools.values()
-        ) if subpools else 0.0
+        if subpools:
+            occ = max(
+                (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0
+                else 0.0
+                for e in subpools.values()
+            )
+            used = sum(e["used_bytes"] for e in subpools.values())
+            cap = sum(e["cap_bytes"] for e in subpools.values())
+        else:
+            occ = 0.0
+            used = 0
+            cap = 0
         if occ > self.theta_hi:
             state_label = "HIGH" if occ < self.theta_crit else "CRITICAL"
             logger.info(

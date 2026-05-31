@@ -1,9 +1,27 @@
-# T5 — sglang→daemon webhook + daemon event router
+# sglang→daemon webhook + daemon event router
 
-> **NOTE (pre-round-9)**.  The webhook kinds listed here are the
-> pre-round-9 set.  DESIGN.md round-9 adds `PRESSURE_CRITICAL` and
-> `APPLY_FAILED` (round-9 B4) as additional kinds the router must
-> dispatch.  Refresh when round-9 lands in sglang / daemon code.
+> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> task.  Guards the webhook receiver + event dispatcher at the
+> daemon's `POST /aginfer/event` endpoint:
+>
+> * sglang fires `kind` ∈ {`memory_pressure`, `pressure_resolved`,
+>   `still_high`, `session_arrival`, `llm_prefill`, `tool_call_start`,
+>   `tool_call_end`} today; this verify exercises that core set.
+> * 4 additional kinds extend the surface as their owning Tn lands:
+>   - **T23** (PLAN §3) — `APPLY_FAILED` webhook from sglang on
+>     migrate apply failure.  PENDING.
+>   - **T24** (PLAN §3) — `HASH_COLLISION` webhook from
+>     `apply_aginfer_migrations` DFS detection.  Detection wired in
+>     T20 commit (`e8e618ed5f`); webhook + daemon-side `fatal()`
+>     handler PENDING.
+>   - **T31** (PLAN §3) — `SESSION_END` channel from harbor /
+>     external client.  PENDING.
+>   - `PRESSURE_CRITICAL` — already-emitted by sglang when occ ≥
+>     theta_crit (sglang's `aginfer_webhook.py`); router already
+>     routes it.
+>
+> When those land, probes will be added here (or split into
+> sibling verify dirs as size dictates).
 
 ## WHAT WE PROMISED
 
@@ -48,7 +66,7 @@
 
 ## HOW WE VERIFY
 
-Mechanism. `verify/t5/verify.py` (two layers: A pure-asyncio, B real-sglang gated by `AGINFER_T5_FULL=1`):
+Mechanism. `verify/daemon_webhook_router/verify.py` (two layers: A pure-asyncio, B real-sglang gated by `AGINFER_T5_FULL=1`):
 
 ```
 1. sglang side
@@ -109,10 +127,10 @@ conda activate agsched
 cd /scratch/yuzhou/projects/sglang/dev/aginfer
 
 # Layer A only (~5 s, no GPU):
-python verify/t5/verify.py
+python verify/daemon_webhook_router/verify.py
 
 # Layer A + Layer B (~3 min, real sglang on a free GPU):
-AGINFER_T5_FULL=1 CUDA_VISIBLE_DEVICES=4 python verify/t5/verify.py
+AGINFER_T5_FULL=1 CUDA_VISIBLE_DEVICES=4 python verify/daemon_webhook_router/verify.py
 ```
 
 Layer B launches sglang with aggressive thresholds
@@ -193,7 +211,7 @@ Found 2 BLOCKER + 7 MINOR + 5 NIT.  Real fixes:
 * **MINOR M5** — Worker never called `queue.task_done()`; a future
   `queue.join()` would hang.  Fixed: paired in a `finally`.
 * **NIT N1** — README HOW WE VERIFY referred to a legacy path
-  (`verify/t5_event_router.py`); actual is `verify/t5/verify.py`.
+  (`verify/t5_event_router.py`); actual is `verify/daemon_webhook_router/verify.py`.
   Fixed.
 * **NIT N2** — WORST CASE table rows that are deferred to T9 / T10
   ("Webhook receiver completely down", "Daemon process killed

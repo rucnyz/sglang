@@ -87,17 +87,43 @@ def make_stub_sglang(state_hbm_used: int = 0, state_hbm_cap: int = 65536) -> Fas
 
     @app.get("/aginfer/state")
     async def _state() -> Any:
+        # DESIGN §5 schema (post-T17).  Stub emits the FULL shape so
+        # daemon's cold_start_probe + build_paper_state can parse it;
+        # most fields are zero placeholders since this test only
+        # cares about HBM occ.
         return {
-            "tier_usage": {
-                "HBM": {
+            "time_counter": 0,
+            "throughput_ema": {"prefill_bps": 0.0,
+                               "decode_per_program": {}},
+            "pool_usage": {
+                "HBM":  {"subpools": {"full": {
                     "used_bytes": app.state.hbm_used,
                     "cap_bytes": app.state.hbm_cap,
-                },
-                "DRAM": {"used_bytes": 0, "cap_bytes": 0},
+                    "available_bytes": max(0, app.state.hbm_cap - app.state.hbm_used),
+                    "evictable_bytes": 0,
+                    "page_bytes": 1,
+                }}},
+                "DRAM": {"subpools": {"full": {
+                    "used_bytes": 0, "cap_bytes": 0,
+                    "available_bytes": 0, "evictable_bytes": 0,
+                    "page_bytes": 1}}},
+                "DISK": {"subpools": {"full": {
+                    "used_bytes": 0, "cap_bytes": 0,
+                    "available_bytes": 0, "evictable_bytes": 0,
+                    "page_bytes": 1}}},
             },
+            "per_program_usage": {},
             "units": [],
-            "page_size": 1,
-            "bytes_per_token": 1,
+            "link_stats": {
+                link: {"peak_bw_bps": 1, "recent_throughput_bps": 0,
+                       "time_since_last_sample_s": 1.0e12}
+                for link in ("HBM->DRAM", "DRAM->HBM",
+                             "DRAM->DISK", "DISK->DRAM")
+            },
+            "tier_holding_cost": {
+                t: {"full": {"h_max_per_byte_sec": 0.0}}
+                for t in ("HBM", "DRAM", "DISK")
+            },
         }
 
     return app
@@ -458,7 +484,7 @@ async def la_firer_retry_and_payload() -> None:
             theta_crit=0.9,
         )
         try:
-            firer.maybe_fire(used_tokens=58000, cap_tokens=65536)  # ~0.885 -> HIGH (< 0.9 crit)
+            firer.maybe_fire(58000 / 65536)  # ~0.885 -> HIGH (< 0.9 crit)
             # The firer's background thread will retry 0.1 + 0.4 s = 0.5 s.
             # Plus some slack.
             for _ in range(50):  # up to 5 s
