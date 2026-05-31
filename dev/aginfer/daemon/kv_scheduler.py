@@ -436,33 +436,61 @@ def build_paper_state(
     # Zero means operator forgot to configure h_max for a subpool —
     # the holding-tax term in V_u silently collapses to zero, the
     # policy decisions go off-paper, no log.
-    for tier_label, subpools in state_json["tier_holding_cost"].items():
-        for sp, fields in subpools.items():
-            h_max = float(fields["h_max_per_byte_sec"])
-            if h_max <= 0.0:
-                fatal(
-                    "holding_cost_non_positive",
-                    tier=tier_label,
-                    subpool=sp,
-                    h_max_per_byte_sec=h_max,
-                    state=state_json,
-                )
+    #
+    # Conditional (audit #161): sglang ships a pre-T12 placeholder
+    # of H=0.0 for every (tier, subpool), so cold-start sees ALL
+    # h_max == 0.  We treat that as "no operator config yet" and
+    # let it pass (analogous to the prefill_bps "once any prefill
+    # has run" qualifier).  The actual deployment bug is PARTIAL
+    # configuration — SOME entries positive and SOME zero — which
+    # silently zeroes the holding tax for the zero-config subpool.
+    holding_values = [
+        float(fields["h_max_per_byte_sec"])
+        for subpools in state_json["tier_holding_cost"].values()
+        for fields in subpools.values()
+    ]
+    any_positive = any(v > 0.0 for v in holding_values)
+    any_negative = any(v < 0.0 for v in holding_values)
+    if any_negative:
+        # Negative is always a deployment bug; locate one and fatal.
+        for tier_label, subpools in state_json["tier_holding_cost"].items():
+            for sp, fields in subpools.items():
+                v = float(fields["h_max_per_byte_sec"])
+                if v < 0.0:
+                    fatal(
+                        "holding_cost_non_positive",
+                        tier=tier_label, subpool=sp,
+                        h_max_per_byte_sec=v,
+                        state=state_json,
+                    )
+    if any_positive:
+        # Once any positive value exists, every entry must be positive
+        # (partial-config deployment bug).
+        for tier_label, subpools in state_json["tier_holding_cost"].items():
+            for sp, fields in subpools.items():
+                v = float(fields["h_max_per_byte_sec"])
+                if v <= 0.0:
+                    fatal(
+                        "holding_cost_non_positive",
+                        tier=tier_label, subpool=sp,
+                        h_max_per_byte_sec=v,
+                        state=state_json,
+                    )
 
     # DESIGN §10 line 2319 positivity invariant #3:
     #   prefill_bps > 0 ONCE ANY PREFILL HAS RUN.
-    # Three cases:
-    #   - negative: always fatal (negative throughput is structurally
-    #     nonsense; can never be a startup state)
-    #   - zero + no units + time_counter == 0: startup; not a bug
-    #   - zero + (units OR time_counter > 0): fatal — we have
-    #     evidence prefill has run (units only appear post-commit;
-    #     time_counter increments per prefill) but the EMA reports
-    #     zero throughput.
+    #
+    # Pre-T26 reality (audit #161 follow-up): sglang's
+    # _aginfer_throughput_ema ships ``prefill_bps=0.0`` as a placeholder
+    # awaiting T26 measurement wiring.  The strict "0 + units > 0 →
+    # fatal" check fires on every event after the first prefill,
+    # treating sglang's "no measurement yet" the same as
+    # "measurement broken".  Until T26 lands, we ONLY fatal on
+    # NEGATIVE prefill_bps (structurally nonsense; can never be a
+    # startup state).  Once T26 wires real measurement, this check
+    # should re-tighten to the "zero + traffic = bug" form.
     prefill_bps = float(state_json["throughput_ema"]["prefill_bps"])
-    has_traffic = (
-        bool(state_json["units"]) or int(state_json["time_counter"]) > 0
-    )
-    if prefill_bps < 0.0 or (prefill_bps == 0.0 and has_traffic):
+    if prefill_bps < 0.0:
         fatal(
             "prefill_bps_non_positive_with_traffic",
             prefill_bps=prefill_bps,
@@ -775,6 +803,7 @@ class KvScheduler:
         http_client: Optional[httpx.AsyncClient] = None,
         policy: Optional[OursGreedyPolicy] = None,
         lambda_acting: float = _DEFAULT_LAMBDA_ACTING,
+        observability=None,  # daemon._observability.DaemonObservability
     ) -> None:
         self.tracker = tracker
         self.sglang_base_url = sglang_base_url.rstrip("/")
@@ -782,6 +811,11 @@ class KvScheduler:
         self._owns_client = http_client is None
         self.policy = policy or OursGreedyPolicy(default_costs())
         self.lambda_acting = lambda_acting
+        # T42: optional injection from main.py (router.observability).
+        # When set, every migrate skip-reason bumps the per-reason
+        # counter in addition to its per-event log line.  Left None
+        # for unit tests that only care about the policy / wire path.
+        self.observability = observability
         # Telemetry for tests.
         self.decisions: int = 0
         self.migrate_calls: int = 0
@@ -960,21 +994,33 @@ class KvScheduler:
             applied=applied,
             skipped=skipped,
         )
-        # Per-action skip reason breakdown — high-value for finding
-        # G11-class issues (race:already_on_dram / promote_not_yet_wired
-        # / race:not_in_tree / etc.).  Each line ≈ 1 µs, fires at most
-        # `skipped` times per POST.
+        # Per-action skip reason breakdown.
+        self._record_skips(skipped_list, _m)
+
+    def _record_skips(self, skipped_list, _m_func=None) -> None:
+        """Per-skip accounting: emit a ``migrate_skipped`` line AND
+        (when observability is attached) bump the cumulative
+        per-reason counter on the daemon's T42 aggregator.
+
+        Extracted as a method so unit tests can exercise the skip-
+        accounting path without spinning up the HTTP client.
+        Each line ≈ 1 µs, fires at most ``len(skipped_list)`` times
+        per migrate POST — high-value for finding G11-class issues
+        (race:already_on_dram / promote_not_yet_wired /
+        race:not_in_tree / etc.).
+        """
+        if _m_func is None:
+            from ._metrics import m as _m_func
         for entry in skipped_list:
             # Direct subscript: sglang's /aginfer/migrate ALWAYS emits
             # `reason` per DESIGN §6 + verify/t20 enforcement.  A
             # missing field is a real protocol regression worth
             # surfacing, not a silent "?" metric value.
-            reason = entry["reason"]
             # Replace spaces with _ since metric format is space-sep.
-            _m(
-                "migrate_skipped",
-                reason=reason.replace(" ", "_")[:120],
-            )
+            reason = entry["reason"].replace(" ", "_")[:120]
+            _m_func("migrate_skipped", reason=reason)
+            if self.observability is not None:
+                self.observability.record_failure(reason)
 
 
 # ----------------------------------------------------------------- attach

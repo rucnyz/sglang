@@ -9,7 +9,9 @@ the event_worker (T7 / T8) serially with an action_lock.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import enum
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -50,6 +52,11 @@ class Event:
     kind: EventKind
     session: Optional[str] = None
     payload: Dict[str, Any] = field(default_factory=dict)
+    # T42 — monotonic-clock timestamp stamped by EventBus.emit at the
+    # moment the event is put on the queue.  The worker reads this at
+    # dispatch entry to compute time-in-queue.  Default 0.0 is the
+    # "unstamped" sentinel that triggers emit() to fill it in.
+    enqueue_time: float = 0.0
 
 
 class EventBus:
@@ -96,5 +103,14 @@ class EventBus:
         v1 queue is unbounded so this is just ``put_nowait``.  If a
         future maintainer adds bounding, this should fall back to
         drop-event-with-warning rather than block the proxy step.
+
+        T42: stamps ``enqueue_time`` if the caller didn't already.
+        Since Event is frozen + slots, we replace the instance via
+        ``dataclasses.replace`` (caller's reference is unaffected;
+        the queued copy carries the timestamp).
         """
+        if event.enqueue_time == 0.0:
+            event = dataclasses.replace(
+                event, enqueue_time=time.perf_counter()
+            )
         self._q.put_nowait(event)

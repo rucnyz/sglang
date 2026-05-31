@@ -74,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="admission per-event pause/resume cap (default 16)",
     )
     p.add_argument(
+        "--observability-summary-every-n", type=int, default=200,
+        help=(
+            "T42: emit one daemon_obs_summary line per N handled events "
+            "(default 200).  Set lower (e.g. 20) for short load demos / "
+            "stress probes so the summary cadence is visible in modest "
+            "traffic."
+        ),
+    )
+    p.add_argument(
         "--log-level", default="info",
         help="uvicorn / daemon log level",
     )
@@ -96,7 +105,10 @@ def main(argv=None) -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    app = create_app(sglang_base_url=args.sglang_base_url)
+    app = create_app(
+        sglang_base_url=args.sglang_base_url,
+        observability_summary_every_n=args.observability_summary_every_n,
+    )
     bus = app.state.event_bus
     tracker = app.state.program_tracker
     router = app.state.event_router
@@ -107,7 +119,11 @@ def main(argv=None) -> None:
     admission = None
     if enable_kv:
         sched = KvScheduler(
-            tracker=tracker, sglang_base_url=args.sglang_base_url
+            tracker=tracker, sglang_base_url=args.sglang_base_url,
+            # T42 — share the router's T42 aggregator so kv_scheduler's
+            # per-skip reason counts land in the same observability
+            # summary the router emits.
+            observability=router.observability,
         )
         attach_kv_scheduler(router, sched)
         app.state.kv_scheduler = sched
@@ -160,6 +176,11 @@ def main(argv=None) -> None:
             theta_hi=args.theta_hi,
             theta_lo=args.theta_lo,
         )
+        # T42 — final observability summary so the last partial window
+        # (events since the last summary_every_n cadence emission) is
+        # not lost on shutdown.  Same line format as the periodic
+        # `daemon_obs_summary`; operator's grep pipeline gets both.
+        router.observability.emit_summary()
 
     uvicorn.run(
         app, host=args.host, port=args.port, log_level=args.log_level

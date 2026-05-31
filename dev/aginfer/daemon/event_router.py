@@ -25,12 +25,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from ._observability import DaemonObservability
 from .events import Event, EventBus, EventKind
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,8 @@ class EventRouter:
         http_client: Optional[httpx.AsyncClient] = None,
         theta_hi: float = 0.7,
         theta_crit: float = 0.9,
+        observability_capacity: int = 1024,
+        observability_summary_every_n: int = 200,
     ) -> None:
         self.bus = bus
         self.sglang_base_url = sglang_base_url.rstrip("/")
@@ -76,6 +80,14 @@ class EventRouter:
         self.events_received: int = 0
         self.events_handled: int = 0
         self.handler_failures: int = 0
+        # T42 — observability aggregator.  Handlers should call
+        # router.fetch_state() (which is now the instrumented wrapper)
+        # to get the state-fetch latency metric.  The worker records
+        # queue depth + time-in-queue at dispatch entry.
+        self.observability = DaemonObservability(
+            capacity=observability_capacity,
+            summary_every_n=observability_summary_every_n,
+        )
 
     # ---- registration ----
 
@@ -200,6 +212,21 @@ class EventRouter:
     # ---- helpers used by handlers ----
 
     async def fetch_state(self) -> dict:
+        """Public entry point used by handlers.  T42: wraps
+        ``_fetch_state_impl`` with a perf_counter to record state-
+        fetch latency into the observability aggregator.  Tests that
+        need to stub the network should override ``_fetch_state_impl``
+        (the timer still fires); replacing ``fetch_state`` itself
+        bypasses the instrumentation.
+        """
+        t0 = time.perf_counter()
+        result = await self._fetch_state_impl()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        self.observability.record_state_fetch(elapsed_ms)
+        return result
+
+    async def _fetch_state_impl(self) -> dict:
+        """The HTTP-only path; override in tests to skip the network."""
         assert self._client is not None
         r = await self._client.get(f"{self.sglang_base_url}/aginfer/state")
         r.raise_for_status()
@@ -212,10 +239,25 @@ class EventRouter:
         while True:
             event = await self.bus.queue.get()
             self.events_received += 1
+            # T42 — observability: queue depth at dispatch entry +
+            # time-in-queue.  qsize() reports remaining backlog AFTER
+            # this pop (operator-meaningful "how far behind are we").
+            t_dispatch = time.perf_counter()
+            time_in_queue_ms = (
+                (t_dispatch - event.enqueue_time) * 1000.0
+                if event.enqueue_time > 0.0 else 0.0
+            )
+            qdepth_after_pop = self.bus.queue.qsize()
+            self.observability.record_dispatch(
+                qdepth=qdepth_after_pop,
+                time_in_queue_ms=time_in_queue_ms,
+            )
             _m(
                 "event_received",
                 kind=event.kind.value,
                 sid=event.session if event.session else "-",
+                qdepth=qdepth_after_pop,
+                time_in_queue_ms=time_in_queue_ms,
             )
             try:
                 async with self._dispatch_lock:

@@ -149,6 +149,7 @@ def create_app(
     enable_event_router: bool = True,
     theta_hi: float = 0.7,
     theta_crit: float = 0.9,
+    observability_summary_every_n: int = 200,
 ) -> FastAPI:
     """Build the daemon's FastAPI app.
 
@@ -182,6 +183,7 @@ def create_app(
             http_client=None,  # router lazily creates its own on start()
             theta_hi=theta_hi,
             theta_crit=theta_crit,
+            observability_summary_every_n=observability_summary_every_n,
         )
         attach_event_routes(app, router)
         app.state.event_router = router

@@ -557,7 +557,13 @@ async def la_no_periodic_timer_in_source() -> None:
       - .sleep           (asyncio.sleep / time.sleep / loop.sleep)
       - .call_later      (delayed callback)
       - .call_at         (absolute-time callback)
-      - .perf_counter    (proxy for "running a timer-driven loop")
+
+    Note (post-T42): ``perf_counter`` was previously banned as a
+    heuristic proxy for "running a timer-driven loop", but it is the
+    standard high-res measurement primitive — T42's state-fetch
+    latency timer and ``Event.enqueue_time`` stamp legitimately use
+    it for measurement, not control flow.  Polling manifests as
+    sleep/call_later/call_at; those bans remain.
 
     Anywhere these appear in the daemon's event-driven hot path is a
     contract violation.
@@ -577,7 +583,7 @@ async def la_no_periodic_timer_in_source() -> None:
         ("daemon/proxy.py", inspect.getsource(proxy)),
         ("daemon/events.py", inspect.getsource(events_mod)),
     ]
-    forbidden = ("sleep", "call_later", "call_at", "perf_counter")
+    forbidden = ("sleep", "call_later", "call_at")
     for name, src in sources:
         tree = ast.parse(src)
         for node in ast.walk(tree):

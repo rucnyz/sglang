@@ -504,9 +504,22 @@ def stage_7_unsupported_tree_cache() -> None:
 
 
 def stage_9_h_max_per_byte_sec_non_positive() -> None:
-    """DESIGN §10 line 2319 positivity invariant: every
-    ``tier_holding_cost[τ][sp].h_max_per_byte_sec > 0``.  Zero is a
-    deployment bug (operator forgot to set ``h_max`` for a subpool)."""
+    """DESIGN §10 line 2319 positivity invariant — with the audit
+    #161 conditional: only PARTIAL config (some positive, some zero)
+    is a deployment bug.  All-zero is cold-start before operator
+    config / T12 calibration ships.
+
+    Sub-cases:
+      (a) PARTIAL config — seed has DRAM=1e-10, DISK=1e-11 positive
+          but HBM.attn=0 → fatal.  This is the real deployment bug
+          (operator set 2 of 3 tiers; daemon would silently lose
+          holding-tax on HBM units).
+      (b) NEGATIVE value — always fatal regardless of others
+          (negative throughput-cost is structurally nonsense).
+      (c) ALL-ZERO cold-start — every (tier, subpool) at 0.0; this
+          is what sglang ships pre-T12 (placeholder).  Must NOT fatal.
+    """
+    # (a) partial config
     state = _seed_valid_state()
     state["tier_holding_cost"]["HBM"]["attn"]["h_max_per_byte_sec"] = 0.0
     with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
@@ -514,7 +527,7 @@ def stage_9_h_max_per_byte_sec_non_positive() -> None:
         result = _run_build_paper_state(state, data_dir=data_dir)
         if result.returncode != 1:
             raise StageFail(
-                f"expected exit=1 on h_max=0; got {result.returncode}; "
+                f"(a) partial: expected exit=1; got {result.returncode}; "
                 f"stderr={result.stderr}"
             )
         if "UNEXPECTED-SUCCESS" in result.stderr:
@@ -522,43 +535,71 @@ def stage_9_h_max_per_byte_sec_non_positive() -> None:
         _assert_forensic_file(
             data_dir, "holding_cost_non_positive", result.stderr,
         )
-    # Negative is also a deployment bug (and must not regress to
-    # ``>=0`` silently if someone tightens the check later).
+
+    # (b) negative — always fatal (covers all-other-zero AND seed-positive)
+    state = _seed_valid_state()
     state["tier_holding_cost"]["HBM"]["attn"]["h_max_per_byte_sec"] = -1.0e-9
     with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
         data_dir = Path(td)
         result = _run_build_paper_state(state, data_dir=data_dir)
         if result.returncode != 1:
             raise StageFail(
-                f"expected exit=1 on h_max=-1e-9; got {result.returncode}"
+                f"(b) negative: expected exit=1; got {result.returncode}"
             )
         _assert_forensic_file(
             data_dir, "holding_cost_non_positive", result.stderr,
         )
 
+    # (c) all-zero cold-start — no fatal
+    state = _seed_valid_state()
+    for tier in ("HBM", "DRAM", "DISK"):
+        for sp in state["tier_holding_cost"][tier]:
+            state["tier_holding_cost"][tier][sp]["h_max_per_byte_sec"] = 0.0
+    with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
+        data_dir = Path(td)
+        result = _run_build_paper_state(state, data_dir=data_dir)
+        if result.returncode != 0:
+            raise StageFail(
+                f"(c) all-zero cold-start should NOT fatal; "
+                f"got exit={result.returncode}; stderr={result.stderr}"
+            )
+        forensic_dir = data_dir / "forensic"
+        if forensic_dir.exists() and any(forensic_dir.iterdir()):
+            raise StageFail(
+                f"(c) all-zero should not write a forensic file; "
+                f"{list(forensic_dir.iterdir())}"
+            )
+
 
 def stage_10_prefill_bps_positivity_conditional() -> None:
     """DESIGN §10 line 2319: ``prefill_bps > 0`` ONCE ANY PREFILL HAS
-    RUN.  Three sub-cases:
+    RUN.
 
-      (a) prefill_bps == 0 + no units + time_counter == 0
-          → startup; NO fatal.
-      (b) prefill_bps < 0 → fatal regardless (negative throughput is
-          structurally nonsense; can never be a startup state).
-      (c) prefill_bps == 0 + units present → fatal (we have evidence
-          that prefill has run because there are committed units,
-          but the EMA reports zero throughput → bug).
+    Audit #161 follow-up: sglang's ``_aginfer_throughput_ema`` ships a
+    pre-T26 placeholder of ``prefill_bps=0.0`` (no measurement
+    wiring yet).  The strict "zero + units > 0 = fatal" check used
+    to fire on the FIRST event after any prefill — treating
+    sglang's "measurement not wired yet" as "measurement broken".
+    Until T26 lands, T43 only fatals on NEGATIVE prefill_bps
+    (structurally nonsense).  Once T26 wires real measurement,
+    this check should re-tighten to "zero + traffic = bug".
+
+    Sub-cases:
+      (a) prefill_bps == 0 + no units → cold start; NO fatal.
+      (b) prefill_bps < 0 → fatal regardless (negative is structurally
+          nonsense; can never be a startup state).
+      (c) prefill_bps == 0 + units present → pre-T26 placeholder
+          state; NO fatal (will re-tighten when T26 ships).
     """
-    # (a) startup: prefill_bps=0 + no units → NO fatal
+    # (a) cold start: prefill_bps=0 + no units → NO fatal
     state_a = _seed_valid_state()
     state_a["throughput_ema"]["prefill_bps"] = 0.0
-    # seed already has units=[] and time_counter=0
     with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
         data_dir = Path(td)
         result = _run_build_paper_state(state_a, data_dir=data_dir)
         if result.returncode != 0:
             raise StageFail(
-                f"(a) startup: expected exit=0; got {result.returncode}; "
+                f"(a) cold start: expected exit=0; got {result.returncode}; "
                 f"stderr={result.stderr}"
             )
 
@@ -577,7 +618,7 @@ def stage_10_prefill_bps_positivity_conditional() -> None:
             data_dir, "prefill_bps_non_positive_with_traffic", result.stderr,
         )
 
-    # (c) zero with units present: fatal
+    # (c) zero + units: pre-T26 placeholder; NO fatal (relaxed by #161)
     state_c = _seed_valid_state()
     state_c["throughput_ema"]["prefill_bps"] = 0.0
     state_c["units"] = [{
@@ -593,14 +634,11 @@ def stage_10_prefill_bps_positivity_conditional() -> None:
     with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
         data_dir = Path(td)
         result = _run_build_paper_state(state_c, data_dir=data_dir)
-        if result.returncode != 1:
+        if result.returncode != 0:
             raise StageFail(
-                f"(c) zero+units: expected exit=1; got {result.returncode}; "
-                f"stderr={result.stderr}"
+                f"(c) pre-T26 zero + units: expected exit=0; "
+                f"got {result.returncode}; stderr={result.stderr}"
             )
-        _assert_forensic_file(
-            data_dir, "prefill_bps_non_positive_with_traffic", result.stderr,
-        )
 
 
 def stage_11_cross_rank_n_bytes_disagreement() -> None:
