@@ -129,6 +129,51 @@ round-trip to the daemon, so its V_u handler must be in-process.
 The 11 workload events are surfaced over HTTP (proxy + sglang
 webhook), so their V_u handlers live in the daemon.
 
+### Aginfer is sglang's decision pipeline (superset framing)
+
+aginfer is **not an optional add-on** layered on top of sglang's
+native heuristics — it is the single decision pipeline that
+sglang invokes for every cache-management choice.  sglang's
+historical heuristics (LRU eviction, `hit_count >=
+write_through_threshold` write-through trigger, automatic
+on-access load_back) are expressed as aginfer's **default
+policy module**: the policy module that runs when no daemon is
+attached.
+
+The implication is symmetric across three modes:
+
+| mode | daemon | scorer / write-through policy | behaviour |
+|---|---|---|---|
+| **aginfer disabled** (baseline) | not running | aginfer default policy = LRU-equivalent V_u + hit_count write-through | identical to historical sglang vanilla |
+| **aginfer in-process only** | not running | aginfer default policy | same as baseline; daemon-side benefits absent |
+| **aginfer full** | running | daemon-pushed V_u hints + admission active | full pipeline |
+
+There is **one code path** through the cache manager regardless
+of mode; modes differ only in which V_u inputs the in-process
+scorer reads from the hint table.  Experimental ablations
+(baseline vs ours) flip a policy parameter, not a code path —
+eliminating the "is the diff because of the policy or because
+of daemon-RTT overhead" confound that would otherwise muddle
+every comparison.
+
+Two physical plugin points carry this:
+
+* **Eviction scorer**: sglang's `SGLANG_KV_POLICY_MODULE`
+  registers a scoring function called from the eviction-decision
+  callsite.  Default module re-implements LRU as a V_u proxy
+  (last_access as p_hat surrogate).  Aginfer registers its
+  hint-table-aware V_u.
+* **Write-through trigger**: sglang's HiCache invokes a
+  `should_write_through(node)` function (new plugin point) when
+  considering write_through_selective.  Default implementation
+  is the historical `hit_count >= write_through_threshold`.
+  Aginfer registers a V_u-aware version that triggers when
+  `V_u(residence ∪ {DRAM}) > V_u(residence)`.
+
+The same plugin pattern can be extended to future decision points
+(predictive load_back, mooncake archive trigger) without
+restructuring the framework.
+
 ## 4. Events
 
 Eleven event kinds.  The daemon is **strictly reactive** to events;
@@ -262,14 +307,30 @@ not a decision-rule concern.
   },
 
   "units": [
-    {"hash": str, "tier": "HBM"|"DRAM"|"DISK",
+    {"hash": str,
+     "residence": ["HBM"|"DRAM"|"DISK", ...],  // SET of tiers the unit
+                                                // currently occupies bytes in.
+                                                // A unit can be in HBM+DRAM
+                                                // simultaneously (post write-
+                                                //   through, before HBM
+                                                //   eviction), DRAM+DISK,
+                                                //   etc.  Empty residence
+                                                //   means the unit has been
+                                                //   fully dropped from the
+                                                //   radix tree (it should
+                                                //   not appear in `units`
+                                                //   at all in that case).
      "n_tokens": int,
-     "n_bytes": {                     // per-subpool bytes this unit
-       "<subpool>": int               // contributes to its current tier.
-     },                                // Subpool keys match the tier's
-                                        //   pool_usage.<tier>.subpools keys.
-                                        // Per-architecture concrete shapes
-                                        // are listed in §12 Scenarios.
+     "n_bytes": {                             // per-(tier, subpool) bytes;
+                                                // one outer entry per tier
+                                                // in residence.  Subpool
+                                                // keys match
+                                                // pool_usage[tier].subpools.
+       "<tier>": {"<subpool>": int}
+     },
+                                                // Per-architecture concrete
+                                                //   shapes are in §12
+                                                //   Scenarios.
      "last_access_time": int, "hit_count": int,
      "session_ids": list[str]}
   ],
@@ -381,12 +442,37 @@ class of bug the always-fresh invariant exists to rule out.
 Two daemon → sglang endpoints, both write-only from the daemon's
 perspective.
 
-### `POST /aginfer/migrate` — apply tier transitions
+### `POST /aginfer/migrate` — apply residence-set transitions
 
 Request:
 ```json
-{"actions": [{"hash": str, "target_tier": "HBM"|"DRAM"|"DISK"|"DROP"}, ...]}
+{"actions": [
+  {"hash": str,
+   "add_tiers":    ["HBM"|"DRAM"|"DISK", ...],   // tiers to add to residence
+   "remove_tiers": ["HBM"|"DRAM"|"DISK", ...]}   // tiers to remove from residence
+]}
 ```
+
+The unit's residence set is updated atomically per action:
+`new_residence = (old_residence ∪ add_tiers) \ remove_tiers`.
+A few physical interpretations:
+
+| `add_tiers` | `remove_tiers` | physical operation |
+|---|---|---|
+| `["DRAM"]` | `[]` | write-through to DRAM (create host backup, keep HBM live) |
+| `[]` | `["HBM"]` | evict from HBM (DRAM backup retained if present) |
+| `["DRAM"]` | `["HBM"]` | write-through then evict — the legacy "HBM→DRAM migrate" |
+| `["HBM"]` | `[]` | load_back / predictive promote (HBM populated, DRAM kept) |
+| `[]` | `["HBM","DRAM","DISK"]` | DROP from radix tree entirely |
+| `["DISK"]` | `[]` | archive to disk via Mooncake; DRAM kept until DRAM pressure |
+
+Resulting empty residence (`= []`) implies the unit's radix-tree
+node is removed; sglang deletes the hash on the next state-dump
+boundary.
+
+Adding a tier that already exists in residence is a no-op; same for
+removing one that isn't present.  All operations are idempotent
+per the §10 invariant.
 
 Response:
 ```json
@@ -399,13 +485,16 @@ Response:
 * **`race:*`** — time-window race between daemon's state fetch and
   apply; tree mutated by concurrent evict / request.  Retryable.
   Daemon re-issues on the next event.
-* **`promote_load_back_declined:<category>`** — `load_back()`
-  declined cleanly, with `<category>` distinguishing the sub-cause
-  (full-allocator alloc fail, SWA sub-pool evict short, etc.).
-  Usually transient; surface for diagnosis.
+* **`promote_load_back_declined:<category>`** — `load_back()` for
+  an `add_tiers: ["HBM"]` action declined cleanly, with
+  `<category>` distinguishing the sub-cause (full-allocator alloc
+  fail, SWA sub-pool evict short, etc.).  Usually transient.
 * **`promote_raised:<exc>:<loc>:<msg>`** — load_back threw.
   Indicates an invariant break; investigate.
-* **`unknown_target_tier:...`** / **`unsupported_tree_cache:...`** —
+* **`write_through_declined:<category>`** — `add_tiers: ["DRAM"]`
+  (write-through) declined cleanly (host pool full, mooncake
+  unreachable, etc.).  Usually transient.
+* **`unknown_tier:...`** / **`unsupported_tree_cache:...`** —
   contract violations; daemon misbehavior.  Halt loudly.
 
 The daemon's retry / debug loop dispatches on the **class prefix**,
@@ -610,7 +699,7 @@ because the constraint is a one-sided byte threshold.
 
 | symbol | unit | meaning |
 |---|---|---|
-| `u.n_bytes`, `u.n_tokens` | bytes-dict / tokens | `u.n_bytes` is a dict `{subpool: bytes}` (per §5); `total_bytes(u) = sum(u.n_bytes.values())` |
+| `u.n_bytes`, `u.n_tokens` | nested-dict / tokens | `u.n_bytes` is a nested dict `{tier: {subpool: bytes}}` (per §5).  `bytes_at(u, τ)` = bytes u occupies at tier τ; `total_bytes(u, τ)` = sum across τ's subpools |
 | `p_hat(u, Δt)` | unitless ∈ [0,1] | conditional reuse probability over horizon Δt |
 | `Δt` | seconds | decision look-ahead horizon (§7 inputs) |
 | `hold_time` | seconds | expected residence in candidate tier (§7 inputs) |
@@ -618,7 +707,7 @@ because the constraint is a one-sided byte threshold.
 | `h_(τ, sp)(occ)` | sec / (byte × sec of holding) | per-(tier, subpool) marginal displacement cost at occupancy `occ`; one entry per subpool listed in `pool_usage[τ].subpools`.  Linear placeholder `h_(τ, sp)_max × occ` from `state.tier_holding_cost[τ][sp]`; final shape pending T12 calibration |
 | `occupancy_of(τ, sp, state)` | unitless ∈ [0,1] | `pool_usage[τ].subpools[sp].used_bytes / .cap_bytes` |
 | `bw_free(σ, τ)` | bytes/sec | live free bandwidth on σ↔τ link; reads `state.link_stats[σ→τ].recent_throughput_bps` when active, falls through to `peak_bw_bps` when link idle |
-| `transfer_bytes(u, σ, τ)` | bytes | `u.n_bytes` if `τ ≠ DROP` else 0 |
+| `transfer_bytes(u, σ, τ)` | bytes | `bytes_at(u, σ)` — what the link physically moves when adding τ to residence (source is `authoritative_tier(residence)`) |
 | `transfer_time(σ, τ)` | seconds | `transfer_bytes / bw_free` |
 | `page_bytes` | bytes | DP quantisation granularity = sglang's allocator page size in bytes (model-architecture dependent; for paged-KV with non-uniform per-layer pools, the smallest page across all (tier, subpool) pairs governs) |
 | `cost`, `gain`, `V_u`, `V_u_program` | seconds | net value at the same time-axis |
@@ -634,12 +723,17 @@ because the constraint is a one-sided byte threshold.
 @dataclass(frozen=True)
 class Migrate:
     hash: str                 # u.hash (sglang canonical key)
-    target_tier: Tier
-    target_subpool: str       # destination subpool key in target_tier.subpools
-    cost: float               # seconds
-    relief: dict[str, int]    # per-HBM-subpool bytes freed at the source
-                              # (keys match pool_usage.HBM.subpools)
-    bytes_moved: int          # total bytes the σ→τ transfer moves
+    add_tiers: tuple[Tier, ...]      # tiers to ADD to residence
+    remove_tiers: tuple[Tier, ...]   # tiers to REMOVE from residence
+    cost: float                       # seconds
+    relief: dict[Tier, dict[str, int]]   # per-(tier, subpool) bytes freed at
+                                          # the source side of the transition.
+                                          # Keys: tier ∈ remove_tiers ∩ residence;
+                                          # inner keys: subpools in that tier.
+    acquired: dict[Tier, dict[str, int]] # per-(tier, subpool) bytes newly
+                                          # occupied at destination tiers in
+                                          # add_tiers (consumed against
+                                          # destination cap in §9).
 
 @dataclass(frozen=True)
 class Pause:
@@ -664,35 +758,32 @@ and emits **unit-level migrate candidates** for the joint decider
 in §9.  `kv_scheduler` is a **candidate generator only** — it does
 not select a plan or apply actions; that is §9's job.
 
-```python
-def migrate_candidates(state, D_t) -> list[Migrate]:
-    out = []
-    for u in D_t:
-        for τ in (HBM, DRAM, DISK, DROP):
-            if τ == u.tier: continue
-            cost   = _value(u, u.tier, state) - _value(u, τ, state)
-            cost  += migration_cost(u, u.tier, τ)
-            cost  += unavailability_cost(u, u.tier, τ)
-            relief = bytes_freed_by_migrate(u, u.tier, τ)   # dict per subpool
-            if any(b > 0 for b in relief.values()):         # frees at least
-                                                             # one HBM subpool
-                out.append(Migrate(
-                    hash=u.hash,
-                    target_tier=τ,
-                    cost=cost,
-                    relief=relief,
-                    bytes_moved=transfer_bytes(u, u.tier, τ),
-                ))
-    return out
+A `Migrate` candidate is **a residence-set transition** —
+`(add_tiers, remove_tiers)` applied to `u.residence`.  The generator
+enumerates the meaningful transitions and scores each against the
+current state.
 
-# V_u value at a tier — sum over subpools.  A unit may contribute
-# to multiple subpools (e.g. a Mamba-leaf node holds both attention
-# `full` bytes and a `mamba` snapshot); both terms pay holding
-# cost at their respective subpool's occupancy.
-_value(u, τ, state) =
-    p_hat(u, Δt) × (reload_from_DROP(u) - reload_from(u, τ))
-  - Σ_{sp ∈ u.n_bytes}
-        h_(τ, sp)(occupancy_of(τ, sp, state)) × u.n_bytes[sp] × hold_time
+```python
+# Authoritative tier: the highest-compute-readiness tier in u's
+# residence.  HBM if present (compute-ready), else DRAM (must
+# load_back to use), else DISK.  V_u's holding cost is paid only
+# here — bytes in lower tiers are either backups (sunk cost, sglang
+# keeps them precisely so future evict is cheap) or the active
+# residence.
+def authoritative_tier(residence):
+    return HBM  if HBM  in residence else \
+           DRAM if DRAM in residence else \
+           DISK
+
+# V_u under a hypothetical residence set, summed across the
+# authoritative tier's subpools.  Reload cost is from the
+# authoritative tier (= the tier serving the next access).
+def _value(u, residence, state):
+    a = authoritative_tier(residence)
+    return  p_hat(u, Δt) * (reload_from_DROP(u) - reload_from(u, a)) \
+          - sum(h_(a, sp)(occupancy_of(a, sp, state)) *
+                u.n_bytes[a][sp] * hold_time
+                for sp in u.n_bytes[a])
 
 # Reload costs (paper §3 Tier Parameters, renamed for legibility):
 reload_from(u, τ)    = ρ_τ × u.n_tokens     # per-token reload at tier τ
@@ -703,51 +794,119 @@ occupancy_of(τ, sp, state) =
       state.pool_usage[τ].subpools[sp].used_bytes
     / state.pool_usage[τ].subpools[sp].cap_bytes
 
-# Total bytes the σ→τ transfer moves (sum across u's subpools at σ):
-total_bytes(u) = sum(u.n_bytes.values())
+# Bytes a unit occupies at tier τ (sum across τ's subpools);
+# 0 if τ not in residence.
+def bytes_at(u, τ):
+    return sum(u.n_bytes.get(τ, {}).values())
 
-transfer_bytes(u, σ, τ):
-    if τ == DROP:  return 0
-    return total_bytes(u)
+# Link bandwidth cost of a transition.  Each tier added that wasn't
+# already in residence costs a transfer over the relevant link;
+# tiers removed from residence are metadata-only (no link traffic).
+def migration_cost(u, add_tiers, remove_tiers, state):
+    cost = 0.0
+    for τ in add_tiers:
+        if τ in u.residence:  continue          # already present, no-op
+        source = authoritative_tier(u.residence)
+        cost  += transfer_bytes(u, source, τ) / bw_free(source, τ, state)
+    return cost                                  # removes are free (no link)
 
-# σ→τ transfer time at current link utilisation.
-# DROP short-circuits to 0: DROP only updates the radix tree
-# (remove node) + allocator free list (return bytes); no bytes
-# traverse any tier-to-tier link, so `bw_free(*, DROP)` is not a
-# defined quantity.
-transfer_time(σ, τ) = 0                if τ == DROP        \
-                    else transfer_bytes(u, σ, τ) / bw_free(σ, τ)
+# Bytes the link physically moves (sum of u's per-subpool bytes
+# at the source tier).
+transfer_bytes(u, σ, τ) = bytes_at(u, σ)
 
-# Cost of the σ→τ transfer itself (BW link contention),
-# in seconds.  Same DROP short-circuit as transfer_time.
-migration_cost(u, σ, τ) = 0            if τ == DROP        \
-                        else transfer_bytes(u, σ, τ) / bw_free(σ, τ)
+# Per-(tier, subpool) bytes the residence-set transition frees.
+# Returns a nested dict {tier: {subpool: bytes_freed}} so the §9
+# DP can post each axis independently.
+def bytes_freed_by_migrate(u, add_tiers, remove_tiers):
+    freed = {}
+    for τ in remove_tiers:
+        if τ not in u.residence:  continue       # already absent, no-op
+        freed[τ] = dict(u.n_bytes[τ])            # the τ-side bytes leave
+    return freed
 
-unavailability_cost(u, σ, τ) =
-    p_hat(u, transfer_time(σ, τ))           # access lands during transfer
-  × P(serve-from-σ fails | σ-write-policy)  # 0 under write-through
-  × reload_from(u, σ)                       # penalty if it does fail
+# Per-(tier, subpool) bytes the residence-set transition newly occupies
+# at each destination tier (consumed against `cap_left[τ][sp]` in §9).
+def bytes_acquired_by_migrate(u, add_tiers):
+    acquired = {}
+    for τ in add_tiers:
+        if τ in u.residence:  continue           # already present, no-op
+        source = authoritative_tier(u.residence)
+        # Same physical bytes land on τ (write-through copies the unit
+        # bit-for-bit; subpool layout is the same per architecture).
+        acquired[τ] = dict(u.n_bytes[source])
+    return acquired
 
-# Per-subpool HBM relief from migrating u out of HBM.  Returns
-# a dict {subpool: bytes_freed}; subpool keys match the unit's
-# n_bytes dict.  Non-HBM-source migrates return all-zeros and are
-# filtered upstream.
-bytes_freed_by_migrate(u, σ, τ):
-    if σ != HBM:
-        return {sp: 0 for sp in u.n_bytes}
-    return dict(u.n_bytes)              # u's bytes leave HBM entirely
-                                         # (the whole logical unit moves)
+unavailability_cost(u, add_tiers, remove_tiers) =
+    p_hat(u, transfer_time(add_tiers, u, state))     # access during transfer
+  × P(serve-from-source fails | write-through-semantics)  # 0 under write-through
+  × reload_from(u, authoritative_tier(u.residence))
+
+def migrate_candidates(state, D_t) -> list[Migrate]:
+    """Enumerate the meaningful residence-set transitions for each u ∈ D_t.
+
+    The candidate space is bounded by the small set of physically
+    distinct transitions, not by the 2^|tiers| theoretical product:
+
+      * `add  {DRAM}`               write-through (only if no DRAM yet)
+      * `add  {DISK}`               archive (only if no DISK yet)
+      * `remove {HBM}`              evict from HBM (only if DRAM ∪ DISK ≠ ∅,
+                                       else this is a DROP candidate)
+      * `remove {DRAM}`             evict from DRAM (only if DISK ≠ ∅ or
+                                       HBM ≠ ∅; else DROP)
+      * `remove {HBM, DRAM, DISK}`  DROP (whole-unit eviction)
+      * `add  {HBM}`                load_back / predictive promote
+                                       (only if HBM ∉ residence already)
+
+    A meaningful pressure-relieving transition has nonempty
+    bytes_freed in at least one (tier, subpool).
+    """
+    out = []
+    for u in D_t:
+        for (add, remove) in _meaningful_transitions(u):
+            new_residence = (set(u.residence) | set(add)) - set(remove)
+            if new_residence == set(u.residence):  continue   # no-op
+
+            cost  = _value(u, set(u.residence), state) \
+                  - _value(u, new_residence, state)
+            cost += migration_cost(u, add, remove, state)
+            cost += unavailability_cost(u, add, remove)
+
+            relief   = bytes_freed_by_migrate(u, add, remove)
+            acquired = bytes_acquired_by_migrate(u, add)
+            if not any(b > 0 for subpools in relief.values()
+                              for b in subpools.values()):
+                continue                          # no pressure relieved
+            out.append(Migrate(
+                hash=u.hash,
+                add_tiers=add,
+                remove_tiers=remove,
+                cost=cost,
+                relief=relief,
+                acquired=acquired,
+            ))
+    return out
 ```
 
-The `any(b > 0)` filter is load-bearing: it keeps the §9 knapsack
-focused on the HBM-relief axes.  A unit's bytes are atomic per
-migrate — moving u out of HBM frees its `n_bytes` dict's value
-on every HBM subpool simultaneously; you can't migrate "just
-the SWA part of u" because the radix-tree node owns both.  The
-DP separately tracks relief per subpool because a workload can
-have **one HBM subpool pressured and another spacious**
-(canonical case: Mamba snapshot pool full at 95% while
-attention `full` pool sits at 60%).
+**Action set semantics summary.**  Three physically distinct
+"costs" decompose cleanly under the residence-set framing:
+
+* **Adding** a tier that wasn't in residence is a write/copy — pays
+  link bandwidth `bytes / bw_free(source, target)` and consumes
+  destination subpool capacity.
+* **Removing** a tier from residence is metadata-only — costs zero
+  link bandwidth, frees the source's subpool capacity, and (if it
+  was the authoritative tier) shifts the authoritative-tier role
+  to the next-best surviving tier.
+* **DROP** = `remove_tiers = residence`; the unit's hash leaves the
+  radix tree.  Reload-from-DROP cost (`π_u × n_tokens`) is paid
+  only on a future access that would have hit u.
+
+The §9 DP's per-(tier, subpool) relief axes track `bytes_freed`
+across all `Migrate` candidates simultaneously: a workload with
+**one HBM subpool pressured and another spacious** (Mamba pool
+full at 95% while attention `full` is 60%) sees the DP free
+specifically Mamba bytes via Migrates whose `remove_tiers` reduce
+Mamba residence.
 
 **Under our write-through HiCache semantic the unavailability
 cost evaluates to 0** — see Transfer-window semantics below.  The
@@ -866,8 +1025,9 @@ For the two pressure events, the candidate set is restricted by
 alternative tier:
 
 ```
-regret(u, state) = _value(u, u.tier, state)
-                 - max_{τ ≠ u.tier} _value(u, τ, state)
+regret(u, state) = _value(u, set(u.residence), state)
+                 - max_{R' ∈ meaningful_neighbours(u.residence)}
+                       _value(u, R', state)
 ```
 
 `top_k_by_regret(units, k)` returns the k units of highest regret.
@@ -876,7 +1036,9 @@ regret(u, state) = _value(u, u.tier, state)
 ```
 bytes_needed(state)   = max(0, forecast(state) - theta_hi × cap_total)
                         # = same scalar §9 computes; reused here
-mean_unit_bytes(state) = (Σ_{u ∈ state.units} u.n_bytes) / |state.units|
+mean_unit_bytes(state) = (Σ_{u ∈ state.units}
+                            sum(bytes_at(u, τ) for τ in u.residence))
+                       / |state.units|
                         # arithmetic mean across all units in HBM+DRAM+DISK
 
 top_k_pressure(state) =
@@ -887,8 +1049,12 @@ top_k_pressure(state) =
 Defaults: `K_MAX = 256`, `K_MIN = 16`, `K_SAFETY = 4`.  These are
 deployment constants, not workload tuning knobs — they bound the
 DP table size (§9), not the optimality of the chosen subset.
-`V_u(u)` is the shorthand for `_value(u, u.tier, state)` —
-the unit's value at its current tier under the live state.
+`V_u(u)` is the shorthand for `_value(u, set(u.residence), state)`
+— the unit's value at its **current residence set** under the
+live state.  Holding cost is paid only at the
+`authoritative_tier(residence)`; lower-tier copies (e.g. DRAM
+backup of an HBM-resident unit) are sunk-cost free per the §7
+holding-cost rule.
 
 `TOOL_CALL_START` carries the tool's expected duration; the
 scheduler schedules the promote-back action for `T_start +
@@ -1301,15 +1467,21 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
   ```
   expected_peak_hbm_after_resume(p, state)[sp] =
       Σ_{h ∈ p.unit_hashes}
-          (u.n_bytes[sp] if state.units[h].tier != HBM
-                          and sp in u.n_bytes
-                          else 0)
+          (bytes_at_subpool(state.units[h], "HBM", sp)
+              if "HBM" not in state.units[h].residence
+              else 0)
                                                   # only count units not
-                                                  # currently in HBM —
-                                                  # demoted, dropped, or
-                                                  # absent ones
+                                                  # currently HBM-resident
+                                                  # (demoted, dropped, or
+                                                  # absent).  For HBM+DRAM
+                                                  # coexisting units, the
+                                                  # HBM copy still satisfies
+                                                  # resume needs — no new
+                                                  # HBM bytes consumed.
     + future_inflight_savings(p, state)[sp]       # post-resume decode
                                                   # growth in subpool sp
+
+  bytes_at_subpool(u, τ, sp) = u.n_bytes.get(τ, {}).get(sp, 0)
   ```
 
   Why "not already in HBM" is the correct filter: HBM bytes for a
@@ -1493,40 +1665,36 @@ def joint_decide(state, event):
     dram_subpools = state.pool_usage["DRAM"]["subpools"]
     disk_subpools = state.pool_usage["DISK"]["subpools"]
 
-    # ----- pressure phase: multi-subpool min-cost knapsack -----
-    # bytes_needed is a dict over HBM subpools; pressure fires when
-    # ANY subpool's forecast crosses theta_hi.  Each HBM subpool is
-    # a separate resource axis with its own >= constraint.
+    # Pressure: per (HBM, subpool) target = max(0, forecast - theta_hi × cap).
     bytes_needed = {
-        sp: max(0, forecast(state)[sp] - theta_hi * hbm_subpools[sp]["cap_bytes"])
+        ("HBM", sp): max(0, forecast(state)[sp]
+                            - theta_hi * hbm_subpools[sp]["cap_bytes"])
         for sp in hbm_subpools
     }
     if any(b > 0 for b in bytes_needed.values()):
-        cap_left = {                                     # destination caps
-            ("DRAM", sp): capacity_left_bytes(state, "DRAM", sp)
-            for sp in dram_subpools
-        } | {
-            ("DISK", sp): capacity_left_bytes(state, "DISK", sp)
-            for sp in disk_subpools
-        }
+        cap_left = {("DRAM", sp): capacity_left_bytes(state, "DRAM", sp)
+                    for sp in dram_subpools} | \
+                   {("DISK", sp): capacity_left_bytes(state, "DISK", sp)
+                    for sp in disk_subpools}
         cands  = kv_scheduler.migrate_candidates(state, decision_set(event, state))
         cands += admission.pause_candidates(state, event)
-        cands  = [c for c in cands if any(b > 0 for b in c.relief.values())]
+        cands  = [c for c in cands
+                  if any(b > 0
+                         for sub in (c.relief if isinstance(c, Migrate)
+                                     else {"HBM": c.relief}).values()
+                         for b in sub.values())]
         return knapsack_min_cost_multi(
             items        = cands,
-            bytes_needed = bytes_needed,                # dict keyed by HBM subpool
-            cap_left     = cap_left,                    # dict keyed by (tier, subpool)
+            bytes_needed = bytes_needed,             # keyed by (HBM, sp)
+            cap_left     = cap_left,                 # keyed by (DRAM|DISK, sp)
             bucket_size  = page_bytes,
         )
 
-    # ----- headroom phase: per-HBM-subpool max-value knapsack -----
-    # free_room is a dict over HBM subpools; headroom fires when ALL
-    # subpools have slack below theta_lo.  resume_candidates expose
-    # re_use as a per-subpool dict; the DP picks subsets satisfying
-    # all axes simultaneously (same multi-axis sparse DP, just max-
-    # value instead of min-cost).
+    # Headroom: per HBM-subpool slack budget.  Resumes consume HBM
+    # bytes in each subpool the resumed program's units live in.
     free_room = {
-        sp: max(0, theta_lo * hbm_subpools[sp]["cap_bytes"] - forecast(state)[sp])
+        ("HBM", sp): max(0, theta_lo * hbm_subpools[sp]["cap_bytes"]
+                            - forecast(state)[sp])
         for sp in hbm_subpools
     }
     if all(r > 0 for r in free_room.values()):
@@ -1534,11 +1702,11 @@ def joint_decide(state, event):
         cands = [c for c in cands if any(b > 0 for b in c.re_use.values())]
         return knapsack_max_value_multi(
             items       = cands,
-            budget      = free_room,                    # dict keyed by HBM subpool
+            budget      = free_room,                 # keyed by (HBM, sp)
             bucket_size = page_bytes,
         )
 
-    return []                                            # hysteresis dead-zone
+    return []                                        # hysteresis dead-zone
 ```
 
 A workload with a Mamba snapshot subpool at 95 % occupancy and an
@@ -1573,53 +1741,58 @@ def _hbm_relief_axes(bytes_needed):                 # >= axes (frees HBM)
 def _dest_cap_axes(cap_left):                       # <= axes (destinations)
     return list(cap_left.keys())                    # [(DRAM, sp), (DISK, sp), ...]
 
+def _relief_at(c, tier, sp):
+    """Bytes the candidate frees on (tier, sp)."""
+    if isinstance(c, Pause):
+        return c.relief.get(tier, {}).get(sp, 0) if isinstance(c.relief.get(tier), dict) \
+               else (c.relief.get(sp, 0) if tier == "HBM" else 0)
+    return c.relief.get(tier, {}).get(sp, 0)
+
+def _acquire_at(c, tier, sp):
+    """Bytes the candidate adds to destination (tier, sp).  Pauses
+    and pure-remove Migrates contribute 0."""
+    if isinstance(c, Migrate):
+        return c.acquired.get(tier, {}).get(sp, 0)
+    return 0
+
 def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
     """0/1 knapsack: subset S minimising Σ cost(s∈S) subject to
-    (a) for each HBM subpool sp:
-        Σ relief[sp](s∈S)             >= bytes_needed[sp]
+    (a) for each (HBM, sp) axis:
+        Σ_{s∈S} relief[HBM][sp](s)   >= bytes_needed[(HBM, sp)]
     (b) for each (DRAM|DISK, sp) axis a:
-        Σ_{s∈S: s.target==a} bytes_moved  <= cap_left[a]
+        Σ_{s∈S} acquired[a](s)       <= cap_left[a]
 
-    Pauses contribute 0 to (b); HBM→DROP Migrates contribute 0 to (b).
-    Quantises relief at bucket_size (round DOWN, safe for >=);
-    quantises destination consumption at bucket_size (round UP,
-    safe for <=)."""
-    relief_axes = _hbm_relief_axes(bytes_needed)    # list of HBM subpool keys
-    cap_axes    = _dest_cap_axes(cap_left)          # list of (tier, subpool)
-    # W[axis], Wcap[axis] hold the bucket bound per axis.
-    W    = {sp: _bk_up(bytes_needed[sp], bucket_size) for sp in bytes_needed}
-    Wcap = {a:  _bk(cap_left[a], bucket_size)        for a  in cap_axes}
+    Pure-remove Migrates contribute 0 to (b) by construction.
+    Pauses contribute relief on the HBM tier only.  Quantises
+    relief round-DOWN (safe for >=); quantises destination
+    consumption round-UP (safe for <=)."""
+    relief_axes = list(bytes_needed.keys())          # list of (HBM, sp)
+    cap_axes    = list(cap_left.keys())              # list of (DRAM|DISK, sp)
+    W    = {a: _bk_up(bytes_needed[a], bucket_size) for a in relief_axes}
+    Wcap = {a: _bk(cap_left[a], bucket_size)        for a in cap_axes}
     K    = len(items)
     INF  = float("inf")
 
-    # dp state is a (relief_tuple, cap_tuple) → min cost mapping,
-    # encoded as a flat tuple `(*relief_buckets_per_HBM_subpool,
-    # *cap_buckets_per_dest_subpool)`.  Sparse — only reachable
-    # cells materialise.
+    # dp state encodes (relief_buckets, cap_buckets) as a flat tuple.
+    # Sparse — only reachable cells materialise.
     def zero_state():
         return (*(0 for _ in relief_axes), *(0 for _ in cap_axes))
 
     dp   = {zero_state(): 0.0}
     take = {}
     for k, c in enumerate(items, start=1):
-        # Per-axis deltas this item contributes if taken.
-        d_relief = tuple(_bk(c.relief.get(sp, 0), bucket_size)
-                         for sp in relief_axes)
-        d_cap = tuple(
-            _bk_up(c.bytes_moved, bucket_size)
-                if (isinstance(c, Migrate) and (a[0], a[1]) ==
-                    (c.target_tier, c.target_subpool))
-                else 0
-            for a in cap_axes
-        )
+        d_relief = tuple(_bk(_relief_at(c, tier, sp), bucket_size)
+                         for (tier, sp) in relief_axes)
+        d_cap    = tuple(_bk_up(_acquire_at(c, tier, sp), bucket_size)
+                         for (tier, sp) in cap_axes)
         new_dp = dict(dp)
         for s, cost in dp.items():
             n = len(relief_axes)
             r_buckets, cap_buckets = s[:n], s[n:]
-            r_new   = tuple(min(W[relief_axes[i]], r_buckets[i] + d_relief[i])
-                            for i in range(n))
-            cap_new = tuple(cap_buckets[i] + d_cap[i] for i in range(len(cap_axes)))
-            # Reject if any destination cap exceeded.
+            r_new = tuple(min(W[relief_axes[i]], r_buckets[i] + d_relief[i])
+                          for i in range(n))
+            cap_new = tuple(cap_buckets[i] + d_cap[i]
+                            for i in range(len(cap_axes)))
             if any(cap_new[i] > Wcap[cap_axes[i]] for i in range(len(cap_axes))):
                 continue
             s_new = r_new + cap_new
@@ -1629,17 +1802,17 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
                 take[(k, s_new)] = True
         dp = new_dp
 
-    # Feasible cells: every HBM relief axis hit its bucket bound.
-    full_r = tuple(W[sp] for sp in relief_axes)
+    # Feasible cells: every (HBM, sp) relief axis hit its bucket bound.
+    full_r = tuple(W[a] for a in relief_axes)
     feasible = [(c, s) for s, c in dp.items() if s[:len(relief_axes)] == full_r]
     if feasible:
-        _, s_pick = min(feasible)                   # min over cost tuple
+        _, s_pick = min(feasible)                    # min over cost
     else:
-        # No subset hits every HBM-subpool relief target while
-        # respecting destination caps.  Pick the cell maximising
-        # Σ relief buckets (closest to satisfying), tie-break min
-        # cost.  Every cell already respects (b) by construction.
-        # sglang's next webhook re-fire will surface residual pressure.
+        # No subset satisfies every (HBM, sp) target under (b) caps.
+        # Pick the cell maximising Σ relief buckets (closest to
+        # satisfying), tie-break on min cost.  Every cell already
+        # respects (b) by construction.  sglang's next webhook
+        # re-fire surfaces residual pressure.
         s_pick = max(dp,
                      key=lambda s: (sum(s[:len(relief_axes)]),
                                     -dp[s]))
@@ -1648,17 +1821,14 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
         if take.get((k, s_pick)):
             c = items[k - 1]
             chosen.append(c)
-            # Undo the buckets this item added.
             n = len(relief_axes)
-            r_buckets = list(s_pick[:n])
+            r_buckets   = list(s_pick[:n])
             cap_buckets = list(s_pick[n:])
-            for i, sp in enumerate(relief_axes):
+            for i, (tier, sp) in enumerate(relief_axes):
                 r_buckets[i] = max(0, r_buckets[i]
-                                       - _bk(c.relief.get(sp, 0), bucket_size))
-            for i, a in enumerate(cap_axes):
-                if isinstance(c, Migrate) and (a[0], a[1]) == (
-                        c.target_tier, c.target_subpool):
-                    cap_buckets[i] -= _bk_up(c.bytes_moved, bucket_size)
+                                  - _bk(_relief_at(c, tier, sp), bucket_size))
+            for i, (tier, sp) in enumerate(cap_axes):
+                cap_buckets[i] -= _bk_up(_acquire_at(c, tier, sp), bucket_size)
             s_pick = tuple(r_buckets) + tuple(cap_buckets)
         k -= 1
     return chosen
@@ -1666,21 +1836,20 @@ def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
 
 def knapsack_max_value_multi(items, budget, bucket_size):
     """0/1 knapsack: subset S maximising Σ gain(s∈S) subject to
-    for each HBM subpool sp:
-        Σ re_use[sp](s∈S)   <= budget[sp]
-    Quantises re_use at bucket_size (round UP — safe for <=).
-
-    Same sparse multi-axis DP shape as knapsack_min_cost_multi,
-    just objective sign flipped and only <= axes (no >=)."""
-    axes = list(budget.keys())                       # HBM subpools
-    W    = {sp: _bk(budget[sp], bucket_size) for sp in budget}
+    for each (HBM, sp) axis a:
+        Σ_{s∈S} re_use[sp](s)   <= budget[a]
+    Quantises re_use round-UP (safe for <=).  Same sparse multi-axis
+    DP shape as knapsack_min_cost_multi."""
+    axes = list(budget.keys())                       # list of (HBM, sp)
+    W    = {a: _bk(budget[a], bucket_size) for a in axes}
     K    = len(items)
     NEG  = float("-inf")
 
     dp   = {tuple(0 for _ in axes): 0.0}
     take = {}
     for k, c in enumerate(items, start=1):
-        d = tuple(_bk_up(c.re_use.get(sp, 0), bucket_size) for sp in axes)
+        d = tuple(_bk_up(c.re_use.get(sp, 0), bucket_size)
+                  for (tier, sp) in axes)
         new_dp = dict(dp)
         for s, gain in dp.items():
             s_new = tuple(s[i] + d[i] for i in range(len(axes)))
@@ -1692,13 +1861,14 @@ def knapsack_max_value_multi(items, budget, bucket_size):
                 take[(k, s_new)] = True
         dp = new_dp
 
-    s_pick = max(dp, key=dp.get)                     # max gain anywhere in budget
+    s_pick = max(dp, key=dp.get)
     chosen, k = [], K
     while k > 0:
         if take.get((k, s_pick)):
             c = items[k - 1]
             chosen.append(c)
-            s_pick = tuple(s_pick[i] - _bk_up(c.re_use.get(axes[i], 0), bucket_size)
+            s_pick = tuple(s_pick[i] - _bk_up(c.re_use.get(axes[i][1], 0),
+                                              bucket_size)
                            for i in range(len(axes)))
         k -= 1
     return chosen
@@ -2001,6 +2171,31 @@ Sparse DP cell count remains the binding factor — at 7 axes the
 dense table is intractable but the reachable-cell count under
 agent workloads (where most candidates touch only 1–2 axes
 nontrivially) stays in the 10⁵ envelope.
+
+### Residence evolution
+
+A unit's `residence` set evolves through the §6
+`POST /aginfer/migrate` actions (and through sglang's own
+default-policy plugin when no daemon is attached).  Canonical
+lifecycle for an attention KV unit:
+
+```
+{HBM}                  fresh, just allocated by forward pass
+  → {HBM, DRAM}        after `should_write_through(u)` triggers
+                          (default: hit_count ≥ threshold;
+                           aginfer: V_u(R∪DRAM) > V_u(R))
+  → {DRAM}             after HBM pressure forces remove HBM
+  → {DRAM, HBM}        re-accessed; load_back populates HBM,
+                          DRAM kept as backup
+  → ...                cycles between {DRAM} and {DRAM, HBM}
+  → {DRAM, DISK}       on DRAM pressure: archive via Mooncake,
+                          DRAM kept until DRAM pressure
+  → {DISK}             on DRAM eviction
+  → {}                 final DROP (radix-tree node removed)
+```
+
+Mamba snapshot units follow the same lifecycle but the bytes
+involved live in different subpools (see S3).
 
 ### Scenario-independent assertions
 
