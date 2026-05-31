@@ -281,6 +281,93 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
+class _StateDumpMetrics:
+    """PLAN T14 — bounded ring buffer of recent ``_dump_aginfer_state_impl``
+    latencies + emitted-byte counts.  Piggybacked into ``/aginfer/state``
+    under the ``state_dump_metrics`` top-level key so monitoring scripts
+    (and PLAN §2's "p99 > 50 ms → F3-revisit trigger") can poll on the
+    same hot path the daemon already uses.
+
+    Single-threaded by construction: only the scheduler process'
+    ``_dump_aginfer_state_impl`` calls into this class, and the
+    scheduler serialises requests on the event loop.  No lock.
+    """
+
+    __slots__ = (
+        "_capacity", "_samples", "_first_recorded_perf_ns",
+        "_total_count",
+    )
+
+    def __init__(self, capacity: int = 1024) -> None:
+        self._capacity = int(capacity)
+        # (elapsed_ns, dump_bytes); dump_bytes == -1 for the dict path
+        # (we never measure serialised size there).
+        self._samples: list[tuple[int, int]] = []
+        self._first_recorded_perf_ns: Optional[int] = None
+        self._total_count = 0
+
+    def record(self, elapsed_ns: int, dump_bytes: int) -> None:
+        if self._first_recorded_perf_ns is None:
+            self._first_recorded_perf_ns = time.perf_counter_ns()
+        self._samples.append((int(elapsed_ns), int(dump_bytes)))
+        if len(self._samples) > self._capacity:
+            # Pop from the front; cheap at our sizes (1k entries, O(N)
+            # once per recorded sample after wrap).  Deque would be O(1)
+            # but disallows random indexing for quantile sort.
+            del self._samples[0]
+        self._total_count += 1
+
+    def summary(self) -> dict:
+        """Snapshot the contract field set the verify/t14 probe asserts.
+
+        Cold start (n=0): all numeric quantiles report 0.0; the
+        sentinel last_dump_bytes=-1 differentiates 'no dump yet'
+        from 'dump path saw bytes=0'.
+        """
+        n = len(self._samples)
+        if n == 0:
+            return {
+                "n_samples": 0,
+                "n_recorded_total": 0,
+                "capacity": self._capacity,
+                "window_seconds": 0.0,
+                "p50_ms": 0.0,
+                "p95_ms": 0.0,
+                "p99_ms": 0.0,
+                "max_ms": 0.0,
+                "mean_ms": 0.0,
+                "last_dump_ms": 0.0,
+                "last_dump_bytes": -1,
+            }
+        times = sorted(s[0] for s in self._samples)
+
+        def _q(p: float) -> float:
+            if n == 1:
+                return times[0] / 1e6
+            idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+            return times[idx] / 1e6
+
+        last_ns, last_bytes = self._samples[-1]
+        now_ns = time.perf_counter_ns()
+        window_s = (
+            (now_ns - self._first_recorded_perf_ns) / 1e9
+            if self._first_recorded_perf_ns is not None else 0.0
+        )
+        return {
+            "n_samples": n,
+            "n_recorded_total": self._total_count,
+            "capacity": self._capacity,
+            "window_seconds": window_s,
+            "p50_ms": _q(0.50),
+            "p95_ms": _q(0.95),
+            "p99_ms": _q(0.99),
+            "max_ms": times[-1] / 1e6,
+            "mean_ms": sum(times) / n / 1e6,
+            "last_dump_ms": last_ns / 1e6,
+            "last_dump_bytes": int(last_bytes),
+        }
+
+
 class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -377,6 +464,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # the warning log every batch.  Populated by
         # apply_aginfer_migrations.
         self._aginfer_collision_seen: set[tuple[int, int]] = set()
+        # T14 — per-call state-dump latency + emitted bytes.  Piggybacked
+        # into /aginfer/state under the ``state_dump_metrics`` top-level
+        # key.  Capacity 1024 ≈ 5 minutes at the daemon's typical 3.4 Hz
+        # poll rate; deep enough for a meaningful p99 over recent window
+        # but bounded so it doesn't blow up memory under year-long uptime.
+        self._aginfer_state_dump_metrics = _StateDumpMetrics(capacity=1024)
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict = {}
@@ -2884,14 +2977,42 @@ class UnifiedRadixCache(BasePrefixCache):
         * ``want_bytes=False`` (in-process callers / tests): same walk
           but builds Python dicts per unit.  Convenient, not allocation-
           bounded; not on the HTTP hot path.
+
+        T14: wraps the inner build with a ``perf_counter_ns`` so each
+        call lands a (elapsed, dump_bytes) sample in the ring buffer.
+        The summary embedded INTO this dump is from samples PRIOR to
+        this call (chicken-and-egg: we can't include our own latency
+        before we've finished measuring it).  Each /aginfer/state poll
+        therefore advances ``n_recorded_total`` by exactly 1.
         """
+        t0 = time.perf_counter_ns()
         bytes_per_token = self._aginfer_bytes_per_token()
         sp_full = self._aginfer_subpool_name(BASE_COMPONENT_TYPE)
+        metrics_summary = self._aginfer_state_dump_metrics.summary()
         if want_bytes:
-            return self._dump_aginfer_state_bytes(bytes_per_token, sp_full)
-        return self._dump_aginfer_state_dict(bytes_per_token, sp_full)
+            result = self._dump_aginfer_state_bytes(
+                bytes_per_token, sp_full, metrics_summary,
+            )
+            dump_bytes = len(result)
+        else:
+            result = self._dump_aginfer_state_dict(
+                bytes_per_token, sp_full, metrics_summary,
+            )
+            # Dict path: serialised size isn't measured (the call site
+            # doesn't go through orjson).  Sentinel.
+            dump_bytes = -1
+        elapsed_ns = time.perf_counter_ns() - t0
+        self._aginfer_state_dump_metrics.record(
+            elapsed_ns=elapsed_ns, dump_bytes=dump_bytes,
+        )
+        return result
 
-    def _dump_aginfer_state_dict(self, bytes_per_token: int, sp_full: str) -> dict:
+    def _dump_aginfer_state_dict(
+        self,
+        bytes_per_token: int,
+        sp_full: str,
+        metrics_summary: dict,
+    ) -> dict:
         """Dict-path snapshot.  Convenient for in-process callers; not
         on the HTTP hot path so per-unit Python dict allocations are
         acceptable."""
@@ -2980,6 +3101,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "units": units,
             "link_stats": self._aginfer_link_stats(),
             "tier_holding_cost": self._aginfer_tier_holding_cost(pool_usage),
+            # T14 — piggybacked observability; pre-this-call summary.
+            "state_dump_metrics": metrics_summary,
         }
 
     def _aginfer_patch_dram_used(self, pool_usage: dict,
@@ -2992,8 +3115,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 e["available_bytes"] = max(0, e["cap_bytes"] - used)
                 e["evictable_bytes"] = used
 
-    def _dump_aginfer_state_bytes(self, bytes_per_token: int,
-                                  sp_full: str) -> bytes:
+    def _dump_aginfer_state_bytes(
+        self,
+        bytes_per_token: int,
+        sp_full: str,
+        metrics_summary: dict,
+    ) -> bytes:
         """Allocation-light bytes-path snapshot.
 
         Hot loop writes each unit's JSON directly into a ``bytearray``
@@ -3155,6 +3282,9 @@ class UnifiedRadixCache(BasePrefixCache):
         out.extend(orjson.dumps(link_stats))
         out.extend(b',"tier_holding_cost":')
         out.extend(orjson.dumps(tier_holding_cost))
+        # T14 — piggybacked state-dump cost observability.
+        out.extend(b',"state_dump_metrics":')
+        out.extend(orjson.dumps(metrics_summary))
         out.extend(b'}')
         return bytes(out)
 
