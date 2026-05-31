@@ -551,6 +551,20 @@ single "pressure crossed" trigger.
 ### Decision rule (one definition; reused per trigger)
 
 ```python
+def cost_per_byte(p, state):
+    """V_u lost per HBM byte freed if we pause p — knapsack-greedy key."""
+    relief = marginal_relief_value(p, state)
+    if relief <= 0:
+        return float('inf')          # pausing p frees no HBM → never pick
+    return V_u_program(p) / relief
+
+def value_per_byte(p, state):
+    """V_u recovered per HBM byte re-occupied if we resume p."""
+    cost = marginal_relief_value(p, state)   # bytes p would re-take
+    if cost <= 0:
+        return float('inf')          # resuming p costs no HBM → trivially OK
+    return V_u_program(p) / cost
+
 def admission_evaluate(event):
     # Always-fresh state (§10): re-fetch inside the loop because
     # each pause / resume mutates allocator state.
@@ -558,7 +572,7 @@ def admission_evaluate(event):
         state = fetch_state()
         if forecast(state) <= theta_hi: break
         if not active_programs(state): break
-        victim = argmin(active_programs(state), key=V_u_program)
+        victim = argmin(active_programs(state), key=lambda p: cost_per_byte(p, state))
         if marginal_pause_cost(victim, event) > marginal_relief_value(victim, state):
             break
         pause(victim)
@@ -567,10 +581,27 @@ def admission_evaluate(event):
         state = fetch_state()
         if forecast(state) >= theta_lo: break
         if not paused_programs(state): break
-        candidate = argmax(paused_programs(state), key=V_u_program)
+        candidate = argmax(paused_programs(state), key=lambda p: value_per_byte(p, state))
         if not capacity_fits(candidate, state): break
         resume(candidate)
 ```
+
+The selection key is **V_u-per-byte**, not raw V_u.  Admission is
+a 0/1 knapsack ("free at least `theta_hi → safe` bytes,
+minimising total V_u loss"); LP-relaxation greedy on
+`V_u / relief` is the standard approximation and gives the
+correct ordering when program footprints vary.  Picking by raw
+`argmin V_u` instead would systematically choose the
+smallest-footprint program (smallest contribution to relief),
+then have to pause more programs to reach the byte target — a
+runaway-decode program with huge in-flight bytes but low V_u
+would be left untouched, defeating the point.
+
+The `marginal_pause_cost > marginal_relief_value` early-break
+inside the loop is the **per-step trade gate** (don't pause if
+this specific pause does net harm even at the best V_u/relief
+ratio).  Selection key picks the BEST candidate; the gate
+refuses to act when even the best candidate is a bad trade.
 
 Component definitions:
 
