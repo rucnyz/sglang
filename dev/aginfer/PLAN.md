@@ -173,7 +173,16 @@ Order roughly by dependency.
    - on action apply failure, sglang fires this webhook back to
      daemon with `{endpoint, action_id, reason}`
 
-8. **All action endpoints idempotent** (DESIGN §10 R2):
+8. **`HASH_COLLISION` webhook + content verification at insert**
+   (DESIGN §4 + §10 round-15/16):
+   - on every radix-tree hash-bucket insertion: compare the
+     incoming token sequence against the existing node's sequence
+     (sglang's `match_prefix` already does this walk; reuse it)
+   - mismatch fires the `HASH_COLLISION` webhook with payload
+     `{hash, existing_node_summary, incoming_node_summary}`
+   - daemon `fatal()`s on receipt — deployment-bug class
+
+9. **All action endpoints idempotent** (DESIGN §10 R2):
    - re-applying the same action returns 200 with `applied=0`
    - migrate, pause/resume, hint PUT, threshold PUT
 

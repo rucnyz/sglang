@@ -118,7 +118,7 @@ Three layers, three cadences (none of them periodic).
 | Layer | Where | Trigger event | Role |
 |---|---|---|---|
 | inline scorer | inside sglang's eviction-decision callsite | sglang-internal: free-pages-now | scoring function for the allocator's eviction heap (operates on the hint table) |
-| kv_scheduler | daemon | workload events (12 kinds, §4) | **unit-migrate candidate generator** consumed by §9 `joint_decide` |
+| kv_scheduler | daemon | workload events (13 kinds, §4) | **unit-migrate candidate generator** consumed by §9 `joint_decide` |
 | admission_controller | daemon | every workload event | **program pause / resume candidate generator** consumed by §9 `joint_decide` |
 
 All three use the **same V_u rule**.  They live where they live
@@ -126,7 +126,7 @@ because of **event ownership**, not as fallbacks for each other:
 the eviction-decision callsite is sglang-internal, fires
 synchronously on the scheduler step, and cannot wait for an HTTP
 round-trip to the daemon, so its V_u handler must be in-process.
-The 12 workload events are surfaced over HTTP (proxy + sglang
+The 13 workload events are surfaced over HTTP (proxy + sglang
 webhook), so their V_u handlers live in the daemon.
 
 ### Aginfer is sglang's decision pipeline (superset framing)
@@ -176,7 +176,7 @@ restructuring the framework.
 
 ## 4. Events
 
-Twelve event kinds.  The daemon is **strictly reactive** to events;
+Thirteen event kinds.  The daemon is **strictly reactive** to events;
 the system has no internal timer.
 
 | kind | emitted by | semantic |
@@ -193,6 +193,7 @@ the system has no internal timer.
 | `PRESSURE_CRITICAL` | sglang webhook | allocator-truth HBM occupancy crossed `theta_crit` upward (above HIGH); same payload shape as `MEMORY_PRESSURE`.  Routing-priority signal: the event router preempts any pending lower-priority event and runs `joint_decide` immediately.  See §9 for why no decision-rule branch is needed (forecast + widened `Pause.relief` carry the urgency) |
 | `PRESSURE_RESOLVED` | sglang webhook | allocator-truth HBM occupancy crossed `theta_lo` downward (back to OK band, hysteresis) |
 | `APPLY_FAILED` | sglang webhook | a daemon-issued action could not be applied; payload carries `{endpoint, action_id, reason}` where `endpoint ∈ {migrate, program_paused, hints, thresholds}` and `reason` is the skip-class (§6 `POST /aginfer/migrate` reasons + the analogue for other endpoints).  The daemon's `joint_decide` re-evaluates on the next event handler entry; idempotent invariants (§10) let it safely re-issue any superseding action without explicit retry bookkeeping |
+| `HASH_COLLISION` | sglang webhook | sglang's radix-tree hash-bucket insert observed a content mismatch on an existing hash — two distinct token sequences produced the same hash, or the hash table got corrupted.  Payload `{hash, existing_node_summary, incoming_node_summary}`.  The daemon `fatal('hash_collision', ...)` with a forensic dump on receipt — this is a deployment-bug-class fault (§10), not absorbed.  Probability is < 10⁻²² on a 128-bit content hash at any tree size aginfer encounters; the event exists so the design fails loud if the assumption is ever wrong, not because it's expected |
 
 Each event carries (`kind`, `session_id` if applicable, `payload`).
 The payload may include event-specific context the decision rule can
@@ -1918,7 +1919,7 @@ candidates from the live state.  joint_decide runs the same DP;
 typically there is nothing to do (no pressure, no slack-to-fill)
 and an empty plan is returned, but the entry-point is uniform.
 A reader skimming for "what events trigger decisions" should
-read: all 12 events trigger `joint_decide`; what differs is
+read: all 13 events trigger `joint_decide`; what differs is
 which candidates are eligible.
 
 The two phases are mutually exclusive per event (forecast is
@@ -2297,11 +2298,11 @@ for pause/resume).
 | invariant | enforced by |
 |---|---|
 | **Daemon is a single asyncio process**: one OS process hosts the event_router consumer task, the proxy's request-forwarding tasks, and the outbound action worker task.  They share memory directly (no IPC).  On crash all tasks die together; "the daemon" and "the proxy" never desynchronise.  This makes the volatile-queue and proxy-gate invariants below well-defined as a single failure domain | daemon launch script + asyncio runtime |
-| **Two fault classes**: faults split into **deployment-bug** (schema mismatch, missing required state fields, joint_decide infeasibility, `peak_bw_bps ≤ 0`, mode-switch attempt — "this should never happen in a correct deployment") and **load** (apply_failed race, sglang briefly slow, transient outbound queue depth — "this is just how the system handles bursty workload").  Deployment-bug faults `fatal(...)` — the daemon dumps forensic state and exits.  Load faults absorb — the daemon logs, continues, lets the next-event re-convergence handle it.  The two classes never blur: a load fault never becomes fatal, and a deployment-bug fault never gets a "let's retry" wrapper.  Hash collision (separate invariant below) is excluded — it has no detection path by design and would manifest as silent corruption, not as a fault class | daemon code review |
+| **Two fault classes**: faults split into **deployment-bug** (schema mismatch, missing required state fields, joint_decide infeasibility, `peak_bw_bps ≤ 0`, mode-switch attempt, hash collision — "this should never happen in a correct deployment") and **load** (apply_failed race, sglang briefly slow, transient outbound queue depth — "this is just how the system handles bursty workload").  Deployment-bug faults `fatal(...)` — the daemon dumps forensic state and exits.  Load faults absorb — the daemon logs, continues, lets the next-event re-convergence handle it.  The two classes never blur: a load fault never becomes fatal, and a deployment-bug fault never gets a "let's retry" wrapper | daemon code review |
 | **Fatal halts emit forensic state dump**: every `fatal(reason, **context)` call writes a structured JSON file to `<daemon-data>/forensic/<reason>_<ts>.json` containing the event that triggered the handler, the full `/aginfer/state` snapshot fetched at handler entry, the candidate sets produced upstream, all DP inputs (`bytes_needed`, `cap_left`, `bucket_size`, etc.), the failure reason string, and the Python traceback — then logs a fatal-level line pointing at the file path and `sys.exit(1)`.  Supervisor restart policy is deployment-controlled; the forensic file survives the restart for post-hoc analysis | daemon `fatal()` helper |
 | **Policy mode is launch-time, never runtime-switched**: sglang launches in exactly one mode — either with the aginfer daemon attached (full policy via hint table), or with the default policy module (LRU-equivalent V_u, baseline ablation).  A daemon configured for "aginfer full" that loses its daemon mid-run halts loudly; it does not degrade to the default module.  Mode is a deployment choice, not a runtime fallback | sglang launch flags + daemon liveness check |
 | **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer anywhere — kv_scheduler, admission, forecast refresh, program_tracker, and the proxy all recompute only on event arrival.  SESSION_END is signalled by the client explicitly (§4); there is no time-based fallback | asyncio queue + single consumer |
-| **Unit hashes are content-derived and collision-free in practice**: `u.hash` is sglang's existing radix-tree key — a 128-bit content-derived hash over the unit's token prefix.  Collision probability is negligible at any tree size aginfer encounters (≤ 10⁷ live units, birthday-paradox upper bound < 10⁻²²).  Collision is therefore treated as impossible; on the off-chance of one, behavior is undefined and falls under "deployment bug" — the design does not carry a collision-detection / merge path | sglang radix-tree hash function |
+| **Unit hashes are content-derived and collision-detected at insert**: `u.hash` is sglang's existing 128-bit content-derived radix-tree key over the unit's token prefix.  Collision probability is negligible at any tree size aginfer encounters (≤ 10⁷ live units, birthday-paradox upper bound < 10⁻²²) but is verified, not assumed: on every hash-bucket insertion sglang compares the incoming token sequence against the existing node's sequence.  Mismatch fires the `HASH_COLLISION` webhook (§4) and the daemon `fatal()`s with a forensic dump.  Cost is amortised free — sglang's `match_prefix` already walks the token sequence, so the comparison reuses that work | sglang radix-tree hash-bucket insert |
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
 | **Idempotent daemon→sglang actions**: every endpoint accepts re-application — migrate (a no-op `applied=0` with a `race:*` skip when the target tier already matches), pause/resume (200 with `applied:false` when the program is already in the requested state), hint PUT (overwrite-by-stamp).  Same reasoning across all of them: the daemon may emit the same action twice across consecutive event handlers because state-dump propagation lags the daemon's just-emitted action; the sglang side must absorb this without error | sglang endpoints |
 | **Outbound queue is volatile**: the daemon's outbound action queue lives in memory only.  On daemon crash, pending actions are lost — and that's correct.  After restart, the daemon's first `GET /aginfer/state` reads the live state; if the lost action was needed, `joint_decide` re-issues it.  No disk WAL exists for outbound actions, by the same first-principles argument that rules out a webhook persistence WAL (§11): every authoritative quantity already lives in sglang's state, the daemon is just a decision function over it | daemon outbound worker |
