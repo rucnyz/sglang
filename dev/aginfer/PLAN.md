@@ -342,7 +342,7 @@ Conditions that flip an out-of-scope item back into the work plan.
   - daemon-side event-queue depth > 64 sustained, or
   - time-in-queue > 100 ms p99
 - **Hint cross-rank divergence**: triggered if the test in
-  Section 2 ever observes per-rank evicted-hash divergence under
+  §2 ever observes per-rank evicted-hash divergence under
   TP > 1
 - **Linear `h_(τ, sp)(occ)` placeholder**: replaced by whatever
   T12 calibration picks; if T12 finds linear *is* the best fit,

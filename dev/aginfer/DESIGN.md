@@ -10,7 +10,7 @@ of what's described, the simplification is called out explicitly.
 A daemon-side scheduler that decides, on every workload-relevant
 event:
 
-* which cache **units** belong in which **tier** (HBM / DRAM / Disk / Drop)
+* which cache **units** belong in which **tier** (HBM / DRAM / DISK / DROP)
 * which **programs** should be paused or resumed under memory pressure
 
 The mechanism is **event-driven**, **per-unit value-based**, and
@@ -46,7 +46,7 @@ Three facts follow that drive every design choice:
 2. **Cache value lives on a continuum, not binary keep/evict.**
    "1% chance of future reuse" doesn't deserve HBM but isn't worth
    dropping either.  Hardware exposes a tier hierarchy (HBM ≫ DRAM
-   ≫ Disk in $/bandwidth); the decision space must match.
+   ≫ DISK in $/bandwidth); the decision space must match.
 
 3. **KV is owned by programs.**  Per-unit micro-management can't
    express "pause this whole program because its tools are slow and
@@ -94,7 +94,7 @@ Three layers, three cadences (none of them periodic).
                  ▼                          ▼
        ┌──────────────────────────────────────────────────┐
        │  sglang (inference engine; HBM↔DRAM via HiCache,  │
-       │          DRAM↔Disk via Mooncake)                   │
+       │          DRAM↔DISK via Mooncake)                   │
        │                                                   │
        │  inline scorer — V_u handler for the              │
        │    eviction-decision callsite (synchronous, in-   │
@@ -521,7 +521,7 @@ Response:
 * **`promote_load_back_declined:<category>`** — `load_back()` for
   an `add_tiers: ["HBM"]` action declined cleanly, with
   `<category>` distinguishing the sub-cause (full-allocator alloc
-  fail, SWA sub-pool evict short, etc.).  Usually transient.
+  fail, SWA subpool evict short, etc.).  Usually transient.
 * **`promote_raised:<exc>:<loc>:<msg>`** — load_back threw.
   Indicates an invariant break; investigate.
 * **`write_through_declined:<category>`** — `add_tiers: ["DRAM"]`
@@ -742,8 +742,9 @@ because the constraint is a one-sided byte threshold.
 
 | symbol | unit | meaning |
 |---|---|---|
-| `u.n_bytes`, `u.n_tokens` | nested-dict / tokens | `u.n_bytes` is a nested dict `{tier: {subpool: bytes}}` (per §5).  `bytes_at(u, τ)` = bytes u occupies at tier τ; `total_bytes(u, τ)` = sum across τ's subpools |
+| `u.n_bytes`, `u.n_tokens` | nested-dict / tokens | `u.n_bytes` is a nested dict `{tier: {subpool: bytes}}` (per §5).  `bytes_at(u, τ)` = bytes u occupies at tier τ (= sum over τ's subpools, returns 0 if τ ∉ residence) |
 | `p_hat(u, Δt)` | unitless ∈ [0,1] | conditional reuse probability over horizon Δt |
+| `λ` | accesses / sec | per-program-state access rate used in hint-pushed `p_access` estimators (§6 hint table, §7 estimator chain); legacy Poisson-fit shorthand subsumed by the conditional `p_hat` form |
 | `Δt` | seconds | decision look-ahead horizon (§7 inputs) |
 | `hold_time` | seconds | expected residence in candidate tier (§7 inputs) |
 | `reload_from(u, τ)`, `reload_from_DROP(u)` | seconds | per-paper-§3 reload costs `ρ_τ × n_tokens`, `π_u × n_tokens` |
@@ -1064,7 +1065,7 @@ def session_scoped_units(units, sid):
     after END they're either evicted (if all V_u<0) or demoted to
     the cheapest tier that still offers nonzero `p_hat` from the
     workload-prior (next program with this prefix shape will
-    benefit from a warm DRAM/Disk copy)."""
+    benefit from a warm DRAM/DISK copy)."""
     return frozenset(u for u in units if u.session_ids == {sid})
 
 def child_output_unit(event):
@@ -1200,7 +1201,7 @@ Estimator priority (highest signal first):
 
 `hold_time` is "how long the unit will actually stay in τ before
 the next migrate/evict/drop reconsiders it".  This is the time
-the `h_τ(occupancy) × bytes × hold_time` holding tax integrates
+the `h_(τ, sp)(occupancy) × bytes × hold_time` holding tax integrates
 over — a **physical residence time**, not a prediction window.
 
 Under Poisson-rate models the two quantities collapse to `1/λ`
@@ -1259,7 +1260,7 @@ Why per-subpool, not per-tier: in a hybrid Mamba+attention model,
 the Mamba snapshot subpool and the attention `full` subpool can
 sit at very different occupancies and have very different
 displacement-cost curves (a Mamba snapshot is a much larger byte
-unit and rarer-to-reuse).  Sharing one `h_τ` across both subpools
+unit and rarer-to-reuse).  Sharing one `h_(τ, ·)` across both subpools
 would mean Mamba pressure shows up as attention demotion or vice
 versa.
 
@@ -1340,8 +1341,8 @@ output materialises as a `subagent_ctx` unit.
 **Newborns are HBM-only by physical necessity.**  The forward
 pass writes KV into HBM-backed tensors directly (GPU compute
 writes go to device memory); there is no `alloc_at_tier(σ)` API
-because there cannot be one — DRAM/Disk are pure storage
-classes, only reachable through a load-back round-trip and
+because there cannot be one — DRAM/DISK are pure storage
+classes, only reachable through a `load_back` round-trip and
 unable to host compute.  The first physical residence of every
 unit is HBM-only by construction.
 
@@ -1396,7 +1397,7 @@ def pause_candidates(state, event):
         Pause(
             program_id = p.id,
             cost       = V_u_program(p, state)                # work-loss (seconds)
-                       + marginal_pause_cost(p, event),
+                       + marginal_pause_cost(p, state),
             relief     = pause_relief(p, state),              # HBM bytes (≥ 0)
         )
         for p in _programs(state)
@@ -1651,7 +1652,7 @@ entirely).
 
 `theta_hi` (up-crossing) and `theta_lo` (down-crossing) form the
 admission hysteresis band.  sglang's webhook and the daemon's
-admission controller must read the SAME values; this is launched
+`admission_controller` must read the SAME values; this is launched
 from a single source per the §10 invariant.
 
 ## 9. Joint decision over a union action space
@@ -1788,7 +1789,7 @@ A workload with a Mamba snapshot subpool at 95 % occupancy and an
 attention `full` subpool at 60 % will see `bytes_needed[mamba] > 0
 and bytes_needed[full] == 0` — the DP picks candidates that relieve
 specifically `mamba` (Pauses of programs holding large mamba state,
-Migrates of mamba-leaf units to DRAM/Disk), without disturbing
+Migrates of Mamba-leaf units to DRAM/DISK), without disturbing
 attention-resident units that are cheap and healthy.
 
 Both phases are **exact 0/1 knapsack** at K ≈ tens of items
@@ -2010,7 +2011,7 @@ its knapsack from scratch.
 > per-item filter rather than as a multi-dimensional knapsack
 > resource.  This is a pure code lag — both replacements run in
 > the same microsecond order on K ≈ 30 candidates.  Replace with
-> `knapsack_min_cost_multi` / `knapsack_max_value` per the
+> `knapsack_min_cost_multi` / `knapsack_max_value_multi` per the
 > pseudo-code above.
 
 ### What collapses out
@@ -2062,7 +2063,7 @@ for pause/resume).
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
 | **Pool-truth admission, per subpool**: admission's `forecast(state)` returns a dict over HBM subpools, each reading `state.pool_usage.HBM.subpools[sp].used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes).  Pressure fires when **any** subpool's forecast crosses `theta_hi`; this prevents the failure mode where a Mamba snapshot subpool at 95 % is hidden by an attention subpool at 60 %.  If the snapshot lacks `pool_usage.HBM.subpools` the daemon halts loudly | daemon `admission_controller.forecast` |
-| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_τ(occ)` reads `state.tier_holding_cost[τ].h_max_per_byte_sec`, never a constant baked into the daemon.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; operator config sets per-tier `h_max`); the daemon consumes them.  If `link_stats` or `tier_holding_cost` are missing the daemon halts loudly | sglang instrumentation + operator config |
+| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_(τ, sp)(occ)` reads `state.tier_holding_cost[τ][sp].h_max_per_byte_sec`, never a constant baked into the daemon.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; operator config sets per-(tier, subpool) `h_max`); the daemon consumes them.  If `link_stats` or `tier_holding_cost` are missing the daemon halts loudly | sglang instrumentation + operator config |
 | **Pool-truth V_u**: V_u's `h_(τ, sp)(occ)` term reads `pool_usage[τ].subpools[sp]` (the per-subpool allocator-truth view) so holding cost reflects real pressure, not an inferred radix-tree slice | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
 | **Hint table covers every live unit**: sglang seeds a "fresh access just happened" entry on unit birth (`p_hat ≈ 1` for the next event horizon); the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
@@ -2227,7 +2228,7 @@ matching the round-6 multi-resource baseline.
 ### S2 — SWA-hybrid attention (e.g. Mistral, Gemma)
 
 Two attention components: full-attention layers and sliding-window
-layers, with separate sub-pools because SWA layers retain only the
+layers, with separate subpools because SWA layers retain only the
 last N tokens per sequence.
 
 | field | shape |
