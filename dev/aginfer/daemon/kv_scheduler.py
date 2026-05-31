@@ -136,98 +136,194 @@ def _tier_from_string(label: str) -> Optional[Tier]:
 
 
 def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
-    """Audit round-1 B2: aggregate a multi-rank state payload.
+    """Aggregate a multi-rank DESIGN §5 state payload.
 
     sglang multi-DP emits ``{"per_rank": [<per-rank dict>, ...]}``.
-    The per-rank dicts each have their own ``tier_usage`` and
-    ``units``; the daemon needs one global view to make a coherent
-    scheduling decision (units that exist on rank R can only be
-    migrated by rank R, but the policy needs to see the GLOBAL HBM
-    occupancy when deciding which rank's units to demote).
+    The daemon needs one global view to make a coherent scheduling
+    decision (units that exist on rank R can only be migrated by
+    rank R, but the policy must see the GLOBAL HBM occupancy when
+    deciding which rank's units to demote).
 
-    Aggregation rule:
-      * tier_usage: sum used_bytes and cap_bytes across ranks (HBM is
-        per-rank; total HBM is the sum).
-      * units: concatenate verbatim — **no hash prefix**.  Audit
-        round-2 R2-B1: previous version prefixed with ``rN/`` so the
-        daemon could "route back" to the right rank, but sglang's
-        ``POST /aginfer/migrate`` does an EXACT ``hash_to_node.get(h)``
-        lookup; a prefix landed every action in ``skipped`` and the
-        daemon never knew (200 + empty ``applied_hashes``).  sglang's
+    Per-field aggregation rule (DESIGN §6 multi-rank table):
+      * pool_usage[tier].subpools[sp].{used,cap,available,evictable}_bytes:
+        SUM across ranks (each rank has its own KV pool).  page_bytes
+        is identical across ranks (static deployment config); take
+        rank-0.  Subpool key set must be identical across ranks
+        (sglang's tree_components are TP-shared); ASSERT on mismatch.
+      * link_stats[link].peak_bw_bps: identical across ranks (static
+        deployment); take rank-0.
+      * link_stats[link].recent_throughput_bps: MEAN across ranks
+        (EMAs of independent per-rank links).
+      * link_stats[link].time_since_last_sample_s: MAX across ranks
+        (the LONGEST idle window; admission's bw_free branch keys on
+        the worst-case link).
+      * tier_holding_cost[tier][sp].h_max_per_byte_sec: identical
+        across ranks (static deployment); take rank-0.
+      * throughput_ema.prefill_bps: SUM across ranks (each rank
+        processes its prefill slice; aggregate is the system rate).
+      * throughput_ema.decode_per_program[pid]: SUM across ranks
+        (a program may have decode work on multiple ranks via TP).
+      * per_program_usage[pid].hbm.committed[sp] (and dram.committed):
+        SUM across ranks; state takes the most-active (REASONING >
+        ACTING > PAUSED > ENDED) across ranks; unit_hashes is the
+        union.  pre_pause_state mirrors state.
+      * units: concatenate verbatim — **no hash prefix**.  sglang's
         hashes are globally unique (hex SHA256 or ``node-<id>``); if
         two ranks emit the SAME hash it's the same logical unit
-        (replicated prefix) and we dedupe via ``seen_hashes`` —
-        broadcasting one migrate to both ranks is the correct action.
-      * time_counter: max across ranks (clocks may differ).
+        (replicated prefix) and we dedupe — broadcasting one migrate
+        to both ranks is the correct action.  On residence disagree-
+        ment between ranks we keep the COLDER union (= the unit's
+        bytes are persisted somewhere even if mid-migration on one
+        rank).
+      * time_counter: MAX across ranks (clocks may differ).
+
     Single-rank shape (no ``per_rank``) is returned unchanged.
     """
     if "per_rank" not in state_json:
         return state_json
-    per_rank = state_json["per_rank"]
-    agg_tu: Dict[str, Dict[str, int]] = {
-        "HBM": {"used_bytes": 0, "cap_bytes": 0},
-        "DRAM": {"used_bytes": 0, "cap_bytes": 0},
-        "DISK": {"used_bytes": 0, "cap_bytes": 0},
+    per_rank: List[Dict[str, Any]] = state_json["per_rank"]
+    if not per_rank:
+        raise ValueError("per_rank list is empty")
+
+    # ---- pool_usage: per-(tier, subpool) sum across ranks ----
+    rank0 = per_rank[0]
+    agg_pool: Dict[str, Dict[str, Any]] = {}
+    for tier in ("HBM", "DRAM", "DISK"):
+        rank0_subpools = rank0["pool_usage"][tier]["subpools"]
+        sp_keys = set(rank0_subpools.keys())
+        agg_subpools: Dict[str, Dict[str, int]] = {}
+        for sp in sp_keys:
+            agg_subpools[sp] = {
+                "used_bytes": 0,
+                "cap_bytes": 0,
+                "available_bytes": 0,
+                "evictable_bytes": 0,
+                # page_bytes is static; take rank-0's value.
+                "page_bytes": int(rank0_subpools[sp]["page_bytes"]),
+            }
+        for rank in per_rank:
+            rank_subpools = rank["pool_usage"][tier]["subpools"]
+            if set(rank_subpools.keys()) != sp_keys:
+                raise ValueError(
+                    f"per-rank pool_usage[{tier}].subpools key mismatch: "
+                    f"rank-0 has {sp_keys}, this rank has "
+                    f"{set(rank_subpools.keys())}")
+            for sp, fields in rank_subpools.items():
+                agg_subpools[sp]["used_bytes"] += int(fields["used_bytes"])
+                agg_subpools[sp]["cap_bytes"] += int(fields["cap_bytes"])
+                agg_subpools[sp]["available_bytes"] += int(
+                    fields["available_bytes"])
+                agg_subpools[sp]["evictable_bytes"] += int(
+                    fields["evictable_bytes"])
+        agg_pool[tier] = {"subpools": agg_subpools}
+
+    # ---- link_stats ----
+    rank0_links = rank0["link_stats"]
+    agg_links: Dict[str, Dict[str, float]] = {}
+    for link in rank0_links:
+        peak_bw = int(rank0_links[link]["peak_bw_bps"])
+        total_throughput = 0.0
+        max_idle = 0.0
+        for rank in per_rank:
+            entry = rank["link_stats"][link]
+            total_throughput += float(entry["recent_throughput_bps"])
+            max_idle = max(max_idle, float(entry["time_since_last_sample_s"]))
+        agg_links[link] = {
+            "peak_bw_bps": peak_bw,
+            "recent_throughput_bps": total_throughput / len(per_rank),
+            "time_since_last_sample_s": max_idle,
+        }
+
+    # ---- tier_holding_cost: identical across ranks; take rank-0 ----
+    agg_holding = rank0["tier_holding_cost"]
+
+    # ---- throughput_ema: sum prefill, merge decode per program ----
+    agg_throughput: Dict[str, Any] = {
+        "prefill_bps": sum(
+            float(rank["throughput_ema"]["prefill_bps"]) for rank in per_rank),
+        "decode_per_program": {},
     }
-    # G10 fix: aggregate allocator-level pool_usage across ranks.
-    # token_usage is recomputed at the end from summed used/cap; the
-    # max-of-sub-pools convention (full vs swa) is preserved per rank
-    # then SUMMED across ranks (a rank under pressure raises the max).
-    agg_pool: Dict[str, Dict[str, int]] = {
-        "HBM": {"used_bytes": 0, "cap_bytes": 0,
-                "available_bytes": 0, "evictable_bytes": 0},
-    }
-    pool_present = False
-    # Track each hash's index in agg_units so we can update on tier
-    # disagreement (audit round-5 MINOR: mid-migration race where
-    # rank-0 still reports HBM while rank-1 already reports DRAM —
-    # prefer the COLDER tier under the assumption the migration is
-    # in-progress and the unit is on its way out of hot tiers).
+    for rank in per_rank:
+        for pid, bps in rank["throughput_ema"]["decode_per_program"].items():
+            agg_throughput["decode_per_program"][pid] = (
+                agg_throughput["decode_per_program"].get(pid, 0.0)
+                + float(bps))
+
+    # ---- per_program_usage: sum committed bytes; union unit_hashes ----
+    # State preference (most-active wins): REASONING > ACTING > PAUSED > ENDED.
+    _STATE_RANK = {"REASONING": 3, "ACTING": 2, "PAUSED": 1, "ENDED": 0}
+    agg_programs: Dict[str, Dict[str, Any]] = {}
+    for rank in per_rank:
+        for pid, e in rank["per_program_usage"].items():
+            agg = agg_programs.get(pid)
+            if agg is None:
+                agg = {
+                    "hbm": {"committed": {}, "inflight": {}},
+                    "dram": {"committed": {}},
+                    "state": e["state"],
+                    "pre_pause_state": e["pre_pause_state"],
+                    "unit_hashes": [],
+                }
+                agg_programs[pid] = agg
+            for side, side_dict in (("hbm", e["hbm"]),
+                                    ("dram", e["dram"])):
+                for sub_kind, sub in side_dict.items():
+                    if side == "dram" and sub_kind != "committed":
+                        continue
+                    bucket = agg[side][sub_kind]
+                    for sp, b in sub.items():
+                        bucket[sp] = bucket.get(sp, 0) + int(b)
+            if _STATE_RANK[e["state"]] > _STATE_RANK[agg["state"]]:
+                agg["state"] = e["state"]
+                agg["pre_pause_state"] = e["pre_pause_state"]
+            agg["unit_hashes"].extend(e["unit_hashes"])
+    # Dedup unit_hashes per program (rank-replicated units appear on
+    # multiple ranks).
+    for pid, agg in agg_programs.items():
+        agg["unit_hashes"] = sorted(set(agg["unit_hashes"]))
+
+    # ---- units: concat with hash-dedup (union residence on collision) ----
     agg_units: List[Dict[str, Any]] = []
     hash_to_idx: Dict[str, int] = {}
     agg_time = 0
-    # Tier ordering (colder = lower value): DROP < DISK < DRAM < HBM.
-    _tier_rank = {"HBM": 3, "DEVICE": 3, "DRAM": 2, "HOST": 2, "DISK": 1, "DROP": 0}
     for rank in per_rank:
-        rank_tu = rank["tier_usage"]
-        for label in agg_tu:
-            sub = rank_tu[label]
-            agg_tu[label]["used_bytes"] += int(sub["used_bytes"])
-            agg_tu[label]["cap_bytes"] += int(sub["cap_bytes"])
-        rank_pool = rank.get("pool_usage")
-        if rank_pool and "HBM" in rank_pool:
-            pool_present = True
-            sub = rank_pool["HBM"]
-            agg_pool["HBM"]["used_bytes"] += int(sub.get("used_bytes", 0))
-            agg_pool["HBM"]["cap_bytes"] += int(sub.get("cap_bytes", 0))
-            agg_pool["HBM"]["available_bytes"] += int(sub.get("available_bytes", 0))
-            agg_pool["HBM"]["evictable_bytes"] += int(sub.get("evictable_bytes", 0))
         for u in rank["units"]:
             uhash = str(u["hash"])
             if uhash in hash_to_idx:
-                # Replicated-prefix or in-flight migration: same hash
-                # on multiple ranks.  If tiers disagree, keep the
-                # COLDER one (assume migration is in progress).
+                # Replicated-prefix: union residence (the unit is in
+                # whatever tiers ANY rank reports for it; the colder
+                # union is a superset of any single rank's view).
                 existing = agg_units[hash_to_idx[uhash]]
-                new_rank = _tier_rank.get(str(u["tier"]).upper(), 99)
-                old_rank = _tier_rank.get(str(existing["tier"]).upper(), 99)
-                if new_rank < old_rank:
-                    agg_units[hash_to_idx[uhash]] = dict(u)
+                merged_residence = sorted(
+                    set(existing["residence"]) | set(u["residence"]))
+                # n_bytes: max across ranks per (tier, subpool) — same
+                # logical unit, ranks should agree, take max to absorb
+                # mid-migration race.
+                merged_nb: Dict[str, Dict[str, int]] = {}
+                for tier in set(existing["n_bytes"]) | set(u["n_bytes"]):
+                    merged_nb[tier] = {}
+                    for sp in set(existing["n_bytes"].get(tier, {})) | set(
+                            u["n_bytes"].get(tier, {})):
+                        merged_nb[tier][sp] = max(
+                            int(existing["n_bytes"].get(tier, {}).get(sp, 0)),
+                            int(u["n_bytes"].get(tier, {}).get(sp, 0)),
+                        )
+                existing["residence"] = merged_residence
+                existing["n_bytes"] = merged_nb
                 continue
             hash_to_idx[uhash] = len(agg_units)
             agg_units.append(dict(u))
         agg_time = max(agg_time, int(rank["time_counter"]))
-    out: Dict[str, Any] = {
-        "tier_usage": agg_tu,
-        "units": agg_units,
+
+    return {
         "time_counter": agg_time,
+        "throughput_ema": agg_throughput,
+        "pool_usage": agg_pool,
+        "per_program_usage": agg_programs,
+        "units": agg_units,
+        "link_stats": agg_links,
+        "tier_holding_cost": agg_holding,
     }
-    if pool_present:
-        hbm = agg_pool["HBM"]
-        cap = hbm["cap_bytes"]
-        hbm["token_usage"] = (hbm["used_bytes"] / cap) if cap > 0 else 0.0
-        out["pool_usage"] = agg_pool
-    return out
 
 
 def _log_unknown_tier_once(label: str, seen: set) -> None:
@@ -255,63 +351,74 @@ def build_paper_state(
     unknown_tier_log: set,
     lambda_acting: float = _DEFAULT_LAMBDA_ACTING,
 ) -> SchedulerState:
-    """Convert sglang ``/aginfer/state`` JSON → ``SchedulerState``.
+    """Convert sglang ``/aginfer/state`` JSON (DESIGN §5) → ``SchedulerState``.
 
-    paper §3's reduced state: per-unit (tier, age, p_hat, λ), per-tier
-    usage, and the event's decision_set.  ``λ`` for ACTING/PAUSED
-    programs is the calibrated floor; for REASONING programs we keep
-    the inline scorer's ``hits/age`` proxy so two scoring paths agree.
+    Paper §3's reduced state: per-unit (residence, age, p_hat, λ),
+    per-(tier, subpool) usage, and the event's decision_set.  ``λ``
+    for ACTING/PAUSED programs is the calibrated floor; for REASONING
+    programs we keep the inline scorer's ``hits/age`` proxy so two
+    scoring paths agree.
 
-    Audit round-3.5: removed dead null-defense (``or {}`` / ``or []``
-    / ``or 0`` patterns) on fields sglang's dump_aginfer_state always
-    emits with proper types.  A missing/null field is now a contract
-    violation — handle()'s try/except logs the full traceback so ops
-    see exactly which field broke.  Also removed the
-    ``raw.get("tier", "HBM")`` default, which was a B1-class bug
-    (missing tier → silent HBM misclassification).
-
-    sglang's emission contract:
-      * tier_usage: dict with HBM / DRAM / DISK sub-dicts
-        (each has used_bytes + cap_bytes, both int)
-      * units: list of dicts; each has hash, tier, n_tokens, n_bytes,
-        last_access_time, hit_count, session_ids
+    sglang's emission contract (post-T17):
+      * pool_usage: {tier: {"subpools": {sp: {used/cap/avail/evict/page_bytes}}}}
+      * units: each has hash, residence: list[Tier], n_tokens,
+               n_bytes: dict[tier][sp]→int, last_access_time, hit_count,
+               session_ids
+      * per_program_usage: per-pid committed/inflight bytes + state
       * time_counter: int
+      * link_stats / tier_holding_cost / throughput_ema: aux fields
     """
-    # Audit round-5 MAJOR: scheduler emits ``unsupported_tree_cache``
-    # marker when the tree cache doesn't expose ``dump_aginfer_state``
-    # (e.g. a non-Unified RadixCache).  Daemon used to silently see
-    # all-zero state and make no decisions — log a one-shot warning
-    # per tree-cache class name so ops can grep for the misconfig.
-    marker = state_json.get("unsupported_tree_cache")
-    if marker:
-        _log_unknown_tier_once(
-            f"unsupported_tree_cache:{marker}", unknown_tier_log
-        )
+    # Halt-loudly on unsupported tree cache (DESIGN §5 invariant).
+    if "unsupported_tree_cache" in state_json:
+        raise ValueError(
+            f"sglang reported unsupported_tree_cache="
+            f"{state_json['unsupported_tree_cache']!r}; daemon refuses to "
+            f"run against a non-UnifiedRadixCache deployment per DESIGN §5")
 
-    # Audit round-1 B2: multi-rank sglang (TP × DP > 1) emits
-    # ``{"per_rank": [...]}``; aggregate into a single global view.
+    # Multi-rank aggregation: DESIGN §6 per-field table.
     state_json = _flatten_per_rank(state_json)
 
-    tier_usage = TierUsage(capacity_bytes={}, used_bytes={})
-    raw_tu = state_json["tier_usage"]
-    for label, tier in (("HBM", Tier.HBM), ("DRAM", Tier.DRAM), ("DISK", Tier.DISK)):
-        sub = raw_tu[label]
-        tier_usage.capacity_bytes[tier] = int(sub["cap_bytes"])
-        tier_usage.used_bytes[tier] = int(sub["used_bytes"])
-    # bw_free defaults: use the full per-pair BW from costs config.
-    # Production T8 / measurement layer can plumb live bw_free in here.
-    tier_usage.bw_free = dict(default_costs().bw)
-
-    # G10 fix: extract allocator-truth pool_pressure for admission gating.
-    # Missing key (older sglang) is acceptable — pool_pressure stays empty
-    # and admission falls back to tier_usage.occupancy_ratio (the old,
-    # always-~0 behavior).  Log once if seen so ops notice the rollback.
-    pool_pressure: Dict[Tier, float] = {}
-    raw_pool = state_json.get("pool_usage")
-    if raw_pool:
-        hbm_sub = raw_pool.get("HBM")
-        if hbm_sub and "token_usage" in hbm_sub:
-            pool_pressure[Tier.HBM] = float(hbm_sub["token_usage"])
+    # ---- TierUsage: per-(tier, subpool) view from pool_usage ----
+    raw_pool = state_json["pool_usage"]
+    tier_usage = TierUsage()
+    pool_pressure: Dict[Tier, Dict[str, float]] = {}
+    for label, tier in (("HBM", Tier.HBM), ("DRAM", Tier.DRAM),
+                        ("DISK", Tier.DISK)):
+        subpools = raw_pool[label]["subpools"]
+        tier_usage.pool_used[tier] = {}
+        tier_usage.pool_cap[tier] = {}
+        tier_usage.pool_available[tier] = {}
+        tier_usage.pool_evictable[tier] = {}
+        tier_usage.page_bytes[tier] = {}
+        pool_pressure[tier] = {}
+        for sp, fields in subpools.items():
+            used = int(fields["used_bytes"])
+            cap = int(fields["cap_bytes"])
+            tier_usage.pool_used[tier][sp] = used
+            tier_usage.pool_cap[tier][sp] = cap
+            tier_usage.pool_available[tier][sp] = int(fields["available_bytes"])
+            tier_usage.pool_evictable[tier][sp] = int(fields["evictable_bytes"])
+            tier_usage.page_bytes[tier][sp] = int(fields["page_bytes"])
+            pool_pressure[tier][sp] = used / cap if cap > 0 else 0.0
+    # bw_free derived from link_stats: peak when link is cold-idle,
+    # else (peak - recent_throughput).  Negative bw_free clamps to 0.
+    raw_links = state_json["link_stats"]
+    _LINK_IDLE_SECONDS = 1.0  # DESIGN §7 bw_free branch threshold
+    _LINK_PAIRS = [
+        ((Tier.HBM, Tier.DRAM), "HBM->DRAM"),
+        ((Tier.DRAM, Tier.HBM), "DRAM->HBM"),
+        ((Tier.DRAM, Tier.DISK), "DRAM->DISK"),
+        ((Tier.DISK, Tier.DRAM), "DISK->DRAM"),
+    ]
+    for (src, dst), link_label in _LINK_PAIRS:
+        entry = raw_links[link_label]
+        peak = float(entry["peak_bw_bps"])
+        recent = float(entry["recent_throughput_bps"])
+        idle = float(entry["time_since_last_sample_s"])
+        # DESIGN §7: if link is cold-idle (idle > 1.0 s), assume peak
+        # is fully available.  Otherwise free = peak - recent.
+        bw = peak if idle > _LINK_IDLE_SECONDS else max(0.0, peak - recent)
+        tier_usage.bw_free[(src, dst)] = bw
 
     units_raw = state_json["units"]
     now_counter = int(state_json["time_counter"])
@@ -319,46 +426,38 @@ def build_paper_state(
     units: Dict[str, ReuseUnit] = {}
     # Owner program → its ACTING-floor λ (cached per call).
     program_lambda: Dict[str, float] = {}
+    _RESIDENCE_TIER = {"HBM": Tier.HBM, "DRAM": Tier.DRAM,
+                       "DISK": Tier.DISK}
     for raw in units_raw:
         uhash = str(raw["hash"])
         if not uhash:
             continue
         n_tokens = int(raw["n_tokens"])
-        n_bytes = int(raw["n_bytes"])
-        # sglang's emit code hardcodes "tier" as a non-optional field
-        # (`tier_lit` in the bytes-path / explicit dict key in the dict-
-        # path).  Direct access — KeyError is sglang misbehaving.
-        raw_tier_label = str(raw["tier"])
-        tier = _tier_from_string(raw_tier_label)
-        if tier is None:
-            # Unrecognised label — skip + log once (forward-compat with
-            # future tier labels we haven't taught the daemon about).
-            _log_unknown_tier_once(raw_tier_label, unknown_tier_log)
+        # Residence + nested n_bytes from new schema.
+        residence: List[Tier] = []
+        for tier_label in raw["residence"]:
+            tier = _RESIDENCE_TIER.get(tier_label)
+            if tier is None:
+                _log_unknown_tier_once(tier_label, unknown_tier_log)
+                continue
+            residence.append(tier)
+        if not residence:
+            # Empty residence after filtering — shouldn't happen per
+            # DESIGN §5 (empty-residence units don't appear in units[]);
+            # skip rather than build a degenerate ReuseUnit.
             continue
+        n_bytes_by_tier: Dict[Tier, Dict[str, int]] = {}
+        for tier_label, sp_dict in raw["n_bytes"].items():
+            tier = _RESIDENCE_TIER.get(tier_label)
+            if tier is None:
+                continue
+            n_bytes_by_tier[tier] = {sp: int(b) for sp, b in sp_dict.items()}
         last_access = int(raw["last_access_time"])
         hits = int(raw["hit_count"])
         age = max(1, now_counter - last_access)
-        # baseline λ from inline scorer (hits/age proxy).
-        # `age` is `max(1, ...)` above, so it's always >= 1.
-        # p_hat is computed below from the program-alive rule (T11a).
         lam = max(1e-3, hits / age)
-        # Iterate holders to compute two reductions in one pass:
-        #   * any_acting  → clamp λ to the ACTING floor (paper §7
-        #     "expected reuse interval ~ tool duration" rule).
-        #   * any_alive   → program-alive rule (T11a): if any holder's
-        #     program is tracked-alive, p_hat = 1.0.  Rationale:
-        #     conditional on the queryable predicate
-        #     `ProgramTracker.state(sid) is not None`, monotonic-
-        #     extension workloads have P(next-step reuse) = 1 within
-        #     paper §7's 1-step horizon.  hits/age is unbiased only
-        #     under uniform-Poisson, which multi-turn agent workloads
-        #     violate; the proxy under-values young trunk units (low
-        #     age, hits=1) by ~20× vs structural 1.0.  System-prompt
-        #     high value emerges from T8's shared-aware aggregation
-        #     across many alive holders, not from a separate rule.
-        #     Known limitation: tracker has no ENDED state yet; an
-        #     ended program stays state()!=None until manually
-        #     forgotten.  Bounded over-estimation; v1 trade-off.
+        # Iterate holders to compute λ floor + p_hat (program-alive rule
+        # — see prior comments in commit history for §7 justification).
         session_ids = raw["session_ids"]
         any_acting = False
         any_alive = False
@@ -367,15 +466,6 @@ def build_paper_state(
             if st is not None:
                 any_alive = True
             if sid not in program_lambda:
-                # Audit round-2 R2-M1: PAUSED programs are STILL
-                # mid-tool-call (admission_controller pinned them).
-                # Paper §7's "expected reuse interval ~ tool duration"
-                # applies to them too.  Round-1 only fired the floor
-                # for ACTING; PAUSED fell back to hits/age — the
-                # OPPOSITE of paper intent (a high-hit prefix would
-                # get high λ and be KEPT on HBM during the tool call,
-                # which is exactly what admission gating is trying
-                # to free up).
                 program_lambda[sid] = (
                     _clamp_lambda_acting(lambda_acting)
                     if st in (State.ACTING, State.PAUSED)
@@ -387,8 +477,6 @@ def build_paper_state(
             lam = program_lambda[
                 next(sid for sid in session_ids if program_lambda[sid] > 0)
             ]
-        # Program-alive rule (see comment above).  Fall back to
-        # hits/age proxy when ALL holders are unknown (orphan unit).
         if any_alive:
             p_hat = 1.0
         else:
@@ -398,8 +486,8 @@ def build_paper_state(
             type=UnitType.SESSION,  # platform / tool_def tags arrive later
             scope=Scope.SESSION,
             n_tokens=n_tokens,
-            n_bytes=n_bytes,
-            tier=tier,
+            n_bytes_by_tier=n_bytes_by_tier,
+            residence=residence,
             age_seconds=float(age),
             p_hat=p_hat,
             lambda_rate=lam,
@@ -540,12 +628,24 @@ def _tier_to_wire(tier: Tier) -> str:
 
 
 def assignments_to_wire(
-    assignments: Iterable[Tuple[str, Tier]],
-) -> List[Dict[str, str]]:
-    """Translate ``[(unit_hash, tier), ...]`` → migrate JSON body."""
+    assignments: Iterable[Tuple[str, List[Tier], List[Tier]]],
+) -> List[Dict[str, Any]]:
+    """Translate ``[(unit_hash, add_tiers, remove_tiers), ...]`` →
+    DESIGN §6 ``POST /aginfer/migrate`` JSON body items.
+
+    Each item carries ``add_tiers`` + ``remove_tiers`` (residence-set
+    transitions per §7) plus an ``action_id`` opaque correlator that
+    the sglang side echoes back in APPLY_FAILED webhooks (T23).
+    """
+    import uuid
     return [
-        {"hash": uhash, "target_tier": _tier_to_wire(tier)}
-        for uhash, tier in assignments
+        {
+            "hash": uhash,
+            "add_tiers": [_tier_to_wire(t) for t in add],
+            "remove_tiers": [_tier_to_wire(t) for t in remove],
+            "action_id": uuid.uuid4().hex,
+        }
+        for uhash, add, remove in assignments
     ]
 
 
@@ -611,42 +711,51 @@ class KvScheduler:
             from ._metrics import m as _m
             _m("state_fetch_failed", kind=event.kind.value)
             return
-        # Emit HBM/DRAM occupancy snapshot for every handled event.
-        # (Bounded ~10k–20k lines per cycle; ~16 ms wall.)  This is the
-        # raw data behind T9 G5 (HBM occ trajectory).
+        # Emit per-(tier, subpool) occupancy snapshot for every handled
+        # event.  Bounded ~16 ms wall per cycle.  Raw data behind
+        # the F3 / T14 occupancy-trajectory observability.
         from ._metrics import m as _m
-        try:
-            flat = _flatten_per_rank(state_json)
-            tu = flat.get("tier_usage") or {}
-            hbm = tu.get("HBM", {})
-            dram = tu.get("DRAM", {})
-            # G10: tree_occ_hbm = radix-tree view (matches tier_usage
-            # field used by V_u migration scoring; near-zero under
-            # in-flight decode pressure).  pool_occ_hbm = allocator
-            # truth (matches sglang's `full_token_usage`, what
-            # admission gates on).  Emit BOTH so the trajectory parse
-            # can see the divergence in the cycle log.
-            tree_occ_hbm = (
-                int(hbm.get("used_bytes", 0)) / max(int(hbm.get("cap_bytes", 1)), 1)
-            )
-            pool_occ_hbm = tree_occ_hbm
-            pool_hbm = (flat.get("pool_usage") or {}).get("HBM") or {}
-            if "token_usage" in pool_hbm:
-                pool_occ_hbm = float(pool_hbm["token_usage"])
-            occ_dram = (
-                int(dram.get("used_bytes", 0)) / max(int(dram.get("cap_bytes", 1)), 1)
-            )
-            n_units = len(state_json.get("units") or [])
-            _m(
-                "state_fetched",
-                kind=event.kind.value,
-                occ_hbm=pool_occ_hbm,         # AUTHORITATIVE pressure
-                tree_occ_hbm=tree_occ_hbm,    # radix view for debug
-                occ_dram=occ_dram,
-                units=n_units,
-            )
-        except Exception:  # noqa: BLE001
-            pass  # metric emission must not break the worker
+        # Direct subscript: schema contract is enforced by sglang's dump;
+        # a real schema break should surface as a KeyError logged with
+        # full traceback (handle()'s try/except surrounds the
+        # subsequent build_paper_state call which also reads these
+        # fields).  Per audit: silent .get(..., default) masks the
+        # schema-vs-daemon gap (cf. the G10 fix this code originally
+        # tried to instrument).
+        flat = _flatten_per_rank(state_json)
+        pool_usage = flat["pool_usage"]
+        # Authoritative HBM occupancy = MAX over subpools per DESIGN §5
+        # ('admission acts when ANY subpool crosses theta_hi').
+        hbm_subpools = pool_usage["HBM"]["subpools"]
+        occ_hbm = max(
+            (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
+            for e in hbm_subpools.values()
+        ) if hbm_subpools else 0.0
+        dram_subpools = pool_usage["DRAM"]["subpools"]
+        occ_dram = max(
+            (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
+            for e in dram_subpools.values()
+        ) if dram_subpools else 0.0
+        # Radix-resident slice (evictable bytes) as a separate signal:
+        # post-T17 the daemon no longer maintains a "tree-view" stat
+        # because pool_usage IS the unified allocator view.  Emit
+        # evictable_bytes / cap_bytes as a proxy for "how much of HBM
+        # is radix-resident" so the trajectory parse can see the
+        # in-flight-vs-radix split.
+        tree_occ_hbm = max(
+            (e["evictable_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0
+            else 0.0
+            for e in hbm_subpools.values()
+        ) if hbm_subpools else 0.0
+        n_units = len(flat["units"])
+        _m(
+            "state_fetched",
+            kind=event.kind.value,
+            occ_hbm=occ_hbm,              # AUTHORITATIVE pressure
+            tree_occ_hbm=tree_occ_hbm,    # evictable slice for debug
+            occ_dram=occ_dram,
+            units=n_units,
+        )
         try:
             sched_state = build_paper_state(
                 state_json,
