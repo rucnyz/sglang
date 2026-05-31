@@ -72,7 +72,11 @@ unset SGLANG_KV_POLICY_MODULE
 SGLANG_LOG_REAL="$AGINFER_LOGS/sglang_v4flash.log"
 [[ -e "$SGLANG_LOG_REAL" ]] && mv "$SGLANG_LOG_REAL" "${SGLANG_LOG_REAL}.ta_prev"
 
-bash "$AGINFER_DIR/scripts/launch_sglang_v4flash.sh" >"$SGLANG_LOG" 2>&1 &
+# TA is the baseline arm — no aginfer daemon involved.
+# Empty AGINFER_NOTIFY_URL keeps sglang from firing the webhook
+# at :9100 (nothing listening → connection-refused retry spam).
+AGINFER_NOTIFY_URL="" \
+    bash "$AGINFER_DIR/scripts/launch_sglang_v4flash.sh" >"$SGLANG_LOG" 2>&1 &
 SGLANG_PID=$!
 
 for i in $(seq 1 300); do

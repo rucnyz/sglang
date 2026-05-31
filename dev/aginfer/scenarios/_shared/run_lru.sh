@@ -65,7 +65,10 @@ unset SGLANG_KV_POLICY_MODULE
 SGLANG_LOG_REAL="$AGINFER_LOGS/sglang_v4flash.log"
 [[ -e "$SGLANG_LOG_REAL" ]] && mv "$SGLANG_LOG_REAL" "${SGLANG_LOG_REAL}.lru_prev"
 
-bash "$AGINFER_DIR/scripts/launch_sglang_v4flash.sh" >"$SGLANG_LOG" 2>&1 &
+# No daemon here — pass empty AGINFER_NOTIFY_URL so sglang skips
+# webhook creation (avoids connection-refused retry spam at :9100).
+AGINFER_NOTIFY_URL="" \
+    bash "$AGINFER_DIR/scripts/launch_sglang_v4flash.sh" >"$SGLANG_LOG" 2>&1 &
 SGLANG_PID=$!
 
 echo "[lru] waiting for sglang Uvicorn..."

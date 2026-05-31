@@ -32,6 +32,24 @@ fi
 TP="${SGLANG_TP:-2}"
 EP="${SGLANG_EP:-$TP}"
 
+# Same aginfer webhook wiring as the HiCache variant — admission's
+# pressure trigger must work in Run J too, otherwise the daemon's
+# admission layer is silently a no-op in the HiCache-OFF ablation.
+# `${VAR-default}` (no colon) so explicit empty string opts out.
+AGINFER_NOTIFY_URL="${AGINFER_NOTIFY_URL-http://127.0.0.1:9100}"
+AGINFER_THETA_HI="${AGINFER_THETA_HI:-0.85}"
+AGINFER_THETA_CRIT="${AGINFER_THETA_CRIT:-0.95}"
+AGINFER_HEARTBEAT_S="${AGINFER_HEARTBEAT_S:-5.0}"
+AGINFER_FLAGS=()
+if [[ -n "$AGINFER_NOTIFY_URL" ]]; then
+    AGINFER_FLAGS=(
+        --aginfer-notify-url "$AGINFER_NOTIFY_URL"
+        --aginfer-theta-hi "$AGINFER_THETA_HI"
+        --aginfer-theta-crit "$AGINFER_THETA_CRIT"
+        --aginfer-heartbeat-s "$AGINFER_HEARTBEAT_S"
+    )
+fi
+
 SGLANG_KV_POLICY_MODULE="${SGLANG_KV_POLICY_MODULE:-}" \
 PYTHONPATH="$AGINFER_ROOT:${PYTHONPATH:-}" \
 CUDA_VISIBLE_DEVICES="$AGINFER_GPUS" \
@@ -45,6 +63,7 @@ python -m sglang.launch_server \
     --context-length 65536 \
     $MAX_TOTAL_TOKENS_ARG \
     $MAX_RUNNING_ARG \
+    "${AGINFER_FLAGS[@]}" \
     --reasoning-parser deepseek-r1 \
     --trust-remote-code \
     --enable-metrics \

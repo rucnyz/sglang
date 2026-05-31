@@ -52,6 +52,35 @@ fi
 TP="${SGLANG_TP:-2}"
 EP="${SGLANG_EP:-$TP}"
 
+# aginfer T5 webhook target.  sglang's AginferWebhookFirer POSTs
+# memory_pressure / pressure_resolved transitions here.  Default
+# matches launch_daemon.sh's listening port (9100).
+#
+# Use `${VAR-default}` (no colon) so an *explicitly empty* env var
+# (``AGINFER_NOTIFY_URL="" bash launch_sglang_v4flash.sh``) opts
+# OUT of webhook firing — needed by no-daemon baseline runners
+# (run_lru.sh, run_thunderagent.sh, run_direct.sh) so sglang
+# doesn't spam connection-refused retries.
+AGINFER_NOTIFY_URL="${AGINFER_NOTIFY_URL-http://127.0.0.1:9100}"
+# Threshold knobs (sglang side).  Must match daemon-side
+# admission_controller theta_hi / theta_lo for the design's
+# "sglang fires → daemon acts" handshake to be consistent.
+AGINFER_THETA_HI="${AGINFER_THETA_HI:-0.85}"
+AGINFER_THETA_CRIT="${AGINFER_THETA_CRIT:-0.95}"
+AGINFER_HEARTBEAT_S="${AGINFER_HEARTBEAT_S:-5.0}"
+
+# Only forward aginfer flags when notify URL is non-empty (avoid
+# firing webhook at no-one in baseline runners).
+AGINFER_FLAGS=()
+if [[ -n "$AGINFER_NOTIFY_URL" ]]; then
+    AGINFER_FLAGS=(
+        --aginfer-notify-url "$AGINFER_NOTIFY_URL"
+        --aginfer-theta-hi "$AGINFER_THETA_HI"
+        --aginfer-theta-crit "$AGINFER_THETA_CRIT"
+        --aginfer-heartbeat-s "$AGINFER_HEARTBEAT_S"
+    )
+fi
+
 # aginfer eviction-scorer plug-in.  Format: 'pkg.mod:callable' (loaded by
 # UnifiedRadixCache._load_eviction_scorer).  Unset / empty = stock LRU.
 # Run H sets SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:ours_greedy_score.
@@ -75,8 +104,13 @@ python -m sglang.launch_server \
     --hicache-storage-backend mooncake \
     --hicache-storage-prefetch-policy best_effort \
     --hicache-storage-backend-extra-config "$MOONCAKE_EXTRA" \
+    "${AGINFER_FLAGS[@]}" \
     --reasoning-parser deepseek-r1 \
     --trust-remote-code \
     --enable-metrics \
+    --enable-cache-report \
+    --log-requests \
+    --log-requests-level 0 \
+    --log-requests-format json \
     --random-seed "${SGLANG_RANDOM_SEED:-42}" \
     >>"$LOG" 2>&1

@@ -80,7 +80,10 @@ export SGLANG_KV_POLICY_MODULE="baselines.sglang_adapter:ours_greedy_score"
 SGLANG_LOG_REAL="$AGINFER_LOGS/sglang_v4flash.log"
 [[ -e "$SGLANG_LOG_REAL" ]] && mv "$SGLANG_LOG_REAL" "${SGLANG_LOG_REAL}.h_prime_prev"
 
-bash "$AGINFER_DIR/scripts/launch_sglang_v4flash.sh" >"$SGLANG_LOG" 2>&1 &
+# direct_sglang arm (no daemon) — explicit empty webhook URL so
+# sglang doesn't fire at the absent daemon on :9100.
+AGINFER_NOTIFY_URL="" \
+    bash "$AGINFER_DIR/scripts/launch_sglang_v4flash.sh" >"$SGLANG_LOG" 2>&1 &
 SGLANG_PID=$!
 
 echo "[h_prime] waiting for sglang Uvicorn on :30000 (up to 600 s)..."
