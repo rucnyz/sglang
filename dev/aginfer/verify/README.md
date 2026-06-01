@@ -69,7 +69,7 @@ Each task lives in its own folder `tN/` with:
 | 7 | (infra) | kv_scheduler value rule | [`kv_scheduler_value_rule/`](kv_scheduler_value_rule/) | ⚠️ **STALE post-T33** — pre-round-9 API; full rewrite tracked as #146 |
 | 8 | (infra) | admission_controller | [`admission_controller/`](admission_controller/) | ⚠️ **STALE post-T33** — pre-round-9 API; rewrite tracked as #146 (shared with kv_scheduler_value_rule) |
 | 9 | (moved) | Run K + K-a + J ablation | see [`scenarios/`](../scenarios/) | moved 2026-05-31; old verify/t9 README deleted (was redirect-only + dead links to N3_GAPS.md) |
-| 10 | (pending) | integration stress (6 stress flavors A–F) | — | not yet started; tracked as #147 (B partially covered by `verify/t17/` Stage 7) |
+| 10 | #147 | integration stress (6 cross-component stress flavors A–F) | [`integration_stress/`](integration_stress/) | **passed** 2026-06-01 (6/6 against real sglang+daemon stack on Qwen3-0.6B; B p99_max=34ms suggests #160 may be closable) |
 | 11 | T11 | empirical p_hat estimator (PLAN §1) | [`t11/`](t11/) | OPEN WORK — calibration task, no verify.py; deliverable lands as a model-selection report in `t11/results/`; tracked under #126 |
 
 Per-task `tN/results/` directories hold raw outputs (logs, JSON, harbor
