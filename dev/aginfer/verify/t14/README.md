@@ -250,6 +250,51 @@ threshold.**  Per PLAN: the trigger fires, and we open the F3-revisit
 task to decide drop-on-full vs coalesce vs incremental-state.
 Tracked as #160.
 
+### Re-verification (2026-06-01, #160 closure)
+
+Same fixture (32 concurrent × 90 s × max-tokens=200 ×
+prefix-256-512 × Qwen3-0.6B × HiCache write_through ×
+max-total-tokens 65536) re-run via `run_stress_real.py` after
+the verify-batch that landed in early June (T15/T22/T36/T42/T43/
+T164/integration_stress).
+
+| metric | 2026-05-31 (#160 open) | 2026-06-01 (re-verification) | Δ |
+|---|---|---|---|
+| samples | 470 | 552 | — |
+| peak units | 187 | 171 | — |
+| peak HBM used | ~99 % | 99.9 % | — |
+| **peak p99 (ms)** | **321.94** | **3.52** | **91× ↓** |
+| peak max (ms) | 395 | 415.46 | comparable |
+
+The **single outlier** spike (~400 ms) STILL fires (~once per
+90 s run) — that's a real GC/scheduler-contention stall on the
+state-dump syscall.  But the AGGREGATE p99 stays at ~3.5 ms
+because outliers don't accumulate: 1024-entry × 150 ms-poll ring
+holds ~2.5 min of recent history, and 1 outlier per ~600 samples
+can't pull p99 above ~3-4 ms.
+
+**#160 closure verdict**: PLAN T14's F3-revisit trigger condition
+(`p99 > 50 ms` sustained under load) **does not fire** in the
+current state of the code.  The original 321.94 ms p99 was driven
+by a cluster of ~290 ms outliers (~1 % of the window).  In the
+current snapshot the outlier count per 90 s window dropped from
+~5 to ~1.  Aggregate stays well below the F3-revisit threshold.
+
+No single code change targeted state-dump cost; the improvement
+is incidental — likely cumulative impact of T17 schema
+simplifications, T36 outbound fire-and-forget removing daemon-
+side blocking, and T42 daemon observability reducing cross-
+process contention.
+
+The single ~400 ms outlier remaining is documented for posterity.
+If it ever clusters again under different workloads (larger
+models, hicache storage backend, different sglang config), the
+trigger will fire and #160 should re-open.
+
+* date: 2026-06-01
+* raw log: `results/20260601_t160_revisit_run.log`
+* raw TSV: `results/20260601_094923_t160_revisit_stress_samples.tsv`
+
 Two ancillary findings from the stress probe (not blocking T14):
 * `peak_dram_used_frac = 0.0` throughout despite `--hicache-write-policy
   write_through` — the HiCache backup pipeline appears not to be
