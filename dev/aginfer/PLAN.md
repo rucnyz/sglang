@@ -245,9 +245,24 @@ Order roughly by dependency.
 5. **T21 — `PUT /aginfer/program_paused`** (DESIGN §6 round-6 H2):
    - new endpoint
    - writes `state` and `pre_pause_state` into `per_program_usage`
-   - **Status (#170 audit — 2026-06-01)**: OPEN.  Only the endpoint
-     NAME appears (in `aginfer_webhook.py:55` enum entry); no
-     FastAPI route, no scheduler-side handler.  Tracked as **#181**.
+   - **Status (#181 closure — 2026-06-01)**: DONE.  End-to-end
+     wired:
+     * io_struct: `UpdateAginferProgramPausedReq` + `Output`
+     * `unified_radix_cache.set_aginfer_program_state(pid, state,
+       pre_pause_state)` + storage in `_aginfer_program_states`
+       dict
+     * Both dump paths (dict + bytes) overlay stored state onto
+       `per_program_usage[pid]`; unit-less PAUSED programs still
+       appear
+     * scheduler.update_aginfer_program_paused dispatcher
+     * tokenizer_control_mixin fan-out across DP ranks
+     * http_server PUT /aginfer/program_paused
+     * Idempotent (applied=0 on re-apply at same value)
+     * verify/t21/: 10 stages, all green (incl. setter validation,
+       idempotency, dump-path echo, unit-less programs, legacy-
+       cache rejection)
+     * Unblocks #183 (T30+T39 proxy disconnect) and #185 (T41
+       SESSION_END for PAUSED handler).
 
 6. **T22 — `GET /aginfer/thresholds` + `PUT /aginfer/thresholds`**
    (DESIGN §6 round-6 H3):

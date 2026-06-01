@@ -1764,6 +1764,30 @@ class UpdateAginferThresholdsReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateAginferProgramPausedReq(BaseReq):
+    """T21 (#181, DESIGN §6 round-6 H2): daemon → sglang PUT
+    /aginfer/program_paused.
+
+    Daemon owns the program-state transition (REASONING / ACTING /
+    PAUSED / ENDED); sglang stores it as a passthrough and echoes
+    it back in the next /aginfer/state dump's per_program_usage[pid]
+    entry.  Idempotent re-application returns applied=0
+    (DESIGN §10 R2).
+    """
+
+    pid: str
+    state: str
+    pre_pause_state: Optional[str] = None
+
+
+@dataclass
+class UpdateAginferProgramPausedReqOutput(BaseReq):
+    ok: bool
+    reason: str
+    applied: int = 0  # 0 = idempotent no-op; 1 = state changed
+
+
+@dataclass
 class GetAginferStateReqOutput(BaseReq):
     """Per-DP-rank snapshot.  aginfer state is the JSON-serialisable dict
     described in dev/aginfer/DESIGN.md §sglang surface.

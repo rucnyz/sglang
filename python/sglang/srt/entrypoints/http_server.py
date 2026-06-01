@@ -896,6 +896,63 @@ async def aginfer_thresholds_put(raw_request: Request):
     return ORJSONResponse({"ok": True, "ranks": len(responses)})
 
 
+# T21 (#181): daemon → sglang program-state broadcast.  Body is
+# {pid, state, pre_pause_state?}.  Sglang stores per-pid on each
+# rank's tree cache (set_aginfer_program_state); the next
+# /aginfer/state dump echoes the state back in
+# per_program_usage[pid].  Idempotent: applied=0 if already at
+# requested state (DESIGN §10 R2).
+@app.put("/aginfer/program_paused")
+async def aginfer_program_paused_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="body must be a JSON object",
+        )
+    required = ("pid", "state")
+    missing = [k for k in required if k not in body]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"missing required field(s): {missing}",
+        )
+    from sglang.srt.managers.io_struct import (
+        UpdateAginferProgramPausedReq,
+    )
+    pre = body.get("pre_pause_state")
+    if pre is not None and not isinstance(pre, str):
+        raise HTTPException(
+            status_code=400,
+            detail="pre_pause_state must be string or null",
+        )
+    req = UpdateAginferProgramPausedReq(
+        pid=str(body["pid"]),
+        state=str(body["state"]),
+        pre_pause_state=pre,
+    )
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_program_paused(req)
+    )
+    all_ok = all(r.ok for r in responses)
+    if not all_ok:
+        first_fail = next(r for r in responses if not r.ok)
+        raise HTTPException(
+            status_code=400,
+            detail=f"validation: {first_fail.reason}",
+        )
+    # Sum applied across ranks (typically 1 OR len(responses); they
+    # share the same daemon view so all flip in unison).  Caller
+    # treats >0 as "state changed", 0 as "idempotent no-op".
+    return ORJSONResponse({
+        "ok": True,
+        "ranks": len(responses),
+        "applied": sum(int(r.applied) for r in responses),
+    })
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).

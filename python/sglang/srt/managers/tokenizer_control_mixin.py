@@ -43,6 +43,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     MigrateAginferReq,
     MigrateAginferReqOutput,
+    UpdateAginferProgramPausedReq,
+    UpdateAginferProgramPausedReqOutput,
     UpdateAginferThresholdsReq,
     UpdateAginferThresholdsReqOutput,
     GetLoadsReqInput,
@@ -125,6 +127,7 @@ _COMMUNICATOR_SPECS = [
     ("get_aginfer_state", GetAginferStateReqOutput),
     ("migrate_aginfer", MigrateAginferReqOutput),
     ("update_aginfer_thresholds", UpdateAginferThresholdsReqOutput),
+    ("update_aginfer_program_paused", UpdateAginferProgramPausedReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
@@ -840,6 +843,21 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         responses: List[UpdateAginferThresholdsReqOutput] = (
             await self.update_aginfer_thresholds_communicator(obj)
+        )
+        return responses
+
+    async def update_aginfer_program_paused(
+        self: TokenizerManager, obj: UpdateAginferProgramPausedReq,
+    ) -> List[UpdateAginferProgramPausedReqOutput]:
+        """T21 (#181): daemon → sglang PUT /aginfer/program_paused.
+
+        Per DESIGN §6 round-6 H2, the daemon owns the program-state
+        transition.  Fans out to every rank's scheduler (the cache
+        is per-rank).  Caller aggregates: success only if all ranks
+        ok; partial ok = race with another in-flight PUT."""
+        self.auto_create_handle_loop()
+        responses: List[UpdateAginferProgramPausedReqOutput] = (
+            await self.update_aginfer_program_paused_communicator(obj)
         )
         return responses
 

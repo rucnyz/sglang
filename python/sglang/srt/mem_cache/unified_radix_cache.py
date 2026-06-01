@@ -470,6 +470,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # poll rate; deep enough for a meaningful p99 over recent window
         # but bounded so it doesn't blow up memory under year-long uptime.
         self._aginfer_state_dump_metrics = _StateDumpMetrics(capacity=1024)
+        # T21 (#181, DESIGN §6 round-6 H2): daemon-pushed program state.
+        # The daemon owns the (REASONING / ACTING / PAUSED / ENDED)
+        # state transition; sglang stores the daemon's view as a
+        # passthrough and echoes it back in the next /aginfer/state
+        # dump.  Set via PUT /aginfer/program_paused → scheduler →
+        # set_aginfer_program_state.  Empty cold-start: dumps default
+        # state="REASONING", pre_pause_state=None for every pid that
+        # has live units cited in session_ids.
+        self._aginfer_program_states: dict[str, dict] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict = {}
@@ -2663,6 +2672,49 @@ class UnifiedRadixCache(BasePrefixCache):
                 "skipped": skipped,
                 "hash_collisions": hash_collisions}
 
+    _AGINFER_VALID_STATES = ("REASONING", "ACTING", "PAUSED", "ENDED")
+
+    def set_aginfer_program_state(
+        self,
+        *,
+        pid: str,
+        state: str,
+        pre_pause_state: "Optional[str]",
+    ) -> tuple:
+        """T21 (#181, DESIGN §6 round-6 H2): daemon → sglang PUT
+        ``/aginfer/program_paused`` storage.
+
+        Returns ``(ok: bool, reason: str, applied: int)`` where
+        ``applied == 0`` if the (state, pre_pause_state) for this
+        pid was already at the requested value (idempotent re-apply
+        per DESIGN §10 R2).
+
+        ``state`` must be one of ``{REASONING, ACTING, PAUSED, ENDED}``.
+        ``pre_pause_state`` is the same set or None.
+        """
+        valid = self._AGINFER_VALID_STATES
+        if not isinstance(pid, str) or not pid:
+            return (False, f"pid must be non-empty string; got {pid!r}", 0)
+        if state not in valid:
+            return (
+                False,
+                f"state must be in {valid}; got {state!r}",
+                0,
+            )
+        if pre_pause_state is not None and pre_pause_state not in valid:
+            return (
+                False,
+                f"pre_pause_state must be None or in {valid}; "
+                f"got {pre_pause_state!r}",
+                0,
+            )
+        existing = self._aginfer_program_states.get(pid)
+        new_entry = {"state": state, "pre_pause_state": pre_pause_state}
+        if existing is not None and existing == new_entry:
+            return (True, "ok", 0)  # idempotent no-op
+        self._aginfer_program_states[pid] = new_entry
+        return (True, "ok", 1)
+
     def _aginfer_node_summary(self, node) -> dict:
         """T24 (#182): compact summary of a radix-tree node for the
         HASH_COLLISION webhook payload.  Daemon-side fatal()
@@ -3143,6 +3195,23 @@ class UnifiedRadixCache(BasePrefixCache):
                     for sp, bytes_total in sp_dict.items():
                         bucket[sp] = bucket.get(sp, 0) + bytes_total // n_holders
 
+        # T21 (#181): merge daemon-pushed program states.  PUT
+        # /aginfer/program_paused stores into self._aginfer_program_
+        # states; we echo the stored (state, pre_pause_state) here.
+        # Programs that have no live units still appear in the dump
+        # so the daemon can read its own PAUSED-with-no-residue
+        # bookkeeping.
+        for pid, stored in self._aginfer_program_states.items():
+            e = per_program.setdefault(pid, {
+                "hbm":  {"committed": {}, "inflight": {}},
+                "dram": {"committed": {}},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": [],
+            })
+            e["state"] = stored["state"]
+            e["pre_pause_state"] = stored["pre_pause_state"]
+
         return {
             "time_counter": int(peek_time_counter()),
             "throughput_ema": self._aginfer_throughput_ema(),
@@ -3314,6 +3383,23 @@ class UnifiedRadixCache(BasePrefixCache):
             }
             for pid, e in pp.items()
         }
+        # T21 (#181): overlay daemon-pushed program states (PAUSED /
+        # ACTING / ENDED) on top.  Programs with no live units still
+        # appear in the dump so the daemon can read its own PAUSED-
+        # with-no-residue bookkeeping.
+        for pid, stored in self._aginfer_program_states.items():
+            e = per_program.get(pid)
+            if e is None:
+                e = {
+                    "hbm":  {"committed": {}, "inflight": {}},
+                    "dram": {"committed": {}},
+                    "state": "REASONING",
+                    "pre_pause_state": None,
+                    "unit_hashes": [],
+                }
+                per_program[pid] = e
+            e["state"] = stored["state"]
+            e["pre_pause_state"] = stored["pre_pause_state"]
 
         # ---- assemble final wire JSON ----
         import orjson

@@ -111,6 +111,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     MigrateAginferReq,
     MigrateAginferReqOutput,
+    UpdateAginferProgramPausedReq,
+    UpdateAginferProgramPausedReqOutput,
     UpdateAginferThresholdsReq,
     UpdateAginferThresholdsReqOutput,
     GetLoadsReqInput,
@@ -1461,6 +1463,7 @@ class Scheduler(
                 (GetAginferStateReq, self.get_aginfer_state),
                 (MigrateAginferReq, self.migrate_aginfer),
                 (UpdateAginferThresholdsReq, self.update_aginfer_thresholds),
+                (UpdateAginferProgramPausedReq, self.update_aginfer_program_paused),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -3518,6 +3521,43 @@ class Scheduler(
         }
         ok, reason = apply_thresholds_payload(self.aginfer_webhook, body)
         return UpdateAginferThresholdsReqOutput(ok=ok, reason=reason)
+
+    def update_aginfer_program_paused(
+        self, recv_req: UpdateAginferProgramPausedReq,
+    ) -> UpdateAginferProgramPausedReqOutput:
+        """T21 (#181): daemon → sglang PUT /aginfer/program_paused.
+
+        DESIGN §6 round-6 H2: daemon owns the program-state
+        transition (REASONING / ACTING / PAUSED / ENDED); sglang
+        stores it as a passthrough and echoes it back in the next
+        /aginfer/state dump's per_program_usage[pid] entry.
+        Idempotent re-apply returns applied=0 (DESIGN §10 R2).
+
+        Storage lives on the radix cache so the dump-path can read
+        it without a scheduler round-trip.  Tree caches without
+        the setter (legacy HiRadixCache) reject the PUT.
+        """
+        setter = getattr(
+            self.tree_cache, "set_aginfer_program_state", None,
+        )
+        if setter is None:
+            return UpdateAginferProgramPausedReqOutput(
+                ok=False,
+                reason=(
+                    f"tree cache {type(self.tree_cache).__name__} "
+                    f"does not support set_aginfer_program_state; "
+                    f"set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1"
+                ),
+                applied=0,
+            )
+        ok, reason, applied = setter(
+            pid=recv_req.pid,
+            state=recv_req.state,
+            pre_pause_state=recv_req.pre_pause_state,
+        )
+        return UpdateAginferProgramPausedReqOutput(
+            ok=ok, reason=reason, applied=applied,
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
