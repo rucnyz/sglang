@@ -45,14 +45,24 @@ dropped it).
   `apply_thresholds_payload(self.aginfer_webhook, body)`.  Returns
   `(ok, reason)` to the tokenizer-manager and out to HTTP.
 
-**Bootstrap fetch + daemon-push (sustained broadcast)**.  This
-commit lands the GET/PUT plumbing.  Wiring sglang's launch path to
-call `fetch_bootstrap_thresholds(daemon_base_url)` and halt on
-failure is a small follow-up that belongs in a sglang-side launch
-patch — Phase B0/B1 of the verify exercise it once that wires.
-Daemon-side broadcast on runtime threshold change is also a
-follow-up (operator-signal handler + outbound enqueue of
-`PUT /aginfer/thresholds`).  Both are out of scope for this PR.
+**Bootstrap fetch wired into sglang launch (G9 closure, #165).**
+``bootstrap_thresholds_into_server_args(server_args)`` is called
+from `prepare_server_args` AFTER CLI parse but BEFORE the scheduler
+subprocess spawn.  If `--aginfer-notify-url` is set:
+  * Fetches from daemon.  Unreachable / malformed shape / timeout
+    → ERROR log + `sys.exit(1)`.  No silent fallback.
+  * Overwrites each ``aginfer_<theta_hi|theta_lo|theta_crit|
+    heartbeat_s>`` field with the daemon's view.  When the operator
+    explicitly passed a non-default CLI flag that disagrees with
+    the daemon, a WARNING line names the override so the operator
+    sees their launch flag is moot (DESIGN §6 step 3).
+  * No-op when `--aginfer-notify-url` is unset (legacy / daemon-
+    less mode, sglang stays on CLI defaults).
+
+Daemon-side broadcast on runtime threshold change (SIGHUP /
+admin endpoint enqueueing `PUT /aginfer/thresholds`) is still a
+follow-up; the canonical-source contract is closed by the bootstrap
+side alone.
 
 ## WORST CASE
 
@@ -108,7 +118,8 @@ No GPU / no sglang launch.  Runs in < 1 s.
 
 ## RESULTS
 
-**PASSED** — all 4 stages.
+**PASSED** — all 8 stages (4 initial + 4 G9-closure stages added by
+#165 audit follow-up).
 
 * date: 2026-06-01
 * lines: ~95 sglang (`aginfer_webhook.py` properties + apply +
@@ -124,5 +135,10 @@ No GPU / no sglang launch.  Runs in < 1 s.
 | A1 firer.apply_thresholds is atomic | PASS — 20k reads × 4 threads × 50 concurrent writes, zero torn pairs |
 | A2 PUT validation rejects malformed | PASS — 6 malformed cases all rejected with structured reasons; firer state preserved; happy path mutates |
 | A3 bootstrap_fetch happy + unreachable | PASS — happy returns dict; dead port raises httpx.HTTPError subclass |
+| A4 bootstrap_into_server_args no-notify-url no-op | PASS — legacy/daemon-less mode untouched |
+| A5 bootstrap_into_server_args overrides from daemon | PASS — all 4 fields overwritten, no false-positive WARN |
+| A6 WARN on operator-CLI disagreement (DESIGN §6 step 3) | PASS — operator-explicit `theta_hi=0.5` overridden by daemon 0.85, WARNING line fires |
+| A7 halt loudly on unreachable daemon (G9 closure) | PASS — `_exit_func(1)` called, ERROR line names deployment-ordering bug, server_args unmutated |
 
-* raw log: `results/20260601_t22_initial_pass.log`
+* raw log: `results/20260601_t22_initial_pass.log` (pre-#165)
+* raw log: `results/20260601_t22_g9_closure_pass.log` (post-#165)

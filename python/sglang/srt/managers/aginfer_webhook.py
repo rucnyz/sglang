@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -522,6 +523,19 @@ def apply_thresholds_payload(
     return True, "ok"
 
 
+# Sglang's CLI defaults for the four aginfer thresholds.  Used by
+# ``bootstrap_thresholds_into_server_args`` to distinguish
+# "operator left this at the default" from "operator explicitly
+# passed a non-default value" — the latter case logs a WARNING when
+# it disagrees with the daemon (DESIGN §6 step 3 spirit).
+_SGLANG_CLI_THRESHOLD_DEFAULTS: Dict[str, float] = {
+    "theta_hi":    0.7,
+    "theta_lo":    0.55,
+    "theta_crit":  0.9,
+    "heartbeat_s": 5.0,
+}
+
+
 def fetch_bootstrap_thresholds(
     daemon_base_url: str,
     *,
@@ -557,3 +571,79 @@ def fetch_bootstrap_thresholds(
             f"daemon /aginfer/thresholds returned unexpected shape: {body!r}"
         )
     return {k: float(body[k]) for k in required}
+
+
+def bootstrap_thresholds_into_server_args(
+    server_args,
+    *,
+    timeout_s: float = 10.0,
+    _exit_func=None,  # injected for tests; defaults to sys.exit
+) -> None:
+    """T22 G9 closure (DESIGN §6 step 1 + step 3).
+
+    Called from ``prepare_server_args`` AFTER CLI parse, BEFORE the
+    scheduler subprocess spawn.  Behavior:
+
+      1. If ``server_args.aginfer_notify_url`` is None: legacy /
+         daemon-less mode.  No-op.  Sglang stays on CLI defaults.
+
+      2. Otherwise (the canonical "daemon-managed" deployment):
+
+         a. ``fetch_bootstrap_thresholds`` from the daemon.  On
+            ANY failure (unreachable, timeout, malformed shape) →
+            log ERROR + ``sys.exit(1)``.  Deployment-ordering bug:
+            daemon must be up before sglang.  No silent fallback
+            to CLI defaults (round-14 dropped the cache; this is
+            the same principle).
+
+         b. For each of the four canonical values, OVERWRITE
+            ``server_args.aginfer_<k>`` with the daemon's view.
+            If the CLI value differs from BOTH the daemon and
+            sglang's hardcoded default, the operator explicitly
+            passed a non-default that disagrees with the daemon —
+            log a WARNING per DESIGN §6 step 3.  Daemon always
+            wins; the warning is the operator-visible signal that
+            their launch flag is moot.
+
+    Idempotent: re-calling with the same daemon state produces
+    the same server_args.
+    """
+    if _exit_func is None:
+        _exit_func = sys.exit
+    notify_url = getattr(server_args, "aginfer_notify_url", None)
+    if not notify_url:
+        return
+    try:
+        fetched = fetch_bootstrap_thresholds(notify_url, timeout_s=timeout_s)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "T22 (DESIGN §6 step 1): aginfer bootstrap threshold "
+            "fetch from daemon %r failed: %s.  Deployment-ordering "
+            "bug — daemon must be up before sglang.  Halting.",
+            notify_url, exc,
+        )
+        _exit_func(1)
+        return  # pragma: no cover — _exit_func usually doesn't return
+    for key in ("theta_hi", "theta_lo", "theta_crit", "heartbeat_s"):
+        attr = f"aginfer_{key}"
+        current = float(getattr(server_args, attr))
+        daemon_val = float(fetched[key])
+        default = _SGLANG_CLI_THRESHOLD_DEFAULTS[key]
+        if abs(current - daemon_val) < 1e-9:
+            continue  # already in sync (could be coincidence; harmless)
+        operator_explicit = abs(current - default) > 1e-9
+        if operator_explicit:
+            logger.warning(
+                "T22 (DESIGN §6 step 3): operator passed "
+                "--aginfer-%s=%g but daemon canonical value is %g.  "
+                "Daemon wins.  Align the launch flag (or omit it) "
+                "to silence this warning.",
+                key.replace("_", "-"), current, daemon_val,
+            )
+        else:
+            logger.info(
+                "T22: aginfer %s seeded from daemon: %g (was sglang "
+                "default %g)",
+                key, daemon_val, current,
+            )
+        setattr(server_args, attr, daemon_val)

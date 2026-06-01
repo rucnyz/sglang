@@ -7530,7 +7530,19 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         force=True,
     )
 
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+
+    # T22 (#155, #165): if --aginfer-notify-url is set, bootstrap
+    # the four canonical thresholds from the daemon BEFORE the
+    # scheduler subprocess starts and constructs AginferWebhookFirer.
+    # Halts loudly if the daemon is unreachable (DESIGN §6 step 1) —
+    # this is the real closure of G9 (theta drift between sglang and
+    # daemon).  No-op in daemon-less / legacy deployments.
+    from sglang.srt.managers.aginfer_webhook import (
+        bootstrap_thresholds_into_server_args,
+    )
+    bootstrap_thresholds_into_server_args(server_args)
+    return server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233

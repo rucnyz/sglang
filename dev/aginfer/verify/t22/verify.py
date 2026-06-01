@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import sys
@@ -70,6 +71,7 @@ from daemon.events import EventBus  # noqa: E402
 from daemon.event_router import EventRouter, attach_event_routes  # noqa: E402
 from sglang.srt.managers.aginfer_webhook import (  # noqa: E402
     AginferWebhookFirer,
+    bootstrap_thresholds_into_server_args,
     fetch_bootstrap_thresholds,
 )
 
@@ -401,6 +403,256 @@ def stage_a3_bootstrap_fetch_happy_and_unreachable() -> None:
     asyncio.run(_go())
 
 
+class _FakeServerArgs:
+    """Minimal ServerArgs stand-in for the bootstrap-into-server-args
+    helper.  The helper only touches ``aginfer_notify_url`` +
+    ``aginfer_<theta_hi|theta_lo|theta_crit|heartbeat_s>``, so we
+    don't need to instantiate the real ServerArgs (which pulls in
+    the whole sglang model-config tree)."""
+
+    def __init__(
+        self,
+        *,
+        aginfer_notify_url: Optional[str] = None,
+        aginfer_theta_hi: float = 0.7,
+        aginfer_theta_lo: float = 0.55,
+        aginfer_theta_crit: float = 0.9,
+        aginfer_heartbeat_s: float = 5.0,
+    ) -> None:
+        self.aginfer_notify_url = aginfer_notify_url
+        self.aginfer_theta_hi = aginfer_theta_hi
+        self.aginfer_theta_lo = aginfer_theta_lo
+        self.aginfer_theta_crit = aginfer_theta_crit
+        self.aginfer_heartbeat_s = aginfer_heartbeat_s
+
+
+def stage_a4_bootstrap_into_server_args_no_notify_url_is_noop() -> None:
+    """When ``aginfer_notify_url is None`` (legacy / daemon-less
+    deployment), the helper is a no-op — sglang stays on CLI
+    defaults, no network, no halt.
+
+    The G9 closure ONLY activates when the operator opts in via
+    ``--aginfer-notify-url``."""
+    sa = _FakeServerArgs(
+        aginfer_notify_url=None,
+        aginfer_theta_hi=0.7, aginfer_theta_lo=0.55,
+        aginfer_theta_crit=0.9, aginfer_heartbeat_s=5.0,
+    )
+    # No daemon up; if this called fetch, it would explode.
+    bootstrap_thresholds_into_server_args(sa)
+    if (sa.aginfer_theta_hi, sa.aginfer_theta_lo,
+            sa.aginfer_theta_crit, sa.aginfer_heartbeat_s) != (
+            0.7, 0.55, 0.9, 5.0):
+        raise StageFail(
+            f"no-notify-url path should NOT touch fields; got "
+            f"{(sa.aginfer_theta_hi, sa.aginfer_theta_lo, sa.aginfer_theta_crit, sa.aginfer_heartbeat_s)}"
+        )
+
+
+def stage_a5_bootstrap_into_server_args_overrides_from_daemon() -> None:
+    """Daemon up, sglang launched with default CLI values: helper
+    overrides ALL four fields with daemon's view + logs INFO lines
+    (operator left defaults, no warning).  This is the headline
+    G9-closure path."""
+    captured_warnings: List[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                captured_warnings.append(record.getMessage())
+
+    handler = _CaptureHandler()
+    awh_logger = logging.getLogger(
+        "sglang.srt.managers.aginfer_webhook"
+    )
+    prior_level = awh_logger.level
+    awh_logger.addHandler(handler)
+    awh_logger.setLevel(logging.INFO)
+    try:
+        async def _go():
+            app, _router = _build_daemon_app(
+                theta_hi=0.85, theta_lo=0.70,
+                theta_crit=0.95, heartbeat_s=4.0,
+            )
+            port = _free_port()
+            async with _run_server(app, "127.0.0.1", port):
+                sa = _FakeServerArgs(
+                    aginfer_notify_url=f"http://127.0.0.1:{port}/aginfer/event",
+                    # All four at sglang CLI defaults.
+                    aginfer_theta_hi=0.7, aginfer_theta_lo=0.55,
+                    aginfer_theta_crit=0.9, aginfer_heartbeat_s=5.0,
+                )
+                await asyncio.to_thread(
+                    bootstrap_thresholds_into_server_args, sa,
+                )
+                return sa
+        result = asyncio.run(_go())
+        for name, want in (
+            ("aginfer_theta_hi", 0.85),
+            ("aginfer_theta_lo", 0.70),
+            ("aginfer_theta_crit", 0.95),
+            ("aginfer_heartbeat_s", 4.0),
+        ):
+            got = getattr(result, name)
+            if abs(got - want) > 1e-9:
+                raise StageFail(
+                    f"{name}: want {want}, got {got}"
+                )
+        # Operator was at defaults; no explicit-disagreement
+        # warnings should have fired.
+        if captured_warnings:
+            raise StageFail(
+                f"operator-at-defaults should not WARN; "
+                f"got {captured_warnings!r}"
+            )
+    finally:
+        awh_logger.removeHandler(handler)
+        awh_logger.setLevel(prior_level)
+
+
+def stage_a6_bootstrap_warns_on_operator_disagreement() -> None:
+    """DESIGN §6 step 3: when operator explicitly passes a CLI
+    value that disagrees with the daemon, daemon wins AND a WARNING
+    line fires so the operator sees their launch flag is moot.
+
+    Operator at defaults for 3 fields + an EXPLICIT non-default
+    for theta_hi.  Daemon's theta_hi differs from operator's.
+    Expect: theta_hi WARNS; other three INFO (or silent if equal)."""
+    captured_warnings: List[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                captured_warnings.append(record.getMessage())
+
+    handler = _CaptureHandler()
+    awh_logger = logging.getLogger(
+        "sglang.srt.managers.aginfer_webhook"
+    )
+    prior_level = awh_logger.level
+    awh_logger.addHandler(handler)
+    awh_logger.setLevel(logging.INFO)
+    try:
+        async def _go():
+            app, _router = _build_daemon_app(
+                theta_hi=0.85, theta_lo=0.55,
+                theta_crit=0.9, heartbeat_s=5.0,
+            )
+            port = _free_port()
+            async with _run_server(app, "127.0.0.1", port):
+                sa = _FakeServerArgs(
+                    aginfer_notify_url=f"http://127.0.0.1:{port}/aginfer/event",
+                    # Operator explicitly set theta_hi to 0.5
+                    # (NOT the sglang default 0.7) — disagrees
+                    # with daemon's 0.85.
+                    aginfer_theta_hi=0.5,
+                    # The other three are sglang defaults.
+                    aginfer_theta_lo=0.55,
+                    aginfer_theta_crit=0.9,
+                    aginfer_heartbeat_s=5.0,
+                )
+                await asyncio.to_thread(
+                    bootstrap_thresholds_into_server_args, sa,
+                )
+                return sa
+        result = asyncio.run(_go())
+        if abs(result.aginfer_theta_hi - 0.85) > 1e-9:
+            raise StageFail(
+                f"daemon should win on theta_hi; got {result.aginfer_theta_hi}"
+            )
+        explicit_warns = [
+            w for w in captured_warnings
+            if "theta-hi" in w and "operator passed" in w
+        ]
+        if not explicit_warns:
+            raise StageFail(
+                f"operator-explicit-disagreement should WARN; "
+                f"captured={captured_warnings!r}"
+            )
+    finally:
+        awh_logger.removeHandler(handler)
+        awh_logger.setLevel(prior_level)
+
+
+def stage_a7_bootstrap_halts_on_unreachable_daemon() -> None:
+    """DESIGN §6 step 1: daemon unreachable at bootstrap → halt
+    loudly (no silent CLI-fallback, which IS what round-14 removed).
+
+    The helper calls ``_exit_func(1)`` (injectable for tests; defaults
+    to ``sys.exit``).  We pass a recording ``_exit_func`` so the
+    test can assert "exit was called with 1" without terminating
+    the verify run."""
+    captured_errors: List[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.ERROR:
+                captured_errors.append(record.getMessage())
+
+    handler = _CaptureHandler()
+    awh_logger = logging.getLogger(
+        "sglang.srt.managers.aginfer_webhook"
+    )
+    prior_level = awh_logger.level
+    awh_logger.addHandler(handler)
+    awh_logger.setLevel(logging.ERROR)
+    try:
+        exit_calls: List[int] = []
+        def _fake_exit(code: int) -> None:
+            exit_calls.append(code)
+            raise SystemExit(code)  # mimic sys.exit so caller stops
+
+        sa = _FakeServerArgs(
+            aginfer_notify_url="http://127.0.0.1:1/aginfer/event",
+            aginfer_theta_hi=0.7, aginfer_theta_lo=0.55,
+            aginfer_theta_crit=0.9, aginfer_heartbeat_s=5.0,
+        )
+        raised: Optional[BaseException] = None
+        try:
+            bootstrap_thresholds_into_server_args(
+                sa, timeout_s=1.0, _exit_func=_fake_exit,
+            )
+        except SystemExit as exc:
+            raised = exc
+        if raised is None:
+            raise StageFail(
+                "bootstrap with unreachable daemon should halt "
+                "(SystemExit); didn't"
+            )
+        if exit_calls != [1]:
+            raise StageFail(
+                f"_exit_func should have been called with 1 exactly once; "
+                f"got {exit_calls}"
+            )
+        if not captured_errors:
+            raise StageFail(
+                f"halt path should log an ERROR; captured={captured_errors!r}"
+            )
+        # ERROR line should name the deployment-ordering invariant
+        # so the operator gets the right hint.
+        if not any(
+            "Deployment-ordering bug" in e
+            or "daemon must be up" in e.lower()
+            for e in captured_errors
+        ):
+            raise StageFail(
+                f"ERROR line should name the deployment-ordering bug; "
+                f"got {captured_errors!r}"
+            )
+        # Fields should NOT have been mutated since the fetch failed.
+        if (sa.aginfer_theta_hi, sa.aginfer_theta_lo,
+                sa.aginfer_theta_crit, sa.aginfer_heartbeat_s) != (
+                0.7, 0.55, 0.9, 5.0):
+            raise StageFail(
+                "halt path must NOT mutate server_args (no partial "
+                "application): got "
+                f"{(sa.aginfer_theta_hi, sa.aginfer_theta_lo, sa.aginfer_theta_crit, sa.aginfer_heartbeat_s)}"
+            )
+    finally:
+        awh_logger.removeHandler(handler)
+        awh_logger.setLevel(prior_level)
+
+
 # ============================================================ run
 
 
@@ -410,6 +662,14 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                                                        stage_a1_firer_apply_thresholds_atomic),
     ("A2 PUT validation rejects malformed bodies",     stage_a2_malformed_put_rejected),
     ("A3 bootstrap_fetch happy + unreachable contract", stage_a3_bootstrap_fetch_happy_and_unreachable),
+    ("A4 bootstrap_into_server_args no-notify-url is no-op",
+                                                       stage_a4_bootstrap_into_server_args_no_notify_url_is_noop),
+    ("A5 bootstrap_into_server_args overrides from daemon",
+                                                       stage_a5_bootstrap_into_server_args_overrides_from_daemon),
+    ("A6 WARN on operator-CLI disagreement (DESIGN §6 step 3)",
+                                                       stage_a6_bootstrap_warns_on_operator_disagreement),
+    ("A7 halt loudly on unreachable daemon (G9 closure)",
+                                                       stage_a7_bootstrap_halts_on_unreachable_daemon),
 ]
 
 
