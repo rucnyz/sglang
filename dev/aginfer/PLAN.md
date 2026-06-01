@@ -123,7 +123,30 @@ under stale hints.  Test plan:
 - Log per-rank evicted-hash set per state-dump window
 - Compare sets; any divergence breaks the §6 invariant
 
-Open output: `verify/t15/README.md`.
+**Status (#174 — 2026-06-01)**:
+* **DONE** in `verify/t15/`:
+  * `detector.py` — `detect_divergence` (window-diff over time-series
+    of per-rank state dumps) + `summarise` formatter
+  * `verify.py` — 11 synthetic stages (single-rank no-op, identical
+    eviction no-op, distinct-rank divergence, partial overlap, 3-rank
+    2v1, sustained 4-window divergence, rank-set-change ValueError,
+    time_counter propagation, summary smoke)
+  * `run_tp2_real.py` — real DP=2 sglang launcher + churn driver +
+    detector run.  Demonstrated 102 real per_rank JSON snapshots
+    parsed cleanly; under DP=2, 34/101 windows show divergence
+    (expected — each replica serves a different program subset)
+* **BLOCKED on sglang patch (#174)** — the §6 invariant the probe
+  is actually meant to catch is cross-TP-rank divergence (NOT
+  cross-DP-rank).  But `/aginfer/state` aggregates across TP ranks
+  inside the tokenizer-server fanout; the per-TP-rank pre-aggregation
+  view is not exposed as any endpoint today.  To finish the spec:
+  * patch sglang to expose `/aginfer/state?per_tp_rank=1` (or a
+    debug endpoint) that returns each TP rank's local view BEFORE
+    the multi-rank aggregator in `http_server.py` runs
+  * re-run the detector against TP > 1 sglang under churn
+  * any non-empty report = §6 invariant break
+
+Output: `verify/t15/README.md`.
 
 ### T16 — Coresidence budget `re_use` no-double-count (DESIGN §8 capacity_fits / re_use)
 
