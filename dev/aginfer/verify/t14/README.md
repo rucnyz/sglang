@@ -250,50 +250,49 @@ threshold.**  Per PLAN: the trigger fires, and we open the F3-revisit
 task to decide drop-on-full vs coalesce vs incremental-state.
 Tracked as #160.
 
-### Re-verification (2026-06-01, #160 closure)
+### Re-verification (2026-06-01, #160 reproducibility check — N=3)
 
-Same fixture (32 concurrent × 90 s × max-tokens=200 ×
-prefix-256-512 × Qwen3-0.6B × HiCache write_through ×
-max-total-tokens 65536) re-run via `run_stress_real.py` after
-the verify-batch that landed in early June (T15/T22/T36/T42/T43/
-T164/integration_stress).
+Initial closure attempt (committed `74507237a3`, then reverted)
+was based on a SINGLE run with the WRONG fixture: it omitted
+`--mem-fraction-static 0.15` and `--attention-backend flashinfer`
+and added an extra `--max-running-requests 32`.  That fixture
+produced a state-dump of only ~50 kB (vs original 573 kB), making
+the latency comparison meaningless.  Audit (#176-round) caught
+this + the violation of the user's "N≥3 + mean/std" feedback
+(`memory:feedback-latency-multi-run.md`).
 
-| metric | 2026-05-31 (#160 open) | 2026-06-01 (re-verification) | Δ |
-|---|---|---|---|
-| samples | 470 | 552 | — |
-| peak units | 187 | 171 | — |
-| peak HBM used | ~99 % | 99.9 % | — |
-| **peak p99 (ms)** | **321.94** | **3.52** | **91× ↓** |
-| peak max (ms) | 395 | 415.46 | comparable |
+Re-run with the EXACT original launch flags
+(see `run_stress_real.py:_launch_sglang` for the recipe) ×
+N=3 independent trials, each with a fresh sglang launch.  Each
+trial: 90 s × 32 concurrent unique-prefix chats × max-tokens=200.
 
-The **single outlier** spike (~400 ms) STILL fires (~once per
-90 s run) — that's a real GC/scheduler-contention stall on the
-state-dump syscall.  But the AGGREGATE p99 stays at ~3.5 ms
-because outliers don't accumulate: 1024-entry × 150 ms-poll ring
-holds ~2.5 min of recent history, and 1 outlier per ~600 samples
-can't pull p99 above ~3-4 ms.
+| trial | samples | peak_p99 (ms) | peak_max (ms) | samples > 50 ms in ring | peak dump bytes |
+|---|---|---|---|---|---|
+| 1 | 462 | 343.79 | 426.83 | 216 | 567 792 |
+| 2 | 460 | 343.31 | 420.54 | 216 | 558 629 |
+| 3 | 469 | 344.60 | 371.88 | 194 | 586 420 |
+| **mean** | — | **343.90** | — | 209 | ~571 kB |
+| **stdev** | — | **0.65** | — | — | — |
 
-**#160 closure verdict**: PLAN T14's F3-revisit trigger condition
-(`p99 > 50 ms` sustained under load) **does not fire** in the
-current state of the code.  The original 321.94 ms p99 was driven
-by a cluster of ~290 ms outliers (~1 % of the window).  In the
-current snapshot the outlier count per 90 s window dropped from
-~5 to ~1.  Aggregate stays well below the F3-revisit threshold.
+**3/3 trials fire** the PLAN T14 F3-revisit trigger (`p99 > 50 ms`).
+Mean p99 = 343.90 ± 0.65 ms — extremely consistent across trials.
+Average ~209 samples > 50 ms per trial (= ~45 % of the 1024-cap
+ring during the 90 s window).
 
-No single code change targeted state-dump cost; the improvement
-is incidental — likely cumulative impact of T17 schema
-simplifications, T36 outbound fire-and-forget removing daemon-
-side blocking, and T42 daemon observability reducing cross-
-process contention.
+**#160 stays OPEN.**  The original 321.94 ms finding reproduces
+robustly; the temporary "closure" was a fixture-mismatch
+artifact.  The state-dump path's contention spike on near-cap HBM
+is a real, reproducible problem.
 
-The single ~400 ms outlier remaining is documented for posterity.
-If it ever clusters again under different workloads (larger
-models, hicache storage backend, different sglang config), the
-trigger will fire and #160 should re-open.
+Diagnosis (unchanged from original): peak_units only ~170, so the
+~400 ms outliers are NOT tree-walk-cost.  They're GC / scheduler-
+contention stalls on the state-dump syscall under near-100 % HBM
+saturation.  An incremental-state path (F3) does not help; the
+right F3-revisit options are still drop-on-full vs coalesce.
 
 * date: 2026-06-01
-* raw log: `results/20260601_t160_revisit_run.log`
-* raw TSV: `results/20260601_094923_t160_revisit_stress_samples.tsv`
+* raw log: `results/20260601_t160_n3_run2.log`
+* raw TSVs: `results/20260601_*_t160_trial{1,2,3}_samples.tsv`
 
 Two ancillary findings from the stress probe (not blocking T14):
 * `peak_dram_used_frac = 0.0` throughout despite `--hicache-write-policy
