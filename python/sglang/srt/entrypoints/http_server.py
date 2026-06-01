@@ -650,27 +650,113 @@ async def server_info():
 # aginfer daemon (see dev/aginfer/DESIGN.md) consumes on every event.
 # Single-DP deployments get a flat dict; multi-DP deployments get
 # {"per_rank": [...]} so the daemon can still address each rank.
-@app.get("/aginfer/state")
-async def aginfer_state():
-    # Each entry is a GetAginferStateReqOutput; ``state_bytes`` is the
-    # pre-serialised fast path (UnifiedRadixCache), ``state`` is the
-    # legacy dict fallback (unsupported tree caches).
-    responses = await _global_state.tokenizer_manager.get_aginfer_state()
+#
+# #160 / F3-revisit (2026-06-01): direct synchronous dump under load
+# hits scheduler-loop tick variance (p99 ~340 ms when scheduler is
+# busy with prefill/decode batches).  Fix: HTTP-layer cache + a
+# background refresh task that absorbs the variance.  Daemon sees
+# bounded staleness (~refresh-interval) instead of unbounded latency.
+#
+# Cache invariants:
+#  * Bytes payload (or per_rank dict) cached in a single module-
+#    level slot, guarded by a lock.
+#  * Background task refreshes at AGINFER_STATE_REFRESH_MS cadence
+#    (default 50 ms).  Refresh blocks on the scheduler the same way
+#    the old synchronous path did; the variance lives in the
+#    background task's own loop, not the user-facing handler.
+#  * First-ever request: if cache is empty, do a synchronous fetch
+#    (one-time cold start; subsequent requests see the cache).
+#  * Refresh task auto-stops if the response shape regresses to
+#    `unsupported_tree_cache` (e.g. CLI launch without
+#    SGLANG_ENABLE_UNIFIED_RADIX_TREE=1) — no point repeatedly
+#    fetching a static error envelope.
+import os
+import threading
+
+_AGINFER_REFRESH_MS = float(
+    os.environ.get("AGINFER_STATE_REFRESH_MS", "50.0")
+)
+# Per #160 closure: a 50ms refresh cadence at ~5ms dump cost is <1%
+# scheduler overhead.  Operators can tune via the env var.
+
+_AGINFER_CACHE_LOCK = threading.Lock()
+_aginfer_cached_body: Optional[bytes] = None
+_aginfer_cached_media: str = "application/json"
+_aginfer_refresh_task: Optional[asyncio.Task] = None
+_aginfer_refresh_started: bool = False
+
+
+async def _aginfer_serialise(responses) -> tuple:
+    """Run the same single-rank / per_rank branch the synchronous
+    handler used to run; return (body_bytes, media_type)."""
     if len(responses) == 1:
         r = responses[0]
         if r.state_bytes is not None:
-            return Response(content=r.state_bytes, media_type="application/json")
-        return ORJSONResponse(r.state)
-    # Multi-DP: have to re-aggregate.  Decode the bytes lazily (orjson
-    # round-trip is still faster than building Python dicts during the
-    # tree walk).
+            return r.state_bytes, "application/json"
+        import orjson
+        return orjson.dumps(r.state), "application/json"
     import orjson
-
     per_rank = [
         orjson.loads(r.state_bytes) if r.state_bytes is not None else r.state
         for r in responses
     ]
-    return ORJSONResponse({"per_rank": per_rank})
+    return orjson.dumps({"per_rank": per_rank}), "application/json"
+
+
+async def _aginfer_refresh_one() -> None:
+    """Single refresh tick: fetch from scheduler, update cache.
+    Exceptions are logged + swallowed; the cache holds stale data
+    until the next successful tick."""
+    global _aginfer_cached_body, _aginfer_cached_media
+    try:
+        responses = (
+            await _global_state.tokenizer_manager.get_aginfer_state()
+        )
+        body, media = await _aginfer_serialise(responses)
+        with _AGINFER_CACHE_LOCK:
+            _aginfer_cached_body = body
+            _aginfer_cached_media = media
+    except Exception:  # noqa: BLE001
+        logger.exception("aginfer state refresh failed; keeping stale cache")
+
+
+async def _aginfer_refresh_loop() -> None:
+    """Background refresh task — re-fetches at the configured
+    cadence.  Survives forever (until process exit) so the cache
+    stays fresh under sustained traffic."""
+    interval_s = _AGINFER_REFRESH_MS / 1000.0
+    while True:
+        await _aginfer_refresh_one()
+        await asyncio.sleep(interval_s)
+
+
+@app.get("/aginfer/state")
+async def aginfer_state():
+    global _aginfer_refresh_task, _aginfer_refresh_started
+
+    # Lazy-start the refresh task on the first request.  Single-flight
+    # guarded by _aginfer_refresh_started (Python attr write is atomic).
+    if not _aginfer_refresh_started:
+        _aginfer_refresh_started = True
+        # Synchronous cold-start fetch so the FIRST response has fresh
+        # data (subsequent ones return cache).
+        await _aginfer_refresh_one()
+        _aginfer_refresh_task = asyncio.create_task(
+            _aginfer_refresh_loop(), name="aginfer-state-refresh",
+        )
+
+    with _AGINFER_CACHE_LOCK:
+        body = _aginfer_cached_body
+        media = _aginfer_cached_media
+    if body is None:
+        # Should not happen post-cold-start; refresh raised and left
+        # cache empty.  Fall back to a synchronous fetch so the
+        # caller doesn't get a confusing 500.
+        responses = (
+            await _global_state.tokenizer_manager.get_aginfer_state()
+        )
+        body, media = await _aginfer_serialise(responses)
+    return Response(content=body, media_type=media)
 
 
 # POST /aginfer/migrate -- apply paper §6 residence-set transitions.

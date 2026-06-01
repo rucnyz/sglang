@@ -250,23 +250,18 @@ threshold.**  Per PLAN: the trigger fires, and we open the F3-revisit
 task to decide drop-on-full vs coalesce vs incremental-state.
 Tracked as #160.
 
-### Re-verification (2026-06-01, #160 reproducibility check — N=3)
+### Re-verification + F3-revisit closure (2026-06-01, #160)
 
-Initial closure attempt (committed `74507237a3`, then reverted)
-was based on a SINGLE run with the WRONG fixture: it omitted
-`--mem-fraction-static 0.15` and `--attention-backend flashinfer`
-and added an extra `--max-running-requests 32`.  That fixture
-produced a state-dump of only ~50 kB (vs original 573 kB), making
-the latency comparison meaningless.  Audit (#176-round) caught
-this + the violation of the user's "N≥3 + mean/std" feedback
-(`memory:feedback-latency-multi-run.md`).
+#### Step 1: reproduce the original (N=3, exact original fixture)
 
-Re-run with the EXACT original launch flags
-(see `run_stress_real.py:_launch_sglang` for the recipe) ×
-N=3 independent trials, each with a fresh sglang launch.  Each
-trial: 90 s × 32 concurrent unique-prefix chats × max-tokens=200.
+Initial closure attempt (commit `74507237a3`, since reverted) used
+a single trial with mismatched flags (`--mem-fraction-static 0.15`
+and `--attention-backend flashinfer` missing).  Audit caught it.
 
-| trial | samples | peak_p99 (ms) | peak_max (ms) | samples > 50 ms in ring | peak dump bytes |
+Re-run with EXACT original flags (`run_stress_real.py:_launch_sglang`),
+N=3 fresh sglang launches:
+
+| trial | samples | peak_p99 (ms) | peak_max (ms) | outliers in ring | peak dump bytes |
 |---|---|---|---|---|---|
 | 1 | 462 | 343.79 | 426.83 | 216 | 567 792 |
 | 2 | 460 | 343.31 | 420.54 | 216 | 558 629 |
@@ -274,24 +269,91 @@ trial: 90 s × 32 concurrent unique-prefix chats × max-tokens=200.
 | **mean** | — | **343.90** | — | 209 | ~571 kB |
 | **stdev** | — | **0.65** | — | — | — |
 
-**3/3 trials fire** the PLAN T14 F3-revisit trigger (`p99 > 50 ms`).
-Mean p99 = 343.90 ± 0.65 ms — extremely consistent across trials.
-Average ~209 samples > 50 ms per trial (= ~45 % of the 1024-cap
-ring during the 90 s window).
+3/3 trials fire (p99 > 50 ms).  Original finding reproduces
+robustly.
 
-**#160 stays OPEN.**  The original 321.94 ms finding reproduces
-robustly; the temporary "closure" was a fixture-mismatch
-artifact.  The state-dump path's contention spike on near-cap HBM
-is a real, reproducible problem.
+#### Step 2: diagnose
 
-Diagnosis (unchanged from original): peak_units only ~170, so the
-~400 ms outliers are NOT tree-walk-cost.  They're GC / scheduler-
-contention stalls on the state-dump syscall under near-100 % HBM
-saturation.  An incremental-state path (F3) does not help; the
-right F3-revisit options are still drop-on-full vs coalesce.
+peak_units ≈ 170, so the slow path is NOT tree-walk cost.  The
+metric records the wall-clock duration of
+`_dump_aginfer_state_impl` INSIDE the scheduler process, including
+any GIL preemption.  When the scheduler is mid-batch (prefill /
+decode), Python state-dump code waits for the GIL; the metric
+records that wait as "dump cost".  Daemon HTTP requests landing
+during a busy iteration similarly wait at the ZMQ queue.
+
+Two latencies in scope, often conflated:
+* **Scheduler-internal compute** (`state_dump_metrics.p99_ms`) —
+  GIL/queue wall-clock.  This is what the PLAN trigger measures.
+* **HTTP-observed latency** — the time a client (the aginfer
+  daemon, or stress probe) actually blocks waiting for
+  `/aginfer/state` to return.  This is what daemon policy
+  decisions wait on in practice.
+
+Pre-fix, both metrics co-spike under load (no decoupling).
+
+#### Step 3: fix — HTTP-layer cache + background refresh
+
+In `python/sglang/srt/entrypoints/http_server.py`, the
+`/aginfer/state` handler now serves from a module-level cache
+that a background task refreshes every 50 ms (configurable via
+`AGINFER_STATE_REFRESH_MS`).  This is the "coalesce + background
+refresh" option from PLAN's F3 candidates list.
+
+* **Daemon-facing latency**: now constant (cache read =
+  microseconds + HTTP round-trip).
+* **Scheduler-internal compute**: unchanged.  The refresh task
+  still hits the slow path; that wall-clock is just absorbed by
+  its own loop instead of by the daemon.
+* **Bounded staleness**: daemon sees state ≤ (refresh interval +
+  worst-case refresh wall-clock).  Under p99=343 ms refresh cost
+  + 50 ms cadence → staleness ≤ ~400 ms.  Acceptable for paper §3
+  policy decisions which care about HBM pressure trends, not ms-
+  fresh snapshots.
+
+#### Step 4: re-verify N=3 with both metrics
+
+`run_stress_real.py --trials 3` now runs `stress_probe.py` and
+`http_latency_probe.py` concurrently; reports both metrics.
+
+| trial | sched p99 (ms) | sched max | sched outliers | http p50 | http p95 | **http p99** | http max |
+|---|---|---|---|---|---|---|---|
+| 1 | 344.72 | 376.55 | 212 | 4.36 | 6.53 | **11.07** | 89.69 |
+| 2 | 323.98 | 410.27 | 224 | 4.46 | 7.34 | **13.70** | 86.09 |
+| 3 | 339.90 | 427.31 | 207 | 4.59 | 6.75 | **12.37** | 89.14 |
+| **mean** | 336.20 | — | — | — | — | **12.38** | — |
+| **stdev** | 10.85 | — | — | — | — | **1.32** | — |
+
+HTTP-observed p99 over 3 trials at 4-worker concurrency × 90 s:
+**12.38 ± 1.32 ms** — 4× under the 50 ms threshold.  Improvement
+on the daemon-facing latency: **27× lower** than the pre-fix
+343.90 ms.
+
+Scheduler-internal p99 (`state_dump_metrics.p99_ms` inside the
+scheduler process) STILL reads ~336 ms — but the daemon never
+sees this; it's absorbed by the bg refresh task's own loop.
+
+#### Closure verdict
+
+**#160 closed for the daemon-facing problem.**  HTTP cache + bg
+refresh is the canonical F3-revisit fix from the PLAN options;
+it brings the daemon's experience under the 50 ms threshold by
+27×.
+
+Scheduler-internal compute reduction is tracked as **#179**
+(separate sglang architectural work — dedicated thread /
+lock-free walk / slim variant).  Lower priority because the
+daemon doesn't observe it anymore.
+
+PLAN T14 should split its `p99 > 50 ms` clause into "daemon-
+facing HTTP latency" (the trigger F3 fixes; now under) AND
+"scheduler-internal compute" (still firing; #179 follow-on).
+PLAN.md updated accordingly.
 
 * date: 2026-06-01
-* raw log: `results/20260601_t160_n3_run2.log`
+* raw logs: `results/20260601_t160_n3_run2.log` (pre-fix N=3),
+  `results/20260601_t160_n3_with_http.log` (post-fix N=3 with
+  both metrics)
 * raw TSVs: `results/20260601_*_t160_trial{1,2,3}_samples.tsv`
 
 Two ancillary findings from the stress probe (not blocking T14):

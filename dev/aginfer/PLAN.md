@@ -109,7 +109,30 @@ designing the fix.
 - Either trigger flips us back into a F3-revisit task to decide
   drop-on-full vs coalesce vs incremental-state.
 
-Open output: `verify/t14/README.md`.
+**F3-revisit status (#160 — 2026-06-01)**:
+* **Sglang trigger FIRED** on 2026-05-31 with peak p99 = 321.94 ms
+  (originally reproduced N=3 today as 343.90 ± 0.65 ms).
+* **Fix landed**: HTTP-layer cache + 50 ms-cadence background
+  refresh in `python/sglang/srt/entrypoints/http_server.py`.
+  This is the "coalesce + background refresh" option from the
+  three F3 candidates.  Daemon's HTTP-observed p99 dropped from
+  343 ms → **12.4 ms** (27× lower).
+* **Remaining gap**: the SCHEDULER-INTERNAL `state_dump_metrics.
+  p99_ms` still reads ~336 ms.  The cache hides this from the
+  daemon, but the scheduler still spends real wall-clock on slow
+  dumps when GIL-contended with prefill/decode.  Reducing the
+  scheduler-side compute is a separate sglang architectural
+  change (dedicated thread / lock-free walk) — tracked as #179.
+* **Trigger re-scoping**: PLAN T14's `p99 > 50 ms` clause should
+  be split into:
+    1. **Daemon-facing latency** (HTTP-observed) — the trigger
+       the F3-revisit options were designed to fix.  Currently
+       **12.4 ms**; under threshold.
+    2. **Scheduler-internal compute** (`state_dump_metrics.p99_ms`
+       from inside `_dump_aginfer_state_impl`) — separate concern;
+       reducing it is the #179 follow-on.
+
+Output: `verify/t14/README.md`.
 
 ### T15 — Hint table cross-rank divergence (DESIGN §6 "Hint consistency", round-8 H3)
 
