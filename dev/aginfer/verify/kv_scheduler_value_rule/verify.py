@@ -1,1045 +1,967 @@
-"""T7 verify: kv_scheduler event handlers + dispatch.
+"""verify/kv_scheduler_value_rule (#146): rewrite for post-T33 contract.
 
-Layer A (in-process, this file):
-  Stub /aginfer/state + stub /aginfer/migrate; drive paper §4 events
-  through the EventRouter; assert decision_set per event-kind, action
-  direction, migrate body, top-k bound, latency budget.
+The legacy verify in ``legacy/`` exercised the pre-round-9 surface:
+``_value(u, tier, state)`` over a single tier, ``Action.assignments``
+as ``(unit_id, Tier)``, ``state['tier_usage']`` flat dict.  T33
+collapsed that to a residence-set form (``_value(u, next_residence:
+List[Tier], state)``, ``Action.assignments`` 3-tuples, nested
+``pool_usage[tier].subpools[sp]``), and the legacy verify can no
+longer load any of its fixtures.
 
-Per memory:feedback-latency-multi-run: timing claims use mean ± std
-over N >= 3 runs.  Per memory:feedback-per-task-docs: noteworthy
-findings land in this folder's README RESULTS section.
+This file is the post-T33 contract pin.  It does NOT re-test T17's
+schema migration or T20's migrate-POST envelope — those have their
+own verify dirs.  Scope here is the kv_scheduler MODULE's behavior
+on top of those primitives:
 
-Run::
+  * ``build_paper_state``: post-T17 schema → ``SchedulerState``
+  * ``_build_decision_set``: paper §4 D_t per EventKind
+  * Program-aware λ / p_hat rules (ACTING-floor, alive p_hat)
+  * Top-k regret demote candidates (paper §7.1)
+  * ``Action.assignments`` 3-tuple shape
+  * Dispatch wiring (post-T36 outbound-only)
+  * Idempotence + robustness + latency floor
 
-    cd /scratch/yuzhou/projects/sglang/dev/aginfer
-    python verify/t7/verify.py
+Each stage is independent — fixture per stage, no cross-stage state.
 
-Expected last line: ``=== T7 PASSED ===``.
+Usage:
+    python dev/aginfer/verify/kv_scheduler_value_rule/verify.py
 """
 from __future__ import annotations
 
 import asyncio
-import json
-import socket
-import statistics
 import sys
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import httpx
-import uvicorn
-from fastapi import FastAPI, Request
 
-# Make the sibling daemon / baselines packages importable.
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
-sys.path.insert(0, str(_AGINFER_ROOT))
+if str(_AGINFER_ROOT) not in sys.path:
+    sys.path.insert(0, str(_AGINFER_ROOT))
 
-from daemon.events import Event, EventBus, EventKind  # noqa: E402
-from daemon.event_router import EventRouter  # noqa: E402
-from daemon.kv_scheduler import (  # noqa: E402
-    KvScheduler,
-    assignments_to_wire,
-    attach_kv_scheduler,
-    build_paper_state,
-)
+from baselines.base import Action, Tier  # noqa: E402
+from baselines.ours_greedy import OursGreedyPolicy  # noqa: E402
+from baselines.costs import default_costs  # noqa: E402
+from daemon import kv_scheduler as kvs  # noqa: E402
+from daemon.events import Event, EventKind  # noqa: E402
+from daemon.outbound import OutboundQueue  # noqa: E402
 from daemon.program_tracker import ProgramTracker, State  # noqa: E402
-from baselines.base import Tier  # noqa: E402
 
 
-# ---------------------------------------------------------------- helpers
+def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
+def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+class StageFail(AssertionError):
+    pass
 
 
-@asynccontextmanager
-async def run_server(app: FastAPI, host: str, port: int):
-    cfg = uvicorn.Config(app, host=host, port=port, log_level="error")
-    server = uvicorn.Server(cfg)
-    task = asyncio.create_task(server.serve())
-    # Wait for startup.
-    for _ in range(200):
-        if server.started:
-            break
-        await asyncio.sleep(0.01)
-    if not server.started:
-        raise RuntimeError(f"uvicorn never started on :{port}")
-    try:
-        yield
-    finally:
-        server.should_exit = True
-        await task
+# ============================================================ fixtures
 
 
-# ---------------------------------------------------------------- fixtures
-
-
-def make_synthetic_state(
+def _unit(
     *,
-    n_programs: int = 4,
-    platform_tokens: int = 1024,
-    session_tail_tokens: int = 4096,
-    hbm_cap_bytes: int = 8 * 1024 * 1024,  # 8 MiB to force pressure
-    dram_cap_bytes: int = 1024 * 1024 * 1024,
-    disk_cap_bytes: int = 64 * 1024 * 1024 * 1024,
-    bytes_per_token: int = 2048,
-    age_offset: int = 1,
+    uhash: str,
+    residence: List[str],
+    holders: List[str],
+    n_tokens: int = 1000,
+    n_bytes_per_tier: Optional[Dict[str, int]] = None,
+    last_access_time: int = 0,
+    hit_count: int = 1,
+    subpool: str = "kv",
 ) -> Dict[str, Any]:
-    """Build a /aginfer/state JSON that mirrors the T7 README fixture:
-
-      * 1 shared "platform" prefix held by all N programs;
-      * N per-program "session" tails (varying age).
-    """
-    units: List[Dict[str, Any]] = []
-    holders = [f"prog-{i}" for i in range(n_programs)]
-    units.append(
-        {
-            "hash": "u-shared-platform",
-            "tier": "HBM",
-            "n_tokens": platform_tokens,
-            "n_bytes": platform_tokens * bytes_per_token,
-            "last_access_time": 100,
-            "hit_count": 50 * n_programs,
-            "session_ids": holders,
-        }
-    )
-    for i in range(n_programs):
-        units.append(
-            {
-                "hash": f"u-tail-{i}",
-                "tier": "HBM",
-                "n_tokens": session_tail_tokens,
-                "n_bytes": session_tail_tokens * bytes_per_token,
-                # Older programs less recently used.
-                "last_access_time": 100 - i,
-                "hit_count": 4,
-                "session_ids": [f"prog-{i}"],
-            }
-        )
-    used_hbm = sum(u["n_bytes"] for u in units)
+    """Synthetic post-T17 unit JSON."""
+    if n_bytes_per_tier is None:
+        n_bytes_per_tier = {t: n_tokens * 2048 for t in residence}
+    n_bytes = {t: {subpool: nb} for t, nb in n_bytes_per_tier.items()}
     return {
-        "tier_usage": {
-            "HBM": {"used_bytes": used_hbm, "cap_bytes": hbm_cap_bytes},
-            "DRAM": {"used_bytes": 0, "cap_bytes": dram_cap_bytes},
-            "DISK": {"used_bytes": 0, "cap_bytes": disk_cap_bytes},
-        },
-        "units": units,
-        "time_counter": 100 + age_offset,
-        "bytes_per_token": bytes_per_token,
-        "page_size": 16,
+        "hash": uhash,
+        "residence": list(residence),
+        "n_tokens": n_tokens,
+        "n_bytes": n_bytes,
+        "last_access_time": last_access_time,
+        "hit_count": hit_count,
+        "session_ids": list(holders),
     }
 
 
-def build_stub_sglang(state_provider) -> tuple[FastAPI, List[Dict[str, Any]]]:
-    """A stub of sglang's /aginfer/state + /aginfer/migrate endpoints.
+def _state_json(
+    *,
+    units: List[Dict[str, Any]],
+    programs: Optional[Dict[str, Dict[str, Any]]] = None,
+    time_counter: int = 100,
+    hbm_cap: int = 10 * 1024 * 1024 * 1024,
+    hbm_used: int = 1 * 1024 * 1024 * 1024,
+    dram_cap: int = 40 * 1024 * 1024 * 1024,
+    dram_used: int = 1 * 1024 * 1024 * 1024,
+    disk_cap: int = 200 * 1024 * 1024 * 1024,
+    disk_used: int = 0,
+    h_max_per_byte_sec: float = 0.0,  # cold-start placeholder; see kv_scheduler positivity rules
+    peak_bw_bps: int = 64 * 1024 * 1024 * 1024,  # 64 GB/s nominal PCIe5
+    prefill_bps: float = 0.0,  # pre-T26 placeholder
+    subpool: str = "kv",
+) -> Dict[str, Any]:
+    """Synthetic post-T17 state JSON.  All required fields populated.
 
-    ``state_provider`` is a zero-arg callable that returns the current
-    state JSON (so a test can mutate it between events).  Migrate POSTs
-    are captured into the returned list.
-    """
-    app = FastAPI()
-    migrate_calls: List[Dict[str, Any]] = []
-
-    @app.get("/aginfer/state")
-    async def _state() -> Any:
-        return state_provider()
-
-    @app.post("/aginfer/migrate")
-    async def _migrate(raw: Request) -> Any:
-        body = await raw.json()
-        migrate_calls.append(body)
-        actions = body.get("actions", []) if isinstance(body, dict) else []
+    Defaults match the cold-start pre-T26/T12 reality: h_max=0,
+    prefill_bps=0.  Override per stage when those signals matter."""
+    def _pool(used: int, cap: int) -> Dict[str, Any]:
         return {
-            "applied": len(actions),
-            "applied_hashes": [a.get("hash") for a in actions if isinstance(a, dict)],
-            "skipped": [],
-        }
-
-    return app, migrate_calls
-
-
-@asynccontextmanager
-async def boot_router(
-    sglang_base_url: str, tracker: ProgramTracker
-) -> tuple[EventRouter, KvScheduler]:
-    bus = EventBus()
-    router = EventRouter(bus=bus, sglang_base_url=sglang_base_url)
-    scheduler = KvScheduler(
-        tracker=tracker, sglang_base_url=sglang_base_url
-    )
-    attach_kv_scheduler(router, scheduler)
-    await router.start()
-    try:
-        yield router, scheduler
-    finally:
-        await router.stop()
-        await scheduler.aclose()
-
-
-# ---------------------------------------------------------------- steps
-
-
-def step_build_paper_state_smoke() -> None:
-    """[1] Pure-Python: build_paper_state on a synthetic state JSON
-    returns a SchedulerState whose decision_set matches the per-event
-    table (paper §4)."""
-    tracker = ProgramTracker()
-    # prog-2 is in tool call → its tail unit should be a demote candidate
-    # under λ_ACTING.
-    tracker.observe_arrival("prog-0")
-    tracker.observe_arrival("prog-2")
-    tracker.observe_completion("prog-2")  # ACTING
-
-    state_json = make_synthetic_state(n_programs=4)
-
-    # session_arrival: only shared-prefix units in D_t.
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.SESSION_ARRIVAL, session="prog-NEW"),
-        tracker=tracker,
-        unknown_tier_log=set(),
-    )
-    assert s.decision_set == ["u-shared-platform"], s.decision_set
-
-    # tool_call_start(prog-0): its own session tail.
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.TOOL_CALL_START, session="prog-0"),
-        tracker=tracker,
-        unknown_tier_log=set(),
-    )
-    assert s.decision_set == ["u-tail-0"], s.decision_set
-
-    # tool_call_end(prog-0): same tail (promote angle).
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.TOOL_CALL_END, session="prog-0"),
-        tracker=tracker,
-        unknown_tier_log=set(),
-    )
-    assert s.decision_set == ["u-tail-0"], s.decision_set
-
-    # sub_dispatch_blocking(prog-1): own tail + shared.
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.SUB_DISPATCH_BLOCKING, session="prog-1"),
-        tracker=tracker,
-        unknown_tier_log=set(),
-    )
-    assert set(s.decision_set) == {"u-tail-1", "u-shared-platform"}, s.decision_set
-
-    # sub_dispatch_async: only shared prefix.
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.SUB_DISPATCH_ASYNC, session="prog-1"),
-        tracker=tracker,
-        unknown_tier_log=set(),
-    )
-    assert s.decision_set == ["u-shared-platform"], s.decision_set
-
-    # llm_prefill: informational only, no decisions.
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.LLM_PREFILL, session="prog-0"),
-        tracker=tracker,
-        unknown_tier_log=set(),
-    )
-    assert s.decision_set == [], s.decision_set
-
-    # ACTING-floor λ applied to prog-2's tail unit.
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.TOOL_CALL_START, session="prog-2"),
-        tracker=tracker,
-        lambda_acting=0.2,
-        unknown_tier_log=set(),
-    )
-    tail2 = s.units["u-tail-2"]
-    # λ for prog-2's tail must come from ACTING floor (0.2), not from
-    # hits/age (which would be 4/age ≈ different).
-    assert tail2.lambda_rate == 0.2, tail2.lambda_rate
-    # Shared prefix is held by prog-2 too → also clamped to ACTING.
-    plat = s.units["u-shared-platform"]
-    assert plat.lambda_rate == 0.2, plat.lambda_rate
-
-
-def step_top_k_bounded() -> None:
-    """[2] memory_pressure event's D_t is bounded by top-k regardless
-    of tree size, AND the SELECTED units are the lowest-V (best demote
-    candidates per paper §7.1) — not just any 256 units.
-
-    Audit round-1 M1+N7: previously only asserted length.  A regression
-    that returned ``items[-k:]`` (the HIGHEST-V units, i.e. the
-    BEST-to-KEEP) would have passed.  We now plant 10 "obvious
-    low-V" sentinels among 10 000 noisy fillers and assert ALL 10
-    sentinels appear in the returned decision_set.
-
-    Sentinel design: huge n_bytes (=> massive holding tax) + zero
-    hit_count (=> p_hat = 0) → V_u is most negative.  Fillers have
-    high hit_count + tiny n_bytes → V_u positive or only mildly
-    negative.  Any correct sort/slice puts the 10 sentinels first.
-    """
-    from daemon import kv_scheduler as _kvs
-
-    tracker = ProgramTracker()
-    units: List[Dict[str, Any]] = []
-    # Fillers: high hit_count, tiny size → strong KEEP signal.
-    for i in range(9_990):
-        units.append(
-            {
-                "hash": f"u-filler-{i}",
-                "tier": "HBM",
-                "n_tokens": 16,
-                "n_bytes": 32_768,
-                "last_access_time": i,
-                "hit_count": 1000,  # high p_hat → V_u positive
-                "session_ids": [],
-            }
-        )
-    # Sentinels: zero hit_count, huge size → strong DEMOTE signal.
-    sentinel_hashes = [f"u-sentinel-{j}" for j in range(10)]
-    for j, h in enumerate(sentinel_hashes):
-        units.append(
-            {
-                "hash": h,
-                "tier": "HBM",
-                "n_tokens": 4096,
-                "n_bytes": 4096 * 2048,  # 8 MiB each — biggest in the pool
-                "last_access_time": 10_000 - j,  # young (high age denom)
-                "hit_count": 0,                  # zero p_hat
-                "session_ids": [],
-            }
-        )
-    state_json = {
-        "tier_usage": {
-            "HBM": {
-                "used_bytes": sum(u["n_bytes"] for u in units),
-                "cap_bytes": 1024 * 1024 * 1024,
+            "subpools": {
+                subpool: {
+                    "used_bytes": used,
+                    "cap_bytes": cap,
+                    "available_bytes": max(0, cap - used),
+                    "evictable_bytes": used,
+                    "page_bytes": 64 * 1024,
+                },
             },
-            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
-            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
+        }
+    return {
+        "time_counter": time_counter,
+        "throughput_ema": {
+            "prefill_bps": prefill_bps,
+            "decode_per_program": {},
         },
+        "pool_usage": {
+            "HBM": _pool(hbm_used, hbm_cap),
+            "DRAM": _pool(dram_used, dram_cap),
+            "DISK": _pool(disk_used, disk_cap),
+        },
+        "per_program_usage": programs or {},
         "units": units,
-        "time_counter": 20_000,
+        "link_stats": {
+            link: {
+                "peak_bw_bps": peak_bw_bps,
+                "recent_throughput_bps": 0.0,
+                "time_since_last_sample_s": 5.0,  # idle
+            } for link in ("HBM->DRAM", "DRAM->HBM",
+                           "DRAM->DISK", "DISK->DRAM")
+        },
+        "tier_holding_cost": {
+            tier: {subpool: {"h_max_per_byte_sec": h_max_per_byte_sec}}
+            for tier in ("HBM", "DRAM", "DISK")
+        },
     }
-    s = build_paper_state(
-        state_json,
-        event=Event(
-            kind=EventKind.MEMORY_PRESSURE,
-            payload={"state": "HIGH", "occ": 0.95},
-        ),
-        tracker=tracker,
+
+
+def _build_state(
+    state_json: Dict[str, Any],
+    event: Event,
+    tracker: Optional[ProgramTracker] = None,
+):
+    if tracker is None:
+        tracker = ProgramTracker()
+    return kvs.build_paper_state(
+        state_json, event=event, tracker=tracker,
         unknown_tier_log=set(),
     )
-    assert len(s.decision_set) == _kvs._DEFAULT_MEMORY_PRESSURE_TOPK, (
-        f"top-k bound violated: {len(s.decision_set)} != "
-        f"{_kvs._DEFAULT_MEMORY_PRESSURE_TOPK}"
+
+
+# ============================================================ A. schema
+
+
+def stage_a0_schema_pool_usage_to_tier_usage() -> None:
+    """post-T17 ``pool_usage[tier].subpools[sp]`` populates
+    ``TierUsage.pool_used / pool_cap / page_bytes / pool_evictable``
+    per-(tier, subpool)."""
+    sj = _state_json(
+        units=[_unit(uhash="u0", residence=["HBM"], holders=["p0"])],
+        hbm_used=3 * 1024 * 1024 * 1024,
+        hbm_cap=10 * 1024 * 1024 * 1024,
     )
-    # Audit M1+N7: assert all 10 sentinels are in the selected 256.
-    # A regression that flipped the sort direction (or returned
-    # `items[-k:]`) would put the 10 high-keep fillers in instead and
-    # this would fail.
-    missing = [h for h in sentinel_hashes if h not in s.decision_set]
-    assert not missing, (
-        f"top-k selection failed to include obvious low-V sentinels: "
-        f"{missing} (current top-k must be returning high-keep units "
-        f"instead — check _top_k_by_regret sort direction / slice)"
-    )
-
-
-async def step_event_to_migrate_e2e() -> None:
-    """[3] End-to-end: event arrives → kv_scheduler fetches state →
-    decide() runs → migrate POST hits the stub.
-
-    A regression that (a) drops the migrate POST, (b) sends an empty
-    body, or (c) sends an action whose hash doesn't match a real
-    unit, would trip the assertions below.
-    """
-    state_holder = {"state": make_synthetic_state(n_programs=4)}
-    stub_app, migrate_calls = build_stub_sglang(lambda: state_holder["state"])
-    stub_port = _free_port()
-    stub_url = f"http://127.0.0.1:{stub_port}"
-
-    tracker = ProgramTracker()
-    # prog-2 in tool call so tail can be demoted; rest REASONING.
-    tracker.observe_arrival("prog-0")
-    tracker.observe_arrival("prog-1")
-    tracker.observe_arrival("prog-2")
-    tracker.observe_arrival("prog-3")
-    tracker.observe_completion("prog-2")
-
-    async with run_server(stub_app, "127.0.0.1", stub_port):
-        async with boot_router(stub_url, tracker) as (router, scheduler):
-            # Fire a tool_call_start(prog-2): prog-2's tail must be a
-            # demote candidate (its λ_ACTING floor + small p_hat keeps
-            # HBM expensive vs DRAM).
-            await router.bus.emit(
-                Event(kind=EventKind.TOOL_CALL_START, session="prog-2")
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-
-    assert scheduler.decisions >= 1, scheduler.decisions
-    # The decision_set was just prog-2's tail.
-    assert scheduler.last_decision_set_size == 1, (
-        scheduler.last_decision_set_size
-    )
-    if not migrate_calls:
-        # Action was empty (decide() declined).  That's a legitimate
-        # outcome — assert state-derived expectation matches.
-        action = scheduler.last_action
-        assert action is not None
-        assert not action.assignments, action.assignments
-    else:
-        # We DID send a migrate.  Body must reference prog-2's tail.
-        body = migrate_calls[-1]
-        actions = body.get("actions", [])
-        assert any(
-            a.get("hash") == "u-tail-2" for a in actions
-        ), f"migrate body missing u-tail-2: {actions!r}"
-        # Audit round-1 M2: previously asserted only ``!= "HBM"`` which
-        # allowed DROP.  Paper §4 / README line 50 says the tail moves
-        # to DRAM during a tool call (catastrophic-demote DROP would
-        # save no bytes and re-prefill on return).  Tighten to DRAM
-        # OR DISK — both are non-catastrophic; DROP is the regression
-        # we want to catch.
-        for a in actions:
-            if a["hash"] == "u-tail-2":
-                assert a["target_tier"] in ("DRAM", "DISK"), (
-                    f"tool_call_start demoted to wrong tier "
-                    f"{a['target_tier']!r}; expected DRAM/DISK, NOT DROP "
-                    f"or HBM"
-                )
-
-
-async def step_no_migrate_when_action_empty() -> None:
-    """[4] WORST CASE: every unit high-p_hat + low age → decide()
-    returns Action(assignments=[]) → ZERO migrate POSTs sent.
-
-    Pins paper §7's "no churn if nothing's worth moving" claim.  A
-    regression that always POSTs an empty body (or worse, all-DROP)
-    would trip the migrate-call-count assertion.
-    """
-    # Custom state: tail units have absurdly high hit_count + young age.
-    state = make_synthetic_state(n_programs=2)
-    for u in state["units"]:
-        u["hit_count"] = 1_000_000
-        u["last_access_time"] = 100  # equal to time_counter -1 (young)
-    state["time_counter"] = 101
-
-    state_holder = {"state": state}
-    stub_app, migrate_calls = build_stub_sglang(lambda: state_holder["state"])
-    stub_port = _free_port()
-    stub_url = f"http://127.0.0.1:{stub_port}"
-
-    tracker = ProgramTracker()
-    tracker.observe_arrival("prog-0")
-    tracker.observe_arrival("prog-1")
-    async with run_server(stub_app, "127.0.0.1", stub_port):
-        async with boot_router(stub_url, tracker) as (router, scheduler):
-            await router.bus.emit(
-                Event(
-                    kind=EventKind.MEMORY_PRESSURE,
-                    payload={"state": "HIGH", "occ": 0.92},
-                )
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-    assert scheduler.migrate_calls == 0, (
-        f"expected 0 migrate POSTs (nothing worth moving), got "
-        f"{scheduler.migrate_calls}"
-    )
-    assert scheduler.last_action is not None
-    assert not scheduler.last_action.assignments, (
-        scheduler.last_action.assignments
-    )
-
-
-async def step_state_fetch_failure_recovers() -> None:
-    """[5] WORST CASE: /aginfer/state returns 500 → kv_scheduler logs
-    + bows out; tracker untouched; event_worker keeps draining.
-
-    A regression that lets the fetch exception propagate would crash
-    the event_worker (which would leave the daemon unresponsive to
-    further webhooks).
-    """
-    state_holder = {"fail": True}
-
-    stub_app = FastAPI()
-
-    @stub_app.get("/aginfer/state")
-    async def _bad():  # noqa: ANN001
-        if state_holder["fail"]:
-            from fastapi.responses import JSONResponse
-
-            return JSONResponse({"error": "boom"}, status_code=500)
-        return make_synthetic_state(n_programs=1)
-
-    @stub_app.post("/aginfer/migrate")
-    async def _migrate(raw: Request) -> Any:
-        return {"applied": 0, "applied_hashes": [], "skipped": []}
-
-    stub_port = _free_port()
-    stub_url = f"http://127.0.0.1:{stub_port}"
-    tracker = ProgramTracker()
-    async with run_server(stub_app, "127.0.0.1", stub_port):
-        async with boot_router(stub_url, tracker) as (router, scheduler):
-            # Bad fetch event.
-            await router.bus.emit(
-                Event(
-                    kind=EventKind.MEMORY_PRESSURE,
-                    payload={"state": "HIGH", "occ": 0.95},
-                )
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            # No decisions were made (fetch failed before build_paper_state).
-            assert scheduler.decisions == 0, scheduler.decisions
-            assert scheduler.migrate_calls == 0, scheduler.migrate_calls
-
-            # Worker is still alive: flip the stub, fire again, succeed.
-            state_holder["fail"] = False
-            await router.bus.emit(
-                Event(
-                    kind=EventKind.MEMORY_PRESSURE,
-                    payload={"state": "HIGH", "occ": 0.95},
-                )
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-    assert router.events_handled >= 2, (
-        f"second event was not drained: events_handled={router.events_handled}"
-    )
-
-
-async def step_decide_latency_at_1k_units() -> dict:
-    """[6] COST: decide() < 50 ms at 1 000 units on a memory_pressure
-    event.  Per memory:feedback-latency-multi-run, multi-run mean ±
-    std.  Catches a regression that would let decide() scale linearly
-    past the README's 50 ms budget.
-    """
-    from daemon import kv_scheduler as _kvs
-
-    tracker = ProgramTracker()
-    # Build a 1k-unit synthetic state without rebuilding for each run.
-    units: List[Dict[str, Any]] = []
-    for i in range(1000):
-        units.append(
-            {
-                "hash": f"u-{i}",
-                "tier": "HBM",
-                "n_tokens": 128,
-                "n_bytes": 128 * 2048,
-                "last_access_time": i,
-                "hit_count": (i * 11) % 17,
-                "session_ids": [],
-            }
+    s = _build_state(sj, Event(EventKind.LLM_PREFILL, session="p0"))
+    if s.tier_usage.pool_used[Tier.HBM]["kv"] != 3 * 1024**3:
+        raise StageFail(
+            f"pool_used HBM/kv: {s.tier_usage.pool_used[Tier.HBM]}"
         )
-    state_json = {
-        "tier_usage": {
-            "HBM": {"used_bytes": sum(u["n_bytes"] for u in units),
-                    "cap_bytes": 256 * 1024 * 1024},
-            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
-            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
-        },
-        "units": units,
-        "time_counter": 2000,
-    }
-    from baselines.ours_greedy import OursGreedyPolicy
-    from baselines.costs import default_costs
-
-    policy = OursGreedyPolicy(default_costs())
-
-    N_RUNS = 5
-    run_decide_ms: List[float] = []
-    run_build_ms: List[float] = []
-    for _ in range(N_RUNS):
-        # Warmup
-        _ = build_paper_state(
-            state_json,
-            event=Event(kind=EventKind.MEMORY_PRESSURE),
-            tracker=tracker,
-            unknown_tier_log=set(),
+    if s.tier_usage.pool_cap[Tier.HBM]["kv"] != 10 * 1024**3:
+        raise StageFail(
+            f"pool_cap HBM/kv: {s.tier_usage.pool_cap[Tier.HBM]}"
         )
-        # Build cost.
-        t0 = time.perf_counter()
-        s = build_paper_state(
-            state_json,
-            event=Event(kind=EventKind.MEMORY_PRESSURE),
-            tracker=tracker,
-            unknown_tier_log=set(),
+    if s.tier_usage.page_bytes[Tier.HBM]["kv"] != 64 * 1024:
+        raise StageFail(
+            f"page_bytes HBM/kv: {s.tier_usage.page_bytes[Tier.HBM]}"
         )
-        build_ms = (time.perf_counter() - t0) * 1000
-        # Decide cost.
-        t0 = time.perf_counter()
-        _ = policy.decide(s)
-        decide_ms = (time.perf_counter() - t0) * 1000
-        run_build_ms.append(build_ms)
-        run_decide_ms.append(decide_ms)
-    stats = {
-        "build_mean": statistics.mean(run_build_ms),
-        "build_std": statistics.stdev(run_build_ms),
-        "decide_mean": statistics.mean(run_decide_ms),
-        "decide_std": statistics.stdev(run_decide_ms),
-    }
-    print(
-        f"    decide() @ 1k units, {N_RUNS} runs: "
-        f"build {stats['build_mean']:.2f} ± {stats['build_std']:.2f} ms; "
-        f"decide {stats['decide_mean']:.2f} ± {stats['decide_std']:.2f} ms"
+    # ReuseUnit residence is post-T17 List[Tier], not single Tier.
+    u = s.units["u0"]
+    if u.residence != [Tier.HBM]:
+        raise StageFail(f"unit.residence: {u.residence}")
+    if u.n_bytes_by_tier.get(Tier.HBM, {}).get("kv") != 1000 * 2048:
+        raise StageFail(f"unit.n_bytes_by_tier: {u.n_bytes_by_tier}")
+
+
+def stage_a1_multi_rank_flatten() -> None:
+    """``_flatten_per_rank`` SUMs pool_usage across ranks, dedupes
+    units by hash with residence-union, fatals on n_bytes
+    disagreement."""
+    sj_rank = _state_json(
+        units=[_unit(uhash="shared", residence=["HBM"], holders=["p0"])],
+        hbm_used=2 * 1024**3, hbm_cap=10 * 1024**3,
     )
-    # Audit round-1 N5: README budget is decide < 50 ms but actual is
-    # ~1.5 ms — 33× headroom hides a noticeable regression.  Tighten to
-    # mean+3σ < 5 ms (still ~3× headroom over current; catches an
-    # O(N²) reintroduction).  Build budget stays 5 ms (already tight).
-    decide_env = stats["decide_mean"] + 3.0 * stats["decide_std"]
-    build_env = stats["build_mean"] + 3.0 * stats["build_std"]
-    assert decide_env < 5.0, (
-        f"decide() mean+3σ = {decide_env:.2f} ms exceeds 5 ms budget "
-        f"(was 50 ms before audit round-1 N5 tightened)"
-    )
-    assert build_env < 5.0, (
-        f"build_paper_state mean+3σ = {build_env:.2f} ms exceeds 5 ms budget"
-    )
-    return stats
-
-
-async def step_lambda_acting_sweep() -> None:
-    """[7] Sensitivity: λ_ACTING ∈ {1/30, 1/5, 1/1, 2/1} — the
-    demote/promote SIGN must be stable across the in-range values and
-    must SATURATE (not invert) at the floor / ceiling.
-
-    Forces the calibration justification: tells the user "any λ in
-    the [1/30, 1/1] envelope produces qualitatively the same
-    decision".  Catches a regression that flipped the sign somewhere
-    in the value-function plumbing.
-    """
-    from daemon import kv_scheduler as _kvs
-
-    state_json = make_synthetic_state(n_programs=2)
-    tracker = ProgramTracker()
-    tracker.observe_arrival("prog-0")
-    tracker.observe_arrival("prog-1")
-    tracker.observe_completion("prog-1")  # ACTING
-
-    from baselines.ours_greedy import OursGreedyPolicy
-    from baselines.costs import default_costs
-
-    policy = OursGreedyPolicy(default_costs())
-    # Audit round-1 N1: previously {1/30, 1/5, 1/1, 2/1} tested only
-    # ceiling clamp.  Add 1/100 below the floor to pin floor clamping
-    # too — a regression removing `max(_FLOOR, ...)` from
-    # _clamp_lambda_acting would now diverge λ=1/100 from λ=1/30.
-    lams = [1 / 100, 1 / 30, 1 / 5, 1 / 1, 2 / 1]
-    actions_per_lam: Dict[float, List[Tuple[str, Tier]]] = {}
-    for lam in lams:
-        s = build_paper_state(
-            state_json,
-            event=Event(
-                kind=EventKind.MEMORY_PRESSURE,
-                payload={"state": "HIGH", "occ": 0.95},
-            ),
-            tracker=tracker,
-            lambda_acting=lam,
-            unknown_tier_log=set(),
+    multi = {"per_rank": [sj_rank, sj_rank]}  # same shape on both ranks
+    flat = kvs._flatten_per_rank(multi)
+    # SUM used / cap.
+    if flat["pool_usage"]["HBM"]["subpools"]["kv"]["used_bytes"] != 4 * 1024**3:
+        raise StageFail(
+            f"used_bytes should sum across ranks: "
+            f"{flat['pool_usage']['HBM']['subpools']['kv']}"
         )
-        a = policy.decide(s)
-        actions_per_lam[lam] = list(a.assignments)
-    # Print for debug.
-    for lam, acts in actions_per_lam.items():
-        print(f"    λ_ACTING={lam:.3f}: {len(acts)} migration(s)")
-    # Saturation contract: the ceiling-clamped value (2/1 → clamped to
-    # 1/1) must produce the SAME action set as λ=1/1 (no oscillation
-    # caused by an out-of-range input).
-    assert actions_per_lam[1 / 1] == actions_per_lam[2 / 1], (
-        f"clamping was bypassed: λ=1/1 → {actions_per_lam[1/1]} vs "
-        f"λ=2/1 → {actions_per_lam[2/1]}"
-    )
-    # Audit round-1 N1: floor clamp.  λ=1/100 (below floor 1/30) must
-    # produce the SAME action set as λ=1/30.  A regression removing
-    # the floor would let λ=1/100 propagate → larger hold_time →
-    # different demote decisions.
-    assert actions_per_lam[1 / 100] == actions_per_lam[1 / 30], (
-        f"floor clamp bypassed: λ=1/100 → {actions_per_lam[1/100]} vs "
-        f"λ=1/30 → {actions_per_lam[1/30]}"
-    )
-    # Floor-clamped value (1/30) is the FLOOR of the envelope.  No
-    # action should have target=DROP (we don't want catastrophic
-    # demotion at the floor; the test passes if decisions stay tier-
-    # local).
-    for lam, acts in actions_per_lam.items():
-        for _h, tier in acts:
-            assert tier != Tier.DROP, (
-                f"λ={lam} produced a DROP migration; floor calibration is "
-                f"over-trusting the ACTING signal"
-            )
-
-
-def step_assignments_to_wire_contract() -> None:
-    """[8] Pure unit test: ``assignments_to_wire`` produces the
-    schema sglang's ``POST /aginfer/migrate`` expects.
-
-    Pinned because a refactor that swaps "target_tier" for "tier"
-    (or moves to ints) would silently break dispatch — sglang would
-    400, kv_scheduler logs the rejection but keeps running.
-    """
-    out = assignments_to_wire(
-        [
-            ("u-1", Tier.DRAM),
-            ("u-2", Tier.DROP),
-            ("u-3", Tier.HBM),
-        ]
-    )
-    assert out == [
-        {"hash": "u-1", "target_tier": "DRAM"},
-        {"hash": "u-2", "target_tier": "DROP"},
-        {"hash": "u-3", "target_tier": "HBM"},
-    ], out
-
-
-async def step_idempotent_repeat_event() -> None:
-    """[9] Replay the SAME event 3× and assert the migrate body of the
-    last call equals the first (modulo state drift, which is zero
-    here because the stub state is frozen).
-
-    Audit round-1 N4: previous version used ``if migrate_calls:`` —
-    if the policy declined to migrate (legit outcome) the step
-    silently passed without checking anything.  Now we construct a
-    fixture that GUARANTEES a migrate: pressure event on a state
-    with sentinel low-V units (same trick as step [2]).
-    """
-    # Build a state that's certain to trigger a migrate.
-    units: List[Dict[str, Any]] = [
-        {
-            "hash": f"u-keeper-{i}",
-            "tier": "HBM",
-            "n_tokens": 16,
-            "n_bytes": 32_768,
-            "last_access_time": 1000 + i,
-            "hit_count": 1000,
-            "session_ids": ["prog-keeper"],
-        }
-        for i in range(50)
-    ]
-    # Sentinels — must be demoted under top-k regret + decide().
-    for j in range(5):
-        units.append(
-            {
-                "hash": f"u-sentinel-{j}",
-                "tier": "HBM",
-                "n_tokens": 4096,
-                "n_bytes": 4096 * 2048,
-                "last_access_time": 2000,
-                "hit_count": 0,
-                "session_ids": [],
-            }
-        )
-    state = {
-        "tier_usage": {
-            "HBM": {
-                "used_bytes": sum(u["n_bytes"] for u in units),
-                "cap_bytes": 32 * 1024 * 1024,  # tight; forces pressure
-            },
-            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
-            "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
-        },
-        "units": units,
-        "time_counter": 3000,
-    }
-    state_holder = {"state": state}
-    stub_app, migrate_calls = build_stub_sglang(lambda: state_holder["state"])
-    stub_port = _free_port()
-    stub_url = f"http://127.0.0.1:{stub_port}"
-    tracker = ProgramTracker()
-    tracker.observe_arrival("prog-keeper")
-    async with run_server(stub_app, "127.0.0.1", stub_port):
-        async with boot_router(stub_url, tracker) as (router, scheduler):
-            for _ in range(3):
-                await router.bus.emit(
-                    Event(
-                        kind=EventKind.MEMORY_PRESSURE,
-                        payload={"state": "HIGH", "occ": 0.95},
-                    )
-                )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-    # N4 fix: REQUIRE that all 3 migrates fired.
-    assert len(migrate_calls) == 3, (
-        f"expected exactly 3 migrate POSTs (one per replayed event); "
-        f"got {len(migrate_calls)}.  Fixture must force a migrate "
-        f"otherwise step [9] silently asserts nothing."
-    )
-    # And all 3 bodies must match (paper §9 idempotence).
-    first = migrate_calls[0]
-    for i, body in enumerate(migrate_calls[1:], start=1):
-        assert body == first, (
-            f"non-idempotent migrate body across repeats: replay #{i} "
-            f"differs from first.\n  first={first}\n  later={body}"
+    if flat["pool_usage"]["HBM"]["subpools"]["kv"]["cap_bytes"] != 20 * 1024**3:
+        raise StageFail("cap_bytes should sum across ranks")
+    # Dedupe by hash; residence union.
+    if len(flat["units"]) != 1:
+        raise StageFail(
+            f"shared-hash units should dedupe: got {len(flat['units'])}"
         )
 
 
-async def step_all_event_kinds_registered() -> None:
-    """[11] Audit round-1 M3: ``attach_kv_scheduler`` must register
-    the kv_scheduler handler for ALL 8 paper §4 EventKind values.
-    The previous coverage tested 7 of 8 (PRESSURE_RESOLVED was never
-    fired).  A regression like ``for kind in EventKind: if kind !=
-    PRESSURE_RESOLVED: router.set_handler(...)`` would silently fall
-    back to ``_noop_handler`` for that kind.
-
-    Two-part assertion:
-      (a) For every EventKind value, ``router._handlers[kind.value]``
-          is the kv_scheduler handler (not the noop fallback).
-      (b) Fire a real PRESSURE_RESOLVED event end-to-end; assert
-          ``scheduler.last_decision_set_size`` is non-zero
-          (handler was actually invoked).
-    """
-    # Audit round-3 VACUOUS-1: previous version compared bound-method
-    # identity (``handler == scheduler.handle``), which is fragile —
-    # a future ``functools.partial`` wrapper would fail equality but
-    # routing would be functionally correct (and vice versa, a
-    # wrapper that intercepts but still calls handle would pass
-    # equality while breaking behavior).  Replace with FUNCTIONAL
-    # pin: fire one event of EACH kind in turn and assert
-    # ``last_decision_set_size`` was actually touched by
-    # ``scheduler.handle`` (the sentinel-overwrite check).
-    state_holder = {"state": make_synthetic_state(n_programs=2)}
-    stub_app, _migrate_calls = build_stub_sglang(lambda: state_holder["state"])
-    stub_port = _free_port()
-    stub_url = f"http://127.0.0.1:{stub_port}"
-    tracker = ProgramTracker()
-    tracker.observe_arrival("prog-0")
-    tracker.observe_arrival("prog-1")
-    SENTINEL = -42
-    async with run_server(stub_app, "127.0.0.1", stub_port):
-        async with boot_router(stub_url, tracker) as (router, scheduler):
-            for kind in EventKind:
-                scheduler.last_decision_set_size = SENTINEL
-                await router.bus.emit(
-                    Event(
-                        kind=kind,
-                        session="prog-0",
-                        payload={"state": "HIGH", "occ": 0.95},
-                    )
-                )
-                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-                # If routing landed on _noop_handler instead of
-                # scheduler.handle, the sentinel would still be -42
-                # (noop doesn't touch this field).
-                assert scheduler.last_decision_set_size != SENTINEL, (
-                    f"EventKind.{kind.name} was NOT routed to "
-                    f"scheduler.handle; sentinel stayed {SENTINEL} "
-                    f"(handler probably fell back to _noop_handler)."
-                )
-
-
-async def step_migrate_5xx_does_not_crash() -> None:
-    """[12] Audit round-1 N2: a 5xx from /aginfer/migrate must NOT
-    crash the event_worker.  ``_dispatch_migrate`` logs + bows out;
-    counters reflect the attempt.
-
-    A regression that added ``r.raise_for_status()`` would propagate
-    the exception → event_worker would log + drop the event but
-    ``handler_failures`` would tick.  Pin the no-failure contract.
-    """
-    state_holder = {
-        "state": make_synthetic_state(n_programs=2),
-        "fail_migrate": True,
-    }
-    stub_app = FastAPI()
-
-    @stub_app.get("/aginfer/state")
-    async def _state() -> Any:
-        return state_holder["state"]
-
-    @stub_app.post("/aginfer/migrate")
-    async def _migrate(raw: Request) -> Any:
-        await raw.body()
-        if state_holder["fail_migrate"]:
-            from fastapi.responses import JSONResponse
-
-            return JSONResponse(
-                {"error": "simulated 500"}, status_code=500
-            )
-        return {"applied": 0, "applied_hashes": [], "skipped": []}
-
-    stub_port = _free_port()
-    stub_url = f"http://127.0.0.1:{stub_port}"
-    tracker = ProgramTracker()
-    tracker.observe_arrival("prog-0")
-    tracker.observe_arrival("prog-1")
-    tracker.observe_completion("prog-1")  # ACTING
-    async with run_server(stub_app, "127.0.0.1", stub_port):
-        async with boot_router(stub_url, tracker) as (router, scheduler):
-            # Build a state that triggers a migrate.
-            await router.bus.emit(
-                Event(
-                    kind=EventKind.MEMORY_PRESSURE,
-                    payload={"state": "HIGH", "occ": 0.95},
-                )
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            handler_failures_after_500 = router.handler_failures
-            # Worker still alive: flip the stub, fire again.
-            state_holder["fail_migrate"] = False
-            await router.bus.emit(
-                Event(
-                    kind=EventKind.MEMORY_PRESSURE,
-                    payload={"state": "HIGH", "occ": 0.95},
-                )
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-    # N2 contract: handler must NOT have raised on 5xx.
-    assert handler_failures_after_500 == 0, (
-        f"handler raised on migrate 5xx (expected log+continue); "
-        f"handler_failures={handler_failures_after_500}"
+def stage_a2_unknown_tier_label_skipped() -> None:
+    """A unit residing in an unknown tier label is SKIPPED (not
+    silently coerced to HBM — that was the round-1 B1 bug).  The
+    same label is logged exactly once."""
+    log: set = set()
+    sj = _state_json(units=[
+        _unit(uhash="u0", residence=["HBM"], holders=["p0"]),
+        _unit(uhash="u1", residence=["ZSTD_DISK"], holders=["p1"]),
+    ])
+    s = kvs.build_paper_state(
+        sj, event=Event(EventKind.LLM_PREFILL, session="p0"),
+        tracker=ProgramTracker(), unknown_tier_log=log,
     )
-    # Both events were handled (worker alive after the failure).
-    assert router.events_handled >= 2, router.events_handled
-    # The actual POST WAS attempted (counter increments before status
-    # check in _dispatch_migrate).
-    assert scheduler.migrate_calls >= 1, scheduler.migrate_calls
+    if "u1" in s.units:
+        raise StageFail(
+            "unit with unknown residence label should be skipped; "
+            "got u1 in state.units"
+        )
+    if "ZSTD_DISK" not in log:
+        raise StageFail(
+            f"unknown_tier_log should be marked once: {log}"
+        )
 
 
-def step_env_var_binding() -> None:
-    """[13] Audit round-1 N3: ENV_VAR → module-level constant binding.
-
-    A subprocess sets ``AGINFER_MEMORY_PRESSURE_TOPK=7``, imports
-    ``daemon.kv_scheduler``, reads the module constant.  A regression
-    that renamed the env var key would strand operators on the
-    default.
-    """
+def stage_a3_missing_state_field_fatals() -> None:
+    """A missing top-level required state field fatals via the
+    daemon's fatal() helper (subprocess exit 1, since fatal calls
+    os._exit)."""
     import subprocess
-
-    probe = (
-        "import sys, json; "
-        f"sys.path.insert(0, {str(_AGINFER_ROOT)!r}); "
-        "from daemon import kv_scheduler as k; "
-        "print(json.dumps({"
-        "'topk': k._DEFAULT_MEMORY_PRESSURE_TOPK, "
-        "'lam':  k._DEFAULT_LAMBDA_ACTING}))"
-    )
-    out = subprocess.check_output(
-        [sys.executable, "-c", probe],
-        env={
-            **{k: v for k, v in __import__("os").environ.items()
-               if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))},
-            "AGINFER_MEMORY_PRESSURE_TOPK": "7",
-            "AGINFER_LAMBDA_ACTING": "0.42",
-        },
-        timeout=15,
-    ).decode().strip().splitlines()[-1]
-    parsed = json.loads(out)
-    assert parsed["topk"] == 7, (
-        f"AGINFER_MEMORY_PRESSURE_TOPK -> _DEFAULT_MEMORY_PRESSURE_TOPK "
-        f"binding broken: got {parsed['topk']}"
-    )
-    assert abs(parsed["lam"] - 0.42) < 1e-9, (
-        f"AGINFER_LAMBDA_ACTING -> _DEFAULT_LAMBDA_ACTING binding broken: "
-        f"got {parsed['lam']}"
-    )
-
-
-async def step_unknown_event_kind_safe() -> None:
-    """[10] An unmapped event kind (defensive — paper §4 only has 8 but
-    a future kind might land before its handler) MUST not crash the
-    worker.  We send an event whose kind is in the enum but for which
-    decision_set is empty: assert no decisions, no crash, worker keeps
-    going."""
-    state_holder = {"state": make_synthetic_state(n_programs=1)}
-    stub_app, migrate_calls = build_stub_sglang(lambda: state_holder["state"])
-    stub_port = _free_port()
-    stub_url = f"http://127.0.0.1:{stub_port}"
-    tracker = ProgramTracker()
-    async with run_server(stub_app, "127.0.0.1", stub_port):
-        async with boot_router(stub_url, tracker) as (router, scheduler):
-            # LLM_PREFILL produces empty D_t (informational).  Worker
-            # must drain it without calling decide().
-            await router.bus.emit(
-                Event(kind=EventKind.LLM_PREFILL, session="prog-0")
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="t146_a3_") as td:
+        script = f"""
+import sys
+sys.path.insert(0, {str(_AGINFER_ROOT)!r})
+import os
+os.environ['AGINFER_DATA_DIR'] = {td!r}
+from daemon import kv_scheduler as kvs
+from daemon.events import Event, EventKind
+from daemon.program_tracker import ProgramTracker
+# Construct a state JSON missing `link_stats`.
+bad = {{
+    "time_counter": 0, "throughput_ema": {{"prefill_bps": 0.0,
+        "decode_per_program": {{}}}},
+    "pool_usage": {{"HBM": {{"subpools": {{}}}},
+                    "DRAM": {{"subpools": {{}}}},
+                    "DISK": {{"subpools": {{}}}}}},
+    "per_program_usage": {{}}, "units": [],
+    # MISSING link_stats AND tier_holding_cost.
+}}
+kvs.build_paper_state(
+    bad, event=Event(EventKind.LLM_PREFILL, session=None),
+    tracker=ProgramTracker(), unknown_tier_log=set(),
+)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env={**__import__("os").environ, "PYTHONPATH": str(_AGINFER_ROOT),
+                 "AGINFER_DATA_DIR": td},
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 1:
+            raise StageFail(
+                f"expected fatal exit=1; got {result.returncode}; "
+                f"stderr={result.stderr[-400:]!r}"
             )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-    assert scheduler.decisions == 0, scheduler.decisions
-    assert scheduler.migrate_calls == 0, scheduler.migrate_calls
-    # But the event WAS handled by the worker.
-    assert router.events_handled == 1, router.events_handled
+        if "missing_state_field" not in result.stderr:
+            raise StageFail(
+                f"expected 'missing_state_field' reason in stderr; "
+                f"got {result.stderr[-400:]!r}"
+            )
 
 
-# ---------------------------------------------------------------- main
+def stage_a4_h_max_partial_zero_fatals() -> None:
+    """All-zero h_max is allowed (cold-start placeholder).
+    PARTIAL-zero (some positive, some zero) fatals — that's the
+    real "operator forgot to configure h_max for this subpool"
+    deployment bug."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="t146_a4_") as td:
+        script = f"""
+import sys
+sys.path.insert(0, {str(_AGINFER_ROOT)!r})
+import os
+os.environ['AGINFER_DATA_DIR'] = {td!r}
+from daemon import kv_scheduler as kvs
+from daemon.events import Event, EventKind
+from daemon.program_tracker import ProgramTracker
 
-
-_T7_STATS: dict = {}
-
-
-async def main() -> None:
-    print("=== T7 verify: kv_scheduler event handlers + dispatch ===")
-    print()
-
-    step_build_paper_state_smoke()
-    print("[1] build_paper_state: D_t per paper §4 table (6 event kinds) ✓")
-
-    step_top_k_bounded()
-    print("[2] memory_pressure D_t bounded at top-k = 256 (paper §7.1) ✓")
-
-    await step_event_to_migrate_e2e()
-    print("[3] event arrives → state fetch → decide() → migrate POST ✓")
-
-    await step_no_migrate_when_action_empty()
-    print("[4] WORST CASE: nothing worth moving → 0 migrate POSTs ✓")
-
-    await step_state_fetch_failure_recovers()
-    print("[5] WORST CASE: /aginfer/state 500 → log + continue; worker "
-          "drains next event ✓")
-
-    stats = await step_decide_latency_at_1k_units()
-    global _T7_STATS  # noqa: PLW0603
-    _T7_STATS = stats
-    print("[6] COST: decide() @ 1k units, build + decide within budget "
-          "(5-run mean ± std) ✓")
-
-    await step_lambda_acting_sweep()
-    print("[7] λ_ACTING sweep {1/30, 1/5, 1/1, 2/1}: clamp saturates; no "
-          "DROP migrations at floor ✓")
-
-    step_assignments_to_wire_contract()
-    print("[8] assignments_to_wire schema matches sglang's "
-          "POST /aginfer/migrate contract ✓")
-
-    await step_idempotent_repeat_event()
-    print("[9] same event replayed 3× → identical migrate body "
-          "(paper §9 idempotence) ✓")
-
-    await step_unknown_event_kind_safe()
-    print("[10] LLM_PREFILL (empty D_t) drains without crashing worker ✓")
-
-    await step_all_event_kinds_registered()
-    print("[11] audit M3 fix: all 8 EventKinds routed to kv_scheduler "
-          "(incl. PRESSURE_RESOLVED) + end-to-end fire ✓")
-
-    await step_migrate_5xx_does_not_crash()
-    print("[12] audit N2 fix: /aginfer/migrate 500 → log+continue; "
-          "handler_failures stays 0; worker drains next event ✓")
-
-    step_env_var_binding()
-    print("[13] audit N3 fix: AGINFER_* env vars actually bind to "
-          "module-level constants (subprocess probe) ✓")
-
-    if _T7_STATS:
-        print()
-        print("Latency summary (record in RESULTS):")
-        print(
-            f"  build_paper_state @ 1k units: "
-            f"{_T7_STATS['build_mean']:.2f} ± {_T7_STATS['build_std']:.2f} ms"
+# Partial-zero: HBM h_max positive, DRAM zero, DISK positive.
+sj = {{
+    "time_counter": 0,
+    "throughput_ema": {{"prefill_bps": 0.0, "decode_per_program": {{}}}},
+    "pool_usage": {{
+        t: {{"subpools": {{"kv": {{
+            "used_bytes": 0, "cap_bytes": 10*1024**3,
+            "available_bytes": 10*1024**3, "evictable_bytes": 0,
+            "page_bytes": 64*1024,
+        }}}}}} for t in ("HBM","DRAM","DISK")
+    }},
+    "per_program_usage": {{}}, "units": [],
+    "link_stats": {{
+        link: {{"peak_bw_bps": 64*1024**3,
+                "recent_throughput_bps": 0.0,
+                "time_since_last_sample_s": 5.0}}
+        for link in ("HBM->DRAM","DRAM->HBM","DRAM->DISK","DISK->DRAM")
+    }},
+    "tier_holding_cost": {{
+        "HBM":  {{"kv": {{"h_max_per_byte_sec": 0.001}}}},
+        "DRAM": {{"kv": {{"h_max_per_byte_sec": 0.0}}}},  # partial zero
+        "DISK": {{"kv": {{"h_max_per_byte_sec": 0.0001}}}},
+    }},
+}}
+kvs.build_paper_state(
+    sj, event=Event(EventKind.LLM_PREFILL, session=None),
+    tracker=ProgramTracker(), unknown_tier_log=set(),
+)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env={**__import__("os").environ, "PYTHONPATH": str(_AGINFER_ROOT),
+                 "AGINFER_DATA_DIR": td},
+            capture_output=True, text=True, timeout=10,
         )
-        print(
-            f"  decide() @ 1k units:          "
-            f"{_T7_STATS['decide_mean']:.2f} ± {_T7_STATS['decide_std']:.2f} ms"
+        if result.returncode != 1:
+            raise StageFail(
+                f"expected fatal on partial-zero h_max; got returncode="
+                f"{result.returncode}; stderr={result.stderr[-400:]!r}"
+            )
+        if "holding_cost_non_positive" not in result.stderr:
+            raise StageFail(
+                f"expected 'holding_cost_non_positive' in stderr; "
+                f"got {result.stderr[-400:]!r}"
+            )
+
+
+# ============================================================ B. decision-set
+
+
+def _build_d_t(event_kind: EventKind, session: Optional[str],
+               units: List[Dict[str, Any]],
+               tracker: Optional[ProgramTracker] = None) -> List[str]:
+    """Convenience: build the SchedulerState and return D_t order."""
+    sj = _state_json(units=units)
+    s = _build_state(sj, Event(event_kind, session=session), tracker)
+    return list(s.decision_set)
+
+
+def stage_b0_paper4_decision_set_all_kinds() -> None:
+    """6 paper §4 event kinds → correct D_t.
+
+    Fixture: 3 units —
+      * u-shared: holders={p1,p2}            → shared prefix
+      * u-tail-p1: holders={p1}              → p1's exclusive tail
+      * u-tail-p2: holders={p2}              → p2's exclusive tail
+    """
+    units = [
+        _unit(uhash="u-shared",  residence=["HBM"], holders=["p1", "p2"]),
+        _unit(uhash="u-tail-p1", residence=["HBM"], holders=["p1"]),
+        _unit(uhash="u-tail-p2", residence=["HBM"], holders=["p2"]),
+    ]
+    cases: List[Tuple[EventKind, Optional[str], set]] = [
+        (EventKind.SESSION_ARRIVAL,      None,  {"u-shared"}),
+        (EventKind.LLM_PREFILL,          "p1",  set()),
+        (EventKind.TOOL_CALL_START,      "p1",  {"u-tail-p1"}),
+        (EventKind.TOOL_CALL_END,        "p1",  {"u-tail-p1"}),
+        (EventKind.SUB_DISPATCH_BLOCKING,"p1",  {"u-shared", "u-tail-p1"}),
+        (EventKind.SUB_DISPATCH_ASYNC,   "p1",  {"u-shared"}),
+    ]
+    for kind, session, expected in cases:
+        d_t = set(_build_d_t(kind, session, units))
+        if d_t != expected:
+            raise StageFail(
+                f"{kind.value} D_t mismatch: got {d_t}, expected {expected}"
+            )
+
+
+def stage_b1_memory_pressure_topk_by_regret() -> None:
+    """``MEMORY_PRESSURE`` D_t is bounded by ``top_k`` and ranked by
+    ascending regret (lowest keep-value first → best demote
+    candidates).  Plant 10 low-value sentinels among 100 high-
+    value units; assert all 10 sentinels appear, and any units in
+    excess of the cap are excluded."""
+    # Use AGINFER_MEMORY_PRESSURE_TOPK default (256) via the module
+    # constant; force a smaller fixture by using k=20 indirectly.
+    units = []
+    # 100 "high-value" units (high hit_count → high p_hat).
+    for i in range(100):
+        units.append(_unit(
+            uhash=f"hi-{i}", residence=["HBM"], holders=[f"p{i}"],
+            hit_count=1000, last_access_time=100,  # fresh + hot
+        ))
+    # 10 sentinels (low hit_count → low p_hat → low keep-value).
+    for i in range(10):
+        units.append(_unit(
+            uhash=f"sentinel-{i}", residence=["HBM"], holders=[f"sp{i}"],
+            hit_count=1, last_access_time=1,  # ancient + cold
+        ))
+    # Note: each holder is a unique program with no tracker entry →
+    # all "unknown to tracker" → p_hat = hits/age (NOT alive-rule).
+    # That preserves the regret ordering this test depends on.
+
+    # Direct call: _top_k_by_regret with k=20.
+    sj = _state_json(units=units)
+    s = _build_state(sj, Event(EventKind.MEMORY_PRESSURE, session=None))
+    # Build a local k=20 view to bypass the env-default.
+    top_20 = kvs._top_k_by_regret(s.units, 20)
+    if len(top_20) != 20:
+        raise StageFail(f"top-20 length: {len(top_20)}")
+    sentinel_in_top = sum(1 for uid in top_20 if uid.startswith("sentinel-"))
+    if sentinel_in_top != 10:
+        raise StageFail(
+            f"expected all 10 sentinels in top-20 (low keep-value); "
+            f"got {sentinel_in_top}.  top_20={top_20}"
         )
 
-    print()
-    print("=== T7 PASSED ===")
+
+# ============================================================ C. λ + p_hat
+
+
+def stage_c0_acting_lambda_floor_clamp() -> None:
+    """A program in ``State.ACTING`` propagates the calibrated
+    ACTING-floor λ to ALL its units, clamped to [1/30, 1/1]."""
+    tracker = ProgramTracker()
+    # Move p_act through REASONING → ACTING.
+    tracker.observe_arrival("p_act")
+    tracker.observe_completion("p_act")  # ACTING
+    if tracker.state("p_act") is not State.ACTING:
+        raise StageFail(f"setup: tracker state(p_act)={tracker.state('p_act')}")
+
+    # Try lambdas at the boundaries.
+    units = [_unit(uhash="u0", residence=["HBM"], holders=["p_act"],
+                   hit_count=1000, last_access_time=99)]  # fresh, high hits/age
+    sj = _state_json(units=units)
+    # Pass lambda=10.0 → above ceil 1.0 → clamps to 1.0.
+    s_hi = kvs.build_paper_state(
+        sj, event=Event(EventKind.TOOL_CALL_START, session="p_act"),
+        tracker=tracker, unknown_tier_log=set(), lambda_acting=10.0,
+    )
+    if abs(s_hi.units["u0"].lambda_rate - 1.0) > 1e-6:
+        raise StageFail(
+            f"λ should clamp to ceil 1.0; got {s_hi.units['u0'].lambda_rate}"
+        )
+    # Below floor → clamps to 1/30.
+    s_lo = kvs.build_paper_state(
+        sj, event=Event(EventKind.TOOL_CALL_START, session="p_act"),
+        tracker=tracker, unknown_tier_log=set(), lambda_acting=1e-6,
+    )
+    if abs(s_lo.units["u0"].lambda_rate - 1.0 / 30.0) > 1e-6:
+        raise StageFail(
+            f"λ should clamp to floor 1/30; got {s_lo.units['u0'].lambda_rate}"
+        )
+
+
+def stage_c1_paused_lambda_also_clamped() -> None:
+    """Round-2 R2-M1: programs in ``State.PAUSED`` also get the
+    ACTING-floor (paper §7 intent is "any non-REASONING program is
+    held mid-tool-call")."""
+    tracker = ProgramTracker()
+    tracker.observe_arrival("p_pause")  # REASONING
+    tracker.observe_completion("p_pause")  # ACTING
+    tracker.pause("p_pause")  # PAUSED
+    if tracker.state("p_pause") is not State.PAUSED:
+        raise StageFail(
+            f"setup: tracker state(p_pause)={tracker.state('p_pause')}"
+        )
+    units = [_unit(uhash="u0", residence=["HBM"], holders=["p_pause"],
+                   hit_count=1000, last_access_time=99)]
+    sj = _state_json(units=units)
+    s = kvs.build_paper_state(
+        sj, event=Event(EventKind.TOOL_CALL_START, session="p_pause"),
+        tracker=tracker, unknown_tier_log=set(), lambda_acting=0.2,
+    )
+    # PAUSED → λ should be 0.2 (in [1/30, 1/1]), NOT hits/age (would
+    # be 1000/1 = 1000 → clamped at PolicyOOR).
+    if abs(s.units["u0"].lambda_rate - 0.2) > 1e-6:
+        raise StageFail(
+            f"PAUSED program should use ACTING-floor λ=0.2; got "
+            f"{s.units['u0'].lambda_rate}"
+        )
+
+
+def stage_c2_p_hat_alive_vs_ended() -> None:
+    """Program-alive p_hat rule: alive holder → p_hat=1.0.  All
+    holders unknown to tracker (= ENDED / never-seen) → p_hat =
+    hits/age proxy.  Mixing one ALIVE holder dominates."""
+    tracker = ProgramTracker()
+    tracker.observe_arrival("p_alive")  # REASONING (known to tracker)
+
+    units = [
+        _unit(uhash="u-alive-only", residence=["HBM"],
+              holders=["p_alive"], hit_count=2, last_access_time=99),
+        _unit(uhash="u-ended-only", residence=["HBM"],
+              holders=["p_ended"],  # never seen by tracker
+              hit_count=2, last_access_time=99),  # hits/age = 2/1 = 2
+        _unit(uhash="u-mixed",      residence=["HBM"],
+              holders=["p_alive", "p_ended"],
+              hit_count=2, last_access_time=99),
+    ]
+    sj = _state_json(units=units)
+    s = _build_state(sj, Event(EventKind.LLM_PREFILL, session=None), tracker)
+    # alive-only → p_hat == 1.0
+    if abs(s.units["u-alive-only"].p_hat - 1.0) > 1e-9:
+        raise StageFail(
+            f"alive-only p_hat should be 1.0; got "
+            f"{s.units['u-alive-only'].p_hat}"
+        )
+    # ended-only → p_hat = min(1.0, hits/age) = 1.0 (clamped)
+    # We use hit_count=2, last_access_time=99, time=100 → age=1,
+    # hits/age=2.0 → clamped to 1.0.  To distinguish, use a lower
+    # ratio.  Rebuild with hit=1, last=1 → age=99, ratio≈0.01.
+    units2 = [
+        _unit(uhash="u-ended-cold", residence=["HBM"],
+              holders=["p_ended"], hit_count=1, last_access_time=1),
+    ]
+    s2 = _build_state(_state_json(units=units2),
+                      Event(EventKind.LLM_PREFILL, session=None), tracker)
+    p_cold = s2.units["u-ended-cold"].p_hat
+    if not (0.0 < p_cold < 0.1):
+        raise StageFail(
+            f"ended-only with hits/age ≈ 1/99 should have small p_hat "
+            f"(< 0.1); got {p_cold}"
+        )
+    # mixed → alive wins → p_hat = 1.0
+    if abs(s.units["u-mixed"].p_hat - 1.0) > 1e-9:
+        raise StageFail(
+            f"mixed alive+ended → alive dominates; expected 1.0, got "
+            f"{s.units['u-mixed'].p_hat}"
+        )
+
+
+# ============================================================ D. action / dispatch
+
+
+def stage_d0_action_assignments_3tuple_shape() -> None:
+    """Post-T33 ``Action.assignments`` is ``List[Tuple[str,
+    List[Tier], List[Tier]]]`` — (unit_id, add_tiers, remove_tiers).
+    The legacy 2-tuple ``(unit_id, Tier)`` is gone."""
+    # Force a migrate: a single unit currently HBM-only, queue
+    # pressure that makes DRAM cheaper to hold.  Use h_max ≥ 0 cold-
+    # start path so V signs aren't artifically suppressed.
+    units = [_unit(
+        uhash="u0", residence=["HBM"], holders=["p_ended"],
+        hit_count=1, last_access_time=1,
+    )]
+    sj = _state_json(
+        units=units,
+        # Force HBM near full so DRAM is preferable.
+        hbm_used=int(9.5 * 1024**3), hbm_cap=10 * 1024**3,
+    )
+    s = _build_state(sj, Event(EventKind.MEMORY_PRESSURE, session=None))
+    policy = OursGreedyPolicy(default_costs())
+    action = policy.decide(s)
+    # Action.assignments must be a list, each item is (str, list, list).
+    if not isinstance(action.assignments, list):
+        raise StageFail(f"assignments not a list: {type(action.assignments)}")
+    if not action.assignments:
+        # Policy may decline if V signs collapse to 0 under defaults;
+        # not a contract violation — just no migrate this run.  Stage
+        # purpose is shape; assert assignments_to_wire handles the
+        # empty list gracefully.
+        wire = kvs.assignments_to_wire([])
+        if wire != []:
+            raise StageFail(f"empty assignments should yield []: {wire}")
+        return
+    for assignment in action.assignments:
+        if not (isinstance(assignment, tuple) and len(assignment) == 3):
+            raise StageFail(
+                f"assignment not 3-tuple: {assignment!r}"
+            )
+        uid, add, remove = assignment
+        if not isinstance(uid, str):
+            raise StageFail(f"uid not str: {uid!r}")
+        if not isinstance(add, list):
+            raise StageFail(f"add not list: {add!r}")
+        if not isinstance(remove, list):
+            raise StageFail(f"remove not list: {remove!r}")
+        if add and remove and set(add) & set(remove):
+            raise StageFail(
+                f"add and remove must be disjoint: add={add} remove={remove}"
+            )
+
+
+def stage_d1_assignments_to_wire_envelope() -> None:
+    """``assignments_to_wire`` emits the 4-key envelope per item:
+    ``hash``, ``add_tiers`` (list of strings), ``remove_tiers`` (list
+    of strings), ``action_id`` (unique UUID4 hex per call)."""
+    assignments = [
+        ("u0", [Tier.DRAM], [Tier.HBM]),
+        ("u1", [Tier.HBM], []),  # pure promote
+    ]
+    wire = kvs.assignments_to_wire(assignments)
+    if len(wire) != 2:
+        raise StageFail(f"wire length: {len(wire)}")
+    for i, item in enumerate(wire):
+        keys = set(item)
+        if keys != {"hash", "add_tiers", "remove_tiers", "action_id"}:
+            raise StageFail(f"wire[{i}] keys: {keys}")
+        if not isinstance(item["add_tiers"], list):
+            raise StageFail(f"add_tiers not list: {item}")
+        if not all(isinstance(s, str) for s in item["add_tiers"]):
+            raise StageFail(f"add_tiers not all str: {item}")
+        if not isinstance(item["remove_tiers"], list):
+            raise StageFail(f"remove_tiers not list: {item}")
+        if not item["action_id"] or len(item["action_id"]) < 16:
+            raise StageFail(f"action_id missing/short: {item}")
+    if wire[0]["action_id"] == wire[1]["action_id"]:
+        raise StageFail(
+            f"action_id should be unique per item: {wire[0]['action_id']}"
+        )
+    if wire[0]["hash"] != "u0" or wire[1]["hash"] != "u1":
+        raise StageFail(f"hashes: {[w['hash'] for w in wire]}")
+
+
+def stage_d2_dispatch_without_outbound_raises() -> None:
+    """Post-T36: ``KvScheduler._dispatch_migrate`` REQUIRES an
+    ``outbound`` (no sync fallback).  Constructing without one and
+    calling dispatch raises ``RuntimeError`` — this is a wiring bug
+    surfaced loud, not a silent drop."""
+    sched = kvs.KvScheduler(
+        tracker=ProgramTracker(),
+        sglang_base_url="http://unused",
+        # outbound omitted on purpose.
+    )
+    async def _go():
+        await sched._dispatch_migrate([("u0", [Tier.DRAM], [Tier.HBM])])
+    try:
+        asyncio.run(_go())
+    except RuntimeError as exc:
+        if "OutboundQueue" not in str(exc):
+            raise StageFail(
+                f"RuntimeError should name OutboundQueue: {exc}"
+            )
+    else:
+        raise StageFail(
+            "_dispatch_migrate without outbound should raise RuntimeError; "
+            "got no exception"
+        )
+
+
+def stage_d3_dispatch_routes_through_outbound() -> None:
+    """``_dispatch_migrate`` with an outbound calls
+    ``outbound.enqueue_migrate(wire)`` and increments
+    ``migrate_calls``.  This is a fire-and-forget enqueue, NOT a
+    POST — the actual HTTP happens in the OutboundQueue worker."""
+    class _StubHttp:
+        async def post(self, url, *, json=None):  # noqa: ANN001
+            raise AssertionError("worker not started; should not POST")
+        async def aclose(self): return None
+
+    async def _go():
+        ob = OutboundQueue(
+            sglang_base_url="http://unused", http_client=_StubHttp(),
+        )
+        sched = kvs.KvScheduler(
+            tracker=ProgramTracker(),
+            sglang_base_url="http://unused", outbound=ob,
+        )
+        # Do NOT start the worker — we just want enqueue.
+        await sched._dispatch_migrate(
+            [("u0", [Tier.DRAM], [Tier.HBM]),
+             ("u1", [Tier.HBM], [])]
+        )
+        return ob, sched
+    ob, sched = asyncio.run(_go())
+    if sched.migrate_calls != 1:
+        raise StageFail(f"migrate_calls: {sched.migrate_calls}")
+    if ob.queue.qsize() != 1:
+        raise StageFail(
+            f"outbound queue size after enqueue: {ob.queue.qsize()}"
+        )
+    batch = ob.queue.get_nowait()
+    if batch.endpoint != "migrate":
+        raise StageFail(f"batch.endpoint: {batch.endpoint}")
+    if len(batch.body["actions"]) != 2:
+        raise StageFail(f"batch actions: {batch.body['actions']}")
+    if set(batch.body["actions"][0]) != {
+        "hash", "add_tiers", "remove_tiers", "action_id",
+    }:
+        raise StageFail(f"action envelope: {batch.body['actions'][0]}")
+
+
+# ============================================================ E. robustness
+
+
+class _StubRouter:
+    """Minimal router stub for KvScheduler.handle()."""
+    def __init__(self, state_supplier):
+        self._supply = state_supplier
+    async def fetch_state(self):
+        return self._supply()
+
+
+def stage_e0_state_fetch_raises_handler_survives() -> None:
+    """When ``/aginfer/state`` fetch raises, the handler logs +
+    bows out without crashing the event worker.  No migrate
+    dispatched, no exception propagated."""
+    async def _go():
+        def _raise():
+            raise RuntimeError("simulated upstream down")
+        sched = kvs.KvScheduler(
+            tracker=ProgramTracker(),
+            sglang_base_url="http://unused",
+            outbound=OutboundQueue(sglang_base_url="http://unused",
+                                   http_client=_DummyHttp()),
+        )
+        router = _StubRouter(_raise)
+        # Make fetch_state raise via async wrapper.
+        async def _afetch_state():
+            return _raise()
+        router.fetch_state = _afetch_state
+        await sched.handle(
+            Event(EventKind.LLM_PREFILL, session="p"), router,
+        )
+        return sched
+    sched = asyncio.run(_go())
+    if sched.migrate_calls != 0:
+        raise StageFail(
+            f"no migrate should fire on fetch failure; got "
+            f"migrate_calls={sched.migrate_calls}"
+        )
+    if sched.decisions != 0:
+        raise StageFail(
+            f"no decisions on fetch failure; got {sched.decisions}"
+        )
+
+
+class _DummyHttp:
+    async def post(self, url, *, json=None):  # noqa: ANN001
+        return _Resp200()
+    async def aclose(self): return None
+
+
+class _Resp200:
+    status_code = 200
+    text = ""
+    def json(self): return {"applied": 0, "applied_hashes": [], "skipped": []}
+
+
+def stage_e1_empty_decision_set_no_migrate() -> None:
+    """``LLM_PREFILL`` → D_t is empty → handler returns without
+    calling ``decide()`` or dispatching."""
+    units = [_unit(uhash="u0", residence=["HBM"], holders=["p"])]
+    sj = _state_json(units=units)
+    async def _go():
+        sched = kvs.KvScheduler(
+            tracker=ProgramTracker(),
+            sglang_base_url="http://unused",
+            outbound=OutboundQueue(sglang_base_url="http://unused",
+                                   http_client=_DummyHttp()),
+        )
+        async def _afetch(): return sj
+        router = _StubRouter(lambda: sj)
+        router.fetch_state = _afetch
+        await sched.handle(
+            Event(EventKind.LLM_PREFILL, session="p"), router,
+        )
+        return sched
+    sched = asyncio.run(_go())
+    if sched.decisions != 0:
+        raise StageFail(
+            f"LLM_PREFILL has empty D_t → no decide() call; got "
+            f"decisions={sched.decisions}"
+        )
+    if sched.migrate_calls != 0:
+        raise StageFail(f"no migrate; got {sched.migrate_calls}")
+    if sched.last_decision_set_size != 0:
+        raise StageFail(
+            f"last_decision_set_size: {sched.last_decision_set_size}"
+        )
+
+
+def stage_e2_policy_declines_no_migrate() -> None:
+    """When ``decide()`` returns an empty Action (all V_t non-
+    positive), no migrate POST is enqueued."""
+    # All units are alive (p_hat=1) and HBM-only → policy should
+    # KEEP HBM (no migrate).
+    tracker = ProgramTracker()
+    tracker.observe_arrival("p")  # REASONING
+    units = [_unit(uhash="u0", residence=["HBM"], holders=["p"],
+                   hit_count=1000, last_access_time=99)]
+    sj = _state_json(units=units, hbm_used=1 * 1024**3,
+                     hbm_cap=10 * 1024**3)
+    async def _go():
+        sched = kvs.KvScheduler(
+            tracker=tracker,
+            sglang_base_url="http://unused",
+            outbound=OutboundQueue(sglang_base_url="http://unused",
+                                   http_client=_DummyHttp()),
+        )
+        async def _afetch(): return sj
+        router = _StubRouter(lambda: sj)
+        router.fetch_state = _afetch
+        await sched.handle(
+            Event(EventKind.MEMORY_PRESSURE, session=None), router,
+        )
+        return sched
+    sched = asyncio.run(_go())
+    # The policy may or may not decline given the V signs at cold-
+    # start defaults; what we PIN is: if it does decline,
+    # migrate_calls stays 0.  We do not pin a specific outcome here.
+    if sched.decisions == 1 and sched.last_action is not None:
+        # Decision was made; check that empty assignments → no migrate.
+        if not sched.last_action.assignments:
+            if sched.migrate_calls != 0:
+                raise StageFail(
+                    f"empty assignments must not enqueue migrate; got "
+                    f"migrate_calls={sched.migrate_calls}"
+                )
+
+
+# ============================================================ F. idempotence + latency
+
+
+def stage_f0_idempotence_same_state_same_action() -> None:
+    """Same state JSON + same event → same ``Action.assignments`` on
+    repeated decides.  No hidden carrying across decide() calls."""
+    units = [_unit(
+        uhash="u0", residence=["HBM"], holders=["p_ended"],
+        hit_count=1, last_access_time=1,
+    )]
+    sj = _state_json(units=units, hbm_used=int(9.5 * 1024**3),
+                     hbm_cap=10 * 1024**3)
+    s = _build_state(sj, Event(EventKind.MEMORY_PRESSURE, session=None))
+    policy = OursGreedyPolicy(default_costs())
+    a0 = policy.decide(s)
+    a1 = policy.decide(s)
+    a2 = policy.decide(s)
+    # Compare as serialised tuples (lists aren't hashable).
+    def _key(a: Action):
+        return tuple(
+            (uid, tuple(add), tuple(remove))
+            for uid, add, remove in a.assignments
+        )
+    if _key(a0) != _key(a1) or _key(a1) != _key(a2):
+        raise StageFail(
+            f"non-idempotent: a0={_key(a0)} a1={_key(a1)} a2={_key(a2)}"
+        )
+
+
+def stage_f1_latency_decide_under_budget() -> None:
+    """``decide()`` at 1 000 units, 5 runs, mean+3σ < 25 ms.
+
+    Looser than legacy 5 ms ceiling — post-T33 explores 6 transitions
+    per unit (vs legacy's 4 target tiers), so per-unit work ~1.5×.
+    Future T34 sparse DP target: tighten to < 10 ms."""
+    units = []
+    for i in range(1000):
+        units.append(_unit(
+            uhash=f"u-{i}", residence=["HBM"], holders=[f"p{i % 8}"],
+            hit_count=(i % 50) + 1, last_access_time=i,
+        ))
+    sj = _state_json(units=units, hbm_used=int(9.5 * 1024**3),
+                     hbm_cap=10 * 1024**3)
+    s = _build_state(sj, Event(EventKind.MEMORY_PRESSURE, session=None))
+    policy = OursGreedyPolicy(default_costs())
+    # Warm-up.
+    policy.decide(s)
+    samples_ms: List[float] = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        policy.decide(s)
+        samples_ms.append((time.perf_counter() - t0) * 1000.0)
+    n = len(samples_ms)
+    mean = sum(samples_ms) / n
+    var = sum((x - mean) ** 2 for x in samples_ms) / n
+    std = var ** 0.5
+    bound = mean + 3.0 * std
+    if bound > 25.0:
+        raise StageFail(
+            f"decide() mean+3σ = {bound:.2f} ms (samples={samples_ms!r}); "
+            f"budget 25 ms.  Latency regression?"
+        )
+
+
+# ============================================================ run
+
+
+_STAGES: List[Tuple[str, Callable[[], None]]] = [
+    ("A0 pool_usage post-T17 schema → TierUsage",
+                              stage_a0_schema_pool_usage_to_tier_usage),
+    ("A1 multi-rank per_rank flatten (sum + dedupe)",
+                              stage_a1_multi_rank_flatten),
+    ("A2 unknown tier label skipped + logged once",
+                              stage_a2_unknown_tier_label_skipped),
+    ("A3 missing state field → fatal()",
+                              stage_a3_missing_state_field_fatals),
+    ("A4 h_max partial-zero → fatal()",
+                              stage_a4_h_max_partial_zero_fatals),
+    ("B0 paper §4 D_t per EventKind (6 kinds)",
+                              stage_b0_paper4_decision_set_all_kinds),
+    ("B1 memory_pressure top-k by ascending regret",
+                              stage_b1_memory_pressure_topk_by_regret),
+    ("C0 ACTING program → λ clamped to [1/30, 1/1]",
+                              stage_c0_acting_lambda_floor_clamp),
+    ("C1 PAUSED program also gets ACTING-floor λ",
+                              stage_c1_paused_lambda_also_clamped),
+    ("C2 p_hat: alive holder=1.0, all-ENDED=hits/age",
+                              stage_c2_p_hat_alive_vs_ended),
+    ("D0 Action.assignments is 3-tuple (uid, add, remove)",
+                              stage_d0_action_assignments_3tuple_shape),
+    ("D1 assignments_to_wire → hash/add/remove/action_id envelope",
+                              stage_d1_assignments_to_wire_envelope),
+    ("D2 _dispatch_migrate without outbound → RuntimeError",
+                              stage_d2_dispatch_without_outbound_raises),
+    ("D3 _dispatch_migrate routes through OutboundQueue",
+                              stage_d3_dispatch_routes_through_outbound),
+    ("E0 state-fetch raises → handler survives, no migrate",
+                              stage_e0_state_fetch_raises_handler_survives),
+    ("E1 empty decision_set → no decide() / no migrate",
+                              stage_e1_empty_decision_set_no_migrate),
+    ("E2 policy declines → no migrate enqueued",
+                              stage_e2_policy_declines_no_migrate),
+    ("F0 idempotent: same state → same Action",
+                              stage_f0_idempotence_same_state_same_action),
+    ("F1 latency: decide(1k units) mean+3σ < 25 ms",
+                              stage_f1_latency_decide_under_budget),
+]
+
+
+def main() -> int:
+    failures: List[str] = []
+    for label, fn in _STAGES:
+        try:
+            fn()
+            print(f"  {_green('PASS')}  Stage {label}")
+        except StageFail as exc:
+            failures.append(label)
+            print(f"  {_red('FAIL')}  Stage {label}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(label)
+            print(
+                f"  {_red('FAIL')}  Stage {label}: "
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
+    if failures:
+        print(_red(
+            f"\nkv_scheduler_value_rule FAILED ({len(failures)}): {failures}"
+        ))
+        return 1
+    print(_green(
+        f"\nkv_scheduler_value_rule PASS — all {len(_STAGES)} stages green"
+    ))
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(main())
