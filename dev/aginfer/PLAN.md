@@ -31,6 +31,11 @@ Goal: replace the rule with a **workload-agnostic estimator**:
   with each candidate estimator, score by `Σ |observed_access -
   predicted_p_hat|` on held-out segments
 
+When this lands, the T12 follow-on (collect `(tier, subpool, occ,
+marginal_V_u)` quadruples from the same scenario cycle runs +
+falsify the linear placeholder) becomes unblocked — see task
+#173 + PLAN §1 T12 status.
+
 Open output: `verify/t11/README.md`.
 
 ### T12 — `h_(τ, sp)(occ)` shape calibration (DESIGN §7)
@@ -43,17 +48,28 @@ is unknown; candidate functional forms:
 - hyperbolic `α / (1 - occ)` (diverges as occ → 1, matches §9
   admission cap)
 
-Method:
+**Status (#173 — 2026-06-01)**:
+* **DONE** in `verify/t12/`:
+  * `fitter.py` — `fit_all` / `best_by_aic` over the 3 candidate
+    shapes (least-squares + AIC picker, simpler model wins on ties)
+  * `parse_t12_log_lines` — parser for the structured
+    `aginfer_metric event=t12_calibration tier=… subpool=… occ=…
+    marginal_v_u=…` log format (consumed by the calibration script
+    that lands with T11's scenario-run data path)
+  * verify: clean-data recovery for each shape, robustness under
+    5% Gaussian noise, malformed-line drop, AIC tie-break
+* **DEFERRED until T11's data path lands** (T11 owns the scenario
+  cycle runs that emit `(tier, subpool, occ, marginal_V_u)`):
+  * wire the daemon log line into the kv_scheduler hot path
+    (gated by env var so prod runs aren't spammed)
+  * collect data from a real scenario cycle (S1 at minimum)
+  * pick the best shape per `(tier, subpool)`; falsify the linear
+    placeholder if its residual is materially worse
+  * if linear loses, swap the placeholder in
+    `baselines/costs.py:holding_unit_cost` (or thread the picked
+    shape into the policy)
 
-1. At every event during T11 / `scenarios/` cycle runs, log
-   `(tier, subpool, occ, marginal_V_u)` quadruples — `marginal_V_u`
-   is the V_u of the lowest-V_u resident in that subpool at that
-   occupancy
-2. Fit the three candidate shapes per subpool, report residuals
-3. Pick the one that minimises residual; falsify the linear
-   placeholder if its residual is materially worse
-
-Open output: `verify/t12/README.md`.
+Output: `verify/t12/README.md`.
 
 ### T13 — `bw_free` EMA validation (DESIGN §5 link_stats, §7 bw_free)
 
