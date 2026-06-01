@@ -84,9 +84,11 @@ readiness probes can grep the body fields and depool independently.
 | False positive: high-age but all-success | aged batches, all 2xx | NO fatal (consec=0) | A3 |
 | Operator can't grep current state | hit /health | body has both counters | A4 |
 | True positive: dead sglang + backlog | aged batches + always-fail stub | fatal + forensic dump + exit 1 | B0 |
-| fatal() under uvicorn doesn't exit | aged + always-fail + uvicorn.run | subprocess exits 1 within 15 s | C0 |
+| fatal() under uvicorn doesn't exit | aged + always-fail + uvicorn.run | subprocess exits 1 within 15 s AND stderr names forensic file | C0 |
 | Sticky age after queue drain | drain to empty | /health age ~0, not last-popped value | C1 |
 | /health misses live in-queue head | 3 aged batches, no worker | /health = age of OLDEST (5 s), not 0 | C2 |
+| Live-peek crashes / freezes under concurrent worker pop | delay-stub worker + 10-batch backlog + 10 Hz /health polling | no exception; final age ≈ 0; age series shrinks | C3 |
+| Default `enqueue_ts=0.0` footgun trips escalation | bare `OutboundBatch(...)` / explicit 0 / negative | TypeError / ValueError raised | C4 |
 
 ## HOW WE VERIFY
 
@@ -124,6 +126,19 @@ C1  /health outbound_oldest_age_ms DECAYS to ~0 after the queue
 C2  /health outbound_oldest_age_ms reports the LIVE in-queue
     oldest (3 batches at 5 s / 3 s / 1 s aged, no worker → /health
     must return ~5 s, not 0)
+C3  live-peek under concurrent worker (#167): 10 aged batches +
+    delay-stub worker drains at ~5/s; poll /health ~10/s for
+    ≤ 4 s; assert (a) no exception during any /health call, (b)
+    final age ≈ 0 (drained), (c) age series shrinks (last < first
+    — peek must follow the moving head, not freeze).  Closes the
+    audit's exact "live peek under concurrent pop" concern that
+    A4/C1/C2 cannot exercise (they monkey-patch the worker off).
+C4  OutboundBatch.enqueue_ts validation (#167 nit-3): bare
+    construction without ``enqueue_ts`` raises ``TypeError``;
+    explicit 0.0 or negative raises ``ValueError`` via
+    ``__post_init__``.  Closes a footgun where the previous
+    default of 0.0 would compute age ≈ time.time()*1000 and
+    instantly trip the sustained-escalation fatal.
 ```
 
 ## REPRODUCING
@@ -139,7 +154,7 @@ subprocess).
 
 ## RESULTS
 
-**PASSED** — all 9 stages.
+**PASSED** — all 11 stages.
 
 * date: 2026-06-01
 * initial #164 close: ~50 daemon-side LoC (worker loop + `_post_one`
@@ -148,6 +163,9 @@ subprocess).
   field; add live-peek `current_oldest_pending_age_ms()` method;
   switch `_fatal.py` `sys.exit(1)` → `os._exit(1)` with stdout/err
   flush; +3 verify stages (C0/C1/C2)
+* #167 round-2 audit closure: C0 stderr assertion; +C3 concurrent-
+  peek-under-worker; +C4 `enqueue_ts` validation (no 0.0 default
+  footgun); `main.py` --help text accuracy
 
 | Stage | Result |
 |---|---|
@@ -157,9 +175,12 @@ subprocess).
 | A3 high oldest_age alone does NOT escalate | PASS — 5 aged successes, consec stays 0 |
 | A4 /health body carries outbound counters | PASS — fresh batch reports finite, small `outbound_oldest_age_ms` |
 | B0 subprocess: both thresholds → fatal + forensic | PASS — subprocess exit 1, forensic file with all 6 context keys |
-| C0 fatal() under uvicorn ACTUALLY exits | PASS — uvicorn.run subprocess exits 1 within ~1 s + forensic file lands |
+| C0 fatal() under uvicorn ACTUALLY exits + names forensic on stderr | PASS — uvicorn.run subprocess exits 1 within ~1 s |
 | C1 oldest_age decays after queue drains | PASS — drain to empty → /health reports ~0 ms (pre-#166: sticky 100 s) |
 | C2 /health reports LIVE in-queue oldest | PASS — 3 batches aged 5/3/1 s → /health returns ~5 s (pre-#166: 0 ms) |
+| C3 live-peek under concurrent worker | PASS — 10-batch drain at ~5 Hz, /health polled at ~10 Hz; no exception; age series shrinks |
+| C4 enqueue_ts validation | PASS — bare construction TypeError; 0.0 / negative ValueError |
 
 * raw logs: `results/20260601_t164_initial_pass.log` (initial #164),
-  `results/20260601_t164_post_166_audit_pass.log` (post-#166 closure)
+  `results/20260601_t164_post_166_audit_pass.log` (post-#166 closure),
+  `results/20260601_t164_post_167_audit_pass.log` (post-#167 closure)

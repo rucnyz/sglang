@@ -46,13 +46,26 @@ logger = logging.getLogger(__name__)
 class OutboundBatch:
     """One outbound HTTP request the worker will issue.  Created at
     enqueue time so the worker doesn't need to know how to build the
-    body — handlers shape it per-endpoint."""
+    body — handlers shape it per-endpoint.
+
+    ``enqueue_ts`` is a REQUIRED positive wall-clock time.time().  No
+    default — #167 audit closed a footgun where a default of 0.0 would
+    yield age ≈ ``time.time() * 1000`` ≈ 1.7e15 ms, instantly tripping
+    the sustained-escalation fatal.  The ``__post_init__`` guard
+    catches explicit ``0`` or negative values for the same reason."""
     batch_id: str
     endpoint: str
     body: Dict[str, Any]
-    # Wall-clock at enqueue (not perf_counter; this is for log
-    # correlation across processes, not arithmetic).
-    enqueue_ts: float = 0.0
+    enqueue_ts: float
+
+    def __post_init__(self) -> None:
+        if self.enqueue_ts <= 0.0:
+            raise ValueError(
+                f"OutboundBatch.enqueue_ts must be > 0 (wall-clock "
+                f"time.time()); got {self.enqueue_ts!r}.  A zero or "
+                f"negative value would compute age ≈ time.time()*1000 "
+                f"and instantly trip the sustained-escalation fatal."
+            )
 
 
 # --------------------------------------------------------------- queue

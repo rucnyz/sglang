@@ -97,10 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "T36/F3 #164: outbound consecutive POST failures threshold "
             "for sustained-escalation fatal.  Default 100.  Daemon "
-            "self-kills (sys.exit 1) when this AND --sustained-escalate-"
-            "age-s are both crossed simultaneously (DESIGN §10 sustained "
-            "tier).  Supervisor (systemd/k8s) restarts; if sglang is "
-            "still down, the daemon CrashLoopBackOffs visibly to ops."
+            "self-kills (os._exit 1; #166) when this AND --sustained-"
+            "escalate-age-s are both crossed simultaneously (DESIGN §10 "
+            "sustained tier).  Supervisor (systemd/k8s) restarts; if "
+            "sglang is still down, the daemon CrashLoopBackOffs visibly "
+            "to ops."
         ),
     )
     p.add_argument(

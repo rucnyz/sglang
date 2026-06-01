@@ -505,6 +505,18 @@ def stage_c0_fatal_under_uvicorn_actually_exits() -> None:
                 f"forensic dump missing under {forensic_dir} after "
                 f"fatal-under-uvicorn"
             )
+        # #167 round-2 audit: assert the CRITICAL log line names the
+        # forensic file path on stderr.  Without this assert, a
+        # regression where os._exit runs BEFORE the flush completes
+        # (someone removes the flush loop in _fatal.py) would still
+        # silently pass C0 — supervisor would see exit 1 but no
+        # context.
+        if str(matches[0]) not in result.stderr:
+            raise StageFail(
+                f"stderr does not name forensic file path ({matches[0]}) "
+                f"— flush-before-os._exit regression?  stderr_tail="
+                f"{result.stderr[-800:]!r}"
+            )
 
 
 def stage_c1_oldest_age_decays_when_queue_drains() -> None:
@@ -720,6 +732,163 @@ def stage_b0_subprocess_escalates_to_fatal_with_forensic_dump() -> None:
             )
 
 
+def stage_c3_live_peek_under_concurrent_worker() -> None:
+    """#167 round-2 audit: demonstrate that `current_oldest_pending_
+    age_ms()` is safe AND accurate while a worker pops the queue
+    concurrently from another thread's event loop.
+
+    The "GIL-atomic peek under concurrent pop" claim is asserted in
+    the method docstring + DESIGN §10 but A4/C1/C2 all monkeypatch
+    the worker off — they cannot distinguish "live peek" from "field
+    set once at enqueue and never touched again".
+
+    Setup: 10 aged batches (each 5 s + i*0.5 s old at enqueue time),
+    delay-stub that takes 0.2 s per POST.  Worker drains at ~5/s.
+    Poll /health every ~100 ms; collect (sample_time, age) pairs.
+    Assertions:
+      (a) No exception during any /health call.
+      (b) Final reported age ≈ 0 (queue fully drained).
+      (c) Series is "broadly decreasing": the LAST observation must
+          be < the FIRST observation (i.e. peek actually tracks the
+          head, not a frozen value).
+    """
+    # Build the queue with a delay-stub so the worker spends 0.2 s
+    # per POST → ~10 batches takes ~2 s, plenty of time to poll.
+    stub = _ProgrammableHttpClient([("delay", 0.2)])  # cycles 200 ms
+    ob = OutboundQueue(
+        sglang_base_url="http://unused",
+        http_client=stub,
+        escalate_failures=10_000, escalate_oldest_age_s=10_000,  # high
+    )
+    now = time.time()
+    # Enqueue oldest first: head will be the 10 s aged batch.
+    for i in range(10):
+        ob.queue.put_nowait(OutboundBatch(
+            batch_id=f"c3-b{i}",
+            endpoint="migrate",
+            body={"actions": [], "batch_id": f"c3-b{i}"},
+            enqueue_ts=now - (10.0 - i * 0.5),  # 10.0, 9.5, ..., 5.5 s
+        ))
+    # Start the worker via _spawn_health_server — but this time we
+    # WANT the worker to actually run, so pass start_worker=True.
+    port, server, t = _spawn_health_server(ob, start_worker=True)
+
+    samples: list = []  # list of (elapsed_s, age_ms)
+    start = time.time()
+    last_err: Optional[BaseException] = None
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            # Poll for up to 4 s OR until queue drained for ≥1 sample.
+            deadline = start + 4.0
+            drained_seen_at = None
+            while time.time() < deadline:
+                try:
+                    r = client.get(f"http://127.0.0.1:{port}/health")
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    break
+                body = r.json()
+                age = float(body.get("outbound_oldest_age_ms", -1.0))
+                samples.append((time.time() - start, age))
+                # Stop ~200 ms after we first observe drain to give
+                # the worker time to fully empty.
+                if age == 0.0 and drained_seen_at is None:
+                    drained_seen_at = time.time()
+                elif (drained_seen_at is not None
+                      and time.time() - drained_seen_at > 0.2):
+                    break
+                time.sleep(0.1)
+    finally:
+        server.should_exit = True
+        t.join(timeout=3.0)
+
+    if last_err is not None:
+        raise StageFail(
+            f"/health raised under concurrent worker: "
+            f"{type(last_err).__name__}: {last_err}"
+        )
+    if len(samples) < 4:
+        raise StageFail(
+            f"too few /health samples ({len(samples)}); test fixture "
+            f"may have completed before polling started.  samples="
+            f"{samples!r}"
+        )
+    first_age = samples[0][1]
+    last_age = samples[-1][1]
+    # (b) eventually drained.
+    if last_age > 500.0:
+        raise StageFail(
+            f"queue should have fully drained by the end; final age="
+            f"{last_age} ms.  samples_tail={samples[-5:]!r}"
+        )
+    # (c) live peek must track the head — series must shrink.
+    if last_age >= first_age:
+        raise StageFail(
+            f"age series did not shrink (first={first_age} ms, last="
+            f"{last_age} ms).  /health is not following the live head.  "
+            f"samples={samples!r}"
+        )
+    # (a) implicit: no exceptions during polling — already verified.
+
+
+def stage_c4_enqueue_ts_validation() -> None:
+    """#167 round-2 audit nit-3: `OutboundBatch.enqueue_ts` previously
+    defaulted to 0.0 — silent footgun where `(time.time() - 0.0) *
+    1000 ≈ 1.7e15 ms` would instantly trip sustained-escalation.
+    The fix removes the default + adds a `__post_init__` guard.
+
+    Test contract: bare construction without ``enqueue_ts`` raises
+    ``TypeError`` (Python dataclass enforces required field);
+    construction with non-positive enqueue_ts raises ``ValueError``
+    via ``__post_init__``."""
+    # (1) Missing required arg → TypeError from dataclass.
+    try:
+        OutboundBatch(
+            batch_id="x", endpoint="migrate", body={},
+        )  # type: ignore[call-arg]
+    except TypeError:
+        pass
+    else:
+        raise StageFail(
+            "OutboundBatch(...) without enqueue_ts must raise TypeError "
+            "— default 0.0 footgun still present"
+        )
+
+    # (2) Explicit zero → ValueError from __post_init__.
+    try:
+        OutboundBatch(
+            batch_id="x", endpoint="migrate", body={},
+            enqueue_ts=0.0,
+        )
+    except ValueError:
+        pass
+    else:
+        raise StageFail(
+            "OutboundBatch(..., enqueue_ts=0.0) must raise ValueError"
+        )
+
+    # (3) Explicit negative → ValueError.
+    try:
+        OutboundBatch(
+            batch_id="x", endpoint="migrate", body={},
+            enqueue_ts=-1.0,
+        )
+    except ValueError:
+        pass
+    else:
+        raise StageFail(
+            "OutboundBatch(..., enqueue_ts=-1.0) must raise ValueError"
+        )
+
+    # (4) Sane positive value works.
+    ok = OutboundBatch(
+        batch_id="x", endpoint="migrate", body={},
+        enqueue_ts=time.time(),
+    )
+    if ok.enqueue_ts <= 0.0:
+        raise StageFail(f"ok.enqueue_ts not preserved: {ok.enqueue_ts}")
+
+
 # ============================================================ run
 
 
@@ -740,6 +909,10 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                                                 stage_c1_oldest_age_decays_when_queue_drains),
     ("C2 /health reports LIVE in-queue oldest, not last-popped",
                                                 stage_c2_health_reports_live_in_queue_oldest),
+    ("C3 /health live-peek is safe + accurate under concurrent worker",
+                                                stage_c3_live_peek_under_concurrent_worker),
+    ("C4 OutboundBatch.enqueue_ts validation (no 0.0 footgun)",
+                                                stage_c4_enqueue_ts_validation),
 ]
 
 
