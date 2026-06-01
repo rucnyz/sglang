@@ -18,6 +18,16 @@ PLAN F3-revisit conditions that key on this aggregator:
 - time-in-queue p99 > 100 ms → revisit
 (symmetric to T14's sglang-side `dump p99 > 50ms` trigger.)
 
+**"Sustained" semantics** (audit G3, this README clarifies for PLAN
+L401).  The summary line carries both `queue_depth_p50` and
+`queue_depth_p99`.  We read PLAN's "sustained" as **p50 > 64 over the
+ring window** (a single spike does NOT count): a p50 above the
+threshold means at least half of recent dispatches saw a backlog
+deeper than 64.  Operators MAY also alert on p99 spikes for
+incident detection, but the F3-revisit task should fire on p50 to
+avoid bouncing the design between transient bursts and steady-state
+overload.
+
 ## WHAT WE PROMISED
 
 **Aggregator location.**  `dev/aginfer/daemon/_observability.py`:
@@ -50,6 +60,28 @@ T42 aggregator is the rollup on top.
 | `kv_scheduler.py` | `_record_skips()` helper extracted from `_dispatch_migrate`'s skip loop; bumps `observability.failure_class_counts[reason]` when an observability instance is wired |
 | `main.py` | `--observability-summary-every-n` CLI flag; passes `router.observability` into `KvScheduler`; emits a final summary on shutdown |
 | `proxy.py` | plumbs `observability_summary_every_n` through `create_app` → `EventRouter` |
+
+**Post-commit audit fixes (#162 — subagent audit punch list).**
+
+* **G2 — load-fault counter scope.**  `_record_skips` was the only
+  call site bumping `failure_class_counts`; `state_fetch_failed`
+  (kv_scheduler line 854) now also routes through
+  `observability.record_failure("state_fetch_failed")`.  APPLY_FAILED
+  (T23+T37, #153) plugs in via the same recorder when it lands.
+* **S3 — per-reason breakdown on the summary line.**  Variable-
+  cardinality counter previously folded down to two scalars
+  (`n_failure_classes`, `n_failures_total`); now also emitted as a
+  space-free compact-JSON `failure_class_breakdown={...}` field on
+  the same line.  Operator's grep can recover `not_in_tree=820` etc.
+  without round-tripping through `summary_dict()`.
+* **S6 — counter-name vs semantics drift.**  Renamed
+  `events_handled_total` → `events_dispatched_total` (the increment
+  fires at dispatch entry, NOT after handler-success).  `router.
+  events_handled` separately tracks handler-success; the two now
+  read distinctly when handlers raise.
+* **T4 — `summary_every_n <= 0` rejected.**  Construction raises
+  ValueError instead of silently making every dispatch emit a
+  summary (when summary_every_n=0).
 
 **Daemon contract refinement** (audit #161, surfaced while exercising
 the T42 stress path): two T43 positivity checks were too strict for
@@ -175,8 +207,9 @@ grep "daemon_obs_summary" /tmp/daemon_t42_stress.log | tail -1
 
 ## RESULTS
 
-**Instrumentation: PASSED** — all 13 verify.py stages green
-(7 Phase A + 5 Phase B + 1 Phase C).
+**Instrumentation: PASSED** — all 20 verify.py stages green
+(7 Phase A + 5 Phase B original + 7 audit-driven stages B5–B11
+covering audit punch-list G2/T1/T2/T5/T6/T3/T4 + 1 Phase C).
 
 **PLAN F3-revisit trigger condition `time_in_queue_p99 > 100 ms`:
 FIRED** under a modest synthetic stress (100 webhook events
@@ -254,7 +287,9 @@ Both feed into #156 + #160 (the F3-revisit task).
    broader F3 scope.
 
 Logs:
-- `results/20260531_t42_initial_pass.log` — Phase A/B/C verify (13/13)
+- `results/20260531_t42_initial_pass.log` — first-cut verify (13/13,
+  pre-audit)
+- `results/20260601_t42_audit_pass.log` — post-audit verify (20/20)
 - `results/20260531_t42_stress_100events.log` — full daemon log from
   the 100-webhook stress run (includes both periodic + shutdown
   `daemon_obs_summary` lines)

@@ -852,6 +852,12 @@ class KvScheduler:
             )
             from ._metrics import m as _m
             _m("state_fetch_failed", kind=event.kind.value)
+            # T42 audit G2: route load-fault tally through the same
+            # observability counter that already collects migrate-skip
+            # reasons.  APPLY_FAILED webhook (T23+T37 / #153) will plug
+            # in via the same recorder when it lands.
+            if self.observability is not None:
+                self.observability.record_failure("state_fetch_failed")
             return
         # Emit per-(tier, subpool) occupancy snapshot for every handled
         # event.  Bounded ~16 ms wall per cycle.  Raw data behind

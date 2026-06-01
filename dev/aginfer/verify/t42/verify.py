@@ -126,7 +126,7 @@ def stage_a3_observability_empty_summary_shape() -> None:
         "queue_depth",
         "time_in_queue_ms",
         "failure_class_counts",
-        "events_handled_total",
+        "events_dispatched_total",
     }
     if set(s.keys()) != required:
         raise StageFail(
@@ -248,14 +248,33 @@ def stage_a6_emit_summary_contract_fields() -> None:
             "state_fetch_p50_ms=",
             "queue_depth_p99=",
             "time_in_queue_p99_ms=",
-            "events_handled_total=",
+            "events_dispatched_total=",
             "n_failure_classes=",
+            "failure_class_breakdown=",
         )
         for needle in required_substrings:
             if needle not in line:
                 raise StageFail(
                     f"summary line missing {needle!r}; line={line!r}"
                 )
+        # Audit S3: the breakdown JSON value MUST be space-free
+        # (line-format invariant) AND must round-trip as a JSON object
+        # carrying the per-reason counts (not just a fold-down count).
+        import json as _json
+        m_token = [
+            tok for tok in line.split(" ")
+            if tok.startswith("failure_class_breakdown=")
+        ]
+        if not m_token:
+            raise StageFail(
+                f"failure_class_breakdown token split lost; line={line!r}"
+            )
+        bjson = m_token[0].split("=", 1)[1]
+        bdict = _json.loads(bjson)
+        if bdict.get("add_already_present:DRAM") != 1:
+            raise StageFail(
+                f"breakdown JSON missing the recorded reason: {bdict!r}"
+            )
     finally:
         logger.removeHandler(handler)
         logger.setLevel(prior_level)
@@ -505,13 +524,287 @@ def stage_c0_summary_line_emitted_in_real_dispatch() -> None:
             )
         line = summary_lines[0]
         # Sanity-check the key fields are present and not zero.
-        if "events_handled_total=10" not in line:
+        if "events_dispatched_total=10" not in line:
             raise StageFail(
-                f"summary should show events_handled_total=10; line={line!r}"
+                f"summary should show events_dispatched_total=10; line={line!r}"
             )
     finally:
         metric_logger.removeHandler(handler)
         metric_logger.setLevel(prior_level)
+
+
+def stage_b5_state_fetch_failure_bumps_observability_counter() -> None:
+    """Audit G2: when ``router.fetch_state`` raises, kv_scheduler's
+    catch block must route the failure through
+    ``observability.record_failure('state_fetch_failed')`` — same
+    counter that already holds migrate-skip reasons.  Without this
+    wiring the load-fault tally is incomplete: a daemon that's
+    losing every state-fetch shows ``n_failures_total=0`` and no
+    one notices."""
+    from daemon.kv_scheduler import KvScheduler
+    from daemon.program_tracker import ProgramTracker
+
+    async def _scenario() -> Dict[str, Any]:
+        bus = EventBus()
+        router = EventRouter(
+            bus=bus, sglang_base_url="http://unused",
+            theta_hi=0.7, theta_crit=0.9,
+        )
+        sched = KvScheduler(
+            tracker=ProgramTracker(),
+            sglang_base_url="http://unused",
+            observability=router.observability,
+        )
+
+        async def _broken_fetch():
+            raise RuntimeError("sglang unreachable")
+
+        # Stub the inner impl so the public path still records latency
+        # (we expect record_state_fetch to NOT fire — see T6 separately).
+        router._fetch_state_impl = _broken_fetch  # type: ignore[assignment]
+
+        # Drive one event through the scheduler's handle().
+        await sched.handle(Event(kind=EventKind.MEMORY_PRESSURE), router)
+        return router.observability.summary_dict()
+
+    summary = asyncio.run(_scenario())
+    counts = summary["failure_class_counts"]
+    if counts.get("state_fetch_failed") != 1:
+        raise StageFail(
+            f"state_fetch_failed should bump observability counter; "
+            f"got counts={counts}"
+        )
+
+
+# ---------- audit B-block: branches the original verify never exercised
+
+
+def stage_b6_enqueue_time_zero_fallback() -> None:
+    """Audit T1: ``time_in_queue_ms`` fallback when an event lands on
+    the queue WITHOUT going through ``EventBus.emit`` (e.g. a future
+    helper that calls ``put_nowait`` directly).  The worker reads
+    ``event.enqueue_time > 0.0`` and substitutes ``0.0`` when unset
+    so we don't produce a giant negative time-in-queue.  B0 proves
+    emit() always stamps; only this stage proves the fallback path."""
+    async def _scenario() -> Dict[str, Any]:
+        bus = EventBus()
+        router = EventRouter(
+            bus=bus, sglang_base_url="http://unused",
+            theta_hi=0.7, theta_crit=0.9,
+        )
+        async def _fake_fetch():
+            return {"pool_usage": {"HBM": {"subpools": {}}}}
+        router._fetch_state_impl = _fake_fetch  # type: ignore[assignment]
+        async def _h(evt, r):
+            pass
+        for kind in EventKind:
+            router.set_handler(kind, _h)
+        await router.start()
+        try:
+            # BYPASS emit() — put directly on queue with enqueue_time=0.0.
+            bus.queue.put_nowait(Event(kind=EventKind.MEMORY_PRESSURE))
+            await bus.queue.join()
+            return router.observability.summary_dict()
+        finally:
+            await router.stop()
+
+    summary = asyncio.run(_scenario())
+    tiq = summary["time_in_queue_ms"]
+    if tiq["n"] != 1:
+        raise StageFail(f"expected 1 sample; got {tiq['n']}")
+    if tiq["max"] != 0.0:
+        raise StageFail(
+            f"enqueue_time=0.0 should fall back to time_in_queue=0.0; "
+            f"got {tiq['max']}"
+        )
+
+
+def stage_b7_ring_wrap_quantile_boundary() -> None:
+    """Audit T2: A2 only asserts ``n == 32`` and ``max == 199`` after
+    wrap.  A regression that drops the WRONG end (``del[-1]`` instead
+    of ``del[0]``) would pass A2 because the new-end ``max`` would
+    still match the last recorded sample (since the latest sample
+    IS at index -1).
+
+    Sharper assertion: after wrap, ``p50`` of samples 168..199 is
+    183 (median of consecutive ints in [168, 199] = (168+199)/2 +
+    nearest-rank rounding).  A reverse-eviction would put 0..31 in
+    the window with p50 = 15 — caught here."""
+    from daemon._observability import _DaemonMetricsRing
+    r = _DaemonMetricsRing(capacity=32)
+    for i in range(200):
+        r.record(float(i))
+    s = r.summary()
+    if s["n"] != 32:
+        raise StageFail(f"wrapped n != 32: {s['n']}")
+    # Window is samples 168..199 (inclusive); p50 nearest-rank at
+    # idx=round(0.5 * 31)=16 of sorted [168..199] → 184.
+    if not (180.0 <= s["p50"] <= 190.0):
+        raise StageFail(
+            f"wrap quantile boundary: p50 should be ~184 "
+            f"(samples 168..199); got {s['p50']} — likely a "
+            f"reverse-eviction regression"
+        )
+
+
+def stage_b8_kv_scheduler_observability_none_no_crash() -> None:
+    """Audit T5: ``KvScheduler(observability=None)`` is the unit-test
+    default and the legacy production path before main.py wires the
+    instance.  ``_record_skips`` must still emit ``migrate_skipped``
+    log lines but skip the counter bump without raising.
+
+    Regression target: a future change that drops the ``if
+    self.observability is not None:`` guard would crash the
+    metric-fired-but-no-aggregator path silently."""
+    from daemon.kv_scheduler import KvScheduler
+    from daemon.program_tracker import ProgramTracker
+
+    sched = KvScheduler(
+        tracker=ProgramTracker(),
+        sglang_base_url="http://unused",
+        observability=None,
+    )
+    captured: List[str] = []
+
+    def _capture(event, **kv):
+        captured.append(event)
+
+    sched._record_skips(
+        [{"hash": "h1", "reason": "not_in_tree", "action_id": "a1"}],
+        _m_func=_capture,
+    )
+    # The per-line metric still fires regardless of observability state.
+    if captured != ["migrate_skipped"]:
+        raise StageFail(
+            f"with observability=None, per-line metric should still "
+            f"fire; captured={captured}"
+        )
+
+
+def stage_b9_fetch_state_exception_no_sample_no_leak() -> None:
+    """Audit T6: when ``_fetch_state_impl`` raises, the exception
+    must propagate to the caller AND no sample should be recorded
+    on the state_fetch_lat_ms ring (the timer block doesn't reach
+    record() — current semantics).  Documents the chosen
+    behavior so a refactor that adds a try/finally is visible."""
+    async def _scenario() -> Tuple[Optional[Exception], Dict[str, Any]]:
+        bus = EventBus()
+        router = EventRouter(
+            bus=bus, sglang_base_url="http://unused",
+            theta_hi=0.7, theta_crit=0.9,
+        )
+
+        async def _broken():
+            raise RuntimeError("downstream timeout")
+
+        router._fetch_state_impl = _broken  # type: ignore[assignment]
+        caught: Optional[Exception] = None
+        try:
+            await router.fetch_state()
+        except Exception as exc:  # noqa: BLE001
+            caught = exc
+        return caught, router.observability.summary_dict()
+
+    caught, summary = asyncio.run(_scenario())
+    if caught is None or not isinstance(caught, RuntimeError):
+        raise StageFail(
+            f"fetch_state should re-raise the impl's exception; "
+            f"got {caught!r}"
+        )
+    if summary["state_fetch_lat_ms"]["n"] != 0:
+        raise StageFail(
+            f"a raising fetch should NOT record a sample (current "
+            f"semantics — change with intent); "
+            f"got n={summary['state_fetch_lat_ms']['n']}"
+        )
+
+
+def stage_b10_shutdown_summary_emission() -> None:
+    """Audit T3: main.py's shutdown hook calls ``emit_summary``
+    regardless of the cadence counter.  Verify:
+      (a) shutdown after zero events emits a summary anyway (empty
+          rings; operator sees daemon ran);
+      (b) shutdown after N=5 events with cadence=20 emits the
+          partial-window summary (the periodic emission wouldn't
+          have fired yet);
+      (c) shutdown after N=20 events with cadence=20 emits exactly
+          TWO summaries — one periodic, one shutdown — confirming
+          the shutdown path is independent of the cadence counter
+          (not gated by ``_events_since_summary > 0``).
+    """
+    captured: List[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = _CaptureHandler()
+    metric_logger = logging.getLogger("aginfer.metric")
+    prior_level = metric_logger.level
+    metric_logger.addHandler(handler)
+    metric_logger.setLevel(logging.INFO)
+    try:
+        # (a) zero events — emit_summary directly (simulates shutdown).
+        obs_a = DaemonObservability(capacity=64, summary_every_n=20)
+        obs_a.emit_summary()
+        a_lines = [l for l in captured if "event=daemon_obs_summary" in l]
+        if len(a_lines) != 1:
+            raise StageFail(
+                f"(a) shutdown on zero-event daemon: expected 1 summary; "
+                f"got {len(a_lines)}"
+            )
+        if "events_dispatched_total=0" not in a_lines[0]:
+            raise StageFail(
+                f"(a) summary should report dispatched=0; line={a_lines[0]!r}"
+            )
+
+        # (b) partial window — 5 events at cadence=20.
+        captured.clear()
+        obs_b = DaemonObservability(capacity=64, summary_every_n=20)
+        for i in range(5):
+            obs_b.record_dispatch(qdepth=i, time_in_queue_ms=float(i))
+        obs_b.emit_summary()
+        b_lines = [l for l in captured if "event=daemon_obs_summary" in l]
+        if len(b_lines) != 1:
+            raise StageFail(
+                f"(b) cadence not yet reached: expected 1 (shutdown) "
+                f"summary; got {len(b_lines)}"
+            )
+        if "events_dispatched_total=5" not in b_lines[0]:
+            raise StageFail(
+                f"(b) partial-window summary should show dispatched=5"
+            )
+
+        # (c) periodic + shutdown — exactly 20 events at cadence=20.
+        captured.clear()
+        obs_c = DaemonObservability(capacity=64, summary_every_n=20)
+        for i in range(20):
+            obs_c.record_dispatch(qdepth=i, time_in_queue_ms=float(i))
+        obs_c.emit_summary()  # explicit shutdown call
+        c_lines = [l for l in captured if "event=daemon_obs_summary" in l]
+        if len(c_lines) != 2:
+            raise StageFail(
+                f"(c) 20-events-at-20-cadence + shutdown: expected 2 "
+                f"summaries (1 periodic + 1 shutdown); got {len(c_lines)}"
+            )
+    finally:
+        metric_logger.removeHandler(handler)
+        metric_logger.setLevel(prior_level)
+
+
+def stage_b11_summary_every_n_rejects_non_positive() -> None:
+    """Audit T4: ``summary_every_n <= 0`` is meaningless (0 would
+    fire on every event, negative is nonsense).  Reject at
+    construction so the operator's CLI typo surfaces immediately."""
+    for bad in (0, -1, -100):
+        try:
+            DaemonObservability(summary_every_n=bad)
+        except ValueError:
+            continue
+        raise StageFail(
+            f"summary_every_n={bad} should raise ValueError; "
+            f"construction silently succeeded"
+        )
 
 
 # ============================================================ run
@@ -530,6 +823,17 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("B2 router records state-fetch latency",      stage_b2_router_records_state_fetch_latency),
     ("B3 router exposes failure-class recorder",   stage_b3_router_records_failure_class),
     ("B4 kv_scheduler skips bump observability",   stage_b4_kv_scheduler_skips_bump_observability),
+    ("B5 G2 state_fetch_failed counts in observability",
+                                                   stage_b5_state_fetch_failure_bumps_observability_counter),
+    ("B6 T1 enqueue_time=0 fallback (queue bypass of emit)",
+                                                   stage_b6_enqueue_time_zero_fallback),
+    ("B7 T2 ring wrap quantile boundary",          stage_b7_ring_wrap_quantile_boundary),
+    ("B8 T5 KvScheduler(observability=None) no-crash",
+                                                   stage_b8_kv_scheduler_observability_none_no_crash),
+    ("B9 T6 fetch_state exception re-raises, no sample",
+                                                   stage_b9_fetch_state_exception_no_sample_no_leak),
+    ("B10 T3 shutdown summary emission contract",  stage_b10_shutdown_summary_emission),
+    ("B11 T4 summary_every_n rejects non-positive", stage_b11_summary_every_n_rejects_non_positive),
     ("C0 real-dispatch summary line lands",        stage_c0_summary_line_emitted_in_real_dispatch),
 ]
 

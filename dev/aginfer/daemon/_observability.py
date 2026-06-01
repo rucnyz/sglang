@@ -26,6 +26,7 @@ both keyed on this aggregator's summary line.
 """
 from __future__ import annotations
 
+import json
 from typing import Dict, Optional
 
 
@@ -101,7 +102,7 @@ class DaemonObservability:
         "queue_depth",
         "time_in_queue_ms",
         "failure_class_counts",
-        "events_handled_total",
+        "events_dispatched_total",
         "_summary_every_n",
         "_events_since_summary",
     )
@@ -112,11 +113,19 @@ class DaemonObservability:
         capacity: int = 1024,
         summary_every_n: int = 200,
     ) -> None:
+        if int(summary_every_n) < 1:
+            # Audit T4: ``summary_every_n=0`` would make ``record_dispatch``
+            # emit on EVERY event (since 1 >= 0).  Negative is meaningless.
+            # Reject at construction so the operator sees the mistake
+            # immediately instead of being flooded by per-event summaries.
+            raise ValueError(
+                f"summary_every_n must be >= 1; got {summary_every_n}"
+            )
         self.state_fetch_lat_ms = _DaemonMetricsRing(capacity)
         self.queue_depth = _DaemonMetricsRing(capacity)
         self.time_in_queue_ms = _DaemonMetricsRing(capacity)
         self.failure_class_counts: Dict[str, int] = {}
-        self.events_handled_total: int = 0
+        self.events_dispatched_total: int = 0
         self._summary_every_n = int(summary_every_n)
         self._events_since_summary: int = 0
 
@@ -127,11 +136,18 @@ class DaemonObservability:
 
     def record_dispatch(self, qdepth: int, time_in_queue_ms: float) -> None:
         """Worker calls this AT handler entry (after queue.get()).
-        Bumps ``events_handled_total`` and emits a summary line every
-        ``summary_every_n`` events."""
+        Bumps ``events_dispatched_total`` and emits a summary line every
+        ``summary_every_n`` events.
+
+        Audit S6: this counts *dispatched* events, not *succeeded* ones.
+        The router separately tracks ``events_handled`` (handler return
+        without raising); the two diverge when a handler raises.  The
+        rename from the original ``events_handled_total`` is the fix —
+        operator-facing semantics now match the field name.
+        """
         self.queue_depth.record(float(qdepth))
         self.time_in_queue_ms.record(time_in_queue_ms)
-        self.events_handled_total += 1
+        self.events_dispatched_total += 1
         self._events_since_summary += 1
         if self._events_since_summary >= self._summary_every_n:
             self.emit_summary()
@@ -154,7 +170,7 @@ class DaemonObservability:
             "queue_depth":        self.queue_depth.summary(),
             "time_in_queue_ms":   self.time_in_queue_ms.summary(),
             "failure_class_counts": dict(self.failure_class_counts),
-            "events_handled_total": self.events_handled_total,
+            "events_dispatched_total": self.events_dispatched_total,
         }
 
     def emit_summary(self) -> None:
@@ -168,12 +184,20 @@ class DaemonObservability:
         sf = self.state_fetch_lat_ms.summary()
         qd = self.queue_depth.summary()
         tiq = self.time_in_queue_ms.summary()
-        # failure_class_counts is variable-cardinality; the line carries
-        # the count but not the breakdown (operator queries
-        # summary_dict() directly for the full mapping).
+        # Audit S3: variable-cardinality failure_class_counts emit as a
+        # single space-free JSON-encoded field so the operator's grep
+        # pipeline can parse the per-reason breakdown without a second
+        # event type.  json.dumps with compact separators guarantees
+        # the value has no spaces (which the line format requires).
+        # Sorted keys keep two consecutive summaries diffable by line.
+        breakdown_json = json.dumps(
+            self.failure_class_counts,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         _m(
             "daemon_obs_summary",
-            events_handled_total=self.events_handled_total,
+            events_dispatched_total=self.events_dispatched_total,
             state_fetch_n=sf["n"],
             state_fetch_p50_ms=sf["p50"],
             state_fetch_p95_ms=sf["p95"],
@@ -191,4 +215,5 @@ class DaemonObservability:
             time_in_queue_max_ms=tiq["max"],
             n_failure_classes=len(self.failure_class_counts),
             n_failures_total=sum(self.failure_class_counts.values()),
+            failure_class_breakdown=breakdown_json,
         )
