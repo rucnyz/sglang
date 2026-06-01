@@ -102,6 +102,24 @@ _DEFAULT_LAMBDA_ACTING = _env_float("AGINFER_LAMBDA_ACTING", "0.2")
 _DEFAULT_MEMORY_PRESSURE_TOPK = _env_int("AGINFER_MEMORY_PRESSURE_TOPK", "256")
 
 
+# DESIGN §7 bw_free branch: link is "cold-idle" iff
+# time_since_last_sample_s > LINK_IDLE_SECONDS.  Public so
+# verify/t13/ imports it instead of redeclaring (audit #175 —
+# drift between the local-shadow constant in verify/ and the
+# production constant would let either side change silently).
+LINK_IDLE_SECONDS = 1.0
+
+# The 4 transfer directions the daemon's bw_free vector covers
+# (DESIGN §7 4 link channels).  Public for the same reason as
+# LINK_IDLE_SECONDS above.
+LINK_PAIRS = [
+    ((Tier.HBM, Tier.DRAM), "HBM->DRAM"),
+    ((Tier.DRAM, Tier.HBM), "DRAM->HBM"),
+    ((Tier.DRAM, Tier.DISK), "DRAM->DISK"),
+    ((Tier.DISK, Tier.DRAM), "DISK->DRAM"),
+]
+
+
 def _clamp_lambda_acting(lam: float) -> float:
     return max(_LAMBDA_ACTING_FLOOR, min(_LAMBDA_ACTING_CEIL, lam))
 
@@ -522,14 +540,7 @@ def build_paper_state(
     # bw_free derived from link_stats: peak when link is cold-idle,
     # else (peak - recent_throughput).  Negative bw_free clamps to 0.
     raw_links = state_json["link_stats"]
-    _LINK_IDLE_SECONDS = 1.0  # DESIGN §7 bw_free branch threshold
-    _LINK_PAIRS = [
-        ((Tier.HBM, Tier.DRAM), "HBM->DRAM"),
-        ((Tier.DRAM, Tier.HBM), "DRAM->HBM"),
-        ((Tier.DRAM, Tier.DISK), "DRAM->DISK"),
-        ((Tier.DISK, Tier.DRAM), "DISK->DRAM"),
-    ]
-    for (src, dst), link_label in _LINK_PAIRS:
+    for (src, dst), link_label in LINK_PAIRS:
         entry = raw_links[link_label]
         peak = float(entry["peak_bw_bps"])
         if peak <= 0.0:
@@ -548,7 +559,7 @@ def build_paper_state(
         idle = float(entry["time_since_last_sample_s"])
         # DESIGN §7: if link is cold-idle (idle > 1.0 s), assume peak
         # is fully available.  Otherwise free = peak - recent.
-        bw = peak if idle > _LINK_IDLE_SECONDS else max(0.0, peak - recent)
+        bw = peak if idle > LINK_IDLE_SECONDS else max(0.0, peak - recent)
         tier_usage.bw_free[(src, dst)] = bw
 
     units_raw = state_json["units"]

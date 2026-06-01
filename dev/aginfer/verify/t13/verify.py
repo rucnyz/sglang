@@ -49,10 +49,13 @@ class StageFail(AssertionError):
     pass
 
 
-# ---- contract constants (must match kv_scheduler.py + sglang) ----
+# ---- contract constants (audit #175): IMPORT from kv_scheduler so a
+# drift between verify and production is caught at test time, not by
+# coincidence in prod.  See daemon/kv_scheduler.py LINK_IDLE_SECONDS
+# + LINK_PAIRS.
 
-_LINK_IDLE_SECONDS = 1.0  # daemon's branch threshold
-_REQUIRED_LINKS = ("HBM->DRAM", "DRAM->HBM", "DRAM->DISK", "DISK->DRAM")
+_LINK_IDLE_SECONDS = kvs.LINK_IDLE_SECONDS
+_REQUIRED_LINKS = tuple(label for _pair, label in kvs.LINK_PAIRS)
 _REQUIRED_KEYS_PER_LINK = {
     "peak_bw_bps",
     "recent_throughput_bps",

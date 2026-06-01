@@ -50,7 +50,16 @@ def _hyperbolic(occ: np.ndarray, alpha: float) -> np.ndarray:
 
 @dataclass(frozen=True)
 class FitResult:
-    """Result of fitting one shape to one (tier, subpool) bucket."""
+    """Result of fitting one shape to one (tier, subpool) bucket.
+
+    ``saturated`` flags when a constrained parameter pegged at its
+    bound (only ``power``'s γ ∈ [0.5, 10] is bounded today).  A
+    saturated fit means the true value is outside the bound and
+    the picker should treat the residual as a lower bound — the
+    real shape may not be one of our 3 candidates.  Downstream
+    callers can downgrade saturated picks or widen the bound and
+    re-fit.
+    """
     shape: str                  # "linear" / "power" / "hyperbolic"
     params: Tuple[float, ...]   # alpha, [gamma]
     n_samples: int
@@ -58,6 +67,7 @@ class FitResult:
     mae: float
     r_squared: float
     aic: float                  # lower = better; comparable across nested models
+    saturated: bool = False     # any bounded param at its boundary
 
 
 def _aic(n: int, rss: float, k: int) -> float:
@@ -96,6 +106,7 @@ def fit_one(
     if n < 2:
         raise ValueError(f"need >= 2 samples to fit; got {n}")
 
+    saturated = False
     if shape == "linear":
         params, _ = curve_fit(
             _linear, occ_arr, y_arr,
@@ -104,14 +115,24 @@ def fit_one(
         y_pred = _linear(occ_arr, *params)
         k = 1
     elif shape == "power":
+        # γ ∈ [0.5, 10].  When the true γ is outside this range,
+        # curve_fit silently saturates at the boundary; we flag it
+        # so downstream picker can downgrade or widen + re-fit.
+        gamma_lo, gamma_hi = 0.5, 10.0
         params, _ = curve_fit(
             _power, occ_arr, y_arr,
             p0=[1.0, 1.5],
-            bounds=([-np.inf, 0.5], [np.inf, 10.0]),  # γ ∈ [0.5, 10]
+            bounds=([-np.inf, gamma_lo], [np.inf, gamma_hi]),
             maxfev=5000,
         )
         y_pred = _power(occ_arr, *params)
         k = 2
+        # 1% of the band counts as "at the boundary" — covers both
+        # exact-bound saturation and the noisy-edge case.
+        gamma_fit = float(params[1])
+        edge = 0.01 * (gamma_hi - gamma_lo)
+        if gamma_fit <= gamma_lo + edge or gamma_fit >= gamma_hi - edge:
+            saturated = True
     elif shape == "hyperbolic":
         params, _ = curve_fit(
             _hyperbolic, occ_arr, y_arr,
@@ -133,6 +154,7 @@ def fit_one(
         rmse=rmse, mae=mae,
         r_squared=_r_squared(y_arr, y_pred),
         aic=_aic(n, rss, k),
+        saturated=saturated,
     )
 
 

@@ -11,19 +11,30 @@ as an endpoint today.
 So this driver runs DP=2 — two independent KV pools serving the
 same model.  Under DP, divergence between replicas is
 EXPECTED-BY-DESIGN: each replica serves a different program
-subset, so eviction sets differ across windows.  The point of this
-real-run is to:
+subset, so eviction sets differ across windows.
 
-  (1) Prove the detector + parser work end-to-end against real
-      sglang ``per_rank`` JSON (not just synthetic dicts).
-  (2) Confirm /aginfer/state's per_rank wire format under DP > 1.
+**The divergence COUNT is NOT a §6 signal under this driver** —
+audit #175 caught that without hicache content hashing active,
+unit hashes are per-process counters (``node-N``) rather than
+content-derived SHA256s.  The detector compares strings; two
+unrelated nodes with the same counter value across replicas look
+identical and content-equivalent nodes with different counter
+values look divergent.  What this driver DOES validate:
+
+  (1) Detector + parser work end-to-end against real sglang
+      ``per_rank`` JSON (not just synthetic dicts).
+  (2) /aginfer/state's per_rank wire format under DP > 1 matches
+      the detector's parser assumptions.
+
+The script PRINTS the divergence count, but the README RESULTS
+section is now careful to read it as "parser-integrity" only,
+not as a §6 signal.
 
 For the TP-rank divergence half of T15 (the actual §6 invariant
-the probe is meant to catch), see task #174 — needs a sglang patch
-exposing per-TP-rank state pre-aggregation.
+the probe is meant to catch), see task #174.
 
 Usage:
-    python dev/aginfer/verify/t15/run_tp2_real.py [--duration 60]
+    python dev/aginfer/verify/t15/run_dp2_real.py [--duration 60]
 """
 from __future__ import annotations
 
@@ -199,18 +210,38 @@ async def _amain(duration_s: float, n_workers: int) -> int:
     print(f"[T15] unit population range: min={min(pops)} max={max(pops)} "
           f"final={pops[-1]}")
 
+    # #175 audit: detect counter-format hashes (node-N) before
+    # reporting any divergence number.  Without hicache content
+    # hashing active, hashes are per-process counters — two
+    # unrelated nodes in different DP processes can share the same
+    # ID and the divergence count becomes meaningless.
+    sample_hashes: List[str] = []
+    for r in snapshots[0]["per_rank"]:
+        for u in (r.get("units") or [])[:50]:
+            sample_hashes.append(str(u.get("hash", "")))
+    import re
+    counter_re = re.compile(r"^node-\d+$")
+    n_counter = sum(1 for h in sample_hashes if counter_re.match(h))
+    counter_dominant = (
+        len(sample_hashes) > 0 and n_counter == len(sample_hashes)
+    )
+
     reports = detect_divergence(snapshots)
     n_windows = len(snapshots) - 1
     print()
     print(summarise(reports))
     print(f"\n[T15] {len(reports)} divergent windows / {n_windows} total")
-
-    # Under DP > 1, EXPECTED-BY-DESIGN: each replica serves a
-    # different program subset, so eviction sets MUST differ.  The
-    # contract this real-run validates is *parser correctness*, not
-    # the §6 cross-TP-rank-eviction invariant (that needs a sglang
-    # patch to expose per-TP-rank state pre-aggregation — task #174).
-    if not reports and n_windows > 5:
+    if counter_dominant:
+        print(
+            "[T15] WARN: ALL sampled hashes are per-process counter "
+            "format (node-N).  Without hicache content-hash mode "
+            "active, the divergence count above is NOT a §6 signal: "
+            "two unrelated nodes in different DP processes can share "
+            "the same counter ID.  Run with a hicache storage backend "
+            "(or wait for T26 content-hash wiring) to make divergence "
+            "a meaningful comparison."
+        )
+    if not reports and n_windows > 5 and not counter_dominant:
         print("[T15] WARN: zero divergence across DP replicas under "
               "churn — either traffic was load-balanced 100% to one "
               "replica, or replicas evicted in lockstep (very "
@@ -234,9 +265,9 @@ def main() -> int:
     results_dir = _HERE / "results"
     results_dir.mkdir(exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    server_log = results_dir / f"{ts}_t15_tp2_sglang.log"
+    server_log = results_dir / f"{ts}_t15_dp2_sglang.log"
 
-    print(f"[T15] launching sglang TP=2 on GPUs {GPUS} port {PORT}")
+    print(f"[T15] launching sglang DP=2 on GPUs {GPUS} port {PORT}")
     print(f"[T15] model: {MODEL}")
     print(f"[T15] server log: {server_log}")
     proc = _launch_sglang(server_log)

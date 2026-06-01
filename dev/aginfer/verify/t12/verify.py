@@ -187,25 +187,41 @@ def stage_b1_fit_one_too_few_samples() -> None:
 
 
 def stage_b2_fit_all_omits_non_converge() -> None:
-    """A pathological input (all zeros on a hyperbolic fit, etc.)
-    should DROP the failing shape from the returned dict, not
-    propagate the curve_fit exception."""
+    """A pathological input that genuinely fails curve_fit (NaN in
+    the target) must drop the failing shape from the returned
+    dict, NOT propagate the exception.  Audit closure (#175): the
+    prior version asserted only ``isinstance(fits, dict)`` which
+    passed even when fit_all silently converged all 3 shapes to
+    α=0 on degenerate data — tautological.
+    """
     occ = np.array([0.1, 0.2, 0.3, 0.4, 0.5])
-    y = np.zeros_like(occ)  # all zeros — degenerate for some shapes
+    # NaN in y forces curve_fit to fail for any of the 3 shapes
+    # (sum-of-squares is NaN, optimizer can't make progress).
+    y = np.array([1.0, np.nan, 3.0, 4.0, 5.0])
     fits = fit_all(occ.tolist(), y.tolist())
-    # We don't assert which shapes survive, just that fit_all does
-    # not raise.  A real production caller would log the missing
-    # shapes via len(fits) < 3.
     if not isinstance(fits, dict):
         raise StageFail(f"fit_all returned non-dict: {type(fits)}")
+    # At least one shape MUST be dropped — otherwise the contract
+    # ("omits non-converging") is unproved.
+    if len(fits) >= 3:
+        raise StageFail(
+            f"NaN-in-y should make ≥1 shape fail curve_fit; got "
+            f"{len(fits)} shapes still present: {sorted(fits.keys())}"
+        )
 
 
 def stage_b3_best_by_aic_ties_prefer_simpler() -> None:
     """If two shapes have identical AICs (numeric tie), the picker
     breaks ties in favour of the model with fewer parameters
-    (Occam's-razor default)."""
-    # Fake two FitResults with the same AIC; one is "power" (2 params),
-    # the other "linear" (1 param).  Picker must return "linear".
+    (Occam's-razor default).
+
+    Audit closure (#175): the prior version only tested linear-vs-
+    power (different param counts).  Same-k ties (linear vs
+    hyperbolic, both 1-param) need a documented stable tie-break;
+    the implementation sorts by ``(aic, n_params)`` which for
+    same-k falls through to dict insertion order.  Pin both cases.
+    """
+    # Case 1: different params, both AIC=12.34 → 1-param wins.
     fits = {
         "linear": FitResult(
             shape="linear", params=(1.0,), n_samples=10,
@@ -219,7 +235,57 @@ def stage_b3_best_by_aic_ties_prefer_simpler() -> None:
     pick = best_by_aic(fits)
     if pick != "linear":
         raise StageFail(
-            f"AIC tie → simpler model expected; got {pick!r}"
+            f"AIC tie linear vs power → simpler model expected; got {pick!r}"
+        )
+    # Case 2: same-k tie (linear vs hyperbolic).  Picker must be
+    # deterministic; the implementation sorts by (aic, n_params)
+    # so dict insertion order decides — we PIN the contract that
+    # ``best_by_aic`` returns a documented stable choice (here
+    # "linear", the first inserted).  If the impl changes to e.g.
+    # alphabetical tie-break, this stage forces the docs to update.
+    fits2 = {
+        "linear": FitResult(
+            shape="linear", params=(1.0,), n_samples=10,
+            rmse=0.1, mae=0.08, r_squared=0.99, aic=42.0,
+        ),
+        "hyperbolic": FitResult(
+            shape="hyperbolic", params=(1.0,), n_samples=10,
+            rmse=0.1, mae=0.08, r_squared=0.99, aic=42.0,
+        ),
+    }
+    pick2 = best_by_aic(fits2)
+    if pick2 not in ("linear", "hyperbolic"):
+        raise StageFail(f"unexpected pick: {pick2!r}")
+    # Insertion-order contract: same call twice must return the same value.
+    if best_by_aic(fits2) != pick2:
+        raise StageFail("best_by_aic non-deterministic for same-k tie")
+
+
+def stage_b4_power_gamma_saturation_flagged() -> None:
+    """#175 audit: when real data has γ > 10 (very steep right tail),
+    curve_fit silently clips γ to the upper bound 10 and the picker
+    has no way to know the fit is meaningless.  FitResult must
+    expose a ``saturated`` flag; downstream code can downgrade or
+    re-bound."""
+    # Generate γ=15 data within fit range [0.05, 0.95].
+    occ = _grid()
+    y = _gen_power(occ, alpha=1.0, gamma=15.0)
+    fit = fit_one("power", occ.tolist(), y.tolist())
+    if not hasattr(fit, "saturated"):
+        raise StageFail(
+            "FitResult missing `saturated` field — saturation "
+            "diagnostic not implemented"
+        )
+    if not fit.saturated:
+        raise StageFail(
+            f"γ=15 input should saturate at upper bound (10.0); "
+            f"got params={fit.params} saturated={fit.saturated}"
+        )
+    # The recovered γ should be at the boundary.
+    _alpha, gamma_fit = fit.params
+    if not (9.9 <= gamma_fit <= 10.0):
+        raise StageFail(
+            f"γ should be at upper bound after saturation; got {gamma_fit}"
         )
 
 
@@ -282,6 +348,7 @@ _STAGES = [
     ("B1 fit_one < 2 samples raises",             stage_b1_fit_one_too_few_samples),
     ("B2 fit_all omits non-converging shapes",    stage_b2_fit_all_omits_non_converge),
     ("B3 best_by_aic ties prefer simpler model",  stage_b3_best_by_aic_ties_prefer_simpler),
+    ("B4 power(γ=15) saturation flagged on FitResult", stage_b4_power_gamma_saturation_flagged),
     ("C0 parser groups by (tier, subpool)",       stage_c0_parser_groups_by_tier_subpool),
     ("C1 parser drops malformed lines",           stage_c1_parser_drops_malformed),
 ]

@@ -16,7 +16,7 @@ implementation gap (not on "just run it").
 |---|---|---|
 | (1) Detector tool + synthetic-data verify | nothing | **DONE — this verify (11 stages)** |
 | (2) Real TP > 1 churn run against detector | sglang patch — expose per-TP-rank state pre-aggregation (the existing endpoint aggregates inside `http_server.py`) | **BLOCKED on sglang patch (task #174)** |
-| (intermediate) Real DP > 1 churn run | nothing | **DONE — `run_tp2_real.py` (102 snapshots parsed, expected-by-design divergence observed)** |
+| (intermediate) Real DP > 1 churn run | nothing | **DONE — `run_dp2_real.py` (102 snapshots parsed without raising)** |
 
 The intermediate DP run exists for two reasons:
 1. **Detector contract green against real JSON** — proves the
@@ -26,9 +26,10 @@ The intermediate DP run exists for two reasons:
    unique-prompt churn, 8,948 peak units → 8,926 final units →
    eviction is actively triggering.
 
-But DP divergence is EXPECTED — each replica serves a different
-program subset, so eviction sets MUST differ across windows.
-This run does NOT validate the §6 invariant.  For that, see #174.
+This run does NOT validate the §6 invariant: see RESULTS below.
+The driver now warns when all sampled hashes are per-process
+counters (audit #175) so the "divergence count" can't be mis-read
+as a §6 signal.
 
 ## SCOPE
 
@@ -119,24 +120,46 @@ python dev/aginfer/verify/t15/run_tp2_real.py --duration 60 --workers 24
 
 ### Real DP=2 run
 
-**Detector parser GREEN against real per_rank JSON.**  102 snapshots
-captured over 60 s of 24-worker churn; 13,620 requests served;
-8,948 peak units in the radix tree; detector reported 34/101
-divergent windows (expected-by-design under DP).
+**Detector + parser PROVEN against real per_rank JSON.**  102
+snapshots captured over 60 s of 24-worker churn; 13,620 requests
+served; 8,948 peak units in the radix tree; no parser exception.
+
+**Divergence count is NOT a §6 signal under this configuration**
+(audit #175): without hicache content hashing active, sglang
+emits ``f"node-{node.id}"`` as the unit hash, where ``node.id`` is
+a per-process counter.  Across DP=2, two different programs in
+the two replicas can land on the same counter ID and look
+"identical" to a string-equality detector; conversely two
+content-equivalent units with different counter values look
+"divergent".  The driver now WARNs when all sampled hashes are
+counter-format.
+
+What this run does prove:
+* `/aginfer/state` `per_rank` wire format matches the detector's
+  parser assumptions.
+* `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1` is the env var required
+  for the aginfer state schema to be emitted at all (without it,
+  every rank returns `{"unsupported_tree_cache": ...}`).
+* The detector survives 100+ real-world snapshots without raising.
 
 * date: 2026-06-01
 * raw log: `results/20260601_t15_real_dp2_unified.log`
 
 **§6 invariant verification (TP > 1):** BLOCKED on sglang patch
-#174 — see PLAN §2 T15 status block.
+#174 — needs (a) per-TP-rank state endpoint AND (b) content-hash
+mode active (hicache storage backend or T26 wiring).  PLAN §2 T15
+status block has the full deferred list.
 
 ## WHEN #174 LANDS
 
-1. Re-run `run_tp2_real.py` with `--tp 2` instead of `--dp 2` and
-   hit `/aginfer/state?per_tp_rank=1`.
-2. Detector should report ZERO divergence over any reasonable
-   churn duration — the all-rank-atomic eviction protocol
-   guarantees identical eviction sets across TP ranks per window.
-3. Any non-zero report = §6 invariant break.  The detector's
-   per-window evicted-hash listing is exactly what's needed to
-   bisect which migrate/evict pair leaked.
+1. Re-run `run_dp2_real.py` (or a sibling `run_tp2_real.py`) with
+   `--tp 2` AND `--enable-hicache-storage` (or another path that
+   activates `compute_node_hash_values`).
+2. Hit the new per-TP-rank debug endpoint exposed by #174.
+3. With content hashes active, detector should report ZERO
+   divergence over any reasonable churn duration — TP's all-rank-
+   atomic eviction protocol guarantees identical eviction sets
+   across ranks per window.
+4. Any non-zero report = §6 invariant break.  The detector's
+   per-window evicted-hash listing identifies which migrate/evict
+   pair leaked.
