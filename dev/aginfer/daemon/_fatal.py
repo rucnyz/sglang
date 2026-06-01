@@ -127,7 +127,16 @@ def fatal(reason: str, **context: Any) -> None:
     Effects:
       1. Writes ``<data_dir>/forensic/<reason>_<unix_ts_ns>.json``.
       2. Logs ``logger.critical`` with the file path.
-      3. ``sys.exit(1)``.
+      3. ``os._exit(1)`` — crash-only.
+
+    ``os._exit`` (not ``sys.exit``) is deliberate.  ``sys.exit(1)``
+    raises ``SystemExit`` which can be caught by an asyncio
+    ``Task.__step`` wrapper, an ``asyncio.gather`` collector, an
+    ``asyncio.shield`` wrap, or a user-installed
+    ``loop.set_exception_handler``.  In modern CPython the propagation
+    usually works (see verify/t164 stage C0), but the crash-only
+    contract MUST NOT depend on exception-machinery routing.  ``os._
+    exit`` bypasses Python shutdown entirely → process dies immediately.
 
     Never returns.  Never raises (errors during serialisation degrade
     to ``repr``)."""
@@ -193,4 +202,16 @@ def fatal(reason: str, **context: Any) -> None:
             "FATAL reason=%s (no forensic file written) payload=%s",
             reason, json.dumps(payload, default=repr),
         )
-    sys.exit(1)
+    # Flush logging handlers + stdio so the supervisor's log scrape
+    # captures the CRITICAL line before we kill the process.
+    for h in list(logging.getLogger().handlers):
+        try:
+            h.flush()
+        except Exception:  # pragma: no cover - degraded env
+            pass
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:  # pragma: no cover
+        pass
+    os._exit(1)

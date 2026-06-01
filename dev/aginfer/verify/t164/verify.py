@@ -34,6 +34,22 @@ Phase B (subprocess, real fatal()):
       under `<data>/forensic/sglang_sustained_unreachable_*.json`
       with the contract context fields.
 
+Phase C (#166 audit closure):
+  C0  fatal() inside a UVICORN-hosted daemon MUST exit the process.
+      The naive ``sys.exit(1)`` raises ``SystemExit`` which the
+      asyncio Task wrapper swallows — under real uvicorn.run, the
+      worker dies silently and the daemon keeps running.  Crash-
+      only-software contract REQUIRES ``os._exit(1)`` (or signal).
+  C1  After the queue drains to empty (sglang heals), /health
+      ``outbound_oldest_age_ms`` decays back to ~0.  Pre-fix the
+      cached ``last_outbound_oldest_age_ms`` was sticky at the last-
+      popped batch's age forever — k8s readiness probes scripted
+      against the field would mark the daemon NotReady permanently.
+  C2  /health reports the LIVE oldest in-queue batch's age (not the
+      last-popped batch's age).  Enqueue 3 batches of varying age
+      (5 s / 3 s / 1 s); /health should return ~5 s — the actual
+      oldest pending.
+
 Usage:
     python dev/aginfer/verify/t164/verify.py
 """
@@ -282,34 +298,33 @@ def stage_a3_high_age_alone_does_not_escalate() -> None:
         )
 
 
-def stage_a4_health_body_carries_outbound_counters() -> None:
-    """The daemon's `/health` endpoint includes the two outbound
-    counters so the operator's alerting (k8s readiness, dashboard)
-    can grep them before fatal threshold fires."""
+def _spawn_health_server(
+    outbound: OutboundQueue, *, start_worker: bool = False,
+):
+    """Start a uvicorn /health server backed by ``outbound`` on a free
+    port.  Returns ``(port, server, thread)`` — caller stops via
+    ``server.should_exit = True; thread.join()``.
+
+    By default ``start_worker=False`` no-ops ``outbound.start()`` so
+    the test fixture's pre-populated queue stays intact (otherwise
+    uvicorn's startup hook would drain it before /health is hit).
+    Pass ``start_worker=True`` when the test specifically needs the
+    worker to run inside uvicorn's thread loop."""
     import socket
     import threading
     import uvicorn
     from daemon.proxy import create_app
 
-    # Build a minimal daemon app w/ an outbound queue already in a
-    # known "5 consecutive failures" state.  We DON'T start the
-    # outbound worker (we just want to read /health while the
-    # counter is preset).
     app = create_app(
         sglang_base_url="http://unused",
         enable_event_router=False,
     )
-    # Attach an outbound queue manually since we disabled the router.
-    outbound = OutboundQueue(
-        sglang_base_url="http://unused",
-        http_client=_ProgrammableHttpClient([("ok", None)]),
-        escalate_failures=100, escalate_oldest_age_s=300.0,
-    )
-    outbound.consecutive_failures = 5
-    outbound.last_outbound_oldest_age_ms = 123.4
+    if not start_worker:
+        async def _noop_start() -> None:  # type: ignore[no-redef]
+            return None
+        outbound.start = _noop_start  # type: ignore[method-assign]
     app.state.outbound = outbound
 
-    # Bind a free port + spin uvicorn in a thread.
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -319,14 +334,36 @@ def stage_a4_health_body_carries_outbound_counters() -> None:
     server = uvicorn.Server(cfg)
     t = threading.Thread(target=server.run, daemon=True)
     t.start()
+    for _ in range(40):
+        if server.started:
+            break
+        time.sleep(0.05)
+    if not server.started:
+        raise StageFail("uvicorn /health server didn't start in time")
+    return port, server, t
+
+
+def stage_a4_health_body_carries_outbound_counters() -> None:
+    """The daemon's `/health` endpoint includes the two outbound
+    counters so the operator's alerting (k8s readiness, dashboard)
+    can grep them before fatal threshold fires.
+
+    #166: ``outbound_oldest_age_ms`` is now computed LIVE from the
+    in-queue head (previously was a sticky cached field — see C1/C2).
+    Enqueue one fresh batch + preset consec so we can grep both
+    fields with one /health call.  No worker — we only test the
+    /health serialisation here, not worker semantics."""
+    outbound = OutboundQueue(
+        sglang_base_url="http://unused",
+        http_client=_ProgrammableHttpClient([("ok", None)]),
+        escalate_failures=100, escalate_oldest_age_s=300.0,
+    )
+    outbound.consecutive_failures = 5
+    # Single fresh batch in the queue — age should be small (< 100 ms).
+    _enqueue(outbound, n=1)
+
+    port, server, t = _spawn_health_server(outbound)
     try:
-        # Wait briefly for the server to start.
-        for _ in range(40):
-            if server.started:
-                break
-            time.sleep(0.05)
-        if not server.started:
-            raise StageFail("uvicorn /health server didn't start in time")
         with httpx.Client(timeout=2.0) as client:
             r = client.get(f"http://127.0.0.1:{port}/health")
         if r.status_code != 200:
@@ -338,10 +375,215 @@ def stage_a4_health_body_carries_outbound_counters() -> None:
             raise StageFail(
                 f"outbound_consecutive_failures: {body!r}"
             )
-        if abs(
-            float(body.get("outbound_oldest_age_ms", 0.0)) - 123.4
-        ) > 1e-3:
-            raise StageFail(f"outbound_oldest_age_ms: {body!r}")
+        # Fresh batch → age should be < 100 ms (just-enqueued).  The
+        # field MUST be present and finite.
+        age = body.get("outbound_oldest_age_ms")
+        if age is None:
+            raise StageFail(f"outbound_oldest_age_ms missing: {body!r}")
+        if not isinstance(age, (int, float)):
+            raise StageFail(
+                f"outbound_oldest_age_ms wrong type: {age!r}"
+            )
+        if not (0.0 <= float(age) < 1000.0):
+            raise StageFail(
+                f"fresh batch should have small age; got {age} ms"
+            )
+    finally:
+        server.should_exit = True
+        t.join(timeout=3.0)
+
+
+# ============================================================ Phase C
+# #166 audit closure: fatal-under-uvicorn + sticky-age + live-head.
+
+
+_SUBPROCESS_SCRIPT_UVICORN = """\
+import os
+import socket
+import sys
+import time
+sys.path.insert(0, {aginfer_root!r})
+
+os.environ['AGINFER_DATA_DIR'] = {data_dir!r}
+
+import httpx
+import uvicorn
+from daemon.outbound import OutboundQueue, OutboundBatch
+from daemon.proxy import create_app
+
+
+class _AlwaysFail:
+    async def post(self, url, *, json=None):
+        raise httpx.ConnectError('simulated unreachable')
+
+    async def aclose(self):
+        return None
+
+
+app = create_app(
+    sglang_base_url='http://unused',
+    enable_event_router=False,
+)
+
+ob = OutboundQueue(
+    sglang_base_url='http://unused',
+    http_client=_AlwaysFail(),
+    escalate_failures=3,
+    escalate_oldest_age_s=0.001,
+)
+# Pre-seed 10 aged batches so worker trips fatal on first failures.
+old_ts = time.time() - 5.0
+for i in range(10):
+    ob.queue.put_nowait(OutboundBatch(
+        batch_id='b{{}}'.format(i),
+        endpoint='migrate',
+        body={{'actions': [], 'batch_id': 'b{{}}'.format(i)}},
+        enqueue_ts=old_ts,
+    ))
+app.state.outbound = ob
+
+s = socket.socket()
+s.bind(('127.0.0.1', 0))
+port = s.getsockname()[1]
+s.close()
+
+# This is the production code path: uvicorn.run owns the event loop.
+# fatal() raised from inside the worker Task MUST exit the process.
+uvicorn.run(app, host='127.0.0.1', port=port, log_level='critical')
+"""
+
+
+def stage_c0_fatal_under_uvicorn_actually_exits() -> None:
+    """fatal() called from the outbound worker MUST terminate the
+    daemon process when running under uvicorn.run (not just under
+    bare asyncio.run as B0 tests).  Crash-only-software contract.
+
+    Pre-fix: `_fatal.py` uses ``sys.exit(1)`` → ``SystemExit`` raised
+    inside the worker ``asyncio.Task`` is swallowed by the Task
+    wrapper.  Uvicorn keeps running.  The subprocess hangs until our
+    timeout, returncode != 1, → FAIL.
+
+    Post-fix: ``os._exit(1)`` bypasses Python's normal shutdown; the
+    process dies immediately regardless of asyncio loop state."""
+    with tempfile.TemporaryDirectory(prefix="aginfer_t164_c0_") as td:
+        data_dir = Path(td)
+        body = _SUBPROCESS_SCRIPT_UVICORN.format(
+            aginfer_root=str(_AGINFER_ROOT),
+            data_dir=str(data_dir),
+        )
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(_AGINFER_ROOT)
+        env["AGINFER_DATA_DIR"] = str(data_dir)
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", body],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise StageFail(
+                "uvicorn-hosted daemon did NOT exit within 15 s after "
+                "sustained-fatal trigger — process is hanging.  This is "
+                "the production scenario; sys.exit(1) is being swallowed "
+                "by the asyncio Task wrapper. "
+                f"stderr_tail={(exc.stderr or '')[-400:]!r}"
+            )
+        if result.returncode != 1:
+            raise StageFail(
+                f"expected uvicorn subprocess exit=1; got "
+                f"{result.returncode}; stderr={result.stderr[-600:]!r}"
+            )
+        # Forensic file should still land.
+        forensic_dir = data_dir / "forensic"
+        matches = sorted(forensic_dir.glob(
+            "sglang_sustained_unreachable_*.json"
+        )) if forensic_dir.exists() else []
+        if not matches:
+            raise StageFail(
+                f"forensic dump missing under {forensic_dir} after "
+                f"fatal-under-uvicorn"
+            )
+
+
+def stage_c1_oldest_age_decays_when_queue_drains() -> None:
+    """After the queue drains to empty (sglang heals), /health
+    ``outbound_oldest_age_ms`` decays back to ~0.
+
+    Pre-fix: ``last_outbound_oldest_age_ms`` is a sticky cached field
+    only updated at pop time → after drain, it holds the last-popped
+    batch's (large) age forever.  Post-fix: /health peeks the live
+    in-queue head, returns 0 when queue is empty."""
+    async def _drain():
+        stub = _ProgrammableHttpClient([("ok", None)])  # always 200
+        ob = OutboundQueue(
+            sglang_base_url="http://unused",
+            http_client=stub,
+            escalate_failures=1000,
+            escalate_oldest_age_s=10_000,
+        )
+        old_ts = time.time() - 100.0  # 100 s aged
+        _enqueue(ob, n=3, enqueue_ts_override=old_ts)
+        await ob.start()
+        try:
+            await ob.queue.join()  # drain to empty
+            await asyncio.sleep(0.05)
+        finally:
+            await ob.stop()
+        return ob
+    ob = asyncio.run(_drain())
+    # Queue is now empty; /health MUST report a tiny age, not the
+    # sticky last-popped 100_000 ms value.
+    port, server, t = _spawn_health_server(ob)
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            r = client.get(f"http://127.0.0.1:{port}/health")
+        body = r.json()
+        age = float(body.get("outbound_oldest_age_ms", -1.0))
+        if age > 1000.0:
+            raise StageFail(
+                f"queue drained to empty; /health should report ~0 ms, "
+                f"got {age} ms (sticky-cached-field bug). body={body!r}"
+            )
+    finally:
+        server.should_exit = True
+        t.join(timeout=3.0)
+
+
+def stage_c2_health_reports_live_in_queue_oldest() -> None:
+    """/health ``outbound_oldest_age_ms`` reports the LIVE oldest
+    in-queue batch's age, not the last-popped batch's age.
+
+    Pre-fix: cached field starts at 0.0 and only updates on pop.  No
+    pops yet → /health returns 0 even though 5 s-aged batches are
+    backed up.  Post-fix: /health peeks the queue head live."""
+    # No worker started — items just sit in the queue.
+    ob = OutboundQueue(
+        sglang_base_url="http://unused",
+        http_client=_ProgrammableHttpClient([("ok", None)]),
+        escalate_failures=100, escalate_oldest_age_s=300.0,
+    )
+    now = time.time()
+    # Enqueue oldest first (FIFO head): 5 s, 3 s, 1 s aged.
+    _enqueue(ob, n=1, enqueue_ts_override=now - 5.0)
+    _enqueue(ob, n=1, enqueue_ts_override=now - 3.0)
+    _enqueue(ob, n=1, enqueue_ts_override=now - 1.0)
+
+    port, server, t = _spawn_health_server(ob)
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            r = client.get(f"http://127.0.0.1:{port}/health")
+        body = r.json()
+        age_ms = float(body.get("outbound_oldest_age_ms", -1.0))
+        # Should reflect the OLDEST head ≈ 5_000 ms.  Allow generous
+        # tolerance (test fixture timing slack).
+        if not (4_000.0 <= age_ms <= 7_000.0):
+            raise StageFail(
+                f"/health should report the oldest in-queue batch's age "
+                f"(~5_000 ms); got {age_ms} ms — the sticky-last-popped "
+                f"field reads 0 because no pops have happened. body={body!r}"
+            )
     finally:
         server.should_exit = True
         t.join(timeout=3.0)
@@ -492,6 +734,12 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A4 /health body carries outbound counters", stage_a4_health_body_carries_outbound_counters),
     ("B0 subprocess: both thresholds trip → fatal + forensic dump",
                                                 stage_b0_subprocess_escalates_to_fatal_with_forensic_dump),
+    ("C0 fatal() under uvicorn ACTUALLY exits the process",
+                                                stage_c0_fatal_under_uvicorn_actually_exits),
+    ("C1 oldest_age decays after queue drains (sticky-cache bug)",
+                                                stage_c1_oldest_age_decays_when_queue_drains),
+    ("C2 /health reports LIVE in-queue oldest, not last-popped",
+                                                stage_c2_health_reports_live_in_queue_oldest),
 ]
 
 

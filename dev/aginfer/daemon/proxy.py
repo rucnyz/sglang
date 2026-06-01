@@ -238,8 +238,11 @@ def create_app(
             body["outbound_consecutive_failures"] = (
                 outbound.consecutive_failures
             )
+            # #166: live peek of the current in-queue head; decays to
+            # 0 when sglang heals and the queue drains.  Previous
+            # cached-field implementation was sticky.
             body["outbound_oldest_age_ms"] = (
-                outbound.last_outbound_oldest_age_ms
+                outbound.current_oldest_pending_age_ms()
             )
         return body
 

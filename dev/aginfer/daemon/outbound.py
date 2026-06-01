@@ -120,7 +120,6 @@ class OutboundQueue:
         # exposes the current value so an operator can alert before
         # the fatal threshold.
         self.consecutive_failures: int = 0
-        self.last_outbound_oldest_age_ms: float = 0.0
         self._escalate_failures = int(escalate_failures)
         self._escalate_oldest_age_s = float(escalate_oldest_age_s)
         if self._escalate_failures < 1:
@@ -132,6 +131,33 @@ class OutboundQueue:
                 f"escalate_oldest_age_s must be >= 0; "
                 f"got {escalate_oldest_age_s}"
             )
+
+    # ---- observability (sync; safe to call from /health) -------------
+
+    def current_oldest_pending_age_ms(self) -> float:
+        """Live age in ms of the OLDEST batch still in the queue.
+        Returns 0.0 if the queue is empty.
+
+        Used by ``/health`` so k8s readiness probes / dashboards see
+        the CURRENT backlog snapshot — not a sticky last-popped value
+        (the #166 audit-found bug: cached field updated only at pop
+        time stuck at large values forever once sglang healed).
+
+        Implementation peeks ``asyncio.Queue._queue[0]`` (a
+        ``collections.deque``).  Reading the head element is GIL-
+        atomic on CPython; a concurrent worker pop is a benign race
+        (snapshot either reflects the popped or the new head, both
+        valid coarse observations).  We tolerate ``IndexError`` /
+        ``AttributeError`` for the empty-queue race."""
+        import time
+        q_internal = getattr(self.queue, "_queue", None)
+        if q_internal is None:
+            return 0.0
+        try:
+            head = q_internal[0]
+        except IndexError:
+            return 0.0
+        return max(0.0, (time.time() - head.enqueue_ts) * 1000.0)
 
     # ---- enqueue (handler-facing) -----------------------------------
 
@@ -209,11 +235,19 @@ class OutboundQueue:
             # POSTing the batch we just popped.  qsize() = "backlog
             # still waiting"; batch.enqueue_ts → wall-clock age of
             # the (was-) oldest pending batch.
+            #
+            # #166: `oldest_age_ms` here is the JUST-POPPED batch's
+            # queue-wait time — the correct signal for the
+            # escalation trigger ("how long did this batch sit?").
+            # /health exposes a DIFFERENT metric:
+            # `current_oldest_pending_age_ms()` peeks the LIVE in-
+            # queue head (decays to 0 when the queue drains).  Don't
+            # conflate them — caching just-popped into a sticky field
+            # for /health was the bug closed by #166.
             depth_after_pop = self.queue.qsize()
             oldest_age_ms = max(
                 0.0, (time.time() - batch.enqueue_ts) * 1000.0,
             )
-            self.last_outbound_oldest_age_ms = oldest_age_ms
             if self.observability is not None:
                 self.observability.record_outbound(
                     queue_depth=depth_after_pop,

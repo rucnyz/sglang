@@ -49,10 +49,26 @@ escalate_failures_threshold=..., escalate_oldest_age_s_threshold=
 ...)`.  Forensic JSON dumped to `<data>/forensic/
 sglang_sustained_unreachable_*.json` per T43 contract.
 
+**Exit primitive** (#166): `fatal()` uses `os._exit(1)`, NOT
+`sys.exit(1)`.  The crash-only contract MUST NOT depend on asyncio
+`Task.__step` re-raising `SystemExit` past uvicorn / `gather` /
+`shield` wrappers.  Modern CPython (3.12) happens to route the
+`SystemExit` correctly (verified by stage C0), but a future asyncio
+change or a custom `loop.set_exception_handler` could silently
+swallow it.  `os._exit` bypasses Python shutdown — process dies
+immediately, supervisor restarts cleanly.
+
 **/health observability** (`daemon/proxy.py`):
 Daemon's `/health` body now includes:
-- `outbound_consecutive_failures: int`
-- `outbound_oldest_age_ms: float`
+- `outbound_consecutive_failures: int` — direct read of the counter
+- `outbound_oldest_age_ms: float` — **LIVE** peek of the current
+  in-queue head's age (#166).  Earlier draft cached the just-popped
+  batch's age in a sticky `last_outbound_oldest_age_ms` field;
+  bug: once the queue drained (sglang healed), the field stuck at
+  the last large value forever, marking the daemon perma-NotReady
+  to any k8s readiness probe scripted against it.  The live peek
+  reads `asyncio.Queue._queue[0]` (GIL-atomic on CPython) and
+  returns 0.0 when the queue is empty.
 
 HTTP status stays 200 — the daemon process IS responsive; the
 restart signal is the fatal() exit, not health failure.  k8s
@@ -68,12 +84,15 @@ readiness probes can grep the body fields and depool independently.
 | False positive: high-age but all-success | aged batches, all 2xx | NO fatal (consec=0) | A3 |
 | Operator can't grep current state | hit /health | body has both counters | A4 |
 | True positive: dead sglang + backlog | aged batches + always-fail stub | fatal + forensic dump + exit 1 | B0 |
+| fatal() under uvicorn doesn't exit | aged + always-fail + uvicorn.run | subprocess exits 1 within 15 s | C0 |
+| Sticky age after queue drain | drain to empty | /health age ~0, not last-popped value | C1 |
+| /health misses live in-queue head | 3 aged batches, no worker | /health = age of OLDEST (5 s), not 0 | C2 |
 
 ## HOW WE VERIFY
 
-`verify/t164/verify.py` — 6 stages.  A0-A4 in-process; B0 spawns a
-real subprocess to exercise the actual `fatal()` path (which exits
-the process — can't test in the same process).
+`verify/t164/verify.py` — 9 stages.  A0-A4 + C1-C2 in-process; B0
+and C0 spawn real subprocesses to exercise the actual `fatal()`
+path (which exits the process — can't test in the same process).
 
 ```
 A0  counter resets on 2xx (3 batches: 5xx, 5xx, ok → consec=0)
@@ -86,13 +105,25 @@ A3  high oldest_age alone does NOT escalate (always-200 stub,
     aged batches with old enqueue_ts → oldest_age >> threshold
     but consec stays 0 → no escalation)
 A4  /health body carries outbound_consecutive_failures +
-    outbound_oldest_age_ms (uvicorn server with preset counters)
+    outbound_oldest_age_ms (uvicorn server with a fresh-enqueued
+    batch; age finite and small)
 B0  subprocess: always-fail stub + aged batches + low thresholds
     → fatal('sglang_sustained_unreachable') → process exit 1
     → forensic JSON file landed with context fields
     (sglang_base_url, consecutive_failures, oldest_age_ms,
     queue_depth, escalate_failures_threshold,
     escalate_oldest_age_s_threshold)
+C0  fatal() inside a UVICORN-hosted daemon ACTUALLY exits the
+    process within 15 s (production code path — uvicorn.run owns
+    the event loop; sys.exit(1) propagation through asyncio Task
+    + uvicorn was the audit concern; os._exit(1) makes it
+    deterministic)
+C1  /health outbound_oldest_age_ms DECAYS to ~0 after the queue
+    drains (sticky-cached-field bug: pre-#166 the field held the
+    last-popped batch's large age forever)
+C2  /health outbound_oldest_age_ms reports the LIVE in-queue
+    oldest (3 batches at 5 s / 3 s / 1 s aged, no worker → /health
+    must return ~5 s, not 0)
 ```
 
 ## REPRODUCING
@@ -108,11 +139,15 @@ subprocess).
 
 ## RESULTS
 
-**PASSED** — all 6 stages.
+**PASSED** — all 9 stages.
 
 * date: 2026-06-01
-* lines: ~50 daemon (`outbound.py` worker loop + `_post_one` + ctor;
-  `main.py` 2 CLI flags; `proxy.py` /health body)
+* initial #164 close: ~50 daemon-side LoC (worker loop + `_post_one`
+  + ctor; `main.py` 2 CLI flags; `proxy.py` /health body)
+* #166 audit closure: drop sticky `last_outbound_oldest_age_ms`
+  field; add live-peek `current_oldest_pending_age_ms()` method;
+  switch `_fatal.py` `sys.exit(1)` → `os._exit(1)` with stdout/err
+  flush; +3 verify stages (C0/C1/C2)
 
 | Stage | Result |
 |---|---|
@@ -120,7 +155,11 @@ subprocess).
 | A1 consec increments on 5xx / 4xx / transport-exc | PASS — final consec = 4 after mixed failures |
 | A2 high consec alone does NOT escalate | PASS — 10 failures, no fatal |
 | A3 high oldest_age alone does NOT escalate | PASS — 5 aged successes, consec stays 0 |
-| A4 /health body carries outbound counters | PASS — `outbound_consecutive_failures=5` + `outbound_oldest_age_ms=123.4` in body |
+| A4 /health body carries outbound counters | PASS — fresh batch reports finite, small `outbound_oldest_age_ms` |
 | B0 subprocess: both thresholds → fatal + forensic | PASS — subprocess exit 1, forensic file with all 6 context keys |
+| C0 fatal() under uvicorn ACTUALLY exits | PASS — uvicorn.run subprocess exits 1 within ~1 s + forensic file lands |
+| C1 oldest_age decays after queue drains | PASS — drain to empty → /health reports ~0 ms (pre-#166: sticky 100 s) |
+| C2 /health reports LIVE in-queue oldest | PASS — 3 batches aged 5/3/1 s → /health returns ~5 s (pre-#166: 0 ms) |
 
-* raw log: `results/20260601_t164_initial_pass.log`
+* raw logs: `results/20260601_t164_initial_pass.log` (initial #164),
+  `results/20260601_t164_post_166_audit_pass.log` (post-#166 closure)
