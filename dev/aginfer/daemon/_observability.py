@@ -103,6 +103,13 @@ class DaemonObservability:
         "time_in_queue_ms",
         "failure_class_counts",
         "events_dispatched_total",
+        # T36 audit (#163): the outbound queue is unbounded by design;
+        # operators need visibility into its depth + oldest-pending
+        # age to alert before a multi-minute sglang HTTP stall blows
+        # daemon memory.  Sampled by ``record_outbound`` at every
+        # dispatch tick (cheap: outbound.queue.qsize() is O(1)).
+        "outbound_queue_depth",
+        "outbound_oldest_age_ms",
         "_summary_every_n",
         "_events_since_summary",
     )
@@ -126,6 +133,9 @@ class DaemonObservability:
         self.time_in_queue_ms = _DaemonMetricsRing(capacity)
         self.failure_class_counts: Dict[str, int] = {}
         self.events_dispatched_total: int = 0
+        # T36 audit (#163) — outbound queue health.
+        self.outbound_queue_depth = _DaemonMetricsRing(capacity)
+        self.outbound_oldest_age_ms = _DaemonMetricsRing(capacity)
         self._summary_every_n = int(summary_every_n)
         self._events_since_summary: int = 0
 
@@ -153,6 +163,30 @@ class DaemonObservability:
             self.emit_summary()
             self._events_since_summary = 0
 
+    def record_outbound(
+        self, queue_depth: int, oldest_age_ms: float
+    ) -> None:
+        """T36 audit (#163): sample outbound queue health.
+
+        Called once per OutboundQueue worker iteration (cheap: O(1)
+        qsize + one wall-clock subtraction).  Two streams:
+
+          * ``outbound_queue_depth``: ``asyncio.Queue.qsize()`` AFTER
+            the worker popped the batch it's about to POST.
+            "Backlog still waiting" — operator-meaningful for
+            alerts on multi-minute sglang stalls.
+          * ``outbound_oldest_age_ms``: wall-clock age of the
+            oldest still-pending batch (0 if queue is empty).
+            Detects "queue stopped draining" even when depth is
+            small.
+
+        Together they catch the two pathological regimes of an
+        unbounded queue: rapid growth (depth spikes) AND a slow
+        leak (oldest age climbs while depth stays moderate).
+        """
+        self.outbound_queue_depth.record(float(queue_depth))
+        self.outbound_oldest_age_ms.record(float(oldest_age_ms))
+
     def record_failure(self, reason: str) -> None:
         """Cumulative per-reason counter.  Reason should already be a
         short ``snake_case`` slug — the value is logged verbatim in
@@ -171,6 +205,9 @@ class DaemonObservability:
             "time_in_queue_ms":   self.time_in_queue_ms.summary(),
             "failure_class_counts": dict(self.failure_class_counts),
             "events_dispatched_total": self.events_dispatched_total,
+            # T36 audit (#163) — outbound queue health.
+            "outbound_queue_depth":     self.outbound_queue_depth.summary(),
+            "outbound_oldest_age_ms":   self.outbound_oldest_age_ms.summary(),
         }
 
     def emit_summary(self) -> None:
@@ -195,6 +232,8 @@ class DaemonObservability:
             sort_keys=True,
             separators=(",", ":"),
         )
+        ob = self.outbound_queue_depth.summary()
+        oa = self.outbound_oldest_age_ms.summary()
         _m(
             "daemon_obs_summary",
             events_dispatched_total=self.events_dispatched_total,
@@ -216,4 +255,12 @@ class DaemonObservability:
             n_failure_classes=len(self.failure_class_counts),
             n_failures_total=sum(self.failure_class_counts.values()),
             failure_class_breakdown=breakdown_json,
+            # T36 audit (#163) — outbound queue health.
+            outbound_queue_depth_n=ob["n"],
+            outbound_queue_depth_p50=ob["p50"],
+            outbound_queue_depth_p99=ob["p99"],
+            outbound_queue_depth_max=ob["max"],
+            outbound_oldest_age_ms_p50=oa["p50"],
+            outbound_oldest_age_ms_p99=oa["p99"],
+            outbound_oldest_age_ms_max=oa["max"],
         )

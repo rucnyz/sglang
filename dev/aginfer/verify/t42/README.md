@@ -57,17 +57,18 @@ T42 aggregator is the rollup on top.
 |---|---|
 | `events.py` | `Event.enqueue_time` field + `EventBus.emit` stamps it via `dataclasses.replace` if unset |
 | `event_router.py` | `fetch_state` wraps `_fetch_state_impl` with a perf_counter; the worker records `(qdepth, time_in_queue_ms)` at dispatch entry |
-| `kv_scheduler.py` | `_record_skips()` helper extracted from `_dispatch_migrate`'s skip loop; bumps `observability.failure_class_counts[reason]` when an observability instance is wired |
+| `kv_scheduler.py` | T42-era: had a `_record_skips()` helper that bumped `observability.failure_class_counts[reason]`.  Post-T36 cleanup: that helper is GONE (sync skip-loop removed); the APPLY_FAILED webhook handler (T37) is the sole counter source. |
 | `main.py` | `--observability-summary-every-n` CLI flag; passes `router.observability` into `KvScheduler`; emits a final summary on shutdown |
 | `proxy.py` | plumbs `observability_summary_every_n` through `create_app` → `EventRouter` |
 
 **Post-commit audit fixes (#162 — subagent audit punch list).**
 
-* **G2 — load-fault counter scope.**  `_record_skips` was the only
-  call site bumping `failure_class_counts`; `state_fetch_failed`
-  (kv_scheduler line 854) now also routes through
-  `observability.record_failure("state_fetch_failed")`.  APPLY_FAILED
-  (T23+T37, #153) plugs in via the same recorder when it lands.
+* **G2 — load-fault counter scope.**  At T42 time, `_record_skips`
+  was the only call site bumping `failure_class_counts`.  G2 added
+  `state_fetch_failed` to route through `observability.record_
+  failure("state_fetch_failed")`.  Post-T36 cleanup: `_record_skips`
+  is gone — the APPLY_FAILED webhook handler is the per-skip path,
+  `state_fetch_failed` remains the path-fetch failure path.
 * **S3 — per-reason breakdown on the summary line.**  Variable-
   cardinality counter previously folded down to two scalars
   (`n_failure_classes`, `n_failures_total`); now also emitted as a

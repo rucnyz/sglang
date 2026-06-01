@@ -82,6 +82,17 @@ class OutboundQueue:
       * No retry bookkeeping inside the worker.  Per DESIGN §10
         idempotency, re-issuing the same action is safe; the next
         event sees the unchanged state and emits the same plan.
+
+    **Queue is unbounded by design** (no ``maxsize``).  DESIGN §6
+    makes the producer (event handler) non-blocking, and silently
+    dropping actions would lose scheduling decisions.  Steady-state
+    is bounded because arrival rate is itself capped by sglang's own
+    throughput (webhook firer is sglang-side).  The unbounded queue
+    is at risk only during multi-minute sglang HTTP stalls;
+    ``DaemonObservability.outbound_queue_depth`` and
+    ``outbound_oldest_age_ms`` let an operator alert before OOM,
+    and the sustained-escalation fatal (DESIGN §10 / #164) is the
+    hard backstop — running forever-degraded is not a valid state.
     """
 
     def __init__(
@@ -167,8 +178,27 @@ class OutboundQueue:
     # ---- worker -----------------------------------------------------
 
     async def _worker_loop(self) -> None:
+        import time
         while True:
             batch = await self.queue.get()
+            # T36 audit (#163): sample outbound queue health BEFORE
+            # POSTing the batch we just popped.  qsize() = "backlog
+            # still waiting"; batch.enqueue_ts → wall-clock age of
+            # the (was-) oldest pending batch.  Operator's grep on
+            # `daemon_obs_summary outbound_queue_depth_*` /
+            # `outbound_oldest_age_ms_*` drives the alert; hardcoded
+            # in-process thresholds would lock the deploy out of
+            # tuning the trigger.  Sustained-escalation → fatal
+            # is #164's job, not a hardcoded log here.
+            depth_after_pop = self.queue.qsize()
+            oldest_age_ms = max(
+                0.0, (time.time() - batch.enqueue_ts) * 1000.0,
+            )
+            if self.observability is not None:
+                self.observability.record_outbound(
+                    queue_depth=depth_after_pop,
+                    oldest_age_ms=oldest_age_ms,
+                )
             try:
                 await self._post_one(batch)
             except asyncio.CancelledError:

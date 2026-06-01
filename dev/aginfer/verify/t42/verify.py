@@ -35,7 +35,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 _HERE = Path(__file__).resolve().parent
@@ -127,6 +127,9 @@ def stage_a3_observability_empty_summary_shape() -> None:
         "time_in_queue_ms",
         "failure_class_counts",
         "events_dispatched_total",
+        # T36 audit (#163) — outbound queue health.
+        "outbound_queue_depth",
+        "outbound_oldest_age_ms",
     }
     if set(s.keys()) != required:
         raise StageFail(
@@ -134,7 +137,9 @@ def stage_a3_observability_empty_summary_shape() -> None:
             f"want {required}"
         )
     # Each ring sub-summary has the standard quantile fields.
-    for ring_key in ("state_fetch_lat_ms", "queue_depth", "time_in_queue_ms"):
+    for ring_key in ("state_fetch_lat_ms", "queue_depth",
+                     "time_in_queue_ms",
+                     "outbound_queue_depth", "outbound_oldest_age_ms"):
         sub = s[ring_key]
         if sub["n"] != 0 or sub["p99"] != 0.0:
             raise StageFail(f"empty {ring_key}: {sub}")
@@ -780,6 +785,77 @@ def stage_b10_shutdown_summary_emission() -> None:
         metric_logger.setLevel(prior_level)
 
 
+def stage_b12_outbound_queue_observability() -> None:
+    """T36 audit (#163): ``DaemonObservability`` exposes outbound
+    queue health (depth + oldest-pending age) so an operator can
+    alert before a multi-minute sglang HTTP stall blows daemon
+    memory.  This stage:
+
+    1. Calls ``record_outbound`` with several (depth, age) samples.
+    2. Asserts the rings hold them with correct quantiles.
+    3. Calls ``emit_summary`` and confirms the line carries the
+       new ``outbound_queue_depth_p99=`` / ``outbound_oldest_age_ms_p99=``
+       fields the operator's grep / dashboard wires to.
+
+    The "unbounded queue is OK if monitored" stance is documented
+    in ``daemon/outbound.py``; this stage proves the monitoring
+    exists."""
+    captured: List[str] = []
+
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = _CaptureHandler()
+    metric_logger = logging.getLogger("aginfer.metric")
+    prior_level = metric_logger.level
+    metric_logger.addHandler(handler)
+    metric_logger.setLevel(logging.INFO)
+    try:
+        obs = DaemonObservability(capacity=64, summary_every_n=10_000)
+        # Simulate a gradient of queue depths + ages — most healthy,
+        # one big tail (e.g. sglang briefly stalled).
+        for depth, age_ms in [
+            (0, 0.0), (1, 5.0), (2, 10.0), (3, 12.0),
+            (5, 25.0), (8, 40.0), (4, 18.0), (2, 8.0),
+            (100, 3000.0),  # the stall tail
+        ]:
+            obs.record_outbound(queue_depth=depth, oldest_age_ms=age_ms)
+        s = obs.summary_dict()
+        oqd = s["outbound_queue_depth"]
+        oa = s["outbound_oldest_age_ms"]
+        if oqd["n"] != 9 or oa["n"] != 9:
+            raise StageFail(
+                f"expected 9 samples each; got {oqd['n']}/{oa['n']}"
+            )
+        if oqd["max"] != 100.0 or oa["max"] != 3000.0:
+            raise StageFail(
+                f"max should hit the tail (100, 3000); "
+                f"got {oqd['max']}, {oa['max']}"
+            )
+        # Now emit_summary and confirm the line carries the new fields.
+        obs.emit_summary()
+        summary_lines = [
+            l for l in captured if "event=daemon_obs_summary" in l
+        ]
+        if not summary_lines:
+            raise StageFail("no daemon_obs_summary line captured")
+        line = summary_lines[-1]
+        for needle in (
+            "outbound_queue_depth_p99=",
+            "outbound_queue_depth_max=100",
+            "outbound_oldest_age_ms_p99=",
+            "outbound_oldest_age_ms_max=3000",
+        ):
+            if needle not in line:
+                raise StageFail(
+                    f"summary line missing {needle!r}; line={line!r}"
+                )
+    finally:
+        metric_logger.removeHandler(handler)
+        metric_logger.setLevel(prior_level)
+
+
 def stage_b11_summary_every_n_rejects_non_positive() -> None:
     """Audit T4: ``summary_every_n <= 0`` is meaningless (0 would
     fire on every event, negative is nonsense).  Reject at
@@ -823,6 +899,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                                                    stage_b9_fetch_state_exception_no_sample_no_leak),
     ("B10 T3 shutdown summary emission contract",  stage_b10_shutdown_summary_emission),
     ("B11 T4 summary_every_n rejects non-positive", stage_b11_summary_every_n_rejects_non_positive),
+    ("B12 outbound queue depth + oldest-age observability (#163)",
+                                                   stage_b12_outbound_queue_observability),
     ("C0 real-dispatch summary line lands",        stage_c0_summary_line_emitted_in_real_dispatch),
 ]
 

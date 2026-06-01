@@ -177,8 +177,9 @@ async def boot_stack(
         yield router, admission, sched
     finally:
         await router.stop()
-        if sched is not None:
-            await sched.aclose()
+        # T36 cleanup: KvScheduler.aclose() was removed (the class no
+        # longer owns an httpx client — outbound queue does).  Nothing
+        # to close on sched.
 
 
 # ---------------------------------------------------------------- steps

@@ -45,14 +45,20 @@ a default handler that:
      superseding migration.  DESIGN §10 idempotency makes re-issue
      safe; no per-action retry bookkeeping.
 
-**Double-count avoidance.**  Before T23 the synchronous
-`KvScheduler._record_skips` path bumped the observability counter
-for every item in `/aginfer/migrate`'s response.  Now sglang ALSO
-fires `APPLY_FAILED` for each item — both paths would count.  T23
-removes the bump from `_record_skips` (per-line `migrate_skipped`
-log line preserved).  Webhook is the authoritative source; counter
-goes up by exactly one per skip, regardless of whether the daemon's
-outbound dispatch is sync (today) or async (post-T36).
+**Double-count avoidance (historical).**  Before T23, the
+synchronous `KvScheduler._record_skips` path bumped the observability
+counter for every item in `/aginfer/migrate`'s response.  When sglang
+ALSO started firing `APPLY_FAILED` per item under T23, both paths
+would have counted — so T23 removed the bump from `_record_skips`
+(keeping its per-line `migrate_skipped` log).  Then T36-audit
+cleanup removed the entire sync POST path from `KvScheduler`
+(`_dispatch_migrate` now requires outbound), and `_record_skips`
+went with it.  The webhook is now the SOLE per-skip counter source
+by construction — there is no longer a parallel sync path that
+could double-count, so the original double-count concern is
+structurally impossible.  Per-event grep target is now
+`aginfer_metric event=apply_failed reason=... endpoint=...`
+(emitted by the T37 handler in `event_router.py`).
 
 ## WORST CASE
 
@@ -63,7 +69,7 @@ outbound dispatch is sync (today) or async (post-T36).
 | Counter goes up by reason, not by hash | mix reasons | per-reason buckets | A1 |
 | Unknown endpoint future-compat | endpoint="future_endpoint_42" | still counts | A2 |
 | Malformed payload (no reason) | strip reason key | webhook accepted (200); counter unchanged; worker survives | A3 |
-| Sync path double-counts | `_record_skips(...)` on real KvScheduler | counter stays empty | A4 |
+| Apply_failed structured-metric line | webhook handler fires | `aginfer_metric event=apply_failed reason=... endpoint=...` lands | A4 |
 | Webhook never arrives | sglang config without `--aginfer-notify-url` | `aginfer_webhook is None`; fire is no-op (no crash) | (manual; verified by sglang code path) |
 | Live integration | known-bad migrate to live sglang+daemon | webhook lands, handler logs, counter bumps | B0, B1, manual breakdown check |
 
@@ -79,10 +85,11 @@ A2  every endpoint counted (forward-compat: future endpoints land
     for free without handler edits)
 A3  malformed payload (no reason) accepted with 200; counter
     unchanged; worker survives for the next valid payload
-A4  KvScheduler._record_skips MUST NOT bump observability counter
-    (T23 made the webhook the authoritative source — bumping
-    here would double-count every skip).  Per-line `migrate_skipped`
-    log line still fires for operator's real-time view.
+A4  APPLY_FAILED handler emits structured `event=apply_failed` line
+    (post-T36 cleanup: the legacy sync `_record_skips` path no
+    longer exists; this is the per-event grep target now —
+    `aginfer_metric event=apply_failed endpoint=... reason=...
+    action_id=...`).
 
 B0  (opt-in via AGINFER_VERIFY_BASE_SGLANG): drive a known-bad
     migrate (hash="node-99999999") at live sglang; sync response
@@ -155,7 +162,8 @@ pkill -9 -f sglang.launch_server
   ~30 in `scheduler.py::_fire_apply_failed_for_skipped`; +6 LoC
   daemon (`EventKind.APPLY_FAILED`, `attach_apply_failed_handler`,
   `main.py` wiring); -3 LoC removing the sync-path counter bump
-  from `_record_skips`.
+  from `_record_skips` (T23-era — `_record_skips` itself was later
+  deleted in the T36 cleanup).
 
 | Stage | Result |
 |---|---|
@@ -163,7 +171,7 @@ pkill -9 -f sglang.launch_server
 | A1 webhook bumps counter per reason | PASS — 3 distinct reasons aggregated correctly |
 | A2 every endpoint counted (forward-compat) | PASS — including `future_endpoint_42` |
 | A3 malformed payload ignored, no crash | PASS — second valid payload still counted |
-| A4 sync `_record_skips` no longer bumps | PASS — per-line log fires, counter empty |
+| A4 apply_failed structured metric line lands | PASS — `event=apply_failed endpoint=migrate reason=not_in_tree action_id=a-1` |
 | B0 known-bad migrate returns sync skipped[] | PASS (live sglang) |
 | B1 daemon log shows apply_failed webhook | PASS (live sglang+daemon) |
 

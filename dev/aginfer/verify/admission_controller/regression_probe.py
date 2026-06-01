@@ -308,7 +308,8 @@ async def probe_n4_drain_resumes_per_event() -> None:
             )
             await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
             await router.stop()
-            await sched.aclose()
+            # T36 cleanup: sched.aclose() removed (no httpx client on
+            # KvScheduler anymore).
         # T6 contract: tracker.resume() doesn't transition state out
         # of PAUSED until the next observe_arrival.  So we check the
         # admission's FIFO length (popped on each resume).
