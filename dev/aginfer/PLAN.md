@@ -131,10 +131,13 @@ under stale hints.  Test plan:
     eviction no-op, distinct-rank divergence, partial overlap, 3-rank
     2v1, sustained 4-window divergence, rank-set-change ValueError,
     time_counter propagation, summary smoke)
-  * `run_tp2_real.py` — real DP=2 sglang launcher + churn driver +
+  * `run_dp2_real.py` — real DP=2 sglang launcher + churn driver +
     detector run.  Demonstrated 102 real per_rank JSON snapshots
-    parsed cleanly; under DP=2, 34/101 windows show divergence
-    (expected — each replica serves a different program subset)
+    parsed cleanly (parser-integrity contract green).  The
+    divergence count under DP=2 is NOT a §6 signal — without
+    hicache content-hash mode active, unit hashes are per-process
+    counters (`node-N`) and the comparison is meaningless; driver
+    now WARNs on counter-format dominance (audit #175-round2)
 * **BLOCKED on sglang patch (#174)** — the §6 invariant the probe
   is actually meant to catch is cross-TP-rank divergence (NOT
   cross-DP-rank).  But `/aginfer/state` aggregates across TP ranks

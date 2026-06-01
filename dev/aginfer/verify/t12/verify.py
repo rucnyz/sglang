@@ -254,38 +254,78 @@ def stage_b3_best_by_aic_ties_prefer_simpler() -> None:
         ),
     }
     pick2 = best_by_aic(fits2)
-    if pick2 not in ("linear", "hyperbolic"):
-        raise StageFail(f"unexpected pick: {pick2!r}")
-    # Insertion-order contract: same call twice must return the same value.
+    # PIN the specific winner: insertion order is "linear" first.
+    # If `best_by_aic` is later refactored to (say) alphabetical or
+    # arbitrary order, this test fails loud rather than passing on
+    # whichever value the new code happens to return.
+    if pick2 != "linear":
+        raise StageFail(
+            f"same-k tie should pick the first-inserted ('linear'); "
+            f"got {pick2!r}"
+        )
+    # Deterministic on repeated call.
     if best_by_aic(fits2) != pick2:
         raise StageFail("best_by_aic non-deterministic for same-k tie")
 
 
 def stage_b4_power_gamma_saturation_flagged() -> None:
-    """#175 audit: when real data has γ > 10 (very steep right tail),
-    curve_fit silently clips γ to the upper bound 10 and the picker
-    has no way to know the fit is meaningless.  FitResult must
-    expose a ``saturated`` flag; downstream code can downgrade or
-    re-bound."""
-    # Generate γ=15 data within fit range [0.05, 0.95].
+    """#175 audit: when real data has γ outside [0.5, 10], curve_fit
+    silently clips at the boundary; the picker has no way to know.
+    FitResult must expose `saturated`; downstream code can re-bound
+    or downgrade.
+
+    Cover BOTH bounds (audit #175-round2 found B4 only tested upper).
+    Also pin a NEAR-bound but feasible γ as NOT saturated — that
+    catches a false-positive band that's too wide.
+    """
     occ = _grid()
-    y = _gen_power(occ, alpha=1.0, gamma=15.0)
-    fit = fit_one("power", occ.tolist(), y.tolist())
-    if not hasattr(fit, "saturated"):
+
+    # Upper-bound saturation: γ=15 → curve_fit returns γ ≈ 10.
+    y_hi = _gen_power(occ, alpha=1.0, gamma=15.0)
+    fit_hi = fit_one("power", occ.tolist(), y_hi.tolist())
+    if not hasattr(fit_hi, "saturated"):
         raise StageFail(
             "FitResult missing `saturated` field — saturation "
             "diagnostic not implemented"
         )
-    if not fit.saturated:
+    if not fit_hi.saturated:
         raise StageFail(
             f"γ=15 input should saturate at upper bound (10.0); "
-            f"got params={fit.params} saturated={fit.saturated}"
+            f"params={fit_hi.params} saturated={fit_hi.saturated}"
         )
-    # The recovered γ should be at the boundary.
-    _alpha, gamma_fit = fit.params
-    if not (9.9 <= gamma_fit <= 10.0):
+    _alpha, gamma_hi_fit = fit_hi.params
+    if not (9.9 <= gamma_hi_fit <= 10.0):
         raise StageFail(
-            f"γ should be at upper bound after saturation; got {gamma_fit}"
+            f"γ at upper bound expected; got {gamma_hi_fit}"
+        )
+
+    # Lower-bound saturation: γ=0.1 → curve_fit returns γ ≈ 0.5.
+    y_lo = _gen_power(occ, alpha=1.0, gamma=0.1)
+    fit_lo = fit_one("power", occ.tolist(), y_lo.tolist())
+    if not fit_lo.saturated:
+        raise StageFail(
+            f"γ=0.1 input should saturate at lower bound (0.5); "
+            f"params={fit_lo.params} saturated={fit_lo.saturated}"
+        )
+    _alpha, gamma_lo_fit = fit_lo.params
+    if not (0.5 <= gamma_lo_fit <= 0.6):
+        raise StageFail(
+            f"γ at lower bound expected; got {gamma_lo_fit}"
+        )
+
+    # False-positive guard: γ=0.55 is well inside [0.5, 10] and
+    # MUST NOT be flagged saturated.  The prior #175 implementation
+    # used `edge = 0.01 * (gamma_hi - gamma_lo) = 0.095`, which
+    # flagged γ ≤ 0.595 as saturated even though 0.55 is a normal
+    # interior value.  Pinning here forces the false-positive
+    # band tight.
+    y_feasible = _gen_power(occ, alpha=1.0, gamma=0.55)
+    fit_feasible = fit_one("power", occ.tolist(), y_feasible.tolist())
+    if fit_feasible.saturated:
+        raise StageFail(
+            f"γ=0.55 is feasible (interior to [0.5, 10]); should NOT "
+            f"be saturated. params={fit_feasible.params} "
+            f"saturated={fit_feasible.saturated}"
         )
 
 

@@ -31,6 +31,16 @@ import numpy as np
 from scipy.optimize import curve_fit
 
 
+# ---------------------------------------------------------- bounds
+
+# Power-law γ bounds: γ > 1 is the "right-tail-heavy" regime the
+# DESIGN §7 candidate list calls out, plus headroom either side.
+# These bounds are also referenced in the docstring + verify/t12/
+# stage B4; keep all three in sync.
+_POWER_GAMMA_LO = 0.5
+_POWER_GAMMA_HI = 10.0
+
+
 # ---------------------------------------------------------- model functions
 
 
@@ -118,7 +128,7 @@ def fit_one(
         # γ ∈ [0.5, 10].  When the true γ is outside this range,
         # curve_fit silently saturates at the boundary; we flag it
         # so downstream picker can downgrade or widen + re-fit.
-        gamma_lo, gamma_hi = 0.5, 10.0
+        gamma_lo, gamma_hi = _POWER_GAMMA_LO, _POWER_GAMMA_HI
         params, _ = curve_fit(
             _power, occ_arr, y_arr,
             p0=[1.0, 1.5],
@@ -127,11 +137,16 @@ def fit_one(
         )
         y_pred = _power(occ_arr, *params)
         k = 2
-        # 1% of the band counts as "at the boundary" — covers both
-        # exact-bound saturation and the noisy-edge case.
+        # When curve_fit saturates a bound, the returned parameter
+        # value equals the bound EXACTLY (to numerical noise).
+        # Strict-equality detection avoids false-positives like
+        # γ=0.55 being flagged just because it sits "near" the
+        # lower bound (a 19%-above-bound value the prior 0.01×width
+        # tolerance flagged — audit #175-round2).
         gamma_fit = float(params[1])
-        edge = 0.01 * (gamma_hi - gamma_lo)
-        if gamma_fit <= gamma_lo + edge or gamma_fit >= gamma_hi - edge:
+        atol = 1e-6
+        if (abs(gamma_fit - gamma_lo) < atol
+                or abs(gamma_fit - gamma_hi) < atol):
             saturated = True
     elif shape == "hyperbolic":
         params, _ = curve_fit(

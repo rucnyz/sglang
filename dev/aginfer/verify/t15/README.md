@@ -67,7 +67,7 @@ reports.  Rank-count change between windows raises ValueError
 | D1 | time_counter propagated to report | asserted |
 | D2 | summarise() smoke (text contains hashes) | non-empty |
 
-### Real-run driver (`run_tp2_real.py`)
+### Real-run driver (`run_dp2_real.py`)
 
 Launches `--dp 2` sglang on GPUs 5,6 with
 `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1` (required — without it
@@ -106,7 +106,7 @@ cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t15/verify.py
 
 # Real DP=2 run (3-5 min including startup; needs GPUs 5,6)
-python dev/aginfer/verify/t15/run_tp2_real.py --duration 60 --workers 24
+python dev/aginfer/verify/t15/run_dp2_real.py --duration 60 --workers 24
 ```
 
 ## RESULTS
@@ -152,9 +152,9 @@ status block has the full deferred list.
 
 ## WHEN #174 LANDS
 
-1. Re-run `run_dp2_real.py` (or a sibling `run_tp2_real.py`) with
-   `--tp 2` AND `--enable-hicache-storage` (or another path that
-   activates `compute_node_hash_values`).
+1. Re-run `run_dp2_real.py` (or a sibling launcher) with `--tp 2`
+   AND a hicache storage backend (or another path that activates
+   `compute_node_hash_values`).
 2. Hit the new per-TP-rank debug endpoint exposed by #174.
 3. With content hashes active, detector should report ZERO
    divergence over any reasonable churn duration — TP's all-rank-
