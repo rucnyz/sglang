@@ -3413,26 +3413,54 @@ class Scheduler(
         return GetAginferStateReqOutput(state=dump())
 
     def migrate_aginfer(self, recv_req: MigrateAginferReq) -> MigrateAginferReqOutput:
-        """Apply paper §4 (u, τ_target) migrations dispatched by the daemon."""
+        """Apply paper §4 (u, τ_target) migrations dispatched by the daemon.
+
+        T23: every skipped action ALSO fires an `APPLY_FAILED` webhook
+        back to the daemon's `/aginfer/event` (DESIGN §4 round-9 B4 /
+        §6 L506 fire-and-forget).  The synchronous response.skipped[]
+        is preserved for the cold-start / debug code paths that still
+        read it; the webhook is the authoritative source the daemon's
+        observability counter listens to.
+        """
         apply = getattr(self.tree_cache, "apply_aginfer_migrations", None)
         if apply is None:
+            skipped = [
+                {
+                    "hash": a.get("hash"),
+                    "reason": f"unsupported_tree_cache:{type(self.tree_cache).__name__}",
+                    "action_id": a.get("action_id"),
+                }
+                for a in (recv_req.actions or [])
+            ]
+            self._fire_apply_failed_for_skipped(skipped)
             return MigrateAginferReqOutput(
                 applied=0,
                 applied_hashes=[],
-                skipped=[
-                    {
-                        "hash": a.get("hash"),
-                        "reason": f"unsupported_tree_cache:{type(self.tree_cache).__name__}",
-                    }
-                    for a in (recv_req.actions or [])
-                ],
+                skipped=skipped,
             )
         result = apply(recv_req.actions or [])
+        skipped_list = list(result.get("skipped", []))
+        self._fire_apply_failed_for_skipped(skipped_list)
         return MigrateAginferReqOutput(
             applied=int(result.get("applied", 0)),
             applied_hashes=list(result.get("applied_hashes", [])),
-            skipped=list(result.get("skipped", [])),
+            skipped=skipped_list,
         )
+
+    def _fire_apply_failed_for_skipped(self, skipped_list) -> None:
+        """T23: one APPLY_FAILED webhook per skipped/failed action."""
+        if self.aginfer_webhook is None:
+            return
+        for entry in skipped_list:
+            reason = entry.get("reason")
+            if not isinstance(reason, str) or not reason:
+                continue
+            self.aginfer_webhook.fire_apply_failed(
+                endpoint="migrate",
+                action_id=str(entry.get("action_id") or ""),
+                reason=reason,
+                hash_=entry.get("hash"),
+            )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

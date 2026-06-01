@@ -37,6 +37,12 @@ class EventKind(str, enum.Enum):
     # ---- sglang webhook (T5) ----
     MEMORY_PRESSURE = "memory_pressure"
     PRESSURE_RESOLVED = "pressure_resolved"
+    # T23+T37 (DESIGN §4 round-9 B4): sglang fires this when a daemon-
+    # issued action can't be applied.  Payload {endpoint, action_id,
+    # reason, hash?}.  Handler logs + bumps observability counter;
+    # the next event's joint_decide re-evaluates.  Idempotent
+    # invariants (§10) make any re-issue safe.
+    APPLY_FAILED = "apply_failed"
 
 
 @dataclass(frozen=True, slots=True)

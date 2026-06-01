@@ -418,13 +418,17 @@ def stage_b3_router_records_failure_class() -> None:
         raise StageFail(f"counter mismatch via router: {counts}")
 
 
-def stage_b4_kv_scheduler_skips_bump_observability() -> None:
+def stage_b4_kv_scheduler_skips_log_but_no_counter_bump() -> None:
     """Wire KvScheduler with observability=router.observability and
-    feed it a synthetic skipped_list; assert the per-reason counter
-    in the observability instance reflects the skips.  This is the
-    production wiring (main.py passes router.observability into
-    KvScheduler) — verifying it here closes the loop without spinning
-    up an HTTP server."""
+    feed it a synthetic skipped_list; assert the per-line metric
+    line fires once per skip, but the observability counter is NOT
+    bumped (T23+T37 made the APPLY_FAILED webhook the authoritative
+    source — bumping here would double-count every skip).
+
+    This stage was originally B4 "skips bump observability" before
+    T23 landed; renamed to reflect the corrected contract.  See
+    verify/t23_t37_apply_failed/verify.py stage A4 for the symmetric
+    assertion."""
     from daemon.kv_scheduler import KvScheduler
     from daemon.program_tracker import ProgramTracker
 
@@ -438,8 +442,6 @@ def stage_b4_kv_scheduler_skips_bump_observability() -> None:
         sglang_base_url="http://unused",
         observability=router.observability,
     )
-    # Synthetic /aginfer/migrate response.skipped[]; matches the T20
-    # skip-reason vocabulary.
     skipped = [
         {"hash": "h1", "reason": "add_already_present:DRAM",
          "action_id": "a1"},
@@ -454,19 +456,16 @@ def stage_b4_kv_scheduler_skips_bump_observability() -> None:
     def _capture(event, **kv):
         captured.append(event)
     sched._record_skips(skipped, _m_func=_capture)
-    counts = router.observability.summary_dict()["failure_class_counts"]
-    if counts != {
-        "add_already_present:DRAM": 2,
-        "remove_not_leaf": 1,
-        "not_in_tree": 1,
-    }:
-        raise StageFail(
-            f"kv_scheduler-driven counter mismatch: {counts}"
-        )
     if len(captured) != 4:
         raise StageFail(
             f"per-line `migrate_skipped` should fire once per skip; "
             f"captured={captured}"
+        )
+    counts = router.observability.summary_dict()["failure_class_counts"]
+    if counts != {}:
+        raise StageFail(
+            f"sync _record_skips MUST NOT bump observability counter "
+            f"after T23+T37; got {counts!r}"
         )
 
 
@@ -822,7 +821,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("B1 router records dispatch + time-in-queue", stage_b1_router_records_dispatch_and_time_in_queue),
     ("B2 router records state-fetch latency",      stage_b2_router_records_state_fetch_latency),
     ("B3 router exposes failure-class recorder",   stage_b3_router_records_failure_class),
-    ("B4 kv_scheduler skips bump observability",   stage_b4_kv_scheduler_skips_bump_observability),
+    ("B4 kv_scheduler skips log but no counter bump (post-T23)",
+                                                   stage_b4_kv_scheduler_skips_log_but_no_counter_bump),
     ("B5 G2 state_fetch_failed counts in observability",
                                                    stage_b5_state_fetch_failure_bumps_observability_counter),
     ("B6 T1 enqueue_time=0 fallback (queue bypass of emit)",

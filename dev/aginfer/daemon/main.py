@@ -25,6 +25,7 @@ import sys
 import uvicorn
 
 from .admission_controller import AdmissionController, attach_admission_controller
+from .event_router import attach_apply_failed_handler
 from .kv_scheduler import KvScheduler, attach_kv_scheduler
 from .proxy import create_app
 
@@ -142,6 +143,13 @@ def main(argv=None) -> None:
         )
         attach_admission_controller(router, admission)
         app.state.admission_controller = admission
+
+    # T37 — APPLY_FAILED handler is unconditional (no kv_scheduler /
+    # admission flag gates it; the webhook arrives regardless of which
+    # layers are attached, and the daemon's observability counter needs
+    # to track it).  Attach AFTER admission so we don't double-wrap
+    # the composite for MEMORY_PRESSURE/PRESSURE_RESOLVED.
+    attach_apply_failed_handler(router)
 
     # T9 startup-invariant markers — single grep-friendly line.
     logger.info(

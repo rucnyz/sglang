@@ -287,6 +287,36 @@ class EventRouter:
                     pass
 
 
+async def _apply_failed_handler(event: Event, router: "EventRouter") -> None:
+    """T37 (DESIGN §4 round-9 B4 / §6 L506): bump the per-reason
+    observability counter and log.  The next event's joint_decide
+    re-evaluates state and may re-issue any superseding action
+    (DESIGN §10 idempotency makes re-issue safe).
+
+    No retry / no immediate action here — the design is fire-and-
+    forget + always-fresh state read at the next handler entry.
+    """
+    payload = event.payload or {}
+    reason = payload.get("reason")
+    endpoint = payload.get("endpoint")
+    action_id = payload.get("action_id")
+    if isinstance(reason, str) and reason:
+        router.observability.record_failure(reason)
+    logger.info(
+        "aginfer apply_failed received: endpoint=%s action_id=%s reason=%s "
+        "hash=%s",
+        endpoint, action_id, reason, payload.get("hash"),
+    )
+
+
+def attach_apply_failed_handler(router: "EventRouter") -> None:
+    """Register the T37 default APPLY_FAILED handler on ``router``.
+
+    Always wired by main.py at daemon startup; kept as a separate
+    function so verify probes can opt-in selectively."""
+    router.set_handler(EventKind.APPLY_FAILED, _apply_failed_handler)
+
+
 async def _noop_handler(event: Event, router: "EventRouter") -> None:
     """Default handler used when T7 / T8 haven't registered one yet.
 

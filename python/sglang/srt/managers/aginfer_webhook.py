@@ -44,6 +44,22 @@ class WatermarkState(str, enum.Enum):
 
 
 @dataclass(slots=True)
+class ApplyFailedPayload:
+    """T23 (DESIGN §4 round-9 B4): one webhook fire per failed action
+    inside `apply_aginfer_migrations` / equivalent endpoint impls.
+    Sent to the daemon's /aginfer/event with kind="apply_failed".
+    The daemon's T37 handler bumps its observability counter and
+    lets the next `joint_decide` re-evaluate.
+    """
+    endpoint: str   # "migrate" | "program_paused" | "hints" | "thresholds"
+    action_id: str
+    reason: str
+    hash_: Optional[str]
+    ts: float
+    ts_monotonic: float
+
+
+@dataclass(slots=True)
 class WebhookPayload:
     kind: str  # "memory_pressure" | "pressure_resolved" | "still_high"
     state: str
@@ -207,6 +223,44 @@ class AginferWebhookFirer:
             logger.warning("aginfer webhook scheduling failed", exc_info=True)
         return kind
 
+    def fire_apply_failed(
+        self,
+        *,
+        endpoint: str,
+        action_id: str,
+        reason: str,
+        hash_: Optional[str] = None,
+    ) -> None:
+        """T23 — schedule a fire-and-forget APPLY_FAILED webhook.
+
+        Called from the scheduler's endpoint handlers (e.g.,
+        `migrate_aginfer`) once per skipped/failed action.  The
+        daemon's T37 handler bumps the per-reason observability
+        counter and the next `joint_decide` re-evaluates.
+
+        Never raises; never blocks the scheduler step.  Network
+        errors are logged via the same retry-then-give-up path the
+        watermark webhook uses.
+        """
+        payload = ApplyFailedPayload(
+            endpoint=endpoint,
+            action_id=action_id,
+            reason=reason,
+            hash_=hash_,
+            ts=time.time(),
+            ts_monotonic=time.monotonic(),
+        )
+        try:
+            assert self._loop is not None
+            asyncio.run_coroutine_threadsafe(
+                self._send_apply_failed(payload), self._loop,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "aginfer apply_failed webhook scheduling failed",
+                exc_info=True,
+            )
+
     def close(self) -> None:
         """Stop the background loop + close the httpx client on scheduler
         shutdown.  Audit-round-1 BLOCKER 2: without this, every scheduler
@@ -286,4 +340,45 @@ class AginferWebhookFirer:
         logger.warning(
             "aginfer webhook %s gave up after 3 attempts",
             payload.kind,
+        )
+
+    async def _send_apply_failed(self, payload: ApplyFailedPayload) -> None:
+        # Lazy-init httpx client on the background loop.
+        if self._client is None:
+            import httpx  # noqa: WPS433
+
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+        body = {
+            "kind": "apply_failed",
+            "endpoint": payload.endpoint,
+            "action_id": payload.action_id,
+            "reason": payload.reason,
+            "hash": payload.hash_,
+            "ts": payload.ts,
+            "ts_monotonic": payload.ts_monotonic,
+        }
+        backoff = 0.1
+        for attempt in range(3):
+            try:
+                resp = await self._client.post(self.notify_url, json=body)
+                if resp.status_code < 500:
+                    return
+                logger.info(
+                    "aginfer apply_failed[%s/%s] -> %d (attempt %d/3); "
+                    "retrying",
+                    payload.endpoint, payload.action_id,
+                    resp.status_code, attempt + 1,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info(
+                    "aginfer apply_failed[%s/%s] raised (attempt %d/3): %s",
+                    payload.endpoint, payload.action_id,
+                    attempt + 1, exc,
+                )
+            if attempt < 2:
+                await asyncio.sleep(backoff)
+                backoff *= 4
+        logger.warning(
+            "aginfer apply_failed[%s/%s] gave up after 3 attempts",
+            payload.endpoint, payload.action_id,
         )

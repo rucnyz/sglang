@@ -1025,8 +1025,13 @@ class KvScheduler:
             # Replace spaces with _ since metric format is space-sep.
             reason = entry["reason"].replace(" ", "_")[:120]
             _m_func("migrate_skipped", reason=reason)
-            if self.observability is not None:
-                self.observability.record_failure(reason)
+            # T23+T37: the sync path used to bump
+            # `observability.failure_class_counts` here, but sglang
+            # now ALSO fires an APPLY_FAILED webhook for each skip
+            # (DESIGN §4 round-9 B4 / §6 L506).  The webhook is the
+            # authoritative source; bumping here would double-count
+            # every skip.  Per-line `migrate_skipped` log above keeps
+            # the operator's real-time view intact.
 
 
 # ----------------------------------------------------------------- attach
