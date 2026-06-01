@@ -217,10 +217,22 @@ Order roughly by dependency.
    - single-snapshot under one read-lock so `units[*]` and
      `per_program_usage[*].unit_hashes` and `pool_usage` refer to
      the same logical timestamp
+   - **Status (#170 audit — 2026-06-01)**: OPEN.  No `_lock` around
+     `_dump_aginfer_state_impl` walk; readers can see mid-mutation
+     state.  Tracked as **#180**.
 
 3. **T19 — Atomic unit visibility** (DESIGN §10 D4):
    - units appear in `/aginfer/state.units` only after
      page-aligned chunk commit; partial-prefill chunks not exposed
+   - **Status (#170 audit — 2026-06-01)**: STRUCTURAL.  `insert()`
+     calls `key.page_aligned(self.page_size)` at lines 574/599/731
+     of `unified_radix_cache.py` BEFORE the value is stored, so by
+     construction every unit's `n_tokens` is a multiple of
+     `page_size`.  No dedicated verify dir (the property is a
+     compile-time invariant of the insert path).  Run-time pin
+     deferred — should be added as a single assertion in
+     `verify/integration_stress/` flavor B
+     (`all(u.n_tokens % page_size == 0 for u in dump.units)`).
 
 ### Endpoints
 
@@ -233,6 +245,9 @@ Order roughly by dependency.
 5. **T21 — `PUT /aginfer/program_paused`** (DESIGN §6 round-6 H2):
    - new endpoint
    - writes `state` and `pre_pause_state` into `per_program_usage`
+   - **Status (#170 audit — 2026-06-01)**: OPEN.  Only the endpoint
+     NAME appears (in `aginfer_webhook.py:55` enum entry); no
+     FastAPI route, no scheduler-side handler.  Tracked as **#181**.
 
 6. **T22 — `GET /aginfer/thresholds` + `PUT /aginfer/thresholds`**
    (DESIGN §6 round-6 H3):
@@ -258,10 +273,21 @@ Order roughly by dependency.
      hash computation (`compute_node_hash_values`) is already done
      lazily upstream when KV-event emission or migrate-action
      processing requires it
+   - **Status (#170 audit — 2026-06-01)**: PARTIAL.  Detection +
+     pair-dedupe landed in `unified_radix_cache.py:2376-2412`.
+     Webhook firing NOT wired (code logs "T24 webhook pending"
+     instead of calling `fire_hash_collision`).  Tracked as **#182**.
 
 9. **T25 — All action endpoints idempotent** (DESIGN §10 R2):
    - re-applying the same action returns 200 with `applied=0`
    - migrate, pause/resume, hint PUT, threshold PUT
+   - **Status (#170 audit — 2026-06-01)**: PARTIAL.
+     * **migrate**: idempotent (skip-reasons `race:*`, `not_a_leaf`
+       in `verify/t20/`).
+     * **threshold PUT**: atomic apply contract tested in
+       `verify/integration_stress/` flavor E.
+     * **pause/resume PUT**: gated on T21 (#181).
+     * **hint PUT**: gated on T40 (#184).
 
 ### Instrumentation hooks
 
@@ -274,10 +300,18 @@ Order roughly by dependency.
    - When this lands, T13 ground-truth-vs-EMA comparison + monotonicity
      pins (deferred from T13) must be wired into `verify/t13/` (or a
      follow-on stage in `verify/t26/`).
+   - **Status (#170 audit — 2026-06-01)**: OPEN.  Sglang emits
+     `recent_throughput_bps = 0` cold-start placeholder; no
+     instrumentation in HiCache or Mooncake yet.  Gates #172
+     (T13 deferred half) which is the calibration pin.
 
 11. **T27 — Hint clear ordering** (DESIGN §10 R3):
     - scorer's heap-iteration read happens-before eviction commit
       happens-before hint clear
+    - **Status (#170 audit — 2026-06-01)**: BLOCKED on T40.  Sglang
+      has no HintTable class yet (no `hint_clear`, `HintTable` grep
+      hits); the ordering invariant only applies once the table
+      exists.  Will pick up when #184 (T40) lands.
 
 12. **T28 — `should_write_through(node)` plugin point** (DESIGN §3
     superset framing):
@@ -285,23 +319,34 @@ Order roughly by dependency.
       into a pluggable hook
     - default implementation preserves current behaviour
     - aginfer registers a V_u-aware version when daemon is attached
+    - **Status (#170 audit — 2026-06-01)**: OPEN.  Hardcoded check
+      at `unified_radix_cache.py:1704`.  Tracked as **#178**.
 
 13. **T29 — `SGLANG_KV_POLICY_MODULE` eviction scorer plugin**
     (DESIGN §3 superset framing — partially exists):
     - default module: LRU-equivalent V_u (last_access as p_hat
       surrogate) so baseline runs match historical behaviour
     - aginfer registers its hint-table-aware V_u
+    - **Status (#170 audit — 2026-06-01)**: DONE.
+      `_load_eviction_scorer` exists in `unified_radix_cache.py:69`;
+      `verify/t38/` covers spec resolution end-to-end (stage C1).
 
 14. **T30 — Proxy gate disconnect awareness** (DESIGN §10 F1):
     - daemon's proxy gate awaits BOTH gate condition AND
       `request.is_disconnected()`
     - on disconnect: release gate, respond 499, transition program
       to ENDED via outbound queue
+    - **Status (#170 audit — 2026-06-01)**: OPEN, paired with T39.
+      Tracked as **#183**.
 
 15. **T31 — `harbor /aginfer/session_end` endpoint** (DESIGN §4):
     - out-of-band signal channel the client uses to declare
       "session done"
     - lives outside sglang, on the harbor / agent client side
+    - **Status (#170 audit — 2026-06-01)**: OUT OF SCOPE.  Lives
+      in the harbor / agent client, not in sglang/daemon.  No
+      task tracked; will be picked up when harbor adds the
+      endpoint.
 
 ### Multi-rank correctness
 
@@ -309,6 +354,14 @@ Order roughly by dependency.
     `migrate` / `program_paused` / `hints` action is applied
     atomically across TP/EP ranks via the existing
     tokenizer-server fanout
+    - **Status (#170 audit — 2026-06-01)**: DONE (impl) +
+      smoke-tested (integration).  Tokenizer-server fanout exists
+      across schedulers (`tokenizer_control_mixin.py`
+      `*_communicator` pattern); `verify/t15/run_dp2_real.py`
+      exercises multi-rank wire format end-to-end with DP=2.
+      Per-action atomicity at the TP level relies on the same
+      fanout for migrate (T20) / thresholds (T22); when T21 +
+      T40 land they need to use the same primitive.
 
 ## 4. Daemon implementation work
 
@@ -333,6 +386,12 @@ generalization.
 
 3. **T35 — `authoritative_tier(residence)`** (DESIGN §7):
    - HBM if present else DRAM else DISK
+   - **Status (#170 audit — 2026-06-01)**: DONE.
+     `baselines/base.py:ReuseUnit.authoritative_tier` @property
+     implements the rule + raises ValueError on empty residence.
+     `verify/t35/` (8 stages) pins all combinations:
+     {HBM}/{DRAM}/{DISK}/{HBM,DRAM}/{HBM,DISK}/{DRAM,DISK}/
+     {HBM,DRAM,DISK}/{}-raises.
 
 4. **T36 — Outbound action queue + worker** (DESIGN §6 B4):
    - in-memory `asyncio.Queue[Action]`
@@ -373,15 +432,22 @@ generalization.
 7. **T39 — F1 proxy-gate disconnect handler** (DESIGN §10 F1):
    - `program_tracker.client_disconnected(p)` API
    - enqueue `PUT /aginfer/program_paused {END}` on disconnect
+   - **Status (#170 audit — 2026-06-01)**: OPEN.  Paired with T30
+     in **#183**.
 
 8. **T40 — F2 hint emitter** (DESIGN §10 F2):
    - re-score `D_t` units per event, push all to sglang
      unconditionally
    - **no shadow `{hash: last_pushed_value}` map**
+   - **Status (#170 audit — 2026-06-01)**: OPEN.  No
+     `aginfer/hints` calls in daemon, no `HintTable` in sglang.
+     Gates T27 (hint clear ordering).  Tracked as **#184**.
 
 9. **T41 — F5 SESSION_END-for-PAUSED handler** (DESIGN §11 F5):
    - on SESSION_END for PAUSED program: release gate with HTTP
      499, transition ENDED, enqueue PUT
+   - **Status (#170 audit — 2026-06-01)**: OPEN, blocks on #181
+     (PUT program_paused endpoint).  Tracked as **#185**.
 
 10. **T42 — Observability logging** (DESIGN §10 F3):
     - state-fetch latency p50 / p95 / p99
