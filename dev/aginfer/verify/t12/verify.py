@@ -52,6 +52,8 @@ sys.path.insert(0, str(_HERE))
 
 from fitter import (  # noqa: E402
     FitResult,
+    _POWER_GAMMA_HI,
+    _POWER_GAMMA_LO,
     best_by_aic,
     fit_all,
     fit_one,
@@ -267,6 +269,25 @@ def stage_b3_best_by_aic_ties_prefer_simpler() -> None:
     if best_by_aic(fits2) != pick2:
         raise StageFail("best_by_aic non-deterministic for same-k tie")
 
+    # PIN the PRODUCTION iteration order in fit_all (round-3 audit):
+    # the case-2 test above constructs its own dict, so it pins
+    # `best_by_aic`'s tie-break but NOT what `fit_all` returns in
+    # practice.  If fit_all's tuple `("linear", "power", "hyperbolic")`
+    # is reordered, prod silently flips winners on same-k ties while
+    # the case-2 test stays green.  Lock the iteration order here.
+    occ = _grid()
+    # Identical data → same RSS across shapes; AIC differs only by
+    # the 2k penalty.  Use a small, well-behaved fixture; we only
+    # care about key order, not the picked shape.
+    y = _gen_linear(occ, alpha=2.0)
+    all_fits = fit_all(occ.tolist(), y.tolist())
+    keys = list(all_fits.keys())
+    if keys[:3] != ["linear", "power", "hyperbolic"]:
+        raise StageFail(
+            f"fit_all iteration order must be linear→power→hyperbolic "
+            f"(so same-k AIC ties resolve deterministically); got {keys}"
+        )
+
 
 def stage_b4_power_gamma_saturation_flagged() -> None:
     """#175 audit: when real data has γ outside [0.5, 10], curve_fit
@@ -294,7 +315,7 @@ def stage_b4_power_gamma_saturation_flagged() -> None:
             f"params={fit_hi.params} saturated={fit_hi.saturated}"
         )
     _alpha, gamma_hi_fit = fit_hi.params
-    if not (9.9 <= gamma_hi_fit <= 10.0):
+    if not (_POWER_GAMMA_HI - 0.1 <= gamma_hi_fit <= _POWER_GAMMA_HI):
         raise StageFail(
             f"γ at upper bound expected; got {gamma_hi_fit}"
         )
@@ -304,30 +325,33 @@ def stage_b4_power_gamma_saturation_flagged() -> None:
     fit_lo = fit_one("power", occ.tolist(), y_lo.tolist())
     if not fit_lo.saturated:
         raise StageFail(
-            f"γ=0.1 input should saturate at lower bound (0.5); "
-            f"params={fit_lo.params} saturated={fit_lo.saturated}"
+            f"γ=0.1 input should saturate at lower bound "
+            f"({_POWER_GAMMA_LO}); params={fit_lo.params} "
+            f"saturated={fit_lo.saturated}"
         )
     _alpha, gamma_lo_fit = fit_lo.params
-    if not (0.5 <= gamma_lo_fit <= 0.6):
+    if not (_POWER_GAMMA_LO <= gamma_lo_fit <= _POWER_GAMMA_LO + 0.1):
         raise StageFail(
             f"γ at lower bound expected; got {gamma_lo_fit}"
         )
 
-    # False-positive guard: γ=0.55 is well inside [0.5, 10] and
-    # MUST NOT be flagged saturated.  The prior #175 implementation
-    # used `edge = 0.01 * (gamma_hi - gamma_lo) = 0.095`, which
-    # flagged γ ≤ 0.595 as saturated even though 0.55 is a normal
-    # interior value.  Pinning here forces the false-positive
-    # band tight.
-    y_feasible = _gen_power(occ, alpha=1.0, gamma=0.55)
-    fit_feasible = fit_one("power", occ.tolist(), y_feasible.tolist())
-    if fit_feasible.saturated:
-        raise StageFail(
-            f"γ=0.55 is feasible (interior to [0.5, 10]); should NOT "
-            f"be saturated. params={fit_feasible.params} "
-            f"saturated={fit_feasible.saturated}"
-        )
-
+    # False-positive guards: feasible γ values near BOTH bounds must
+    # NOT be flagged saturated.  #175 had a 19% lower-bound band
+    # that flagged γ=0.55 (well inside [0.5, 10]); round-3 audit
+    # caught that B4 only pinned the lower side, leaving an
+    # equivalent upper-bound regression (γ=9.95 was within the
+    # 0.095 band) un-guarded.  Both bounds pinned here.
+    for gamma_true, label in [(0.55, "lower-bound near"),
+                              (9.95, "upper-bound near")]:
+        y_feasible = _gen_power(occ, alpha=1.0, gamma=gamma_true)
+        fit_feasible = fit_one("power", occ.tolist(), y_feasible.tolist())
+        if fit_feasible.saturated:
+            raise StageFail(
+                f"γ={gamma_true} ({label}) is feasible (interior to "
+                f"[{_POWER_GAMMA_LO}, {_POWER_GAMMA_HI}]); should NOT "
+                f"be saturated. params={fit_feasible.params} "
+                f"saturated={fit_feasible.saturated}"
+            )
 
 # ============================================================ C. log parser
 

@@ -56,7 +56,7 @@ that's first-to-evict at this load.
 `parse_t12_log_lines` extracts the four required fields, groups
 by `(tier, subpool)`, silently drops malformed lines.
 
-## STAGES (9)
+## STAGES (10)
 
 ```
 A. Clean-data recovery (picker returns the true shape)
@@ -66,8 +66,15 @@ A. Clean-data recovery (picker returns the true shape)
 B. Robustness
   B0 5% Gaussian noise: ≥ 4/5 seeds recover the true shape
   B1 fit_one with n < 2 raises ValueError
-  B2 fit_all silently omits non-converging shapes (degenerate inputs)
-  B3 best_by_aic ties break in favour of fewer params (Occam)
+  B2 fit_all omits non-converging shapes (NaN-in-y forces fit
+     failure for every shape; ≥1 must be dropped)
+  B3 best_by_aic ties: 1-param wins over 2-param (Occam); same-k
+     ties resolve to first-inserted ("linear"); fit_all iteration
+     order is locked at linear→power→hyperbolic so production
+     same-k ties match the in-isolation test
+  B4 power γ saturation: γ_true ∈ {15, 0.1} → saturated=True (both
+     bounds); γ_true ∈ {0.55, 9.95} (near-bound but feasible)
+     → saturated=False (false-positive guards on both bounds)
 C. Log parser
   C0 groups by (tier, subpool); ignores non-t12_calibration lines
   C1 malformed lines (missing field / unparseable float) → silently dropped
@@ -86,10 +93,15 @@ no subprocesses).
 
 ## RESULTS
 
-**PASSED** — all 9 stages.
+**PASSED** — all 10 stages.
 
 * date: 2026-06-01
-* raw log: `results/20260601_t12_initial_pass.log`
+* raw logs:
+  * `results/20260601_t12_initial_pass.log` — initial 9-stage pass
+  * `results/20260601_t12_post_175_pass.log` — post-#175 (10 stages,
+    saturation diag + tightened B2/B3)
+  * `results/20260601_t12_post_175r2_pass.log` — post-#175-round-2
+    (saturation false-positive fix; γ=0.55 / γ=9.95 guarded)
 
 | Stage | Result |
 |---|---|
@@ -98,8 +110,9 @@ no subprocesses).
 | A2 hyperbolic recovery | PASS — α = 0.1000 |
 | B0 noisy recovery (4/5 seeds) | PASS for linear / power / hyperbolic |
 | B1 < 2 samples raises | PASS — ValueError |
-| B2 non-converge omitted | PASS — fit_all returns partial dict, no exception |
-| B3 AIC tie → simpler | PASS — linear picked over power on identical AIC |
+| B2 non-converge omitted | PASS — NaN-in-y forces ≥1 shape drop |
+| B3 AIC tie → simpler + same-k → first-inserted + fit_all iter order locked | PASS |
+| B4 saturation: both bounds caught + both feasible-near false-positive guards | PASS |
 | C0 parser groups | PASS — 2 (tier, subpool) buckets; foreign lines ignored |
 | C1 parser drops malformed | PASS — only valid line survives |
 
