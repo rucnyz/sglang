@@ -59,16 +59,23 @@ Open output: `verify/t12/README.md`.
 
 Sglang instruments `recent_throughput_bps` on each direction
 (HiCache write_backup / load_back for HBM↔DRAM, Mooncake put / get
-for DRAM↔DISK).  Validate that the EMA tracks reality:
+for DRAM↔DISK).  Validate that the EMA tracks reality.
 
-- Compare `recent_throughput_bps` against ground-truth wall-clock
-  per migrate, under both idle-link and contended-link conditions
-- Probe the idle path (`time_since_last_sample_s > LINK_IDLE_SECONDS`
-  → `peak_bw_bps` reported)
-- Pin `time_since_last_sample_s` monotonicity across consecutive
-  state-dumps when the link is quiet
+**Status (#172 — 2026-06-01)**:
+* **DONE** in `verify/t13/`:
+  * sglang emission contract (4 directions × 3 keys; cold-start
+    `recent_throughput_bps == 0`; `time_since_last_sample_s > LINK_IDLE_SECONDS`)
+  * daemon `bw_free` branch logic: idle / busy / saturated /
+    `peak <= 0` fatal / threshold boundary
+* **DEFERRED to T26** (HiCache + Mooncake instrumentation must
+  land first — no ground-truth signal to compare against):
+  * compare `recent_throughput_bps` vs ground-truth wall-clock per
+    migrate under idle + contended conditions
+  * pin `time_since_last_sample_s` monotonicity across
+    consecutive state-dumps on a quiet link
+  * EMA decay-rate calibration
 
-Open output: `verify/t13/README.md`.
+Output: `verify/t13/README.md`.
 
 ## 2. Observability instrumentation
 
@@ -199,6 +206,9 @@ Order roughly by dependency.
    - DRAM↔DISK: wall-clock bracket each Mooncake `put` / `get`;
      maintain EMA per direction
    - Expose via `state.link_stats`
+   - When this lands, T13 ground-truth-vs-EMA comparison + monotonicity
+     pins (deferred from T13) must be wired into `verify/t13/` (or a
+     follow-on stage in `verify/t26/`).
 
 11. **T27 — Hint clear ordering** (DESIGN §10 R3):
     - scorer's heap-iteration read happens-before eviction commit
