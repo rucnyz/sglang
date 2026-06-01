@@ -41,9 +41,12 @@ unchanged state and emits the same plan.
 **Wiring.**  `main.py` creates `OutboundQueue` once, injects it into
 `KvScheduler(outbound=outbound)`, and ties its lifecycle to the
 FastAPI startup/shutdown hooks via `app.state.outbound`.
-`KvScheduler._dispatch_migrate` now enqueues + returns; the legacy
-sync POST path is preserved as a fallback when `outbound is None`
-(unit tests).
+`KvScheduler._dispatch_migrate` enqueues + returns; the outbound
+queue is now **mandatory** (calling `_dispatch_migrate` without one
+raises `RuntimeError`).  The legacy sync POST fallback was removed
+post-T36 audit — DESIGN §6 B4 makes fire-and-forget the only valid
+production dispatch path, and maintaining two implementations was
+debt with no real testing benefit.
 
 **Identifier model.**  Each outbound POST carries `batch_id` in the
 JSON body envelope (DESIGN §6 L506).  Per-item `action_id` (T20)
@@ -60,8 +63,8 @@ APPLY_FAILED.
 | SIGTERM mid-burst | stop() drains in-flight then exits within ~2 s | A5 |
 | FIFO inversion | worker dequeues in enqueue order | A2 |
 | batch_id collision after 2^32 enqueues | UUID4 collision probability < 10⁻²² | A0 |
-| Legacy code path forgets to enqueue | `_dispatch_migrate(outbound=None)` falls back to sync POST + `migrate_post` metric | (preserved; not asserted) |
-| kv_scheduler wires outbound | `_dispatch_migrate` enqueues exactly once, no sync POST | A6 |
+| Wiring bug: outbound not injected | `_dispatch_migrate(outbound=None)` raises RuntimeError | T42 B4 |
+| kv_scheduler wires outbound | `_dispatch_migrate` enqueues exactly once | A6 |
 
 ## HOW WE VERIFY
 
@@ -76,7 +79,7 @@ A3  worker survives 5xx storm (5 × 503; no crash; all 5 hit the wire)
 A4  worker survives ConnectError (3 × raise; no crash)
 A5  stop() drains in-flight POSTs then exits within bounded time
 A6  KvScheduler wired with outbound enqueues exactly one OutboundBatch
-    per _dispatch_migrate call (no sync POST)
+    per _dispatch_migrate call
 B0  (opt-in) live daemon + sglang: time_in_queue_p99 < 100 ms PLAN
     threshold under 50-webhook burst
 ```

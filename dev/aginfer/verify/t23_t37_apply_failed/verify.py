@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import sys
@@ -65,7 +66,9 @@ if str(_AGINFER_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGINFER_ROOT))
 
 from daemon.events import Event, EventBus, EventKind  # noqa: E402
-from daemon.event_router import EventRouter, attach_event_routes  # noqa: E402
+from daemon.event_router import (  # noqa: E402
+    EventRouter, attach_apply_failed_handler, attach_event_routes,
+)
 
 
 def _green(s: str) -> str:
@@ -116,9 +119,11 @@ async def _run_daemon_server(app: FastAPI, host: str, port: int):
 
 def _build_test_daemon_app() -> Tuple[FastAPI, EventRouter]:
     """A minimal daemon (no proxy / sglang upstream) that ONLY exposes
-    ``POST /aginfer/event`` and the worker.  We attach the EventRouter
-    and a trivial handler for APPLY_FAILED that just calls
-    ``observability.record_failure`` (the production handler shape).
+    ``POST /aginfer/event`` and the worker.  Uses the PRODUCTION
+    ``attach_apply_failed_handler`` from ``daemon.event_router`` so
+    the verify exercises the same code path the live daemon does
+    (including the structured ``aginfer_metric event=apply_failed``
+    line that A4 checks for).
     """
     app = FastAPI()
     bus = EventBus()
@@ -133,15 +138,8 @@ def _build_test_daemon_app() -> Tuple[FastAPI, EventRouter]:
         return {"pool_usage": {"HBM": {"subpools": {}}}}
     router._fetch_state_impl = _no_fetch  # type: ignore[assignment]
 
-    # Production handler for APPLY_FAILED — bumps counter, logs.
-    async def _apply_failed_handler(evt: Event, r: EventRouter) -> None:
-        reason = evt.payload.get("reason")
-        endpoint = evt.payload.get("endpoint")
-        action_id = evt.payload.get("action_id")
-        if isinstance(reason, str) and reason:
-            r.observability.record_failure(reason)
-
-    router.set_handler(EventKind.APPLY_FAILED, _apply_failed_handler)
+    # Real production handler (same one main.py wires).
+    attach_apply_failed_handler(router)
     attach_event_routes(app, router)
 
     @app.on_event("startup")
@@ -304,52 +302,63 @@ def stage_a3_missing_reason_ignored_no_crash() -> None:
         )
 
 
-def stage_a4_sync_record_skips_no_longer_bumps_counter() -> None:
-    """Double-count avoidance audit: ``KvScheduler._record_skips``
-    used to bump ``observability.failure_class_counts`` for every
-    item in the synchronous /aginfer/migrate response.  Now that
-    sglang ALSO fires APPLY_FAILED for the same items, the sync
-    path must NOT bump (or we'd count every skip twice).
+def stage_a4_apply_failed_handler_emits_structured_metric_line() -> None:
+    """Post-T36 cleanup: the sync ``_record_skips`` path is gone,
+    so the per-event ``aginfer_metric event=migrate_skipped`` log
+    it used to emit is gone too.  T37's handler now emits a
+    structured ``aginfer_metric event=apply_failed endpoint=...
+    reason=... action_id=...`` line so operators still have a
+    per-event grep target.
 
-    This stage proves the sync path is observability-neutral while
-    still emitting the per-line ``migrate_skipped`` log (operator's
-    real-time view stays intact)."""
-    from daemon.kv_scheduler import KvScheduler
-    from daemon.program_tracker import ProgramTracker
-
-    bus = EventBus()
-    router = EventRouter(
-        bus=bus, sglang_base_url="http://unused",
-        theta_hi=0.7, theta_crit=0.9,
-    )
-    sched = KvScheduler(
-        tracker=ProgramTracker(),
-        sglang_base_url="http://unused",
-        observability=router.observability,
-    )
+    This stage captures the metric logger and asserts the line
+    fires once per webhook with the right field set."""
     captured: List[str] = []
 
-    def _capture(event, **kv):
-        captured.append(event)
+    class _CaptureHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
 
-    sched._record_skips(
-        [
-            {"hash": "h1", "reason": "not_in_tree", "action_id": "a1"},
-            {"hash": "h2", "reason": "remove_not_leaf", "action_id": "a2"},
-        ],
-        _m_func=_capture,
-    )
-    if captured != ["migrate_skipped", "migrate_skipped"]:
-        raise StageFail(
-            f"per-line log should still fire; captured={captured}"
-        )
-    counts = router.observability.summary_dict()["failure_class_counts"]
-    if counts != {}:
-        raise StageFail(
-            f"sync _record_skips MUST NOT bump observability counter "
-            f"(APPLY_FAILED webhook is the authoritative source); "
-            f"got {counts!r}"
-        )
+    handler = _CaptureHandler()
+    metric_logger = logging.getLogger("aginfer.metric")
+    prior_level = metric_logger.level
+    metric_logger.addHandler(handler)
+    metric_logger.setLevel(logging.INFO)
+
+    async def _scenario():
+        app, router = _build_test_daemon_app()
+        port = _free_port()
+        async with _run_daemon_server(app, "127.0.0.1", port):
+            url = f"http://127.0.0.1:{port}/aginfer/event"
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(url, json={
+                    "kind": "apply_failed",
+                    "endpoint": "migrate",
+                    "action_id": "a-1",
+                    "reason": "not_in_tree",
+                    "hash": "node-1",
+                })
+            await router.bus.queue.join()
+
+    try:
+        asyncio.run(_scenario())
+        apply_failed_lines = [
+            l for l in captured if "event=apply_failed" in l
+        ]
+        if len(apply_failed_lines) != 1:
+            raise StageFail(
+                f"expected exactly 1 apply_failed metric line per webhook; "
+                f"got {len(apply_failed_lines)}; all captured: {captured!r}"
+            )
+        line = apply_failed_lines[0]
+        for needle in ("endpoint=migrate", "reason=not_in_tree",
+                       "action_id=a-1"):
+            if needle not in line:
+                raise StageFail(
+                    f"line missing {needle!r}; got: {line!r}"
+                )
+    finally:
+        metric_logger.removeHandler(handler)
+        metric_logger.setLevel(prior_level)
 
 
 # ============================================================ Phase B
@@ -462,8 +471,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A1 webhook bumps counter per reason",         stage_a1_webhook_bumps_counter_per_reason),
     ("A2 every endpoint counted (forward-compat)",  stage_a2_unknown_endpoint_still_counts),
     ("A3 malformed payload ignored, no crash",      stage_a3_missing_reason_ignored_no_crash),
-    ("A4 sync _record_skips no longer bumps (no double-count)",
-                                                    stage_a4_sync_record_skips_no_longer_bumps_counter),
+    ("A4 apply_failed handler emits structured metric line",
+                                                    stage_a4_apply_failed_handler_emits_structured_metric_line),
     ("B0 known-bad migrate returns sync skipped[]", stage_b0_known_bad_migrate_fires_webhook),
     ("B1 daemon log shows apply_failed webhook arrival",
                                                     stage_b1_daemon_counter_reflects_webhook),

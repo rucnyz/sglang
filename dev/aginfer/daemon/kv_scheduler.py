@@ -41,8 +41,6 @@ import logging
 import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import httpx
-
 from baselines.base import (
     Action,
     ReuseUnit,
@@ -800,7 +798,6 @@ class KvScheduler:
         *,
         tracker: ProgramTracker,
         sglang_base_url: str,
-        http_client: Optional[httpx.AsyncClient] = None,
         policy: Optional[OursGreedyPolicy] = None,
         lambda_acting: float = _DEFAULT_LAMBDA_ACTING,
         observability=None,  # daemon._observability.DaemonObservability
@@ -808,21 +805,20 @@ class KvScheduler:
     ) -> None:
         self.tracker = tracker
         self.sglang_base_url = sglang_base_url.rstrip("/")
-        self._client = http_client
-        self._owns_client = http_client is None
         self.policy = policy or OursGreedyPolicy(default_costs())
         self.lambda_acting = lambda_acting
         # T42: optional injection from main.py (router.observability).
-        # When set, every migrate skip-reason bumps the per-reason
-        # counter in addition to its per-event log line.  Left None
-        # for unit tests that only care about the policy / wire path.
+        # When set, ``_record_skips`` and other failure paths can bump
+        # the per-reason counter.  Left None for unit tests that only
+        # care about the policy / wire path.
         self.observability = observability
-        # T36: optional injection of the fire-and-forget outbound
-        # queue.  When set, _dispatch_migrate enqueues a batch and
-        # returns immediately; the queue's worker issues the POST in
-        # the background.  Left None for unit tests; legacy sync
-        # POST path is preserved as a fallback for code that hasn't
-        # been migrated.
+        # T36: injection of the fire-and-forget outbound queue.
+        # ``_dispatch_migrate`` REQUIRES this; constructing a
+        # KvScheduler without it is a wiring bug (DESIGN §6 B4 makes
+        # outbound the only valid production dispatch path).  Tests
+        # that only exercise ``handle()`` up to the dispatch point may
+        # leave it None; tests that call ``_dispatch_migrate`` must
+        # provide one.
         self.outbound = outbound
         # Telemetry for tests.
         self.decisions: int = 0
@@ -832,16 +828,6 @@ class KvScheduler:
         # Audit round-2 R2-N2: per-instance unknown-tier log set so
         # cross-test / cross-restart state doesn't leak.
         self._unknown_tier_log: set = set()
-
-    async def ensure_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
-        return self._client
-
-    async def aclose(self) -> None:
-        if self._owns_client and self._client is not None:
-            await self._client.aclose()
-            self._client = None
 
     async def handle(self, event: Event, router) -> None:  # noqa: ANN001
         """Single entry point for all paper §4 events.
@@ -959,107 +945,36 @@ class KvScheduler:
     async def _dispatch_migrate(
         self, assignments: List[Tuple[str, Tier]]
     ) -> None:
-        actions_wire = assignments_to_wire(assignments)
-        from ._metrics import m as _m
-        # T36: fire-and-forget path.  Pre-T36 we did
-        # ``await client.post(...)`` here, blocking the event-worker
-        # coroutine for the full sglang round-trip.  Now enqueue
-        # onto the outbound queue + return immediately; the
-        # OutboundWorker pops + POSTs in the background.  Per-item
-        # failures arrive via the APPLY_FAILED webhook (T23+T37).
-        if self.outbound is not None:
-            batch_id = self.outbound.enqueue_migrate(actions_wire)
-            self.migrate_calls += 1
-            _m(
-                "migrate_enqueued",
-                batch_id=batch_id,
-                n_actions=len(assignments),
-            )
-            return
-        # ---- legacy sync path (no outbound queue injected) ----
-        # Unit tests that exercise the per-skip log lines without
-        # spinning up an OutboundQueue still go through here.  The
-        # production daemon wires outbound from main.py.
-        body = {"actions": actions_wire}
-        client = await self.ensure_client()
-        url = f"{self.sglang_base_url}/aginfer/migrate"
-        try:
-            r = await client.post(url, json=body)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "kv_scheduler: migrate POST raised: %s", exc
-            )
-            _m("migrate_post", status="exception", n_actions=len(assignments))
-            return
-        self.migrate_calls += 1
-        if r.status_code >= 400:
-            logger.warning(
-                "kv_scheduler: migrate returned %d: %s",
-                r.status_code, r.text[:200],
-            )
-            _m(
-                "migrate_post",
-                status=r.status_code,
-                n_actions=len(assignments),
-                applied=0,
-            )
-            return
-        # Parse sglang's response for applied vs skipped counts.
-        # Contract: /aginfer/migrate ALWAYS returns JSON with `applied: int`
-        # and `skipped: list`.  Tight except so a real protocol break
-        # surfaces in the log instead of being silently coerced to -1.
-        try:
-            resp = r.json()
-            applied = int(resp["applied"])
-            skipped_list = resp["skipped"]
-            skipped = len(skipped_list)
-        except (ValueError, KeyError, TypeError) as exc:
-            logger.warning(
-                "kv_scheduler: migrate response malformed (%s): body=%s",
-                type(exc).__name__, r.text[:300],
-            )
-            applied = -1
-            skipped = -1
-            skipped_list = []
-        _m(
-            "migrate_post",
-            status=r.status_code,
-            n_actions=len(assignments),
-            applied=applied,
-            skipped=skipped,
-        )
-        # Per-action skip reason breakdown.
-        self._record_skips(skipped_list, _m)
+        """T36 (DESIGN §6 B4) fire-and-forget enqueue.
 
-    def _record_skips(self, skipped_list, _m_func=None) -> None:
-        """Per-skip accounting: emit a ``migrate_skipped`` line AND
-        (when observability is attached) bump the cumulative
-        per-reason counter on the daemon's T42 aggregator.
+        Returns immediately after a ``put_nowait`` + ``uuid4()``.
+        The shared ``OutboundQueue`` worker (started by main.py) pops
+        + POSTs in the background; per-item failures flow back via
+        the ``APPLY_FAILED`` webhook (T23+T37), not via this call's
+        return path.
 
-        Extracted as a method so unit tests can exercise the skip-
-        accounting path without spinning up the HTTP client.
-        Each line ≈ 1 µs, fires at most ``len(skipped_list)`` times
-        per migrate POST — high-value for finding G11-class issues
-        (race:already_on_dram / promote_not_yet_wired /
-        race:not_in_tree / etc.).
+        ``outbound`` is REQUIRED — there is no longer a synchronous
+        fallback (removed post-T36 audit).  Constructing a
+        ``KvScheduler`` without ``outbound=...`` is a wiring bug that
+        we surface here rather than silently dropping every migrate.
         """
-        if _m_func is None:
-            from ._metrics import m as _m_func
-        for entry in skipped_list:
-            # Direct subscript: sglang's /aginfer/migrate ALWAYS emits
-            # `reason` per DESIGN §6 + verify/t20 enforcement.  A
-            # missing field is a real protocol regression worth
-            # surfacing, not a silent "?" metric value.
-            # Replace spaces with _ since metric format is space-sep.
-            reason = entry["reason"].replace(" ", "_")[:120]
-            _m_func("migrate_skipped", reason=reason)
-            # T23+T37: the sync path used to bump
-            # `observability.failure_class_counts` here, but sglang
-            # now ALSO fires an APPLY_FAILED webhook for each skip
-            # (DESIGN §4 round-9 B4 / §6 L506).  The webhook is the
-            # authoritative source; bumping here would double-count
-            # every skip.  Per-line `migrate_skipped` log above keeps
-            # the operator's real-time view intact.
+        if self.outbound is None:
+            raise RuntimeError(
+                "KvScheduler._dispatch_migrate called without an "
+                "OutboundQueue injected.  main.py wires this; tests "
+                "constructing KvScheduler directly must pass "
+                "outbound=OutboundQueue(...) per DESIGN §6 B4."
+            )
+        actions_wire = assignments_to_wire(assignments)
+        batch_id = self.outbound.enqueue_migrate(actions_wire)
+        self.migrate_calls += 1
+        from ._metrics import m as _m
+        _m(
+            "migrate_enqueued",
+            batch_id=batch_id,
+            n_actions=len(assignments),
+        )
+
 
 
 # ----------------------------------------------------------------- attach

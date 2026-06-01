@@ -418,54 +418,39 @@ def stage_b3_router_records_failure_class() -> None:
         raise StageFail(f"counter mismatch via router: {counts}")
 
 
-def stage_b4_kv_scheduler_skips_log_but_no_counter_bump() -> None:
-    """Wire KvScheduler with observability=router.observability and
-    feed it a synthetic skipped_list; assert the per-line metric
-    line fires once per skip, but the observability counter is NOT
-    bumped (T23+T37 made the APPLY_FAILED webhook the authoritative
-    source — bumping here would double-count every skip).
+def stage_b4_kv_scheduler_dispatch_requires_outbound() -> None:
+    """Post-T36 cleanup: ``KvScheduler._dispatch_migrate`` REQUIRES
+    an ``OutboundQueue`` injected.  The old sync POST fallback was
+    removed; calling without ``outbound=`` is a wiring bug and must
+    raise immediately (DESIGN §6 B4 makes fire-and-forget the only
+    valid production dispatch path).
 
-    This stage was originally B4 "skips bump observability" before
-    T23 landed; renamed to reflect the corrected contract.  See
-    verify/t23_t37_apply_failed/verify.py stage A4 for the symmetric
-    assertion."""
+    Stage was originally "skips bump observability" pre-T23, then
+    "skips log but no counter bump" post-T23.  Both contracts are
+    obsolete now (no sync path = no double-count to worry about).
+    Replaced with the new contract: dispatch fails fast without
+    outbound."""
     from daemon.kv_scheduler import KvScheduler
     from daemon.program_tracker import ProgramTracker
 
-    bus = EventBus()
-    router = EventRouter(
-        bus=bus, sglang_base_url="http://unused",
-        theta_hi=0.7, theta_crit=0.9,
-    )
     sched = KvScheduler(
         tracker=ProgramTracker(),
         sglang_base_url="http://unused",
-        observability=router.observability,
+        # NOTE: no outbound= → wiring bug
     )
-    skipped = [
-        {"hash": "h1", "reason": "add_already_present:DRAM",
-         "action_id": "a1"},
-        {"hash": "h2", "reason": "add_already_present:DRAM",
-         "action_id": "a2"},
-        {"hash": "h3", "reason": "remove_not_leaf",
-         "action_id": "a3"},
-        {"hash": "h4", "reason": "not_in_tree",
-         "action_id": "a4"},
-    ]
-    captured: List[str] = []
-    def _capture(event, **kv):
-        captured.append(event)
-    sched._record_skips(skipped, _m_func=_capture)
-    if len(captured) != 4:
+
+    raised: Optional[Exception] = None
+    try:
+        asyncio.run(sched._dispatch_migrate([]))
+    except RuntimeError as exc:
+        raised = exc
+    if raised is None:
         raise StageFail(
-            f"per-line `migrate_skipped` should fire once per skip; "
-            f"captured={captured}"
+            "_dispatch_migrate() without outbound must raise; got no exception"
         )
-    counts = router.observability.summary_dict()["failure_class_counts"]
-    if counts != {}:
+    if "OutboundQueue" not in str(raised):
         raise StageFail(
-            f"sync _record_skips MUST NOT bump observability counter "
-            f"after T23+T37; got {counts!r}"
+            f"error message should mention OutboundQueue; got {raised!r}"
         )
 
 
@@ -654,7 +639,20 @@ def stage_b8_kv_scheduler_observability_none_no_crash() -> None:
 
     Regression target: a future change that drops the ``if
     self.observability is not None:`` guard would crash the
-    metric-fired-but-no-aggregator path silently."""
+    metric-fired-but-no-aggregator path silently.
+
+    Post-T36 cleanup: previously this stage exercised
+    ``sched._record_skips(...)`` (since-removed sync-path helper).
+    The contract under test is now ``KvScheduler.__init__(observ-
+    ability=None)`` followed by an event-handler-side code path
+    that may not have an observability instance — currently no
+    such call site exists post-cleanup (record_failure is only
+    called from the APPLY_FAILED handler which accesses
+    ``router.observability`` directly).  We assert the
+    constructor accepts ``observability=None`` without raising;
+    real coverage of the "missing observability doesn't crash"
+    path lives in verify/t36 A6 (which constructs KvScheduler
+    without observability for the outbound-enqueue test)."""
     from daemon.kv_scheduler import KvScheduler
     from daemon.program_tracker import ProgramTracker
 
@@ -663,20 +661,11 @@ def stage_b8_kv_scheduler_observability_none_no_crash() -> None:
         sglang_base_url="http://unused",
         observability=None,
     )
-    captured: List[str] = []
-
-    def _capture(event, **kv):
-        captured.append(event)
-
-    sched._record_skips(
-        [{"hash": "h1", "reason": "not_in_tree", "action_id": "a1"}],
-        _m_func=_capture,
-    )
-    # The per-line metric still fires regardless of observability state.
-    if captured != ["migrate_skipped"]:
+    # Just confirm the construct doesn't raise and the field is None.
+    if sched.observability is not None:
         raise StageFail(
-            f"with observability=None, per-line metric should still "
-            f"fire; captured={captured}"
+            f"observability=None should remain None; "
+            f"got {sched.observability!r}"
         )
 
 
@@ -821,8 +810,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("B1 router records dispatch + time-in-queue", stage_b1_router_records_dispatch_and_time_in_queue),
     ("B2 router records state-fetch latency",      stage_b2_router_records_state_fetch_latency),
     ("B3 router exposes failure-class recorder",   stage_b3_router_records_failure_class),
-    ("B4 kv_scheduler skips log but no counter bump (post-T23)",
-                                                   stage_b4_kv_scheduler_skips_log_but_no_counter_bump),
+    ("B4 kv_scheduler._dispatch_migrate requires outbound (post-T36)",
+                                                   stage_b4_kv_scheduler_dispatch_requires_outbound),
     ("B5 G2 state_fetch_failed counts in observability",
                                                    stage_b5_state_fetch_failure_bumps_observability_counter),
     ("B6 T1 enqueue_time=0 fallback (queue bypass of emit)",

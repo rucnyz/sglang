@@ -295,6 +295,11 @@ async def _apply_failed_handler(event: Event, router: "EventRouter") -> None:
 
     No retry / no immediate action here — the design is fire-and-
     forget + always-fresh state read at the next handler entry.
+
+    Also emits a structured ``aginfer_metric event=apply_failed``
+    line so operators have a per-event grep target (post-T36
+    cleanup removed the sync-path ``migrate_skipped`` line that
+    used to serve this purpose).
     """
     payload = event.payload or {}
     reason = payload.get("reason")
@@ -306,6 +311,13 @@ async def _apply_failed_handler(event: Event, router: "EventRouter") -> None:
         "aginfer apply_failed received: endpoint=%s action_id=%s reason=%s "
         "hash=%s",
         endpoint, action_id, reason, payload.get("hash"),
+    )
+    from ._metrics import m as _m
+    _m(
+        "apply_failed",
+        endpoint=endpoint or "?",
+        action_id=action_id or "?",
+        reason=(reason or "?").replace(" ", "_")[:120],
     )
 
 

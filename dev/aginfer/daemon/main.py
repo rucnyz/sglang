@@ -119,9 +119,10 @@ def main(argv=None) -> None:
     # this): kv_scheduler MUST attach BEFORE admission_controller.
     sched = None
     admission = None
-    # T36: shared outbound queue for all fire-and-forget dispatches.
-    # Lifecycle is tied to the FastAPI startup / shutdown hooks below
-    # so the worker is alive whenever the daemon is.
+    # T36 (DESIGN §6 B4): shared outbound queue for all fire-and-forget
+    # dispatches.  Mandatory — KvScheduler._dispatch_migrate raises if
+    # outbound is None.  Lifecycle tied to FastAPI startup / shutdown
+    # via app.state.outbound (see proxy.py).
     outbound = OutboundQueue(
         sglang_base_url=args.sglang_base_url,
         observability=router.observability,
