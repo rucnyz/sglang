@@ -200,12 +200,22 @@ def create_app(
         if app.state.event_router is not None:
             await app.state.event_router.start()
             await app.state.event_router.cold_start_probe()
+        # T36 — start the outbound worker if main.py attached one.
+        outbound = getattr(app.state, "outbound", None)
+        if outbound is not None:
+            await outbound.start()
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         if app.state.event_router is not None:
             await app.state.event_router.stop()
             app.state.event_router = None
+        # T36 — drain + stop outbound worker before closing the shared
+        # http_client so any in-flight POSTs can land.
+        outbound = getattr(app.state, "outbound", None)
+        if outbound is not None:
+            await outbound.stop()
+            app.state.outbound = None
         if app.state.owns_http_client and app.state.http_client is not None:
             await app.state.http_client.aclose()
 

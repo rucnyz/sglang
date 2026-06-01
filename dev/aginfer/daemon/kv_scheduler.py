@@ -804,6 +804,7 @@ class KvScheduler:
         policy: Optional[OursGreedyPolicy] = None,
         lambda_acting: float = _DEFAULT_LAMBDA_ACTING,
         observability=None,  # daemon._observability.DaemonObservability
+        outbound=None,       # daemon.outbound.OutboundQueue
     ) -> None:
         self.tracker = tracker
         self.sglang_base_url = sglang_base_url.rstrip("/")
@@ -816,6 +817,13 @@ class KvScheduler:
         # counter in addition to its per-event log line.  Left None
         # for unit tests that only care about the policy / wire path.
         self.observability = observability
+        # T36: optional injection of the fire-and-forget outbound
+        # queue.  When set, _dispatch_migrate enqueues a batch and
+        # returns immediately; the queue's worker issues the POST in
+        # the background.  Left None for unit tests; legacy sync
+        # POST path is preserved as a fallback for code that hasn't
+        # been migrated.
+        self.outbound = outbound
         # Telemetry for tests.
         self.decisions: int = 0
         self.migrate_calls: int = 0
@@ -951,10 +959,30 @@ class KvScheduler:
     async def _dispatch_migrate(
         self, assignments: List[Tuple[str, Tier]]
     ) -> None:
-        body = {"actions": assignments_to_wire(assignments)}
+        actions_wire = assignments_to_wire(assignments)
+        from ._metrics import m as _m
+        # T36: fire-and-forget path.  Pre-T36 we did
+        # ``await client.post(...)`` here, blocking the event-worker
+        # coroutine for the full sglang round-trip.  Now enqueue
+        # onto the outbound queue + return immediately; the
+        # OutboundWorker pops + POSTs in the background.  Per-item
+        # failures arrive via the APPLY_FAILED webhook (T23+T37).
+        if self.outbound is not None:
+            batch_id = self.outbound.enqueue_migrate(actions_wire)
+            self.migrate_calls += 1
+            _m(
+                "migrate_enqueued",
+                batch_id=batch_id,
+                n_actions=len(assignments),
+            )
+            return
+        # ---- legacy sync path (no outbound queue injected) ----
+        # Unit tests that exercise the per-skip log lines without
+        # spinning up an OutboundQueue still go through here.  The
+        # production daemon wires outbound from main.py.
+        body = {"actions": actions_wire}
         client = await self.ensure_client()
         url = f"{self.sglang_base_url}/aginfer/migrate"
-        from ._metrics import m as _m
         try:
             r = await client.post(url, json=body)
         except Exception as exc:  # noqa: BLE001

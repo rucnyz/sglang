@@ -27,6 +27,7 @@ import uvicorn
 from .admission_controller import AdmissionController, attach_admission_controller
 from .event_router import attach_apply_failed_handler
 from .kv_scheduler import KvScheduler, attach_kv_scheduler
+from .outbound import OutboundQueue
 from .proxy import create_app
 
 logger = logging.getLogger("aginfer.daemon")
@@ -118,6 +119,15 @@ def main(argv=None) -> None:
     # this): kv_scheduler MUST attach BEFORE admission_controller.
     sched = None
     admission = None
+    # T36: shared outbound queue for all fire-and-forget dispatches.
+    # Lifecycle is tied to the FastAPI startup / shutdown hooks below
+    # so the worker is alive whenever the daemon is.
+    outbound = OutboundQueue(
+        sglang_base_url=args.sglang_base_url,
+        observability=router.observability,
+    )
+    app.state.outbound = outbound
+
     if enable_kv:
         sched = KvScheduler(
             tracker=tracker, sglang_base_url=args.sglang_base_url,
@@ -125,6 +135,10 @@ def main(argv=None) -> None:
             # per-skip reason counts land in the same observability
             # summary the router emits.
             observability=router.observability,
+            # T36 — fire-and-forget POST.  KvScheduler._dispatch_migrate
+            # enqueues onto this queue and returns immediately;
+            # OutboundWorker pops + POSTs in the background.
+            outbound=outbound,
         )
         attach_kv_scheduler(router, sched)
         app.state.kv_scheduler = sched
