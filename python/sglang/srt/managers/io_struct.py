@@ -1743,6 +1743,27 @@ class MigrateAginferReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateAginferThresholdsReq(BaseReq):
+    """T22 (#155): daemon → sglang PUT /aginfer/thresholds.
+
+    Carries the four hysteresis values; sglang's scheduler applies
+    them to AginferWebhookFirer atomically.  Returns whether
+    validation succeeded + reason string (DESIGN §6 round-6 H3).
+    """
+
+    theta_hi: float
+    theta_lo: float
+    theta_crit: float
+    heartbeat_s: float
+
+
+@dataclass
+class UpdateAginferThresholdsReqOutput(BaseReq):
+    ok: bool
+    reason: str
+
+
+@dataclass
 class GetAginferStateReqOutput(BaseReq):
     """Per-DP-rank snapshot.  aginfer state is the JSON-serialisable dict
     described in dev/aginfer/DESIGN.md §sglang surface.

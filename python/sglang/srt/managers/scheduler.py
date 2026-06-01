@@ -111,6 +111,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     MigrateAginferReq,
     MigrateAginferReqOutput,
+    UpdateAginferThresholdsReq,
+    UpdateAginferThresholdsReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -1458,6 +1460,7 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (GetAginferStateReq, self.get_aginfer_state),
                 (MigrateAginferReq, self.migrate_aginfer),
+                (UpdateAginferThresholdsReq, self.update_aginfer_thresholds),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -3461,6 +3464,37 @@ class Scheduler(
                 reason=reason,
                 hash_=entry.get("hash"),
             )
+
+    def update_aginfer_thresholds(
+        self, recv_req: UpdateAginferThresholdsReq,
+    ) -> UpdateAginferThresholdsReqOutput:
+        """T22 (#155): daemon → sglang PUT /aginfer/thresholds handler.
+
+        DESIGN §6 round-6 H3 / §10 'Threshold parity': daemon is the
+        canonical source, sglang applies atomically.  Validation
+        lives in ``apply_thresholds_payload``; on success the
+        scheduler's AginferWebhookFirer instance has the new values
+        by next ``maybe_fire``.
+        """
+        if self.aginfer_webhook is None:
+            return UpdateAginferThresholdsReqOutput(
+                ok=False,
+                reason=(
+                    "sglang launched without --aginfer-notify-url; "
+                    "no webhook firer to update"
+                ),
+            )
+        from sglang.srt.managers.aginfer_webhook import (
+            apply_thresholds_payload,
+        )
+        body = {
+            "theta_hi":    recv_req.theta_hi,
+            "theta_lo":    recv_req.theta_lo,
+            "theta_crit":  recv_req.theta_crit,
+            "heartbeat_s": recv_req.heartbeat_s,
+        }
+        ok, reason = apply_thresholds_payload(self.aginfer_webhook, body)
+        return UpdateAginferThresholdsReqOutput(ok=ok, reason=reason)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

@@ -72,6 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="admission resume-gate watermark (default 0.70)",
     )
     p.add_argument(
+        "--theta-crit", type=float, default=0.90,
+        help="critical-pressure threshold (default 0.90)",
+    )
+    p.add_argument(
+        "--heartbeat-s", type=float, default=5.0,
+        help="seconds between still_high heartbeats (default 5.0)",
+    )
+    p.add_argument(
         "--max-pauses-per-event", type=int, default=16,
         help="admission per-event pause/resume cap (default 16)",
     )
@@ -109,6 +117,10 @@ def main(argv=None) -> None:
 
     app = create_app(
         sglang_base_url=args.sglang_base_url,
+        theta_hi=args.theta_hi,
+        theta_lo=args.theta_lo,
+        theta_crit=args.theta_crit,
+        heartbeat_s=args.heartbeat_s,
         observability_summary_every_n=args.observability_summary_every_n,
     )
     bus = app.state.event_bus

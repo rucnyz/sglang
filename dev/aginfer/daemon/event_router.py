@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Request
@@ -55,7 +55,9 @@ class EventRouter:
         sglang_base_url: str,
         http_client: Optional[httpx.AsyncClient] = None,
         theta_hi: float = 0.7,
+        theta_lo: float = 0.55,
         theta_crit: float = 0.9,
+        heartbeat_s: float = 5.0,
         observability_capacity: int = 1024,
         observability_summary_every_n: int = 200,
     ) -> None:
@@ -69,7 +71,14 @@ class EventRouter:
         # to avoid the cold-start synth firing on a different
         # threshold than steady-state webhooks.  Audit-round-1 M1.
         self.theta_hi = float(theta_hi)
+        # T22 (#155): theta_lo + heartbeat_s also live on the router so
+        # the canonical GET /aginfer/thresholds endpoint can serve all
+        # four in one shot.  cold_start_probe only reads theta_hi /
+        # theta_crit; theta_lo + heartbeat_s are owned here for the
+        # threshold-parity contract (DESIGN §10).
+        self.theta_lo = float(theta_lo)
         self.theta_crit = float(theta_crit)
+        self.heartbeat_s = float(heartbeat_s)
         # Per-kind handler.  Defaults to noop; T7 / T8 override.
         self._handlers: dict[str, HandlerFn] = {}
         # Serialise handler execution.  paper §9: "no two handlers
@@ -388,3 +397,18 @@ def attach_event_routes(app: FastAPI, router: EventRouter) -> None:
         )
         await router.bus.emit(evt)
         return {"status": "queued"}
+
+    # ---- T22 (#155): canonical thresholds endpoint -----------------
+    # DESIGN §6 / §10 "Threshold parity": the daemon is the source of
+    # truth for theta_hi / theta_lo / theta_crit / heartbeat_s.
+    # Sglang fetches once at bootstrap (halts loudly if unreachable);
+    # daemon→sglang PUTs (out of scope here, lives in #164/#155
+    # follow-up wiring) carry runtime updates.
+    @app.get("/aginfer/thresholds")
+    async def aginfer_thresholds_get() -> Dict[str, float]:
+        return {
+            "theta_hi":    float(router.theta_hi),
+            "theta_lo":    float(router.theta_lo),
+            "theta_crit":  float(router.theta_crit),
+            "heartbeat_s": float(router.heartbeat_s),
+        }

@@ -766,6 +766,50 @@ async def aginfer_migrate(raw_request: Request):
     )
 
 
+# T22 (#155): daemon → sglang threshold broadcast.  Body is the
+# four-field hysteresis dict (DESIGN §6 round-6 H3).  Sglang's
+# AginferWebhookFirer applies atomically per rank; the daemon's
+# next state-fetch reconciles any one-update lag.
+@app.put("/aginfer/thresholds")
+async def aginfer_thresholds_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="body must be a JSON object",
+        )
+    required = ("theta_hi", "theta_lo", "theta_crit", "heartbeat_s")
+    missing = [k for k in required if k not in body]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"missing required field(s): {missing}",
+        )
+    from sglang.srt.managers.io_struct import UpdateAginferThresholdsReq
+    req = UpdateAginferThresholdsReq(
+        theta_hi=float(body["theta_hi"]),
+        theta_lo=float(body["theta_lo"]),
+        theta_crit=float(body["theta_crit"]),
+        heartbeat_s=float(body["heartbeat_s"]),
+    )
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_thresholds(req)
+    )
+    # Aggregate: success only if all ranks ok.  First rank's reason
+    # propagates on failure so the daemon's APPLY_FAILED handler can
+    # surface a specific cause.
+    all_ok = all(r.ok for r in responses)
+    if not all_ok:
+        first_fail = next(r for r in responses if not r.ok)
+        raise HTTPException(
+            status_code=400,
+            detail=f"validation: {first_fail.reason}",
+        )
+    return ORJSONResponse({"ok": True, "ranks": len(responses)})
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).

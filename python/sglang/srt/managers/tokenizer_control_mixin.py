@@ -43,6 +43,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     MigrateAginferReq,
     MigrateAginferReqOutput,
+    UpdateAginferThresholdsReq,
+    UpdateAginferThresholdsReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
@@ -122,6 +124,7 @@ _COMMUNICATOR_SPECS = [
     ("get_internal_state", GetInternalStateReqOutput),
     ("get_aginfer_state", GetAginferStateReqOutput),
     ("migrate_aginfer", MigrateAginferReqOutput),
+    ("update_aginfer_thresholds", UpdateAginferThresholdsReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
@@ -822,6 +825,21 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         responses: List[MigrateAginferReqOutput] = (
             await self.migrate_aginfer_communicator(obj)
+        )
+        return responses
+
+    async def update_aginfer_thresholds(
+        self: TokenizerManager, obj: UpdateAginferThresholdsReq,
+    ) -> List[UpdateAginferThresholdsReqOutput]:
+        """T22 (#155): daemon → sglang PUT /aginfer/thresholds.
+
+        Applied atomically per rank (each scheduler holds its own
+        AginferWebhookFirer).  Caller usually sums ``ok`` across
+        ranks; partial ok = deployment race that the daemon's next
+        broadcast will reconcile."""
+        self.auto_create_handle_loop()
+        responses: List[UpdateAginferThresholdsReqOutput] = (
+            await self.update_aginfer_thresholds_communicator(obj)
         )
         return responses
 

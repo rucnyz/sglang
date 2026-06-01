@@ -32,7 +32,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -156,10 +156,17 @@ class AginferWebhookFirer:
         if not url.endswith(self._EVENT_PATH):
             url = url + self._EVENT_PATH
         self.notify_url = url
-        self.heartbeat_s = float(heartbeat_s)
-        self.theta_hi = float(theta_hi)
-        self.theta_lo = float(theta_lo)
-        self.theta_crit = float(theta_crit)
+        # T22 (#155): store the four hysteresis values as a tuple so
+        # the runtime ``apply_thresholds`` PUT handler can swap all
+        # four atomically (single tuple rebind = GIL-atomic on
+        # CPython).  Read-access via @property below preserves the
+        # existing ``firer.theta_hi`` etc. caller interface.
+        self._theta_tuple: Tuple[float, float, float, float] = (
+            float(theta_hi),
+            float(theta_lo),
+            float(theta_crit),
+            float(heartbeat_s),
+        )
         # Detector state.
         self._last_state: WatermarkState = WatermarkState.OK
         self._last_fire_ts: float = 0.0
@@ -260,6 +267,77 @@ class AginferWebhookFirer:
                 "aginfer apply_failed webhook scheduling failed",
                 exc_info=True,
             )
+
+    def apply_thresholds(
+        self,
+        *,
+        theta_hi: float,
+        theta_lo: float,
+        theta_crit: float,
+        heartbeat_s: float,
+    ) -> None:
+        """T22 (#155): atomically replace the four hysteresis values.
+
+        Caller is responsible for validating ranges + the
+        ``theta_lo < theta_hi <= theta_crit`` ordering (use
+        ``apply_thresholds_payload`` if the values came from an HTTP
+        body).  Here we just commit the four with a single GIL-atomic
+        rebind to a tuple — a concurrent ``maybe_fire`` either sees
+        all-old or all-new, never a torn write.
+
+        Sglang's scheduler is single-threaded so the atomicity
+        argument is theoretical for the watermark path, but the PUT
+        handler runs on the FastAPI event loop (different thread);
+        the tuple swap is the cheapest correct primitive.
+        """
+        # Single rebind = atomic w.r.t. concurrent reads on CPython.
+        # Storing as a tuple keeps "all four together" by construction.
+        self._theta_tuple = (
+            float(theta_hi),
+            float(theta_lo),
+            float(theta_crit),
+            float(heartbeat_s),
+        )
+
+    # Read-through properties so callers keep ``firer.theta_hi`` etc.
+    # The tuple swap above is the actual write site.
+    @property
+    def theta_hi(self) -> float:  # type: ignore[override]
+        return self._theta_tuple[0]
+
+    @theta_hi.setter
+    def theta_hi(self, value: float) -> None:
+        # Legacy attribute-style write path (some tests use it).
+        # Preserve atomic-pair-swap by rebinding the whole tuple.
+        _, lo, crit, hb = self._theta_tuple
+        self._theta_tuple = (float(value), lo, crit, hb)
+
+    @property
+    def theta_lo(self) -> float:
+        return self._theta_tuple[1]
+
+    @theta_lo.setter
+    def theta_lo(self, value: float) -> None:
+        hi, _, crit, hb = self._theta_tuple
+        self._theta_tuple = (hi, float(value), crit, hb)
+
+    @property
+    def theta_crit(self) -> float:  # type: ignore[override]
+        return self._theta_tuple[2]
+
+    @theta_crit.setter
+    def theta_crit(self, value: float) -> None:
+        hi, lo, _, hb = self._theta_tuple
+        self._theta_tuple = (hi, lo, float(value), hb)
+
+    @property
+    def heartbeat_s(self) -> float:  # type: ignore[override]
+        return self._theta_tuple[3]
+
+    @heartbeat_s.setter
+    def heartbeat_s(self, value: float) -> None:
+        hi, lo, crit, _ = self._theta_tuple
+        self._theta_tuple = (hi, lo, crit, float(value))
 
     def close(self) -> None:
         """Stop the background loop + close the httpx client on scheduler
@@ -382,3 +460,100 @@ class AginferWebhookFirer:
             "aginfer apply_failed[%s/%s] gave up after 3 attempts",
             payload.endpoint, payload.action_id,
         )
+
+
+# --------------------------------------------------------------- T22
+
+
+def apply_thresholds_payload(
+    firer: AginferWebhookFirer,
+    body: Dict[str, object],
+) -> Tuple[bool, str]:
+    """Validate a ``PUT /aginfer/thresholds`` body and apply it.
+
+    DESIGN §6 / §10 "Threshold parity": runtime updates flow daemon
+    → sglang via this endpoint.  Caller (sglang HTTP route) wraps
+    the (ok, reason) return into 200 / 400.
+
+    Validation invariants:
+      * Required keys: ``theta_hi``, ``theta_lo``, ``theta_crit``,
+        ``heartbeat_s`` — no defaults, no partial updates (an
+        operator never wants to set "just one of four" and end up
+        with hysteresis inverted).
+      * All four numeric (``int`` or ``float``).
+      * ``theta_*`` in [0, 1]; ``heartbeat_s`` > 0.
+      * Hysteresis: ``theta_lo < theta_hi <= theta_crit``.
+
+    Mutates ``firer`` only on success (via atomic tuple swap).
+    """
+    required = ("theta_hi", "theta_lo", "theta_crit", "heartbeat_s")
+    missing = [k for k in required if k not in body]
+    if missing:
+        return False, f"missing required field(s): {missing}"
+    vals: Dict[str, float] = {}
+    for k in required:
+        v = body[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return False, f"field {k!r} must be numeric (type/numeric)"
+        vals[k] = float(v)
+    for k in ("theta_hi", "theta_lo", "theta_crit"):
+        if vals[k] < 0.0 or vals[k] > 1.0:
+            return False, (
+                f"field {k!r} out of range [0, 1]: {vals[k]} (negative)"
+                if vals[k] < 0.0
+                else f"field {k!r} out of range [0, 1]: {vals[k]}"
+            )
+    if vals["heartbeat_s"] <= 0.0:
+        return False, (
+            f"field 'heartbeat_s' must be > 0 (range): {vals['heartbeat_s']}"
+        )
+    if not (vals["theta_lo"] < vals["theta_hi"] <= vals["theta_crit"]):
+        return False, (
+            f"hysteresis violation: theta_lo ({vals['theta_lo']}) < "
+            f"theta_hi ({vals['theta_hi']}) <= theta_crit "
+            f"({vals['theta_crit']}) required"
+        )
+    firer.apply_thresholds(
+        theta_hi=vals["theta_hi"],
+        theta_lo=vals["theta_lo"],
+        theta_crit=vals["theta_crit"],
+        heartbeat_s=vals["heartbeat_s"],
+    )
+    return True, "ok"
+
+
+def fetch_bootstrap_thresholds(
+    daemon_base_url: str,
+    *,
+    timeout_s: float = 5.0,
+) -> Dict[str, float]:
+    """Sglang-side bootstrap GET.  Called at sglang launch when the
+    operator passes ``--aginfer-notify-url`` (canonical daemon
+    presence flag); the daemon is the source of truth for thresholds
+    (DESIGN §10 "Threshold parity", round-14 dropped the cache).
+
+    Returns the four-field dict on 200.  Raises a connect-error class
+    (httpx-derived) on unreachable / timeout — caller (sglang
+    launch) MUST halt loudly: running without canonical thresholds
+    is a deployment-ordering bug (daemon must be up before sglang).
+    """
+    import httpx
+
+    base = daemon_base_url.rstrip("/")
+    # Tolerate the operator passing the bare base or the event-path
+    # form (``http://daemon/aginfer/event``).  Strip a trailing
+    # ``/aginfer/event`` to recover the base.
+    suffix = "/aginfer/event"
+    if base.endswith(suffix):
+        base = base[: -len(suffix)]
+    url = f"{base}/aginfer/thresholds"
+    with httpx.Client(timeout=httpx.Timeout(timeout_s)) as client:
+        r = client.get(url)
+    r.raise_for_status()
+    body = r.json()
+    required = {"theta_hi", "theta_lo", "theta_crit", "heartbeat_s"}
+    if not isinstance(body, dict) or set(body.keys()) != required:
+        raise ValueError(
+            f"daemon /aginfer/thresholds returned unexpected shape: {body!r}"
+        )
+    return {k: float(body[k]) for k in required}
