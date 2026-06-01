@@ -142,13 +142,27 @@ def recency_freq_score(node: Any, layer: Any) -> float:
     return float(hits) / float(age)
 
 
-# T38 (#169): hit-count tie-break bonus.  Small enough that age
-# always dominates — for any pair where last_access_time differs by
-# even 1, the bonus can't flip ordering.  The MAX bonus a single
-# node accumulates is `_HIT_COUNT_BONUS * 2**30` (32-bit overflow
-# limit on hit_count), which must still be < 1.0 so adjacent
-# integers in last_access_time remain strictly ordered.
-_DEFAULT_HIT_COUNT_BONUS = 1.0 / (2 ** 31)
+# T38 (#169) + #176 audit-2: hit-count tie-break bonus.  Small
+# enough that age always dominates — for any pair where
+# last_access_time differs by even 1, the bonus can't flip
+# ordering.
+#
+# `node.hit_count` in sglang is an UNBOUNDED Python int (see
+# unified_radix_cache.py:1703 `node.hit_count += 1` with no cap).
+# A long-running deployment can plausibly accumulate hit_counts of
+# 2^32 or higher on a hot shared prefix.  Pick a bonus exponent
+# that keeps the realistic max bonus << 1.0:
+#
+#   * 2^-50 gives max bonus 2^50 * 2^-50 = 1.0 (HARD CAP at
+#     2^50 ≈ 10^15 hits — still 5e4× below float64's 2^53
+#     precision limit on last_access_time addition).
+#   * For practical hit_counts (< 2^40, ~ 10^12), max bonus is
+#     2^40 * 2^-50 = 2^-10 ≈ 0.001 — six orders of magnitude
+#     below the 1.0 minimum age gap.
+#
+# Round-1 used 2^-31 assuming a 32-bit cap that doesn't exist;
+# B4 (round-2) is the regression pin.
+_DEFAULT_HIT_COUNT_BONUS = 2.0 ** -50
 
 
 def default_policy_score(node: Any, layer: Any) -> float:

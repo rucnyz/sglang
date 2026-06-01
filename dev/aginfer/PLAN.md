@@ -328,6 +328,25 @@ generalization.
    - matches sglang's historical scorer exactly when daemon is
      absent or hints are uninitialized
 
+   **Status (#169 + #176 audit closure — 2026-06-01)**:
+   * **DONE** in `verify/t38/`: callable
+     `baselines.sglang_adapter:default_policy_score(node, layer)`
+     = `last_access_time + hit_count × 2^-50`; pluggable via
+     `SGLANG_KV_POLICY_MODULE`; 9 verify stages (A0/A1 shape, B0–
+     B4 ordering invariants incl. unbounded `hit_count`, C0/C1
+     plugin resolution).
+   * **DEFERRED — follow-on tasks**:
+     * **#177 — Wire `default_policy_score` as the in-process
+       default** in `unified_radix_cache.py:_load_eviction_scorer`
+       (currently falls back to `_default_eviction_score`).  This
+       realises DESIGN §3's "one code path" claim.  Needs an
+       ablation regression check vs stock sglang to confirm no
+       behavioral change on the no-tied-age path.
+     * **#178 — `should_write_through(node)` plugin point**.
+       DESIGN §3 names this as the OTHER half of the default-
+       policy module.  Mirrors the eviction-scorer plugin point
+       but for write-through decisions.
+
 7. **T39 — F1 proxy-gate disconnect handler** (DESIGN §10 F1):
    - `program_tracker.client_disconnected(p)` API
    - enqueue `PUT /aginfer/program_paused {END}` on disconnect

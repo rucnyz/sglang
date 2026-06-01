@@ -165,17 +165,40 @@ def stage_b2_tied_age_hit_count_breaks() -> None:
         raise StageFail("lru_score should tie at identical age")
 
 
-def stage_b3_bonus_strictly_under_min_age_gap() -> None:
-    """The max bonus a node can earn must be STRICTLY LESS THAN 1.0,
-    the minimum possible gap between two distinct
-    ``last_access_time`` integers.  This is the invariant that
-    guarantees B0 holds for ALL practical hit_counts."""
+def stage_b3_bonus_under_min_age_gap_at_int32_max() -> None:
+    """Max bonus at int32 max must be STRICTLY LESS THAN 1.0 (the
+    minimum gap between distinct integer ``last_access_time``s)."""
     max_int32 = 2 ** 31 - 1
     max_bonus = max_int32 * _DEFAULT_HIT_COUNT_BONUS
     if not (max_bonus < 1.0):
         raise StageFail(
-            f"max bonus {max_bonus} must be < 1.0 to preserve age "
-            f"ordering; tune _DEFAULT_HIT_COUNT_BONUS"
+            f"max bonus at int32 {max_bonus} must be < 1.0 to "
+            f"preserve age ordering; tune _DEFAULT_HIT_COUNT_BONUS"
+        )
+
+
+def stage_b4_age_dominates_under_unbounded_hit_count() -> None:
+    """Audit #169-round2: `node.hit_count` in sglang is an UNBOUNDED
+    Python int (no cap, no reset — see unified_radix_cache.py:1703
+    `node.hit_count += 1`).  The 32-bit assumption in the comment
+    was wrong.  Under sustained hot-prefix traffic, a single node
+    can accumulate > 2^31 hits.
+
+    Adversarial pin: older node with 2^32 hits MUST still evict
+    before a newer node with 0 hits — same invariant as B0 but
+    with a hit_count value the int32 assumption can't handle."""
+    older = _StubNode(last_access_time=10, hit_count=2 ** 32)
+    newer = _StubNode(last_access_time=11, hit_count=0)
+    if not (default_policy_score(older, _LAYER_HBM)
+            < default_policy_score(newer, _LAYER_HBM)):
+        raise StageFail(
+            f"older < newer must hold for ANY hit_count (including "
+            f"hit_count > 2^31, which sglang allows by construction); "
+            f"got older(hit=2^32, age=10)="
+            f"{default_policy_score(older, _LAYER_HBM)} vs "
+            f"newer(hit=0, age=11)={default_policy_score(newer, _LAYER_HBM)}.  "
+            f"Pick a smaller _DEFAULT_HIT_COUNT_BONUS so the max "
+            f"realistic bonus stays << 1.0."
         )
 
 
@@ -248,7 +271,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("B0 age dominates regardless of hit_count",    stage_b0_age_dominates_arbitrary_hit_count),
     ("B1 uniform hit ordering matches LRU",         stage_b1_uniform_hit_count_matches_lru_order),
     ("B2 tied age → higher hit_count keeps longer", stage_b2_tied_age_hit_count_breaks),
-    ("B3 max bonus < 1.0 invariant",                stage_b3_bonus_strictly_under_min_age_gap),
+    ("B3 max bonus at int32 < 1.0",                 stage_b3_bonus_under_min_age_gap_at_int32_max),
+    ("B4 age dominates under unbounded hit_count",  stage_b4_age_dominates_under_unbounded_hit_count),
     ("C0 module:callable spec resolvable",          stage_c0_module_spec_resolvable),
     ("C1 sglang _resolve_kv_policy_module loads it", stage_c1_sglang_resolver_loads_it),
 ]
