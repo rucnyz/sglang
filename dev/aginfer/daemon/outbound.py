@@ -101,6 +101,14 @@ class OutboundQueue:
         sglang_base_url: str,
         http_client: Optional[httpx.AsyncClient] = None,
         observability=None,  # daemon._observability.DaemonObservability
+        # T36/F3 #164 sustained-escalation thresholds.  BOTH must
+        # trip simultaneously for the worker to fatal().  Defaults
+        # picked per DESIGN §10 "sustained-escalation tier":
+        # 100 consecutive failures = ~3-5 min at 1 POST per few
+        # seconds, queue age 5 min = multi-minute stall regime.
+        # Operator-tunable via main.py CLI flags.
+        escalate_failures: int = 100,
+        escalate_oldest_age_s: float = 300.0,
     ) -> None:
         self.sglang_base_url = sglang_base_url.rstrip("/")
         self._client = http_client
@@ -108,6 +116,22 @@ class OutboundQueue:
         self.observability = observability
         self.queue: asyncio.Queue[OutboundBatch] = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task[None]] = None
+        # T36/F3 #164: counter resets on every 2xx success.  /health
+        # exposes the current value so an operator can alert before
+        # the fatal threshold.
+        self.consecutive_failures: int = 0
+        self.last_outbound_oldest_age_ms: float = 0.0
+        self._escalate_failures = int(escalate_failures)
+        self._escalate_oldest_age_s = float(escalate_oldest_age_s)
+        if self._escalate_failures < 1:
+            raise ValueError(
+                f"escalate_failures must be >= 1; got {escalate_failures}"
+            )
+        if self._escalate_oldest_age_s < 0:
+            raise ValueError(
+                f"escalate_oldest_age_s must be >= 0; "
+                f"got {escalate_oldest_age_s}"
+            )
 
     # ---- enqueue (handler-facing) -----------------------------------
 
@@ -184,23 +208,19 @@ class OutboundQueue:
             # T36 audit (#163): sample outbound queue health BEFORE
             # POSTing the batch we just popped.  qsize() = "backlog
             # still waiting"; batch.enqueue_ts → wall-clock age of
-            # the (was-) oldest pending batch.  Operator's grep on
-            # `daemon_obs_summary outbound_queue_depth_*` /
-            # `outbound_oldest_age_ms_*` drives the alert; hardcoded
-            # in-process thresholds would lock the deploy out of
-            # tuning the trigger.  Sustained-escalation → fatal
-            # is #164's job, not a hardcoded log here.
+            # the (was-) oldest pending batch.
             depth_after_pop = self.queue.qsize()
             oldest_age_ms = max(
                 0.0, (time.time() - batch.enqueue_ts) * 1000.0,
             )
+            self.last_outbound_oldest_age_ms = oldest_age_ms
             if self.observability is not None:
                 self.observability.record_outbound(
                     queue_depth=depth_after_pop,
                     oldest_age_ms=oldest_age_ms,
                 )
             try:
-                await self._post_one(batch)
+                success = await self._post_one(batch)
             except asyncio.CancelledError:
                 # Re-raise so stop() sees clean termination.
                 self.queue.task_done()
@@ -208,20 +228,61 @@ class OutboundQueue:
             except Exception:  # noqa: BLE001
                 # Any uncaught exception in _post_one is a
                 # programmer bug — log + continue so one bad batch
-                # doesn't kill the worker.
+                # doesn't kill the worker.  Treat as failure for
+                # the escalation counter.
                 logger.exception(
                     "outbound worker: unexpected exception while "
                     "POSTing batch %s",
                     batch.batch_id,
                 )
+                success = False
+                self.consecutive_failures += 1
             finally:
                 try:
                     self.queue.task_done()
                 except ValueError:
                     # Already done on the cancel path; tolerate.
                     pass
+            # T36/F3 (#164): sustained-escalation fatal.  Both BOTH
+            # conditions must trip: streak length AND queue
+            # backlog age.  Low-traffic dead-sglang fails consec but
+            # drains fast (oldest_age stays small) → no fatal,
+            # daemon survives until sglang returns.  High-traffic
+            # dead-sglang fails consec AND oldest_age grows → fatal
+            # → supervisor restart.  DESIGN §10 "sustained tier".
+            if (
+                not success
+                and self.consecutive_failures >= self._escalate_failures
+                and oldest_age_ms >= self._escalate_oldest_age_s * 1000.0
+            ):
+                from ._fatal import fatal
+                fatal(
+                    "sglang_sustained_unreachable",
+                    sglang_base_url=self.sglang_base_url,
+                    consecutive_failures=self.consecutive_failures,
+                    oldest_age_ms=oldest_age_ms,
+                    queue_depth=depth_after_pop,
+                    escalate_failures_threshold=self._escalate_failures,
+                    escalate_oldest_age_s_threshold=(
+                        self._escalate_oldest_age_s
+                    ),
+                )
 
-    async def _post_one(self, batch: OutboundBatch) -> None:
+    async def _post_one(self, batch: OutboundBatch) -> bool:
+        """Issue one POST; update the sustained-escalation counter.
+
+        Returns True iff sglang accepted (2xx).  Worker loop reads
+        the return to decide whether to check the escalation
+        threshold (success → reset counter; failure → check).
+
+        Failure classes for the streak counter:
+          * 2xx: success → reset
+          * 4xx: failure (plan-shape bug; restart may not fix but
+            crashloop reveals it — DESIGN §10 calls 4xx a
+            deployment bug too)
+          * 5xx: failure (transient sglang issue)
+          * transport exception: failure (sglang unreachable)
+        """
         from ._metrics import m as _m
         assert self._client is not None
         url = f"{self.sglang_base_url}/aginfer/{batch.endpoint}"
@@ -238,7 +299,8 @@ class OutboundQueue:
                 batch_id=batch.batch_id,
                 status="exception",
             )
-            return
+            self.consecutive_failures += 1
+            return False
         if r.status_code >= 500:
             logger.warning(
                 "outbound %s batch %s: HTTP %d (transient — next "
@@ -251,7 +313,8 @@ class OutboundQueue:
                 batch_id=batch.batch_id,
                 status=r.status_code,
             )
-            return
+            self.consecutive_failures += 1
+            return False
         if r.status_code >= 400:
             # 4xx is plausibly a plan-shape bug from the daemon.  The
             # response body is structured; surface it once.
@@ -266,7 +329,8 @@ class OutboundQueue:
                 batch_id=batch.batch_id,
                 status=r.status_code,
             )
-            return
+            self.consecutive_failures += 1
+            return False
         # 2xx — drop the body on the floor.  sglang's APPLY_FAILED
         # webhook (T23+T37) is the authoritative source for per-item
         # failures.  We still emit a single line so the operator
@@ -277,3 +341,10 @@ class OutboundQueue:
             batch_id=batch.batch_id,
             status=r.status_code,
         )
+        if self.consecutive_failures > 0:
+            logger.info(
+                "outbound recovered after %d consecutive failures",
+                self.consecutive_failures,
+            )
+        self.consecutive_failures = 0
+        return True

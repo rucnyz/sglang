@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Header, Request
@@ -225,7 +225,23 @@ def create_app(
 
     @app.get("/health")
     async def health() -> Any:
-        return {"status": "ok"}
+        # T36/F3 (#164): include the outbound sustained-escalation
+        # counters in the health body so the operator's alerting can
+        # grep for elevated values BEFORE the fatal threshold fires.
+        # HTTP status stays 200 (daemon process is responsive); the
+        # actual "we should restart" signal is the fatal() exit, not
+        # health failure.  k8s readiness can compare these fields
+        # against operator-tuned thresholds independently.
+        outbound = getattr(app.state, "outbound", None)
+        body: Dict[str, Any] = {"status": "ok"}
+        if outbound is not None:
+            body["outbound_consecutive_failures"] = (
+                outbound.consecutive_failures
+            )
+            body["outbound_oldest_age_ms"] = (
+                outbound.last_outbound_oldest_age_ms
+            )
+        return body
 
     @app.post("/v1/chat/completions")
     async def chat_completions(

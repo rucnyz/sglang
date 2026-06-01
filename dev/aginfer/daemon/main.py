@@ -93,6 +93,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--sustained-escalate-fails", type=int, default=100,
+        help=(
+            "T36/F3 #164: outbound consecutive POST failures threshold "
+            "for sustained-escalation fatal.  Default 100.  Daemon "
+            "self-kills (sys.exit 1) when this AND --sustained-escalate-"
+            "age-s are both crossed simultaneously (DESIGN §10 sustained "
+            "tier).  Supervisor (systemd/k8s) restarts; if sglang is "
+            "still down, the daemon CrashLoopBackOffs visibly to ops."
+        ),
+    )
+    p.add_argument(
+        "--sustained-escalate-age-s", type=float, default=300.0,
+        help=(
+            "T36/F3 #164: outbound oldest-pending-batch age (seconds) "
+            "threshold for sustained-escalation fatal.  Default 300 (5 "
+            "minutes).  Both this AND --sustained-escalate-fails must "
+            "trip for fatal — low-traffic dead-sglang doesn't escalate."
+        ),
+    )
+    p.add_argument(
         "--log-level", default="info",
         help="uvicorn / daemon log level",
     )
@@ -134,10 +154,14 @@ def main(argv=None) -> None:
     # T36 (DESIGN §6 B4): shared outbound queue for all fire-and-forget
     # dispatches.  Mandatory — KvScheduler._dispatch_migrate raises if
     # outbound is None.  Lifecycle tied to FastAPI startup / shutdown
-    # via app.state.outbound (see proxy.py).
+    # via app.state.outbound (see proxy.py).  T36/F3 (#164): sustained-
+    # escalation thresholds plumbed from CLI for ops-tunable crash-
+    # only-software backstop.
     outbound = OutboundQueue(
         sglang_base_url=args.sglang_base_url,
         observability=router.observability,
+        escalate_failures=args.sustained_escalate_fails,
+        escalate_oldest_age_s=args.sustained_escalate_age_s,
     )
     app.state.outbound = outbound
 
