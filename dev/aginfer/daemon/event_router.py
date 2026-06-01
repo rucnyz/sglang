@@ -338,6 +338,37 @@ def attach_apply_failed_handler(router: "EventRouter") -> None:
     router.set_handler(EventKind.APPLY_FAILED, _apply_failed_handler)
 
 
+async def _hash_collision_handler(event: Event, router: "EventRouter") -> None:
+    """T24 (#182, DESIGN §4 + §10): sglang fired HASH_COLLISION.
+    Deployment-bug class — fatal() with forensic dump and exit.
+
+    Probability < 10⁻²² at any practical tree size, so if this
+    handler ever runs it's either (a) a sglang hash-function
+    regression, (b) a daemon re-keying bug, or (c) genuinely the
+    1-in-10²² event (in which case the forensic dump captures
+    enough context to recover).
+    """
+    from ._fatal import fatal
+    payload = event.payload or {}
+    fatal(
+        "hash_collision",
+        key=payload.get("key"),
+        node_a_summary=payload.get("node_a_summary"),
+        node_b_summary=payload.get("node_b_summary"),
+        ts=payload.get("ts"),
+        ts_monotonic=payload.get("ts_monotonic"),
+    )
+
+
+def attach_hash_collision_handler(router: "EventRouter") -> None:
+    """Register the T24 HASH_COLLISION fatal handler on ``router``.
+
+    Mirrors attach_apply_failed_handler — wired at daemon startup
+    so any sglang-emitted collision triggers an immediate crash-only
+    restart cycle."""
+    router.set_handler(EventKind.HASH_COLLISION, _hash_collision_handler)
+
+
 async def _noop_handler(event: Event, router: "EventRouter") -> None:
     """Default handler used when T7 / T8 haven't registered one yet.
 

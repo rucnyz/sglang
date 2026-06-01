@@ -273,10 +273,23 @@ Order roughly by dependency.
      hash computation (`compute_node_hash_values`) is already done
      lazily upstream when KV-event emission or migrate-action
      processing requires it
-   - **Status (#170 audit — 2026-06-01)**: PARTIAL.  Detection +
-     pair-dedupe landed in `unified_radix_cache.py:2376-2412`.
-     Webhook firing NOT wired (code logs "T24 webhook pending"
-     instead of calling `fire_hash_collision`).  Tracked as **#182**.
+   - **Status (#182 closure — 2026-06-01)**: DONE.  Webhook firing
+     wired end-to-end:
+     * sglang side: `unified_radix_cache._aginfer_node_summary` +
+       `apply_aginfer_migrations` returns `hash_collisions[]`;
+       `aginfer_webhook.AginferWebhookFirer.fire_hash_collision` +
+       `_send_hash_collision` (3-attempt POST, non-blocking);
+       `scheduler._fire_hash_collisions` invoked inside
+       `migrate_aginfer`.
+     * daemon side: `EventKind.HASH_COLLISION`,
+       `_hash_collision_handler` calls
+       `fatal('hash_collision', ...)`, `attach_hash_collision_handler`
+       wired in `main.py`.
+     * verify/t24/: 8 stages incl. D0 subprocess end-to-end
+       (daemon exits 1, forensic JSON has all 5 ctx keys).
+     * Dedupe via `_aginfer_collision_seen` set means a persistent
+       collision triggers exactly one daemon fatal per (node_a,
+       node_b) pair — supervisor decides restart policy.
 
 9. **T25 — All action endpoints idempotent** (DESIGN §10 R2):
    - re-applying the same action returns 200 with `applied=0`

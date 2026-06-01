@@ -3444,6 +3444,11 @@ class Scheduler(
         result = apply(recv_req.actions or [])
         skipped_list = list(result.get("skipped", []))
         self._fire_apply_failed_for_skipped(skipped_list)
+        # T24 (#182): fire one HASH_COLLISION webhook per pair the
+        # cache's DFS surfaced.  Detection is dedupe-guarded inside
+        # the cache (_aginfer_collision_seen set), so a persistent
+        # collision fires the daemon's fatal exactly once.
+        self._fire_hash_collisions(result.get("hash_collisions") or [])
         return MigrateAginferReqOutput(
             applied=int(result.get("applied", 0)),
             applied_hashes=list(result.get("applied_hashes", [])),
@@ -3463,6 +3468,24 @@ class Scheduler(
                 action_id=str(entry.get("action_id") or ""),
                 reason=reason,
                 hash_=entry.get("hash"),
+            )
+
+    def _fire_hash_collisions(self, collisions) -> None:
+        """T24 (#182): one HASH_COLLISION webhook per (node_a,
+        node_b) pair the cache's DFS surfaced.  Cache's
+        ``_aginfer_collision_seen`` set dedupes pair-by-pair, so
+        a persistent collision triggers exactly one daemon fatal.
+        """
+        if self.aginfer_webhook is None:
+            return
+        for entry in collisions:
+            key = entry.get("key")
+            if not isinstance(key, str) or not key:
+                continue
+            self.aginfer_webhook.fire_hash_collision(
+                key=key,
+                node_a_summary=entry.get("node_a_summary") or {},
+                node_b_summary=entry.get("node_b_summary") or {},
             )
 
     def update_aginfer_thresholds(

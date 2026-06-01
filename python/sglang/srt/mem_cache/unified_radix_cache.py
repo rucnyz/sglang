@@ -2378,7 +2378,15 @@ class UnifiedRadixCache(BasePrefixCache):
         # HASH_COLLISION webhook.  Probability is < 10⁻²² at any tree
         # size aginfer encounters, but the check is amortised free
         # (one extra dict-membership test per node).
+        #
+        # #182 closure (2026-06-01): the caller (scheduler.migrate_
+        # aginfer) reads ``result["hash_collisions"]`` and fires the
+        # HASH_COLLISION webhook per pair via aginfer_webhook.fire_
+        # hash_collision().  Detection here is dedupe-guarded by the
+        # instance-level ``_aginfer_collision_seen`` set so a
+        # persistent collision doesn't spam ~36k webhook fires/hour.
         hash_to_node: dict[str, UnifiedTreeNode] = {}
+        hash_collisions: list[dict] = []
         stack = [self.root_node]
         root = self.root_node
         while stack:
@@ -2392,11 +2400,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 # actually share a key, which is O(1) per node).
                 existing = hash_to_node.get(key)
                 if existing is not None and existing is not node:
-                    # T24 follow-up wires the HASH_COLLISION webhook +
-                    # daemon fatal().  For now log once per (id_a, id_b)
-                    # pair so a persistent collision doesn't spam ~36k
-                    # lines/hour at 10 events/s.  Cache lives at
-                    # __init__: `self._aginfer_collision_seen`.
                     pair = (
                         (existing.id, node.id) if existing.id < node.id
                         else (node.id, existing.id)
@@ -2405,9 +2408,14 @@ class UnifiedRadixCache(BasePrefixCache):
                         self._aginfer_collision_seen.add(pair)
                         logger.warning(
                             "[aginfer] HASH_COLLISION key=%s nodes "
-                            "%d vs %d (T24 webhook pending)",
+                            "%d vs %d (firing webhook)",
                             key, existing.id, node.id,
                         )
+                        hash_collisions.append({
+                            "key": key,
+                            "node_a_summary": self._aginfer_node_summary(existing),
+                            "node_b_summary": self._aginfer_node_summary(node),
+                        })
                 hash_to_node[key] = node
             stack.extend(node.children.values())
 
@@ -2652,7 +2660,49 @@ class UnifiedRadixCache(BasePrefixCache):
             acted_node_ids.add(node.id)
 
         return {"applied": applied, "applied_hashes": applied_hashes,
-                "skipped": skipped}
+                "skipped": skipped,
+                "hash_collisions": hash_collisions}
+
+    def _aginfer_node_summary(self, node) -> dict:
+        """T24 (#182): compact summary of a radix-tree node for the
+        HASH_COLLISION webhook payload.  Daemon-side fatal()
+        consumes this to identify which two nodes collided.
+
+        Keep cheap — this runs inside the apply_aginfer_migrations
+        DFS.  Hash collisions are < 10⁻²² probable, so we never
+        amortise; pay a bit of Python here only when one actually
+        happens.
+        """
+        # Residence: which tiers currently hold this node's KV.
+        residence: list[str] = []
+        cd = node.component_data[0] if node.component_data else None
+        if cd is not None:
+            if getattr(cd, "value", None) is not None:
+                residence.append("HBM")
+            if getattr(cd, "host_value", None) is not None:
+                residence.append("DRAM")
+        # n_tokens on whichever layer holds it.
+        n_tokens = 0
+        if cd is not None:
+            if cd.value is not None:
+                n_tokens = max(n_tokens, len(cd.value))
+            if getattr(cd, "host_value", None) is not None:
+                n_tokens = max(n_tokens, len(cd.host_value))
+        # Hex hash-value (post-compute_node_hash_values) iff present.
+        hv = node.hash_value[-1] if getattr(node, "hash_value", None) else None
+        sids = []
+        try:
+            sids = list(node.session_ids)
+        except (AttributeError, TypeError):
+            pass
+        return {
+            "node_id": int(node.id),
+            "hash_value": str(hv) if hv is not None else None,
+            "residence": residence,
+            "n_tokens": int(n_tokens),
+            "session_ids": [str(s) for s in sids][:8],
+            "hit_count": int(getattr(node, "hit_count", 0) or 0),
+        }
 
     # ---- aginfer daemon snapshot (paper §3 state s_t) ----
     def _aginfer_bytes_per_token(self) -> int:

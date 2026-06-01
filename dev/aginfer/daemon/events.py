@@ -43,6 +43,12 @@ class EventKind(str, enum.Enum):
     # the next event's joint_decide re-evaluates.  Idempotent
     # invariants (§10) make any re-issue safe.
     APPLY_FAILED = "apply_failed"
+    # T24 (#182, DESIGN §4 + §10 round-15/16/17): sglang fires this
+    # when its apply_aginfer_migrations DFS detects two distinct
+    # radix nodes mapping to the same hash key.  Probability <10⁻²²
+    # at any tree size; if it ever fires it's a deployment-bug
+    # class signal.  Handler calls fatal('hash_collision', ...).
+    HASH_COLLISION = "hash_collision"
 
 
 @dataclass(frozen=True, slots=True)

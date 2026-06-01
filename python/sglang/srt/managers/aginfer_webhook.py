@@ -61,6 +61,28 @@ class ApplyFailedPayload:
 
 
 @dataclass(slots=True)
+class HashCollisionPayload:
+    """T24 (#182, DESIGN §4 + §10 round-15/16/17): fire when
+    apply_aginfer_migrations' DFS detects two distinct radix nodes
+    mapping to the same hash key.
+
+    Probability is < 10⁻²² at any tree size aginfer encounters; if
+    it ever fires it's a deployment-bug class signal (sglang side:
+    hash-function regression; daemon side: re-keying bug).  Daemon
+    handler calls fatal() on receipt.
+
+    Both node summaries carry the structural info needed to
+    identify which two nodes collided (residence, n_tokens,
+    session_ids, hex hash_value).
+    """
+    key: str
+    node_a_summary: dict
+    node_b_summary: dict
+    ts: float
+    ts_monotonic: float
+
+
+@dataclass(slots=True)
 class WebhookPayload:
     kind: str  # "memory_pressure" | "pressure_resolved" | "still_high"
     state: str
@@ -269,6 +291,42 @@ class AginferWebhookFirer:
                 exc_info=True,
             )
 
+    def fire_hash_collision(
+        self,
+        *,
+        key: str,
+        node_a_summary: dict,
+        node_b_summary: dict,
+    ) -> None:
+        """T24 (#182, DESIGN §4 + §10 round-15/16/17): schedule a
+        fire-and-forget HASH_COLLISION webhook.
+
+        Called from `scheduler.migrate_aginfer` once per pair the
+        cache's DFS detected (deduped via the cache's
+        `_aginfer_collision_seen` set so a persistent collision
+        doesn't spam fires).  Daemon's handler calls fatal() on
+        receipt — deployment-bug class.
+
+        Never raises; never blocks the scheduler step.
+        """
+        payload = HashCollisionPayload(
+            key=key,
+            node_a_summary=node_a_summary,
+            node_b_summary=node_b_summary,
+            ts=time.time(),
+            ts_monotonic=time.monotonic(),
+        )
+        try:
+            assert self._loop is not None
+            asyncio.run_coroutine_threadsafe(
+                self._send_hash_collision(payload), self._loop,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "aginfer hash_collision webhook scheduling failed",
+                exc_info=True,
+            )
+
     def apply_thresholds(
         self,
         *,
@@ -460,6 +518,44 @@ class AginferWebhookFirer:
         logger.warning(
             "aginfer apply_failed[%s/%s] gave up after 3 attempts",
             payload.endpoint, payload.action_id,
+        )
+
+    async def _send_hash_collision(self, payload: HashCollisionPayload) -> None:
+        # Lazy-init httpx client on the background loop.
+        if self._client is None:
+            import httpx  # noqa: WPS433
+
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+        body = {
+            "kind": "hash_collision",
+            "key": payload.key,
+            "node_a_summary": payload.node_a_summary,
+            "node_b_summary": payload.node_b_summary,
+            "ts": payload.ts,
+            "ts_monotonic": payload.ts_monotonic,
+        }
+        backoff = 0.1
+        for attempt in range(3):
+            try:
+                resp = await self._client.post(self.notify_url, json=body)
+                if resp.status_code < 500:
+                    return
+                logger.info(
+                    "aginfer hash_collision[%s] -> %d (attempt %d/3); "
+                    "retrying",
+                    payload.key, resp.status_code, attempt + 1,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.info(
+                    "aginfer hash_collision[%s] raised (attempt %d/3): %s",
+                    payload.key, attempt + 1, exc,
+                )
+            if attempt < 2:
+                await asyncio.sleep(backoff)
+                backoff *= 4
+        logger.warning(
+            "aginfer hash_collision[%s] gave up after 3 attempts",
+            payload.key,
         )
 
 

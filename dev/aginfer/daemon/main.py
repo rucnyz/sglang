@@ -25,7 +25,10 @@ import sys
 import uvicorn
 
 from .admission_controller import AdmissionController, attach_admission_controller
-from .event_router import attach_apply_failed_handler
+from .event_router import (
+    attach_apply_failed_handler,
+    attach_hash_collision_handler,
+)
 from .kv_scheduler import KvScheduler, attach_kv_scheduler
 from .outbound import OutboundQueue
 from .proxy import create_app
@@ -202,6 +205,15 @@ def main(argv=None) -> None:
     # to track it).  Attach AFTER admission so we don't double-wrap
     # the composite for MEMORY_PRESSURE/PRESSURE_RESOLVED.
     attach_apply_failed_handler(router)
+
+    # T24 (#182) — HASH_COLLISION handler.  Also unconditional;
+    # detection lives in sglang's apply_aginfer_migrations DFS and
+    # fires regardless of which daemon layers are attached.
+    # Handler calls fatal('hash_collision') so the supervisor
+    # restarts the daemon (sglang's _aginfer_collision_seen
+    # dedupes pair-by-pair, so a persistent collision fires exactly
+    # one daemon fatal per (node_a, node_b) pair).
+    attach_hash_collision_handler(router)
 
     # T9 startup-invariant markers — single grep-friendly line.
     logger.info(
