@@ -48,10 +48,20 @@ B. p_hat ENDED-exclusion (the scoring anchor — RED before #187)
      co-holder dominates; the unit survives p)
   B2 never-seen holder → workload-prior (regression — the carve-out
      doesn't disturb the unknown-holder path)
-C. composed handler (stub demote-all policy)
+  B3 the carve-out is EVENT-AGNOSTIC: on a MEMORY_PRESSURE event a
+     leftover ENDED-held unit also scores the workload-prior p_hat
+     and becomes a top-k demote candidate (audit G2 — the change
+     fires on every event, the intended latent-bug fix, not just
+     SESSION_END)
+C. composed handler (stub demote-all / raising policy)
   C0 end → migrate(session_scoped) → PUT, migrate ENQUEUED BEFORE
      the PUT, migrate targets p's exclusive units only
   C1 kv_scheduler=None → pure F5 (ENDED + PUT, no migrate)
+  C2 if the migrate step (kv_scheduler.handle) RAISES, the F5 PUT
+     {ENDED} is STILL enqueued + the program STILL ENDED (audit B1 —
+     handle() only guards its own fetch/build, so the handler wraps
+     the migrate step; F5 state-transition + PUT is the contract,
+     migrate is best-effort on top)
 D. real composed router (main.py attach order)
   D0 attach_kv_scheduler THEN attach_session_end_handler(…, sched):
      a real SESSION_END ends the program AND runs the migrate
@@ -65,9 +75,12 @@ E. real policy (scoring drives the decision)
      plan.  (The absolute keep-vs-demote threshold is a value-rule
      property tested in kv_scheduler_value_rule; here we pin the
      COMPARATIVE effect, which is what SESSION_END relies on.)
-F. shared survives end-to-end
+F. shared survives via D_t exclusion
   F0 p+q hold a unit; SESSION_END(p) via the real policy → that unit
-     is NOT in the migrate plan (excluded from D_t)
+     is NOT in the migrate plan because holders ⊋ {p} excludes it
+     from D_t (the survival mechanism is exclusion, not a scorer
+     keep-decision — so #187 cannot over-evict a surviving program's
+     KV: every unit in p's D_t belongs exclusively to the ending p)
 ```
 
 ## REPRODUCING
@@ -82,23 +95,44 @@ Pure-Python (asyncio); ~0.5 s.  No GPU, no sglang launch.
 
 ## RESULTS
 
-**PASSED** — all 10 stages.
+**PASSED** — all 12 stages (10 initial + 2 from the audit: B3, C2).
 
 * date: 2026-06-02
-* raw log: `results/20260602_t187_initial_pass.log`
+* raw logs: `results/20260602_t187_initial_pass.log` (10),
+  `results/20260602_t187_post_audit_pass.log` (12)
 
 ## REGRESSION SANITY
 
 * kv_scheduler_value_rule: PASS (19) — incl. the existing
   `stage_c2_p_hat_alive_vs_ended`, which stays green because it uses
   NEVER-SEEN holders (tracker.state → None), a path the ENDED carve-
-  out does not touch
+  out does not touch.  NB that test is misnamed ("…_vs_ended") — it
+  never calls `tracker.end()`, so real `State.ENDED` p_hat is
+  covered ONLY by t187 B0/B1 (audit N4).
 * T41 SESSION_END (F5): PASS (17) — the handler composition is
   additive; pure-F5 path (kv_scheduler=None) preserved
 * T40 hint emitter: PASS — SESSION_END now also pushes hints for the
   (low-p_hat) session_scoped units via the same handle() pipeline
 * T6 program_tracker: PASS
-* integration_stress: full-stack sglang + daemon, GPUs 5,6
+* integration_stress: full-stack sglang + daemon (6 flavors), run as
+  a broad sanity.  **It does NOT exercise SESSION_END** (grep:
+  0 hits) — so it is NOT a regression guard for this path.
+
+## COVERAGE HONESTY (audit G3)
+
+There is **no end-to-end (real sglang) test of the SESSION_END
+migrate** landing a demote/drop.  What IS covered:
+
+* the migrate **wire** (`POST /aginfer/migrate` → sglang applies the
+  residence-set transition) is e2e-proven by T20 / T33 / the
+  e2e_smoke migrate loop — #187 does not change that path;
+* the SESSION_END **decision** (p_hat carve-out + D_t selection +
+  handler composition) is daemon-pure logic, fully covered here
+  incl. the real composed router (D0).
+
+The untested seam is the live webhook → daemon handler → migrate
+POST → sglang-demote chain end-to-end.  A SESSION_END flavor for
+integration_stress is the natural home; tracked as a follow-on.
 
 ## RELATIONSHIP TO #185
 

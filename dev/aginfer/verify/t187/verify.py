@@ -186,6 +186,14 @@ class _DemoteAllPolicy:
         return Action(assignments=plan)
 
 
+class _RaisingPolicy:
+    """decide() raises — models a downstream policy/dispatch error.
+    Used to prove the SESSION_END handler still enqueues the F5 PUT
+    even when the migrate step blows up (audit B1)."""
+    def decide(self, state) -> Action:
+        raise RuntimeError("simulated policy.decide failure")
+
+
 def _sched(tracker, ob, policy):
     return KvScheduler(tracker=tracker, sglang_base_url="http://unused",
                        policy=policy, outbound=ob)
@@ -291,6 +299,38 @@ def stage_b2_never_seen_still_prior() -> None:
         raise StageFail(f"never-seen holder should be workload-prior; got {p}")
 
 
+def stage_b3_carve_out_is_event_agnostic() -> None:
+    """audit G2 (blast radius): the ENDED p_hat carve-out fires on
+    EVERY event, not just SESSION_END.  On a MEMORY_PRESSURE event
+    triggered by an unrelated live program, a leftover unit held only
+    by an ENDED program scores the workload-prior p_hat (so it's a
+    demote candidate) — this is the intended latent-bug fix (pre-#187
+    it was pinned at 1.0 forever).  Guards against a future refactor
+    re-pinning ENDED only outside the SESSION_END path."""
+    tracker = ProgramTracker()
+    tracker.observe_arrival("p_end")
+    tracker.end("p_end")
+    sj = _state_json(units=[
+        _unit(uhash="u-ended", residence=["HBM"], holders=["p_end"],
+              hit_count=1, last_access_time=1),
+    ])
+    # NON-SESSION_END event (no session) — the carve-out must still
+    # apply during pressure-driven scoring.
+    s = _build(sj, Event(EventKind.MEMORY_PRESSURE, session=None), tracker)
+    p = s.units["u-ended"].p_hat
+    if not (0.0 < p < 0.1):
+        raise StageFail(
+            f"ENDED carve-out must apply on MEMORY_PRESSURE too (event-"
+            f"agnostic); got p_hat={p}"
+        )
+    # and the unit is a top-k regret candidate (in D_t for pressure)
+    if "u-ended" not in s.decision_set:
+        raise StageFail(
+            f"the leftover ENDED unit should be a pressure demote "
+            f"candidate; D_t={s.decision_set}"
+        )
+
+
 # ============================================================ C. composed handler
 
 
@@ -349,6 +389,36 @@ def stage_c1_no_scheduler_pure_f5() -> None:
     eps = [b.endpoint for b in batches]
     if eps != ["program_paused"]:
         raise StageFail(f"kv_scheduler=None → only the PUT; got {eps}")
+
+
+def stage_c2_migrate_error_still_puts_ended() -> None:
+    """audit B1: if the migrate step (kv_scheduler.handle) raises, the
+    F5 PUT {ENDED} MUST still be enqueued — sglang has to learn the
+    program ended even when the data-plane migrate decision blew up.
+    The state transition (already done) and the PUT are the F5
+    contract; the migrate is best-effort on top."""
+    async def _go():
+        tracker = ProgramTracker()
+        tracker.observe_arrival("p")
+        ob = _new_outbound()
+        sched = _sched(tracker, ob, _RaisingPolicy())  # decide() raises
+        sj = _state_json(units=[
+            _unit(uhash="excl-p", residence=["HBM"], holders=["p"]),
+        ])
+        handler = make_session_end_handler(tracker, ob, sched)
+        # The handler must NOT propagate the migrate error.
+        await handler(Event(EventKind.SESSION_END, session="p"),
+                      _FakeRouter(sj))
+        return tracker, _drain(ob)
+    tracker, batches = asyncio.run(_go())
+    if tracker.state("p") is not State.ENDED:
+        raise StageFail("program must still be ENDED despite migrate error")
+    eps = [b.endpoint for b in batches]
+    if "program_paused" not in eps:
+        raise StageFail(
+            f"F5 PUT {{ENDED}} must still be enqueued when the migrate "
+            f"step raises; got {eps}"
+        )
 
 
 # ============================================================ D. composed router
@@ -444,8 +514,13 @@ def stage_e0_real_policy_keep_value_lower_for_ended() -> None:
 
 
 def stage_f0_shared_unit_survives() -> None:
-    """End-to-end with the real policy: a unit shared by p and a live
-    q is NOT in SESSION_END(p)'s migrate plan (excluded from D_t)."""
+    """The survival mechanism for live/shared units under SESSION_END
+    is D_t EXCLUSION, not a scorer keep-decision: a unit shared by p
+    and a live q has holders ⊋ {p}, so it is never in SESSION_END(p)'s
+    D_t and the policy never even scores it for demotion.  (This is
+    why #187 cannot over-evict a surviving program's KV — every unit
+    in p's D_t belongs exclusively to the ending p.)  Driven through
+    the real policy + real handler end-to-end."""
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p")
@@ -484,11 +559,13 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("B0 ENDED-only holder → workload-prior p_hat (< 1.0)", stage_b0_ended_holder_low_p_hat),
     ("B1 ENDED + live holder → p_hat 1.0 (survives)", stage_b1_ended_plus_live_survives),
     ("B2 never-seen holder → workload-prior (regression)", stage_b2_never_seen_still_prior),
+    ("B3 ENDED carve-out is event-agnostic (MEMORY_PRESSURE)", stage_b3_carve_out_is_event_agnostic),
     ("C0 handler: end → migrate(session_scoped) → PUT", stage_c0_handler_ends_migrates_puts),
     ("C1 handler kv_scheduler=None → pure F5", stage_c1_no_scheduler_pure_f5),
+    ("C2 migrate error still enqueues F5 PUT {ENDED}", stage_c2_migrate_error_still_puts_ended),
     ("D0 composed router runs migrate AND F5", stage_d0_composed_router_runs_migrate_and_f5),
     ("E0 real policy: ENDED lowers keep-value + demotes", stage_e0_real_policy_keep_value_lower_for_ended),
-    ("F0 shared unit survives SESSION_END(p)", stage_f0_shared_unit_survives),
+    ("F0 shared unit survives via D_t exclusion", stage_f0_shared_unit_survives),
 ]
 
 

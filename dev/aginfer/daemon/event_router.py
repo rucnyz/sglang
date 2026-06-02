@@ -391,13 +391,18 @@ def make_session_end_handler(tracker, outbound, kv_scheduler=None):
          untouched (DESIGN §7 table + "SESSION_END normal path").
          Ordering is load-bearing: end() MUST precede handle() or the
          scorer would see p still alive (p_hat=1.0) and keep the
-         units.  handle() is fire-and-forget + swallows its own
-         downstream errors, so it cannot break step 3.
+         units.  The migrate is BEST-EFFORT: this step is wrapped in
+         a try/except so a downstream error can NOT skip step 3.
+         (``handle`` only guards its own ``fetch_state`` /
+         ``build_paper_state``; ``decide`` / ``_dispatch_*`` propagate
+         — #187 audit B1.)
       3. **PUT (F5)** — enqueue ``PUT /aginfer/program_paused
          {state: ENDED}`` so sglang clears p's per_program_usage
          state on the next dump (idempotent; ENDED-no-units entries
          GC'd at dump time per #186).  Enqueued AFTER the migrate
          batch, matching DESIGN's on_session_end (migrate then PUT).
+         Runs even if step 2 raised — the F5 state-transition + PUT
+         is the contract; the migrate is an optimisation on top.
 
     Closure holds ``tracker`` / ``outbound`` / ``kv_scheduler`` (the
     same pattern kv_scheduler/admission use) since the handler
@@ -416,8 +421,17 @@ def make_session_end_handler(tracker, outbound, kv_scheduler=None):
         # 2. T187 migrate D_t = session_scoped_units(p).  Reuses the
         #    full kv_scheduler.handle pipeline (fetch state → build →
         #    decide → dispatch migrate + hints), now that p is ENDED.
+        #    BEST-EFFORT: guarded so a downstream policy/dispatch error
+        #    (handle() only catches its own fetch/build) can't skip the
+        #    F5 PUT below (#187 audit B1).
         if kv_scheduler is not None:
-            await kv_scheduler.handle(event, router)
+            try:
+                await kv_scheduler.handle(event, router)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "SESSION_END migrate (kv_scheduler.handle) failed for "
+                    "pid=%s; continuing to the F5 ENDED PUT", pid,
+                )
         # 3. F5 PUT — after the migrate batch (DESIGN: migrate, then
         #    PUT), regardless of prior state.
         outbound.enqueue_program_paused(
