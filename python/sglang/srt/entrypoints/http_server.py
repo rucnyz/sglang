@@ -967,6 +967,91 @@ async def aginfer_program_paused_put(raw_request: Request):
     })
 
 
+def _validate_hints_body(body):
+    """T40 (#184): validate a PUT /aginfer/hints body.  Returns the
+    normalized list of hint dicts (``[{hash, p_hat, lambda, stamp}]``)
+    or raises ``ValueError`` with a 400-able message.
+
+    Pure function (no FastAPI deps) so verify/t40 can unit-test the
+    type checks + round-trip the daemon's exact wire body.  Rejects
+    out-of-range V_u inputs here so a malformed daemon push fails at
+    the door rather than silently poisoning the inline scorer's
+    eviction order: ``p_hat`` ∈ [0, 1], ``lambda`` ≥ 0, ``stamp`` a
+    non-negative int.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("body must be a JSON object")
+    hints = body.get("hints")
+    if not isinstance(hints, list):
+        raise ValueError("'hints' must be a list")
+    out = []
+    for i, h in enumerate(hints):
+        if not isinstance(h, dict):
+            raise ValueError(f"hints[{i}] must be an object")
+        uhash = h.get("hash")
+        if not isinstance(uhash, str) or not uhash:
+            raise ValueError(f"hints[{i}].hash must be a non-empty string")
+        # bool is an int subclass — reject it explicitly for numerics.
+        p_hat = h.get("p_hat")
+        if isinstance(p_hat, bool) or not isinstance(p_hat, (int, float)):
+            raise ValueError(f"hints[{i}].p_hat must be a number")
+        if not (0.0 <= float(p_hat) <= 1.0):
+            raise ValueError(f"hints[{i}].p_hat must be in [0, 1]; got {p_hat}")
+        lam = h.get("lambda")
+        if isinstance(lam, bool) or not isinstance(lam, (int, float)):
+            raise ValueError(f"hints[{i}].lambda must be a number")
+        if float(lam) < 0.0:
+            raise ValueError(f"hints[{i}].lambda must be >= 0; got {lam}")
+        stamp = h.get("stamp")
+        if isinstance(stamp, bool) or not isinstance(stamp, int):
+            raise ValueError(f"hints[{i}].stamp must be an int")
+        if stamp < 0:
+            raise ValueError(f"hints[{i}].stamp must be >= 0; got {stamp}")
+        out.append({
+            "hash": uhash,
+            "p_hat": float(p_hat),
+            "lambda": float(lam),
+            "stamp": int(stamp),
+        })
+    return out
+
+
+# T40 (#184, DESIGN §6 PUT /aginfer/hints): daemon → sglang push of
+# V_u inputs (p_hat / lambda) for the inline scorer.  Body is
+# {hints: [{hash, p_hat, lambda, stamp}]}.  Each rank's tree cache
+# applies overwrite-by-stamp (set_aginfer_hints); the daemon keeps no
+# shadow cache and re-pushes D_t every event (DESIGN §10).
+@app.put("/aginfer/hints")
+async def aginfer_hints_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    from sglang.srt.managers.io_struct import UpdateAginferHintsReq
+    try:
+        hints = _validate_hints_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    req = UpdateAginferHintsReq(hints=hints)
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_hints(req)
+    )
+    all_ok = all(r.ok for r in responses)
+    if not all_ok:
+        first_fail = next(r for r in responses if not r.ok)
+        raise HTTPException(
+            status_code=400,
+            detail=f"validation: {first_fail.reason}",
+        )
+    # Sum applied across ranks; ranks share the daemon's hash space so
+    # they advance in unison.  Caller treats 0 as idempotent no-op.
+    return ORJSONResponse({
+        "ok": True,
+        "ranks": len(responses),
+        "applied": sum(int(r.applied) for r in responses),
+    })
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).

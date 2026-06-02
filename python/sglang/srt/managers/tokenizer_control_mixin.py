@@ -45,6 +45,8 @@ from sglang.srt.managers.io_struct import (
     MigrateAginferReqOutput,
     UpdateAginferProgramPausedReq,
     UpdateAginferProgramPausedReqOutput,
+    UpdateAginferHintsReq,
+    UpdateAginferHintsReqOutput,
     UpdateAginferThresholdsReq,
     UpdateAginferThresholdsReqOutput,
     GetLoadsReqInput,
@@ -128,6 +130,7 @@ _COMMUNICATOR_SPECS = [
     ("migrate_aginfer", MigrateAginferReqOutput),
     ("update_aginfer_thresholds", UpdateAginferThresholdsReqOutput),
     ("update_aginfer_program_paused", UpdateAginferProgramPausedReqOutput),
+    ("update_aginfer_hints", UpdateAginferHintsReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
@@ -858,6 +861,22 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         responses: List[UpdateAginferProgramPausedReqOutput] = (
             await self.update_aginfer_program_paused_communicator(obj)
+        )
+        return responses
+
+    async def update_aginfer_hints(
+        self: TokenizerManager, obj: UpdateAginferHintsReq,
+    ) -> List[UpdateAginferHintsReqOutput]:
+        """T40 (#184): daemon → sglang PUT /aginfer/hints.
+
+        Fans the V_u-hint batch out to every rank's scheduler (the
+        hint table is per-rank).  Each rank applies overwrite-by-stamp
+        independently; the caller aggregates ``applied`` across ranks.
+        Per-rank atomicity is the §10 hint invariant; cross-rank
+        divergence is bounded + benign (probed in T15)."""
+        self.auto_create_handle_loop()
+        responses: List[UpdateAginferHintsReqOutput] = (
+            await self.update_aginfer_hints_communicator(obj)
         )
         return responses
 

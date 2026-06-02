@@ -479,6 +479,16 @@ class UnifiedRadixCache(BasePrefixCache):
         # state="REASONING", pre_pause_state=None for every pid that
         # has live units cited in session_ids.
         self._aginfer_program_states: dict[str, dict] = {}
+        # T40 (#184, DESIGN §6 PUT /aginfer/hints + §10 overwrite-by-
+        # stamp): daemon-pushed V_u inputs for the inline scorer,
+        # keyed by unit hash → {"p_hat", "lambda", "stamp"}.  The
+        # daemon re-scores D_t every event and pushes unconditionally
+        # (no daemon-side shadow cache); this table dedupes by keeping
+        # only the newest-stamp entry per hash.  The inline scorer's
+        # CONSUMPTION of this table (eviction order) is wired
+        # separately (T27 / T28 / #177); this is the storage + the
+        # overwrite-by-stamp contract only.
+        self._aginfer_hints: dict[str, dict] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict = {}
@@ -2715,6 +2725,66 @@ class UnifiedRadixCache(BasePrefixCache):
         self._aginfer_program_states[pid] = new_entry
         return (True, "ok", 1)
 
+    def set_aginfer_hints(self, hints: "list") -> tuple:
+        """T40 (#184, DESIGN §6 PUT /aginfer/hints + §10 overwrite-by-
+        stamp): apply a batch of daemon-pushed V_u hints.
+
+        Each ``hint`` is ``{"hash", "p_hat", "lambda", "stamp"}``
+        (already type-validated by the HTTP layer's
+        ``_validate_hints_body``; re-checked here so a direct caller /
+        a future non-HTTP path cannot poison the table).
+
+        Overwrite-by-stamp: a hash is written only when the incoming
+        ``stamp`` is STRICTLY newer than the stored one.  An equal
+        stamp is an idempotent no-op (the daemon re-pushed the same
+        D_t against the same sglang time_counter — DESIGN §10 R2); an
+        older stamp is a stale out-of-order delivery and is dropped
+        (it must not clobber a newer value).
+
+        Returns ``(ok, reason, applied)`` where ``applied`` counts the
+        hashes whose stamp advanced (so an idempotent re-push of a
+        whole batch returns ``applied == 0``).
+        """
+        if not isinstance(hints, list):
+            return (False, f"hints must be a list; got {type(hints).__name__}", 0)
+        applied = 0
+        for h in hints:
+            if not isinstance(h, dict):
+                return (False, f"hint must be an object; got {h!r}", 0)
+            uhash = h.get("hash")
+            if not isinstance(uhash, str) or not uhash:
+                return (False, f"hint hash must be non-empty string; got {uhash!r}", 0)
+            try:
+                stamp = int(h["stamp"])
+                p_hat = float(h["p_hat"])
+                lam = float(h["lambda"])
+            except (KeyError, TypeError, ValueError) as exc:
+                return (False, f"hint {uhash!r}: bad numeric field ({exc})", 0)
+            existing = self._aginfer_hints.get(uhash)
+            if existing is not None and stamp <= existing["stamp"]:
+                # equal stamp = idempotent no-op; older = stale drop.
+                continue
+            self._aginfer_hints[uhash] = {
+                "p_hat": p_hat, "lambda": lam, "stamp": stamp,
+            }
+            applied += 1
+        return (True, "ok", applied)
+
+    def get_aginfer_hint(self, uhash: str) -> "Optional[dict]":
+        """T40 (#184): read the current hint entry for a unit hash, or
+        None if the daemon has not pushed one (and no birth-seed
+        exists yet — birth-seeding is a separate task).  Returns the
+        stored ``{"p_hat", "lambda", "stamp"}`` dict."""
+        return self._aginfer_hints.get(uhash)
+
+    def clear_aginfer_hint(self, uhash: str) -> bool:
+        """T40 (#184, DESIGN §10 'Hint clear ordering'): drop the hint
+        entry for a unit on its death (eviction / drop).  Returns True
+        if an entry was removed.  The EVICTION-PATH ordering that calls
+        this (scorer read → evict commit → hint clear) is wired
+        separately (T27); this is the primitive only."""
+        return self._aginfer_hints.pop(uhash, None) is not None
+
     def _aginfer_overlay_program_states(self, per_program: dict) -> dict:
         """T21 (#181): overlay daemon-pushed program states onto the
         unit-walk-derived ``per_program`` dict, IN PLACE.
@@ -3252,6 +3322,13 @@ class UnifiedRadixCache(BasePrefixCache):
             "units": units,
             "link_stats": self._aginfer_link_stats(),
             "tier_holding_cost": self._aginfer_tier_holding_cost(pool_usage),
+            # T40 (#184): count of live daemon-pushed hint entries.  A
+            # COUNT, not the table itself — the daemon keeps no shadow
+            # cache and never reads hints back (it re-scores from
+            # state), so echoing the whole table would only bloat the
+            # dump.  Exposed for observability + e2e verification that
+            # PUT /aginfer/hints landed.
+            "n_aginfer_hints": len(self._aginfer_hints),
             # T14 — piggybacked observability; pre-this-call summary.
             "state_dump_metrics": metrics_summary,
         }
@@ -3437,6 +3514,10 @@ class UnifiedRadixCache(BasePrefixCache):
         out.extend(orjson.dumps(link_stats))
         out.extend(b',"tier_holding_cost":')
         out.extend(orjson.dumps(tier_holding_cost))
+        # T40 (#184): live hint-entry count (see dict-path note).  MUST
+        # match the dict path's key so the two dumps stay schema-equal.
+        out.extend(b',"n_aginfer_hints":')
+        out.extend(str(len(self._aginfer_hints)).encode("ascii"))
         # T14 — piggybacked state-dump cost observability.
         out.extend(b',"state_dump_metrics":')
         out.extend(orjson.dumps(metrics_summary))

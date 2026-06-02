@@ -113,6 +113,8 @@ from sglang.srt.managers.io_struct import (
     MigrateAginferReqOutput,
     UpdateAginferProgramPausedReq,
     UpdateAginferProgramPausedReqOutput,
+    UpdateAginferHintsReq,
+    UpdateAginferHintsReqOutput,
     UpdateAginferThresholdsReq,
     UpdateAginferThresholdsReqOutput,
     GetLoadsReqInput,
@@ -1464,6 +1466,7 @@ class Scheduler(
                 (MigrateAginferReq, self.migrate_aginfer),
                 (UpdateAginferThresholdsReq, self.update_aginfer_thresholds),
                 (UpdateAginferProgramPausedReq, self.update_aginfer_program_paused),
+                (UpdateAginferHintsReq, self.update_aginfer_hints),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -3558,6 +3561,31 @@ class Scheduler(
         return UpdateAginferProgramPausedReqOutput(
             ok=ok, reason=reason, applied=applied,
         )
+
+    def update_aginfer_hints(
+        self, recv_req: UpdateAginferHintsReq,
+    ) -> UpdateAginferHintsReqOutput:
+        """T40 (#184): daemon → sglang PUT /aginfer/hints handler.
+
+        DESIGN §6: the daemon re-scores D_t every event and pushes the
+        V_u inputs unconditionally; sglang's hint table dedupes by
+        overwrite-by-stamp.  Storage lives on the radix cache (the
+        inline scorer reads it at its allocation callsite without a
+        scheduler round-trip).  Tree caches without the setter reject
+        the PUT (same contract as program_paused)."""
+        setter = getattr(self.tree_cache, "set_aginfer_hints", None)
+        if setter is None:
+            return UpdateAginferHintsReqOutput(
+                ok=False,
+                reason=(
+                    f"tree cache {type(self.tree_cache).__name__} "
+                    f"does not support set_aginfer_hints; "
+                    f"set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1"
+                ),
+                applied=0,
+            )
+        ok, reason, applied = setter(recv_req.hints)
+        return UpdateAginferHintsReqOutput(ok=ok, reason=reason, applied=applied)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

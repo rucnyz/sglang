@@ -794,6 +794,42 @@ def assignments_to_wire(
     ]
 
 
+def hints_from_state(sched_state) -> List[Dict[str, Any]]:  # noqa: ANN001
+    """T40 (#184, DESIGN §6 ``PUT /aginfer/hints``): one hint per unit
+    in ``D_t``, carrying the V_u inputs the scorer just computed.
+
+    Wire shape per hint: ``{"hash", "p_hat", "lambda", "stamp"}``.
+    ``stamp`` is sglang's own ``time_counter`` (``sched_state.t``) —
+    a monotonic, daemon-restart-surviving ordering token that makes
+    sglang's overwrite-by-stamp table deterministic WITHOUT any
+    wall-clock call in the daemon's policy path (the §10 "no time.*
+    in the transition path" invariant).
+
+    This is the WHOLE D_t, pushed unconditionally — no shadow
+    ``{hash: last_pushed}`` map, no "value changed beyond threshold"
+    filter (DESIGN §10 "No daemon-side hint cache").  Redundant
+    re-pushes of unchanged values are absorbed by sglang's
+    overwrite-by-stamp dedupe (an equal stamp is an idempotent
+    no-op).
+    """
+    stamp = int(sched_state.t)
+    hints: List[Dict[str, Any]] = []
+    for uid in sched_state.decision_set:
+        u = sched_state.units.get(uid)
+        if u is None:
+            # D_t is derived from units, so this should not happen;
+            # skip defensively rather than push a hint for a hash
+            # sglang has no unit for.
+            continue
+        hints.append({
+            "hash": uid,
+            "p_hat": float(u.p_hat),
+            "lambda": float(u.lambda_rate),
+            "stamp": stamp,
+        })
+    return hints
+
+
 # ----------------------------------------------------------------- handler
 
 
@@ -834,6 +870,7 @@ class KvScheduler:
         # Telemetry for tests.
         self.decisions: int = 0
         self.migrate_calls: int = 0
+        self.hint_calls: int = 0  # T40 (#184): hint PUTs enqueued
         self.last_action: Optional[Action] = None
         self.last_decision_set_size: int = 0
         # Audit round-2 R2-N2: per-instance unknown-tier log set so
@@ -931,6 +968,13 @@ class KvScheduler:
                 outcome="empty_decision_set",
             )
             return
+        # T40 (#184, F2): push the V_u hints for EVERY D_t unit,
+        # unconditionally, BEFORE (and independent of) the migrate
+        # decision.  The inline scorer reads the hint table at its
+        # allocation callsite and cannot wait for the daemon, so the
+        # daemon refreshes it every event.  No shadow cache (DESIGN
+        # §10): re-pushes are absorbed by sglang's overwrite-by-stamp.
+        await self._dispatch_hints(hints_from_state(sched_state))
         action = self.policy.decide(sched_state)
         self.decisions += 1
         self.last_action = action
@@ -984,6 +1028,32 @@ class KvScheduler:
             "migrate_enqueued",
             batch_id=batch_id,
             n_actions=len(assignments),
+        )
+
+    async def _dispatch_hints(self, hints: List[Dict[str, Any]]) -> None:
+        """T40 (#184, DESIGN §6 F2) fire-and-forget hint push.
+
+        Mirrors ``_dispatch_migrate``: ``put_nowait`` + ``uuid4`` then
+        return; the shared OutboundQueue worker PUTs in the background.
+        ``outbound`` is REQUIRED (same wiring contract as migrate).
+        An empty hint list is a no-op (no point PUTting nothing).
+        """
+        if not hints:
+            return
+        if self.outbound is None:
+            raise RuntimeError(
+                "KvScheduler._dispatch_hints called without an "
+                "OutboundQueue injected.  main.py wires this; tests "
+                "constructing KvScheduler directly must pass "
+                "outbound=OutboundQueue(...)."
+            )
+        batch_id = self.outbound.enqueue_hints(hints)
+        self.hint_calls += 1
+        from ._metrics import m as _m
+        _m(
+            "hints_enqueued",
+            batch_id=batch_id,
+            n_hints=len(hints),
         )
 
 

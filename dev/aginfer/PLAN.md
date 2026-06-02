@@ -323,7 +323,9 @@ Order roughly by dependency.
      * **threshold PUT**: atomic apply contract tested in
        `verify/integration_stress/` flavor E.
      * **pause/resume PUT**: gated on T21 (#181).
-     * **hint PUT**: gated on T40 (#184).
+     * **hint PUT**: idempotent overwrite-by-stamp (T40 #184) —
+       equal stamp → applied=0 (verify/t40 D1 + e2e F0); newer
+       stamp wins; stale stamp dropped.
 
 ### Instrumentation hooks
 
@@ -344,10 +346,15 @@ Order roughly by dependency.
 11. **T27 — Hint clear ordering** (DESIGN §10 R3):
     - scorer's heap-iteration read happens-before eviction commit
       happens-before hint clear
-    - **Status (#170 audit — 2026-06-01)**: BLOCKED on T40.  Sglang
-      has no HintTable class yet (no `hint_clear`, `HintTable` grep
-      hits); the ordering invariant only applies once the table
-      exists.  Will pick up when #184 (T40) lands.
+    - **Status (#184 — 2026-06-02)**: UNBLOCKED.  T40 (#184) landed
+      the hint table (`UnifiedRadixCache._aginfer_hints` +
+      `set_aginfer_hints` / `get_aginfer_hint` / `clear_aginfer_hint`).
+      The clear-ordering invariant (scorer heap-read happens-before
+      evict-commit happens-before `clear_aginfer_hint`) applies once
+      the inline scorer CONSUMES the table — wire it together with
+      that consumer (T28 #178 / #177).  `clear_aginfer_hint` is the
+      primitive; the ordering at the eviction callsite is the open
+      work.
 
 12. **T28 — `should_write_through(node)` plugin point** (DESIGN §3
     superset framing):
@@ -501,13 +508,41 @@ generalization.
      DESIGN's "tracker enqueues" sketch — same net effect.  See T30
      status + verify/t30/.
 
-8. **T40 — F2 hint emitter** (DESIGN §10 F2):
+8. **T40 — F2 hint emitter** (DESIGN §6 `PUT /aginfer/hints` + §10):
    - re-score `D_t` units per event, push all to sglang
      unconditionally
    - **no shadow `{hash: last_pushed_value}` map**
-   - **Status (#170 audit — 2026-06-01)**: OPEN.  No
-     `aginfer/hints` calls in daemon, no `HintTable` in sglang.
-     Gates T27 (hint clear ordering).  Tracked as **#184**.
+   - **Status (#184 closure — 2026-06-02)**: DONE (full round-trip).
+     * daemon emitter: `kv_scheduler.hints_from_state(sched_state)`
+       builds one `{hash, p_hat, lambda, stamp}` per D_t unit
+       (`stamp = int(sched_state.t)` = sglang's own `time_counter`,
+       a monotonic restart-surviving token — NO wall-clock in the
+       policy path); `handle()` dispatches them via
+       `_dispatch_hints` → `outbound.enqueue_hints` BEFORE and
+       independent of the migrate decision, EVERY event with a
+       non-empty D_t.  No shadow cache — re-pushes are absorbed by
+       sglang's overwrite-by-stamp.
+     * sglang receiving side (full chain): `PUT /aginfer/hints` +
+       `_validate_hints_body` (http_server) → `UpdateAginferHintsReq`
+       (io_struct) → `update_aginfer_hints` rank fan-out
+       (tokenizer_control_mixin) → scheduler handler →
+       `UnifiedRadixCache.set_aginfer_hints` overwrite-by-stamp
+       storage (`_aginfer_hints` dict) + `get_aginfer_hint` /
+       `clear_aginfer_hint`; `/aginfer/state` echoes
+       `n_aginfer_hints` (count, both dump paths).
+     * overwrite-by-stamp: newer stamp wins; equal stamp =
+       idempotent no-op (DESIGN §10 R2); older stamp = stale drop.
+     * verify/t40/: 14 stages (A enqueue, B emitter incl.
+       unconditional-push + no-shadow-cache, C validator, D
+       overwrite-by-stamp, E daemon-wire round-trip, F0 LIVE e2e
+       against a real sglang launch).  All green.
+     * **Scope boundary** (deferred, separate tasks): the inline
+       scorer CONSUMING the hint table for eviction order, unit-
+       birth seeding (`p_hat≈1`), eviction-time hint clear ordering
+       (T27 #—), V_u-aware `should_write_through` (T28 #178),
+       cross-rank hint fan-out atomicity (#174 probe / T15).  This
+       task is the emitter + storage + overwrite contract only.
+     * Unblocks T27 (hint clear ordering — the table now exists).
 
 9. **T41 — F5 SESSION_END-for-PAUSED handler** (DESIGN §11 F5):
    - on SESSION_END for PAUSED program: release gate with HTTP

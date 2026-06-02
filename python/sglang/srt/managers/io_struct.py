@@ -1788,6 +1788,28 @@ class UpdateAginferProgramPausedReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateAginferHintsReq(BaseReq):
+    """T40 (#184, DESIGN §6 PUT /aginfer/hints): daemon → sglang push
+    of V_u inputs for the inline scorer.
+
+    ``hints`` is a list of ``{"hash": str, "p_hat": float,
+    "lambda": float, "stamp": int}`` (validated at the HTTP layer).
+    Fans out to every rank's scheduler (the hint table is per-rank);
+    each rank applies overwrite-by-stamp and reports its ``applied``
+    count.  Idempotent re-application of an unchanged-stamp batch
+    returns applied=0 (DESIGN §10 R2)."""
+
+    hints: List[Dict[str, Any]]
+
+
+@dataclass
+class UpdateAginferHintsReqOutput(BaseReq):
+    ok: bool
+    reason: str
+    applied: int = 0  # count of hashes whose stamp advanced
+
+
+@dataclass
 class GetAginferStateReqOutput(BaseReq):
     """Per-DP-rank snapshot.  aginfer state is the JSON-serialisable dict
     described in dev/aginfer/DESIGN.md §sglang surface.

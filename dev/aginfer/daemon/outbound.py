@@ -235,6 +235,29 @@ class OutboundQueue:
         self.queue.put_nowait(batch)
         return batch_id
 
+    def enqueue_hints(
+        self,
+        hints: List[Dict[str, Any]],
+    ) -> str:
+        """T40 (#184) / DESIGN §6 ``PUT /aginfer/hints``: enqueue the
+        V_u-input hint batch.  Fire-and-forget like migrate.  Each
+        ``hint`` is ``{"hash", "p_hat", "lambda", "stamp"}``; sglang's
+        hint table is overwrite-by-stamp (DESIGN §10) so the daemon
+        keeps NO shadow ``{hash: last_pushed}`` map — it re-scores the
+        units in D_t and pushes them unconditionally every event.
+
+        Returns the batch_id for APPLY_FAILED correlation.
+        """
+        import time
+        batch_id = str(uuid.uuid4())
+        body = {"hints": list(hints), "batch_id": batch_id}
+        batch = OutboundBatch(
+            batch_id=batch_id, endpoint="hints",
+            body=body, enqueue_ts=time.time(), method="PUT",
+        )
+        self.queue.put_nowait(batch)
+        return batch_id
+
     # ---- lifecycle (daemon-facing) ----------------------------------
 
     async def start(self) -> None:
