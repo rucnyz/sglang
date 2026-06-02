@@ -187,14 +187,16 @@ async def _gate_or_disconnect(
         for t in (wait_task, disc_task):
             if not t.done():
                 t.cancel()
-        # Drain the cancelled loser so its CancelledError doesn't
-        # surface as an "exception never retrieved" warning.
+        # AWAIT the cancelled loser so its ``finally`` runs to
+        # completion before we return.  Critical for the wait_task
+        # (T30 #183): its finally decrements the tracker's gated
+        # count; the proxy checks ``has_gated_waiters`` right after
+        # this returns, so the decrement MUST have landed.  Also
+        # drains the CancelledError (no "exception never retrieved").
         for t in (wait_task, disc_task):
-            if t.cancelled():
-                continue
             try:
-                t.exception()
-            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
     if wait_task in done and not wait_task.cancelled():
         return "proceed" if wait_task.result() else "ended"
@@ -330,29 +332,58 @@ def create_app(
 
         # 1. Gate on pause/resume — racing client disconnect (F1).
         if pid is not None:
-            # T30/T41 (#183 F1 + #185 F5): the gate-wait races the
-            # client's TCP disconnect; whichever fires first wins
-            # (DESIGN §10 "no timer, no fallback").  Three outcomes:
-            #   * proceed    → gate released, forward
-            #   * ended      → SESSION_END landed while parked (F5)
-            #                  → 499
-            #   * disconnect → client dropped while parked (F1) →
-            #                  transition ENDED + enqueue PUT {ENDED}
-            #                  + 499
-            verdict = await _gate_or_disconnect(
-                tracker.wait_if_paused(pid),
-                _until_disconnected(raw),
-            )
-            if verdict == "disconnect":
-                tracker.client_disconnected(pid)
-                outbound = getattr(app.state, "outbound", None)
-                if outbound is not None:
-                    outbound.enqueue_program_paused(
-                        pid=pid, state="ENDED", pre_pause_state=None,
-                    )
-                return Response(status_code=499)
-            if verdict == "ended":
-                return Response(status_code=499)
+            from .program_tracker import State
+
+            # The disconnect race (F1, DESIGN §10) only matters for a
+            # request that would actually PARK in the gate — i.e. the
+            # program is PAUSED right now.  For the common non-gated
+            # request we MUST take the plain fast path: spinning up
+            # `_until_disconnected(raw)` on every request polls
+            # Starlette's receive channel via `is_disconnected()`,
+            # which interferes with the normal request lifecycle
+            # (#183 audit regression: T4 real-uvicorn requests timed
+            # out).  Gate the disconnect race behind the PAUSED check.
+            if tracker.state(pid) is State.PAUSED:
+                # T30/T41 (#183 F1 + #185 F5): the gate-wait races the
+                # client's TCP disconnect; whichever fires first wins
+                # (DESIGN §10 "no timer, no fallback").  Three outcomes:
+                #   * proceed    → gate released, forward
+                #   * ended      → SESSION_END landed while parked (F5)
+                #                  → 499
+                #   * disconnect → client dropped while parked (F1) →
+                #                  transition ENDED + enqueue PUT {ENDED}
+                #                  + 499
+                verdict = await _gate_or_disconnect(
+                    tracker.wait_if_paused(pid),
+                    _until_disconnected(raw),
+                )
+                if verdict == "disconnect":
+                    # This request's TCP connection dropped → 499 it.
+                    # End the PROGRAM only if no SIBLING connection is
+                    # still parked for the same pid (#183 audit: a per-
+                    # connection disconnect must not force-end the
+                    # program / 499 a live sibling).  In the common
+                    # sequential-session case there are no siblings →
+                    # end + PUT.
+                    if not tracker.has_gated_waiters(pid):
+                        tracker.client_disconnected(pid)
+                        outbound = getattr(app.state, "outbound", None)
+                        if outbound is not None:
+                            outbound.enqueue_program_paused(
+                                pid=pid, state="ENDED",
+                                pre_pause_state=None,
+                            )
+                    return Response(status_code=499)
+                if verdict == "ended":
+                    return Response(status_code=499)
+            else:
+                # Not gated → plain verdict-only fast path (no
+                # disconnect poll).  `wait_if_paused` returns
+                # immediately (True) unless a pause/end raced in
+                # between the state() read and this await, in which
+                # case it honours the F5 499 verdict.
+                if not await tracker.wait_if_paused(pid):
+                    return Response(status_code=499)
 
             # 2. Emit arrival-side paper §4 events.
             #    - First-ever request for pid -> SESSION_ARRIVAL.
@@ -360,8 +391,6 @@ def create_app(
             #      prior TOOL_CALL_START) -> TOOL_CALL_END first,
             #      THEN LLM_PREFILL.
             #    - In all cases -> LLM_PREFILL.
-            from .program_tracker import State
-
             prior_state = tracker.state(pid)
             if bus.mark_known(pid):
                 await bus.emit(Event(EventKind.SESSION_ARRIVAL, session=pid))

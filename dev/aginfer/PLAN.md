@@ -376,15 +376,28 @@ Order roughly by dependency.
       * `proxy._gate_or_disconnect` races `wait_if_paused` against
         `_until_disconnected` (polls `is_disconnected()` at 0.1s —
         per-request detection, not policy polling); cancels the
-        loser
-      * chat_completions gate: `disconnect` → client_disconnected +
+        loser (and awaits it, so `wait_if_paused`'s gated-count
+        decrement lands)
+      * the disconnect race runs ONLY when the program is `PAUSED`
+        (would actually park); non-gated requests keep the plain
+        `wait_if_paused` verdict-only fast path and never call
+        `is_disconnected()` (audit-fix: an always-race version
+        timed out T4's real-uvicorn requests by polling Starlette's
+        receive channel on every request)
+      * chat_completions gate: `disconnect` → end the program ONLY
+        if no sibling connection is still parked on the pid
+        (`has_gated_waiters`), then client_disconnected +
         enqueue_program_paused(ENDED) + 499; `ended` (F5) → 499;
         `proceed` → forward
+      * per-connection-vs-per-program fix: `end(release_gate=...)`
+        + `_gated_count` so a single connection's disconnect does
+        not 499 a live sibling or leak the `_ended_while_gated`
+        verdict to the cohort
       * reuses #185's ENDED state + wait_if_paused verdict +
         enqueue_program_paused
-      * verify/t30/: 12 stages, all green (race outcomes + loser-
-        cancel + client_disconnected + real-proxy disconnect/ended/
-        proceed paths)
+      * verify/t30/: 14 stages, all green (race outcomes + loser-
+        cancel + client_disconnected/no-release + real-proxy
+        disconnect/ended/proceed/mid-park/sibling paths)
       * Regression: T4 / T6 / T41 / T36 green.
 
 15. **T31 — `harbor /aginfer/session_end` endpoint** (DESIGN §4):

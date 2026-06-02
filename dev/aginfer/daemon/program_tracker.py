@@ -110,6 +110,14 @@ class ProgramTracker:
         # a request for a session the client already ended.  Consumed
         # (cleared) on read.
         self._ended_while_gated: set = set()
+        # T30 (#183): per-pid count of requests CURRENTLY parked in the
+        # gate (blocked inside wait_if_paused).  A per-connection
+        # disconnect must abort only its OWN request, not force-end the
+        # whole program while sibling connections are still parked
+        # (the #183 audit "two-request, one-disconnects" bug).  The
+        # proxy ends the program on disconnect only when this drops to
+        # zero.
+        self._gated_count: Dict[str, int] = {}
 
     # ---- queries ----
 
@@ -117,6 +125,12 @@ class ProgramTracker:
         """Return current state, or None if the program has never been
         observed."""
         return self._states.get(pid)
+
+    def has_gated_waiters(self, pid: str) -> bool:
+        """T30 (#183): is any request still PARKED in the gate for
+        ``pid``?  The proxy checks this on a client disconnect: it
+        ends the program only when no sibling connection is parked."""
+        return self._gated_count.get(pid, 0) > 0
 
     def size(self) -> int:
         """Number of programs the tracker is currently holding."""
@@ -212,25 +226,35 @@ class ProgramTracker:
 
     # ---- SESSION_END hook (T41 #185, DESIGN §11 F5) ----
 
-    def end(self, pid: str) -> Optional[State]:
+    def end(self, pid: str, *, release_gate: bool = True) -> Optional[State]:
         """Transition ``pid`` to ENDED (terminal) on SESSION_END.
 
         Returns the PRIOR state (so the caller can branch — the F5
         PAUSED path releases the gate with 499; other prior states
         just transition).
 
-        If the program was PAUSED with a request sitting in the
-        gate, ``end()`` marks ``_ended_while_gated`` and releases
-        the gate event so ``wait_if_paused`` wakes and returns the
-        "abort with 499" verdict.  Idempotent: ending an already-
-        ENDED program is a no-op returning ENDED.
+        ``release_gate`` (default True) controls the F5 PAUSED
+        behaviour: when the program was PAUSED and ``release_gate``
+        is True, ``end()`` marks ``_ended_while_gated`` and sets the
+        gate event so the PARKED ``wait_if_paused`` wakes and
+        returns the "abort with 499" verdict.
+
+        The disconnect path (T30 #183) passes ``release_gate=False``:
+        the disconnecting request already left via the gate-vs-
+        disconnect race (it 499s itself), and the proxy only calls
+        this when NO sibling is parked — so there is no waiter to
+        release.  Skipping the flag also avoids leaking it in
+        ``_ended_while_gated`` (the #183 audit leak).
+
+        Idempotent: ending an already-ENDED program is a no-op
+        returning ENDED.
         """
         prev = self._states.get(pid)
         if prev is State.ENDED:
             return State.ENDED
         was_paused = prev is State.PAUSED
         self._states[pid] = State.ENDED
-        if was_paused:
+        if was_paused and release_gate:
             # A request may be parked in the gate; tell wait_if_paused
             # to abort it (499) rather than forward, then release.
             self._ended_while_gated.add(pid)
@@ -247,19 +271,23 @@ class ProgramTracker:
 
     def client_disconnected(self, pid: str) -> Optional[State]:
         """T39 (#183, DESIGN §10 F1): the client's TCP connection
-        dropped while a request was parked in the proxy gate.
+        dropped.  The proxy calls this ONLY after the disconnecting
+        request has left the gate-vs-disconnect race (it 499s
+        itself) AND only when no sibling connection is still parked
+        (``has_gated_waiters(pid)`` is False) — so there is no
+        waiter to release.
 
-        Semantically identical to SESSION_END for the gate: the
-        program transitions to ENDED, the parked ``wait_if_paused``
-        is released with the 499 verdict.  The proxy is responsible
-        for enqueuing the PUT /aginfer/program_paused {ENDED}
-        (it owns the outbound queue + the Request object).
+        Transitions the program to ENDED via ``end(release_gate=
+        False)``: a per-CONNECTION disconnect must NOT 499 sibling
+        connections (the #183 audit "two-request, one-disconnects"
+        bug) and must NOT leak the ``_ended_while_gated`` flag with
+        no waiter to consume it.  The proxy enqueues the PUT
+        /aginfer/program_paused {ENDED} (it owns the outbound queue).
 
-        Returns the prior state.  Distinct from ``end()`` only in
-        the metric tag (so ops can tell client-disconnect-driven
-        ENDs from explicit harbor SESSION_END).
+        Returns the prior state.  Distinct metric tag so ops can
+        tell client-disconnect-driven ENDs from harbor SESSION_END.
         """
-        prev = self.end(pid)
+        prev = self.end(pid, release_gate=False)
         from ._metrics import m as _m
         _m(
             "client_disconnected",
@@ -315,8 +343,20 @@ class ProgramTracker:
             # Did not block → not a parked request → proceed even if
             # an end() flag lingers (this is a fresh arrival).
             return True
-        # Genuinely parked: suspend, then honour the verdict on wake.
-        await e.wait()
+        # Genuinely parked: count this request as gated (T30 #183, so a
+        # sibling's disconnect can tell whether the program still has
+        # parked requests), suspend, then honour the verdict on wake.
+        # The decrement is in ``finally`` so it runs on cancellation
+        # too (the gate-vs-disconnect race cancels the loser).
+        self._gated_count[pid] = self._gated_count.get(pid, 0) + 1
+        try:
+            await e.wait()
+        finally:
+            n = self._gated_count.get(pid, 0) - 1
+            if n <= 0:
+                self._gated_count.pop(pid, None)
+            else:
+                self._gated_count[pid] = n
         return pid not in self._ended_while_gated
 
     # ---- internal ----

@@ -180,7 +180,16 @@ def stage_b0_disconnect_paused_to_ended() -> None:
         raise StageFail(f"state should be ENDED; got {t.state('p')}")
 
 
-def stage_b1_releases_parked_waiter_with_499() -> None:
+def stage_b1_disconnect_no_gate_release_no_flag_leak() -> None:
+    """#183 audit fix: client_disconnected uses release_gate=False —
+    it transitions ENDED but does NOT set the gate verdict flag or
+    release the event.  (The proxy calls it ONLY when no sibling is
+    parked, so there's no waiter to release; and skipping the flag
+    avoids leaking it in _ended_while_gated with no consumer.)
+
+    Pin: a (hypothetical) parked waiter is NOT woken, _ended_while_
+    gated stays empty.  Contrast with end() (SESSION_END), which
+    DOES release."""
     async def _go():
         t = ProgramTracker()
         t.observe_arrival("p")
@@ -190,13 +199,32 @@ def stage_b1_releases_parked_waiter_with_499() -> None:
         if waiter.done():
             raise StageFail("waiter should block while PAUSED")
         t.client_disconnected("p")
-        return await asyncio.wait_for(waiter, timeout=2.0)
-    proceed = asyncio.run(_go())
-    if proceed is not False:
+        # client_disconnected must NOT wake the waiter (release_gate
+        # =False).  Give it a tick to (not) fire.
+        await asyncio.sleep(0.03)
+        woke = waiter.done()
+        flag = set(t._ended_while_gated)
+        state = t.state("p")
+        # Clean up the still-parked waiter.
+        waiter.cancel()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            pass
+        return woke, flag, state
+    woke, flag, state = asyncio.run(_go())
+    if woke:
         raise StageFail(
-            f"disconnect should release the parked waiter with the "
-            f"499 verdict (False); got {proceed}"
+            "client_disconnected (release_gate=False) must NOT wake a "
+            "parked waiter — that's end()'s job (SESSION_END)"
         )
+    if flag:
+        raise StageFail(
+            f"client_disconnected must not leak _ended_while_gated; "
+            f"got {flag}"
+        )
+    if state is not State.ENDED:
+        raise StageFail(f"program should be ENDED; got {state}")
 
 
 def stage_b2_disconnect_unknown() -> None:
@@ -333,6 +361,122 @@ def stage_c1_ended_verdict_no_extra_put() -> None:
         )
 
 
+def stage_c3_mid_park_disconnect() -> None:
+    """#183 audit gap: the REAL F1 scenario — a CONNECTED request
+    parks in the gate, THEN disconnects mid-park (not pre-
+    disconnected).  Drives the real `_until_disconnected` via a
+    Request whose is_disconnected() flips False→True after the
+    request is confirmed parked."""
+    async def _go():
+        ob = _new_outbound()
+        app = _make_app(ob)
+        tracker: ProgramTracker = app.state.program_tracker
+        tracker.observe_arrival("pc3")
+        tracker.pause("pc3")
+        handler = _get_chat_handler(app)
+
+        class _FlipRequest:
+            def __init__(self):
+                self._disc = False
+                self.headers = {}
+            async def json(self):
+                return {"program_id": "pc3", "messages": []}
+            async def is_disconnected(self):
+                return self._disc
+
+        req = _FlipRequest()
+        task = asyncio.create_task(handler(req, x_aginfer_program=None))
+        await asyncio.sleep(0.05)  # let it park in the gate
+        if task.done():
+            raise StageFail("request should be parked while PAUSED")
+        # NOW the client drops mid-park.
+        req._disc = True
+        resp = await asyncio.wait_for(task, timeout=3.0)
+        return resp, tracker, ob
+    resp, tracker, ob = asyncio.run(_go())
+    if getattr(resp, "status_code", None) != 499:
+        raise StageFail(f"mid-park disconnect should 499; got {resp}")
+    if tracker.state("pc3") is not State.ENDED:
+        raise StageFail(
+            f"mid-park disconnect should end the program; "
+            f"got {tracker.state('pc3')}"
+        )
+    if ob.queue.qsize() != 1:
+        raise StageFail(
+            f"mid-park disconnect should enqueue PUT; queue={ob.queue.qsize()}"
+        )
+
+
+def stage_c4_sibling_not_499d_on_disconnect() -> None:
+    """#183 audit BUG fix: two requests for the SAME pid both parked;
+    request A's connection drops mid-park.  A gets 499, but the LIVE
+    sibling B must NOT be 499'd and the program must NOT be force-
+    ended while B is parked (a disconnect is per-CONNECTION)."""
+    async def _go():
+        ob = _new_outbound()
+        app = _make_app(ob)
+        app.state.http_client = _DummyHttp()  # B forwards cleanly on resume
+        tracker: ProgramTracker = app.state.program_tracker
+        tracker.observe_arrival("pc4")
+        tracker.pause("pc4")
+        handler = _get_chat_handler(app)
+
+        class _FlipRequest:
+            def __init__(self):
+                self._disc = False
+                self.headers = {}
+            async def json(self):
+                return {"program_id": "pc4", "messages": []}
+            async def is_disconnected(self):
+                return self._disc
+            def drop(self):
+                self._disc = True
+
+        reqA = _FlipRequest()
+        reqB = _FlipRequest()  # stays connected
+        taskA = asyncio.create_task(handler(reqA, x_aginfer_program=None))
+        taskB = asyncio.create_task(handler(reqB, x_aginfer_program=None))
+        await asyncio.sleep(0.05)  # both park
+        if taskA.done() or taskB.done():
+            raise StageFail("both requests should park while PAUSED")
+        # A's connection drops; B stays connected.
+        reqA.drop()
+        respA = await asyncio.wait_for(taskA, timeout=3.0)
+        # B should STILL be parked (program not ended).
+        await asyncio.sleep(0.05)
+        b_done_early = taskB.done()
+        # Resume the program → B proceeds.
+        tracker.resume("pc4")
+        respB = await asyncio.wait_for(taskB, timeout=3.0)
+        return respA, respB, b_done_early, tracker, ob
+    respA, respB, b_done_early, tracker, ob = asyncio.run(_go())
+    if getattr(respA, "status_code", None) != 499:
+        raise StageFail(f"disconnected A should 499; got {respA}")
+    if b_done_early:
+        raise StageFail(
+            "live sibling B was released early by A's disconnect — the "
+            "per-connection disconnect wrongly force-ended the program"
+        )
+    if getattr(respB, "status_code", None) == 499:
+        raise StageFail(
+            f"live sibling B must NOT be 499'd by A's disconnect; "
+            f"got {respB}"
+        )
+    # The program must NOT have been ENDED while B was parked.  After
+    # resume + B's arrival, B's observe_arrival flips it to REASONING.
+    if tracker.state("pc4") is State.ENDED:
+        raise StageFail(
+            "program should not be ENDED — only A's connection dropped, "
+            "B was live"
+        )
+    # No spurious disconnect-PUT (A didn't end the program).
+    if ob.queue.qsize() != 0:
+        raise StageFail(
+            f"no PUT should be enqueued (program not ended); "
+            f"queue={ob.queue.qsize()}"
+        )
+
+
 def stage_c2_proceed_forwards() -> None:
     """A non-gated request proceeds past the gate (no 499).  We stop
     at the forward step by pointing at a dead sglang — the contract
@@ -368,13 +512,17 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A3 race: losing task cancelled",              stage_a3_loser_cancelled),
     ("A4 race: non-gated fast-proceed (<50ms)",     stage_a4_non_gated_fast_proceed),
     ("B0 client_disconnected(PAUSED) → ENDED",      stage_b0_disconnect_paused_to_ended),
-    ("B1 client_disconnected releases parked waiter (499)",
-                                                    stage_b1_releases_parked_waiter_with_499),
+    ("B1 client_disconnected: no gate-release, no flag leak (release_gate=False)",
+                                                    stage_b1_disconnect_no_gate_release_no_flag_leak),
     ("B2 client_disconnected(unknown) → ENDED",     stage_b2_disconnect_unknown),
     ("B3 distinct client_disconnected metric",      stage_b3_emits_distinct_metric),
     ("C0 proxy disconnect path → 499 + ENDED + PUT", stage_c0_disconnect_path),
     ("C1 proxy ended verdict → 499, no extra PUT",  stage_c1_ended_verdict_no_extra_put),
     ("C2 proxy proceed → not 499, no PUT",          stage_c2_proceed_forwards),
+    ("C3 MID-PARK disconnect (connected→park→drop) → 499 + ENDED + PUT",
+                                                    stage_c3_mid_park_disconnect),
+    ("C4 sibling NOT 499'd on per-connection disconnect (#183 bug fix)",
+                                                    stage_c4_sibling_not_499d_on_disconnect),
 ]
 
 

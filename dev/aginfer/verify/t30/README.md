@@ -29,11 +29,20 @@ The state-machine + outbound pieces already existed from T41 (#185):
   scheduler/admission/event_worker" invariant does not cover the
   proxy's per-request disconnect race — Starlette exposes no pure
   await-until-disconnect).
-* `chat_completions` gate: races the two; on `disconnect` →
+* `chat_completions` gate: the disconnect race ONLY runs when the
+  program is genuinely `PAUSED` (i.e. the request would actually
+  park).  On the common non-gated path the handler takes a plain
+  `await wait_if_paused(pid)` verdict-only fast path and NEVER calls
+  `is_disconnected()`.  This is load-bearing: `_until_disconnected`
+  polls Starlette's receive channel, and spinning it up on every
+  request interferes with the normal request lifecycle (the #183
+  audit-fix regression — T4's real-uvicorn requests hit
+  `httpx.ReadTimeout` until the race was gated behind the PAUSED
+  check).  When PAUSED: races the two; on `disconnect` →
   `client_disconnected(pid)` + `enqueue_program_paused(ENDED)` +
   499; on `ended` (F5) → 499; on `proceed` → forward.
 
-## STAGES (12)
+## STAGES (14)
 
 ```
 A. _gate_or_disconnect race (the F1 core, stub-driven)
@@ -46,7 +55,10 @@ A. _gate_or_disconnect race (the F1 core, stub-driven)
      never returns for a connected client)
 B. ProgramTracker.client_disconnected
   B0 client_disconnected(PAUSED) → ENDED, prev=PAUSED
-  B1 releases a PARKED waiter with the 499 verdict (False)
+  B1 client_disconnected(release_gate=False) → no gate-release,
+     no `_ended_while_gated` flag leak (the per-connection-vs-
+     per-program #183 fix: a disconnecting connection must not
+     poison a sibling parked on the same pid)
   B2 client_disconnected(unknown) → ENDED, prev=None
   B3 emits the distinct 'client_disconnected' metric
 C. Proxy integration (real create_app proxy)
@@ -54,6 +66,11 @@ C. Proxy integration (real create_app proxy)
   C1 ended-while-gated (F5) → 499, NO extra PUT from the proxy
      (the SESSION_END handler owns that PUT)
   C2 non-gated request → forwards (not 499), no disconnect PUT
+  C3 MID-PARK disconnect (request connects, parks PAUSED, THEN the
+     client drops) → 499 + ENDED + PUT {ENDED}
+  C4 sibling NOT 499'd on per-connection disconnect: two requests
+     parked on one pid, one drops → the dropping one 499s, the
+     live sibling proceeds, no program-end (#183 audit bug)
 ```
 
 ## REPRODUCING
@@ -64,21 +81,25 @@ cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t30/verify.py
 ```
 
-Pure-Python (asyncio); ~0.5 s.  No GPU.  C0-C2 build the real
+Pure-Python (asyncio); ~0.5 s.  No GPU.  C0-C4 build the real
 `create_app` proxy and call the chat handler with a fake Request
 (controllable `is_disconnected()` + JSON body).
 
 ## RESULTS
 
-**PASSED** — all 12 stages.
+**PASSED** — all 14 stages.
 
 * date: 2026-06-02
 * raw log: `results/20260602_t30_initial_pass.log`
 
 ## REGRESSION SANITY
 
-* T4 daemon_proxy_events: PASS (gate race additive to the proxy)
-* T6 program_tracker: PASS (client_disconnected additive)
+* T4 daemon_proxy_events: PASS — the disconnect race is gated
+  behind the PAUSED check, so non-gated requests keep the original
+  fast path (an earlier always-race version timed out T4's real-
+  uvicorn requests; see the `_until_disconnected` note above)
+* T6 program_tracker: PASS (client_disconnected + release_gate
+  bookkeeping additive)
 * T41 SESSION_END: PASS (the `ended` verdict path unchanged)
 * T36 outbound: PASS (enqueue_program_paused / method dispatch)
 
