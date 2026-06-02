@@ -632,7 +632,23 @@ so sglang can persist `per_program_usage[p].state` and
 `pre_pause_state`.  This makes `/aginfer/state` the single
 authoritative store for both fields; daemon restart loses nothing.
 
-Request:
+> **AS-BUILT WIRE CONTRACT (#181 / #185 — supersedes the pseudocode
+> field names below).**  The shipped endpoint takes the FINAL state
+> directly, not a transition verb:
+> ```json
+> {"pid": str,
+>  "state": "REASONING"|"ACTING"|"PAUSED"|"ENDED",
+>  "pre_pause_state": "REASONING"|"ACTING"|"PAUSED"|"ENDED"|null}
+> ```
+> `transition: "END"` ≡ `state: "ENDED"`, `pre_pause_state: null`.
+> `transition: "PAUSE"` ≡ `state: "PAUSED"` + the prior state in
+> `pre_pause_state`.  The daemon's `OutboundQueue.enqueue_program_
+> paused(pid, state, pre_pause_state)` (#185) emits this form; the
+> sglang side validates + stores via `set_aginfer_program_state`
+> (#181).  Do NOT code to `program_id`/`transition` — that's the
+> original design sketch, not the wire.
+
+Request (original design sketch — see as-built box above):
 ```json
 {"program_id": str,
  "transition": "PAUSE"|"RESUME"|"END",

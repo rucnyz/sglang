@@ -137,6 +137,10 @@ class ProgramTracker:
         """
         prev = self._states.get(pid)
         self._states[pid] = State.REASONING
+        # T41 (#185): a new arrival starts a fresh session — clear any
+        # stale ended-while-gated verdict so this request (and the
+        # resurrected pid) is not spuriously 499'd.
+        self._ended_while_gated.discard(pid)
         from ._metrics import m as _m
         _m(
             "program_state",
@@ -170,6 +174,10 @@ class ProgramTracker:
         """
         prev = self._states.get(pid)
         self._states[pid] = State.PAUSED
+        # T41 (#185): a new gate cycle — drop any stale end() verdict
+        # from a prior cycle so the freshly-parked request is judged
+        # on THIS cycle's outcome (resume → proceed, end → 499).
+        self._ended_while_gated.discard(pid)
         self._event(pid).clear()
         logger.info("program_tracker: paused %s", pid)
         from ._metrics import m as _m
@@ -242,16 +250,34 @@ class ProgramTracker:
     async def wait_if_paused(self, pid: str) -> bool:
         """Async-block while ``pid`` is paused.  Returns ``True`` to
         proceed (forward the request) or ``False`` if the program was
-        ENDED while this request sat in the gate (T41 #185 F5: the
-        proxy should respond 499 — the client closed the session).
+        ENDED while THIS request was PARKED in the gate (T41 #185 F5:
+        the proxy responds 499 — the client closed the session).
 
-        Un-paused programs return ``True`` immediately.
+        The 499 verdict is honoured ONLY for requests that actually
+        BLOCKED (the gate event was clear on entry and we suspended
+        on ``e.wait()``).  A request that did NOT block — un-paused
+        fast path, or an arrival AFTER end() already set the event —
+        is treated as a fresh request and PROCEEDS.  Rationale
+        (#185 audit):
+
+          * Two concurrent requests for the same pid both parked
+            when SESSION_END fires: BOTH blocked, BOTH wake, BOTH
+            see the ended-while-gated flag → BOTH get 499.  (The
+            old read-once flag let the 2nd proceed — a request for
+            an ended session leaking to sglang.)
+          * A request arriving AFTER SESSION_END is a new session
+            reusing the pid (``observe_arrival`` resurrects
+            ENDED→REASONING); it never parked, so it proceeds.
+
+        The flag is NOT popped on read (so the whole parked cohort
+        sees it); it is cleared by the next lifecycle event for the
+        pid — ``observe_arrival`` (new session) or ``pause`` (new
+        gate cycle).
 
         Defensive against direct-state-mutation tests: if a caller
         wrote ``_states[pid] = PAUSED`` without going through
-        ``pause(pid)`` (which always creates the event), we still want
-        to block.  Cheap belt-and-suspenders: if no event exists yet
-        but state is PAUSED, create a cleared event and await it.
+        ``pause(pid)`` (which always creates the event), we still
+        block; create a cleared event and await it.
         """
         e = self._events.get(pid)
         if e is None:
@@ -259,21 +285,14 @@ class ProgramTracker:
                 e = asyncio.Event()  # default: cleared
                 self._events[pid] = e
             else:
-                # Fast path: never gated.  But still honour an end()
-                # that raced in (ENDED-while-untracked is rare but
-                # the verdict must be consistent).
-                return not self._consume_ended_while_gated(pid)
-        await e.wait()
-        return not self._consume_ended_while_gated(pid)
-
-    def _consume_ended_while_gated(self, pid: str) -> bool:
-        """Pop + return whether ``pid`` was ENDED while gated.  Read-
-        once (cleared) so a later re-arrival of the same pid is not
-        spuriously aborted."""
-        if pid in self._ended_while_gated:
-            self._ended_while_gated.discard(pid)
+                return True  # never gated → proceed
+        if e.is_set():
+            # Did not block → not a parked request → proceed even if
+            # an end() flag lingers (this is a fresh arrival).
             return True
-        return False
+        # Genuinely parked: suspend, then honour the verdict on wake.
+        await e.wait()
+        return pid not in self._ended_while_gated
 
     # ---- internal ----
 

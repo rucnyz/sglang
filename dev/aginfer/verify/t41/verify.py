@@ -181,24 +181,58 @@ def stage_b1_paused_then_end_aborts() -> None:
         )
 
 
-def stage_b2_verdict_read_once() -> None:
-    """After end() sets the 499 verdict and the parked waiter consumes
-    it, a LATER wait_if_paused on the same pid must return True (the
-    pid could be re-used for a new session; we must not abort it)."""
+def stage_b2_arrival_after_end_proceeds() -> None:
+    """#185 audit (corrected contract): a request arriving AFTER
+    SESSION_END is a NEW session reusing the pid — it never parked
+    (the gate event is set), so it PROCEEDS, and observe_arrival
+    resurrects ENDED→REASONING.  Only requests that ACTUALLY BLOCKED
+    when end() fired get 499 (B1 / B5)."""
     async def _go():
         t = ProgramTracker()
         t.observe_arrival("p")
         t.pause("p")
-        t.end("p")
-        first = await t.wait_if_paused("p")   # consumes the verdict
-        second = await t.wait_if_paused("p")  # must proceed
-        return first, second
-    first, second = asyncio.run(_go())
-    if first is not False:
-        raise StageFail(f"first wait should abort; got {first}")
-    if second is not True:
+        t.end("p")  # sets the gate event
+        # This call does NOT block (event already set) → fresh arrival.
+        proceed = await t.wait_if_paused("p")
+        t.observe_arrival("p")  # the proxy's next step
+        return proceed, t.state("p")
+    proceed, state = asyncio.run(_go())
+    if proceed is not True:
         raise StageFail(
-            f"second wait must proceed (verdict read-once); got {second}"
+            f"post-end() non-parked arrival should proceed (new "
+            f"session); got {proceed}"
+        )
+    if state is not State.REASONING:
+        raise StageFail(
+            f"observe_arrival should resurrect ENDED→REASONING; "
+            f"got {state}"
+        )
+
+
+def stage_b5_two_waiters_both_499() -> None:
+    """#185 audit fix: TWO concurrent requests for the same pid both
+    parked in the gate when SESSION_END fires.  BOTH belong to the
+    ended session → BOTH must get 499.  The old read-once flag let
+    the second proceed (leaking a request for an ended session to
+    sglang)."""
+    async def _go():
+        t = ProgramTracker()
+        t.observe_arrival("p")
+        t.pause("p")
+        w1 = asyncio.create_task(t.wait_if_paused("p"))
+        w2 = asyncio.create_task(t.wait_if_paused("p"))
+        await asyncio.sleep(0.02)  # both block
+        if w1.done() or w2.done():
+            raise StageFail("both waiters should be blocked while PAUSED")
+        t.end("p")
+        r1 = await asyncio.wait_for(w1, timeout=2.0)
+        r2 = await asyncio.wait_for(w2, timeout=2.0)
+        return r1, r2
+    r1, r2 = asyncio.run(_go())
+    if r1 is not False or r2 is not False:
+        raise StageFail(
+            f"BOTH parked waiters for an ended session must 499; "
+            f"got w1={r1} w2={r2}"
         )
 
 
@@ -255,6 +289,44 @@ def stage_c1_invalid_method_rejected() -> None:
     except ValueError:
         return
     raise StageFail("OutboundBatch should reject method='DELETE'")
+
+
+def stage_c2_put_body_passes_sglang_validator() -> None:
+    """#185 audit: round-trip the EXACT body enqueue_program_paused
+    produces through sglang's PUT validator + setter, to catch any
+    field-name mismatch (the daemon sends pid/state; the DESIGN
+    pseudocode used program_id/transition — confirm the WIRE matches
+    what sglang actually parses)."""
+    import sys as _sys
+    _sys.path.insert(0, "/scratch/yuzhou/projects/sglang/python")
+    from sglang.srt.entrypoints.http_server import (
+        _validate_program_paused_body,
+    )
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    ob = _new_outbound()
+    ob.enqueue_program_paused(pid="p", state="ENDED", pre_pause_state=None)
+    batch = ob.queue.get_nowait()
+    body = batch.body  # the literal wire body the worker PUTs
+
+    # 1. sglang's HTTP validator must accept it.
+    pid, state, pre = _validate_program_paused_body(body)
+    if (pid, state, pre) != ("p", "ENDED", None):
+        raise StageFail(
+            f"validator parsed wrong fields from the daemon's body: "
+            f"{(pid, state, pre)} (body={body!r})"
+        )
+    # 2. The cache setter must accept the same (state, pre_pause).
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache._aginfer_program_states = {}
+    ok, reason, applied = cache.set_aginfer_program_state(
+        pid=pid, state=state, pre_pause_state=pre,
+    )
+    if not (ok and applied == 1):
+        raise StageFail(
+            f"cache setter rejected the daemon's PUT body: "
+            f"ok={ok} reason={reason!r}"
+        )
 
 
 # ============================================================ D. handler
@@ -318,6 +390,63 @@ def stage_d2_attach_registers_handler() -> None:
         raise StageFail("registered handler not callable")
 
 
+def stage_d3_composed_router_routes_to_f5() -> None:
+    """#185 audit (highest-value gap): build a REAL EventRouter, run
+    the SAME attach sequence main.py uses (kv_scheduler blanket-
+    attaches every EventKind FIRST, then attach_session_end_handler
+    overrides SESSION_END), emit a real SESSION_END Event through
+    the bus, and assert it reaches F5 — NOT kv_scheduler.handle.
+
+    Catches the attach-ORDER shadowing bug: if a future reorder put
+    attach_kv_scheduler after F5, SESSION_END would silently route
+    to kv_scheduler (empty decision_set, no end(), no PUT) and every
+    isolated stage would stay green."""
+    from daemon.event_router import EventRouter
+    from daemon.events import EventBus
+    from daemon.kv_scheduler import KvScheduler, attach_kv_scheduler
+
+    async def _go():
+        tracker = ProgramTracker()
+        tracker.observe_arrival("p")
+        tracker.pause("p")
+        ob = _new_outbound()
+        router = EventRouter(
+            bus=EventBus(), sglang_base_url="http://unused",
+        )
+        # kv_scheduler blanket-attaches EVERY EventKind (incl.
+        # SESSION_END) — must run BEFORE F5 so F5 wins.
+        sched = KvScheduler(
+            tracker=tracker, sglang_base_url="http://unused", outbound=ob,
+        )
+        attach_kv_scheduler(router, sched)
+        attach_session_end_handler(router, tracker, ob)
+        # Dispatch a SESSION_END through the router's handler map.
+        handler = router._handlers.get(EventKind.SESSION_END.value)
+        if handler is None:
+            raise StageFail("no SESSION_END handler registered on router")
+        await handler(Event(EventKind.SESSION_END, session="p"), router)
+        return tracker, ob, sched
+    tracker, ob, sched = asyncio.run(_go())
+    # F5 ran iff the program is ENDED + a PUT was enqueued.
+    if tracker.state("p") is not State.ENDED:
+        raise StageFail(
+            "SESSION_END routed to the WRONG handler (program not "
+            "ENDED) — kv_scheduler.handle shadowed F5.  Check the "
+            "attach order in main.py."
+        )
+    if ob.queue.qsize() != 1:
+        raise StageFail(
+            f"F5 should enqueue one PUT; queue={ob.queue.qsize()} "
+            f"(wrong handler ran?)"
+        )
+    # kv_scheduler must NOT have processed it as a migrate decision.
+    if sched.migrate_calls != 0:
+        raise StageFail(
+            f"kv_scheduler should NOT have run for SESSION_END; "
+            f"migrate_calls={sched.migrate_calls}"
+        )
+
+
 # ============================================================ run
 
 
@@ -329,13 +458,17 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A4 end() idempotent",                         stage_a4_end_idempotent),
     ("B0 un-paused program proceeds (True)",        stage_b0_unpaused_proceeds),
     ("B1 PAUSED + end() → parked waiter aborts (499)", stage_b1_paused_then_end_aborts),
-    ("B2 verdict read-once (re-arrival proceeds)",  stage_b2_verdict_read_once),
+    ("B2 arrival after end() proceeds (new session)", stage_b2_arrival_after_end_proceeds),
     ("B3 end() on non-paused → no 499 verdict",     stage_b3_end_non_paused_no_499),
+    ("B5 two parked waiters → BOTH 499",            stage_b5_two_waiters_both_499),
     ("C0 enqueue_program_paused PUT shape",         stage_c0_enqueue_program_paused_shape),
     ("C1 OutboundBatch rejects invalid method",     stage_c1_invalid_method_rejected),
+    ("C2 PUT body passes sglang validator + setter", stage_c2_put_body_passes_sglang_validator),
     ("D0 handler ends program + enqueues PUT",      stage_d0_handler_ends_and_enqueues),
     ("D1 handler no-session → no-op",               stage_d1_handler_no_session_noop),
     ("D2 attach registers on EventKind.SESSION_END", stage_d2_attach_registers_handler),
+    ("D3 composed router routes SESSION_END to F5 (not kv_scheduler)",
+                                                    stage_d3_composed_router_routes_to_f5),
 ]
 
 

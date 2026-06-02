@@ -25,9 +25,15 @@ primitive before this.  Added:
   parked `wait_if_paused`).
 * `ProgramTracker.wait_if_paused(pid) -> bool` — now returns a
   verdict: `True` = proceed (forward), `False` = the program was
-  ENDED while this request sat in the gate → proxy responds 499.
-  The verdict is **read-once** (consumed on read) so a later
-  re-arrival of the same pid is not spuriously aborted.
+  ENDED while this request was **parked** in the gate → proxy
+  responds 499.  The verdict is honoured ONLY for requests that
+  actually BLOCKED (gate event clear on entry → suspended on
+  `e.wait()`).  A request that did not block — un-paused fast path,
+  or an arrival AFTER `end()` set the event — is a fresh request
+  and proceeds.  The `_ended_while_gated` flag is NOT popped on
+  read (so the whole parked cohort sees it — #185 audit fix for
+  the two-waiter case) and is cleared by the next lifecycle event
+  (`observe_arrival` = new session, `pause` = new gate cycle).
 * `proxy.py` — after `wait_if_paused`, `if not should_proceed:
   return Response(status_code=499)`.
 * `OutboundBatch.method` (new, default "POST") + `_post_one`
@@ -48,7 +54,7 @@ exclusive units) is the **kv_scheduler's** concern — its
 that decision_set is the "SESSION_END normal path" (a sibling of
 F5), tracked separately.  See PLAN §4 T41 status note.
 
-## STAGES (14)
+## STAGES (17 — 14 initial + 3 from #185 audit)
 
 ```
 A. ProgramTracker.end() + ENDED state
@@ -60,16 +66,27 @@ A. ProgramTracker.end() + ENDED state
 B. Gate verdict (the F5 499 mechanism)
   B0 un-paused program → wait_if_paused returns True
   B1 PAUSED + end() → the parked waiter wakes, returns False (→499)
-  B2 verdict read-once: 2nd wait after same end() returns True
+  B2 arrival AFTER end() (not parked) proceeds + resurrects to
+     REASONING (corrected contract; was the old "read-once" stage)
   B3 end() on non-paused → does NOT set the 499 verdict
+  B5 TWO parked waiters, same pid → BOTH 499 (#185 audit: the old
+     read-once flag let the 2nd leak a request for an ended session)
 C. Outbound PUT
   C0 enqueue_program_paused: {pid, state, pre_pause_state,
      batch_id} body, endpoint=program_paused, method=PUT
   C1 OutboundBatch rejects an invalid method (DELETE)
+  C2 the EXACT PUT body passes sglang's _validate_program_paused_
+     body AND set_aginfer_program_state (#185 audit: wire round-trip
+     — catches a pid/state vs program_id/transition field mismatch)
 D. SESSION_END handler
   D0 handler calls tracker.end(pid) + enqueues the PUT
   D1 handler with no session id → no-op (no enqueue)
   D2 attach_session_end_handler registers on EventKind.SESSION_END
+  D3 COMPOSED router (real EventRouter + attach_kv_scheduler then
+     attach_session_end_handler, main.py's order) routes a real
+     SESSION_END event to F5, NOT kv_scheduler.handle (#185 audit:
+     catches the attach-order shadowing bug that every isolated
+     stage would miss)
 ```
 
 ## REPRODUCING
@@ -84,10 +101,11 @@ Pure-Python (asyncio); ~0.3 s.  No GPU, no sglang launch.
 
 ## RESULTS
 
-**PASSED** — all 14 stages.
+**PASSED** — all 17 stages (14 initial + 3 from #185 audit).
 
 * date: 2026-06-02
-* raw log: `results/20260602_t41_initial_pass.log`
+* raw logs: `results/20260602_t41_initial_pass.log` (14 stages),
+  `results/20260602_t41_post_audit_pass.log` (17 stages)
 
 ## REGRESSION SANITY
 
