@@ -187,6 +187,14 @@ _AGINFER_HINT_SCORER_SPEC = "aginfer:hint_v_u"
 # §6): the unit was just created so a reuse is plausibly imminent.  Same
 # order as the daemon's ACTING lambda default.
 _AGINFER_BIRTH_LAMBDA = 0.2
+# Birth-seed STAMP — strictly below any real daemon stamp (the daemon's
+# stamp is int(time_counter) >= 1, the counter starts at 1.0).  The
+# birth seed is a FLOOR; overwrite-by-stamp in set_aginfer_hints skips
+# on `stamp <= existing`, so a real-clock stamp here would let the seed
+# SHADOW the daemon's first refinement if the counter hadn't advanced
+# between birth and that unit's first dump (#188 audit C7).  -1 makes
+# every real daemon push strictly win.
+_AGINFER_BIRTH_STAMP = -1
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
@@ -2972,7 +2980,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self._aginfer_hints[uhash] = {
             "p_hat": 1.0,
             "lambda": _AGINFER_BIRTH_LAMBDA,
-            "stamp": int(node.last_access_time),
+            # Floor stamp (#188 audit C7): below any real daemon stamp so
+            # the daemon's FIRST refinement always wins, even if the
+            # counter didn't advance between birth and that unit's first
+            # dump (equal-stamp would be skipped by overwrite-by-stamp).
+            "stamp": _AGINFER_BIRTH_STAMP,
         }
 
     def _aginfer_overlay_program_states(self, per_program: dict) -> dict:

@@ -69,10 +69,19 @@ B. sglang scorer selection + bound method
   B1 _aginfer_eviction_score reads _aginfer_hints by node hash
      (high-p_hat hint scores higher than low-p_hat, same node)
   B2 default spec → not hint-aware (bare LRU, no hint lookup)
+  B3 real producer→consumer round-trip: set_aginfer_hints (producer) →
+     _aginfer_unit_hash (key) → _aginfer_eviction_score (consumer) —
+     the daemon-PUT key and the scorer-lookup key are the same in code
+     (audit E12)
 C. birth-seed
   C0 hint-aware: seeds p_hat=1.0 for an absent unit
   C1 does NOT clobber an existing (daemon) hint
   C2 no-op when not hint-aware
+  C3 the daemon's FIRST refinement overwrites the birth-seed even at
+     stamp == int(last_access_time) — the seed carries a FLOOR stamp
+     (-1) so a real daemon push always wins (audit C7: an equal stamp
+     would be skipped by overwrite-by-stamp and p_hat=1.0 would shadow
+     the daemon's refinement)
 D. eviction-clear ordering
   D0 _remove_leaf_from_parent clears the node's hint (others untouched)
   D1 clear AFTER detach (§10 commit-before-clear)
@@ -113,10 +122,33 @@ Confirmed live (2026-06-02):
 
 ## RESULTS
 
-**PASSED** — all 13 stages + live e2e.
+**PASSED** — all 15 stages (13 + B3/C3 from the audit) + live e2e.
 
 * date: 2026-06-02
 * raw log: `results/20260602_t27_initial_pass.log`
+
+## AUDIT CLOSURE (2026-06-02)
+
+Adversarial audit confirmed the two load-bearing concerns are CLEAR —
+the daemon-PUT key and the scorer-lookup key are byte-identical in BOTH
+storage modes (`hash_value[-1]` / `node-{id}`), and the clear is
+genuinely death-only (the backuped device-evict keeps the node alive
+and does NOT clear).  Closed:
+
+* **C7 (BUG, low-severity)** — the birth-seed used
+  `stamp = int(last_access_time)`, which could EQUAL the daemon's
+  first-dump stamp; `set_aginfer_hints` skips `stamp <= existing`, so
+  the daemon's first refinement would be dropped and `p_hat=1.0` would
+  shadow it until the next counter bump.  Fixed: seed with a FLOOR
+  stamp `_AGINFER_BIRTH_STAMP = -1` (below any real daemon stamp).
+  Pinned by C3.
+* **E12 (gap)** — added B3, the REAL `set_aginfer_hints` → scorer
+  round-trip through the actual hash key (the prior B1 hand-set the
+  dict, bypassing the keying).
+* **D9 (pre-existing nit)** — the scorer advances the global time
+  counter (`get_and_increase_time_counter` via `_current_time_counter`);
+  inherited from `ours_greedy_score`, benign (no `last_access_time`
+  written during scoring).  Tracked as #193.
 
 ## REGRESSION SANITY
 

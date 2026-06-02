@@ -253,6 +253,35 @@ def stage_b2_normal_spec_not_hint_aware() -> None:
         raise StageFail("default scorer should be bare last_access_time")
 
 
+def stage_b3_real_producer_consumer_round_trip() -> None:
+    """audit E12: drive the REAL producer (set_aginfer_hints) → the
+    REAL key (_aginfer_unit_hash) → the REAL consumer
+    (_aginfer_eviction_score), not a hand-set dict.  Proves the daemon's
+    PUT key and the scorer's lookup key are the same in code, not just
+    by inspection."""
+    c = _bare_cache()
+    os.environ["SGLANG_KV_POLICY_MODULE"] = "aginfer:hint_v_u"
+    try:
+        c._init_aginfer_eviction_scoring()
+    finally:
+        os.environ.pop("SGLANG_KV_POLICY_MODULE", None)
+    n = _Node(last_access_time=0, hit_count=1, n_tokens=100, hash_value=["realhash"])
+    key = c._aginfer_unit_hash(n)
+    ok, reason, applied = c.set_aginfer_hints(
+        [{"hash": key, "p_hat": 0.95, "lambda": 0.5, "stamp": 100}]
+    )
+    if not (ok and applied == 1):
+        raise StageFail(f"producer set_aginfer_hints failed: {reason!r}")
+    score_high = c._eviction_scorer(n, _LAYER)
+    c.set_aginfer_hints([{"hash": key, "p_hat": 0.01, "lambda": 0.5, "stamp": 200}])
+    score_low = c._eviction_scorer(n, _LAYER)
+    if not (score_high > score_low):
+        raise StageFail(
+            "the consumer must read the hint the REAL producer wrote "
+            f"under _aginfer_unit_hash(node); high={score_high} low={score_low}"
+        )
+
+
 # ============================================================ C. birth-seed
 
 
@@ -284,6 +313,35 @@ def stage_c2_birth_seed_noop_when_not_aware() -> None:
     c._aginfer_seed_birth(n)
     if c._aginfer_hints:
         raise StageFail(f"non-hint-aware mode must not birth-seed; got {c._aginfer_hints!r}")
+
+
+def stage_c3_daemon_overwrites_birth_seed() -> None:
+    """audit C7: a birth-seed is a FLOOR — the daemon's FIRST refinement
+    must always win, even in the worst case where the global counter did
+    not advance between the unit's birth and the dump that first scores
+    it (so the daemon's stamp == int(node.last_access_time)).  The seed
+    must therefore carry a stamp strictly below any real daemon stamp;
+    set_aginfer_hints skips on `stamp <= existing`, so an equal-stamp
+    daemon push would otherwise be DROPPED and p_hat=1.0 would shadow
+    the daemon."""
+    c = _bare_cache()
+    c._aginfer_hint_aware = True
+    n = _Node(hash_value=["u"], last_access_time=500)
+    c._aginfer_seed_birth(n)
+    key = c._aginfer_unit_hash(n)
+    # daemon refines with stamp == int(last_access_time) — the no-advance
+    # worst case.  Must overwrite the seed.
+    ok, reason, applied = c.set_aginfer_hints(
+        [{"hash": key, "p_hat": 0.2, "lambda": 0.5, "stamp": 500}]
+    )
+    if applied != 1:
+        raise StageFail(
+            "the daemon's first refinement must overwrite the birth-seed "
+            f"even at stamp == int(last_access_time); applied={applied} "
+            "(birth-seed shadowed the daemon — C7)"
+        )
+    if abs(c._aginfer_hints[key]["p_hat"] - 0.2) > 1e-9:
+        raise StageFail(f"daemon p_hat must win; got {c._aginfer_hints[key]!r}")
 
 
 # ============================================================ D. eviction-clear
@@ -349,9 +407,11 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("B0 sentinel binds the hint-aware scorer",        stage_b0_sentinel_binds_hint_scorer),
     ("B1 scorer reads _aginfer_hints by node hash",    stage_b1_scorer_reads_hint_table),
     ("B2 default spec → not hint-aware",               stage_b2_normal_spec_not_hint_aware),
+    ("B3 real producer→consumer round-trip (hash key)", stage_b3_real_producer_consumer_round_trip),
     ("C0 birth-seed p_hat=1.0 for absent unit",        stage_c0_birth_seed_absent),
     ("C1 birth-seed does not clobber daemon hint",     stage_c1_birth_seed_no_clobber),
     ("C2 birth-seed no-op when not hint-aware",        stage_c2_birth_seed_noop_when_not_aware),
+    ("C3 daemon overwrites birth-seed (C7 stamp floor)", stage_c3_daemon_overwrites_birth_seed),
     ("D0 remove_leaf_from_parent clears the hint",     stage_d0_remove_clears_hint),
     ("D1 clear after detach (§10 ordering)",           stage_d1_clear_after_detach),
     ("D2 clear no-op on empty table",                  stage_d2_clear_noop_empty_table),
