@@ -245,6 +245,31 @@ class ProgramTracker:
         logger.info("program_tracker: ended %s (prev=%s)", pid, prev)
         return prev
 
+    def client_disconnected(self, pid: str) -> Optional[State]:
+        """T39 (#183, DESIGN §10 F1): the client's TCP connection
+        dropped while a request was parked in the proxy gate.
+
+        Semantically identical to SESSION_END for the gate: the
+        program transitions to ENDED, the parked ``wait_if_paused``
+        is released with the 499 verdict.  The proxy is responsible
+        for enqueuing the PUT /aginfer/program_paused {ENDED}
+        (it owns the outbound queue + the Request object).
+
+        Returns the prior state.  Distinct from ``end()`` only in
+        the metric tag (so ops can tell client-disconnect-driven
+        ENDs from explicit harbor SESSION_END).
+        """
+        prev = self.end(pid)
+        from ._metrics import m as _m
+        _m(
+            "client_disconnected",
+            pid=pid,
+            prev_state=prev.value if prev is not None else "NONE",
+        )
+        logger.info("program_tracker: client_disconnected %s (prev=%s)",
+                    pid, prev)
+        return prev
+
     # ---- proxy hook ----
 
     async def wait_if_paused(self, pid: str) -> bool:

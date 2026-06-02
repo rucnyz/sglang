@@ -372,8 +372,20 @@ Order roughly by dependency.
       `request.is_disconnected()`
     - on disconnect: release gate, respond 499, transition program
       to ENDED via outbound queue
-    - **Status (#170 audit — 2026-06-01)**: OPEN, paired with T39.
-      Tracked as **#183**.
+    - **Status (#183 closure — 2026-06-02)**: DONE (paired with T39).
+      * `proxy._gate_or_disconnect` races `wait_if_paused` against
+        `_until_disconnected` (polls `is_disconnected()` at 0.1s —
+        per-request detection, not policy polling); cancels the
+        loser
+      * chat_completions gate: `disconnect` → client_disconnected +
+        enqueue_program_paused(ENDED) + 499; `ended` (F5) → 499;
+        `proceed` → forward
+      * reuses #185's ENDED state + wait_if_paused verdict +
+        enqueue_program_paused
+      * verify/t30/: 12 stages, all green (race outcomes + loser-
+        cancel + client_disconnected + real-proxy disconnect/ended/
+        proceed paths)
+      * Regression: T4 / T6 / T41 / T36 green.
 
 15. **T31 — `harbor /aginfer/session_end` endpoint** (DESIGN §4):
     - out-of-band signal channel the client uses to declare
@@ -468,8 +480,13 @@ generalization.
 7. **T39 — F1 proxy-gate disconnect handler** (DESIGN §10 F1):
    - `program_tracker.client_disconnected(p)` API
    - enqueue `PUT /aginfer/program_paused {END}` on disconnect
-   - **Status (#170 audit — 2026-06-01)**: OPEN.  Paired with T30
-     in **#183**.
+   - **Status (#183 closure — 2026-06-02)**: DONE.
+     `ProgramTracker.client_disconnected(pid)` (thin wrapper over
+     `end()` + distinct metric) transitions ENDED + releases the
+     parked gate with the 499 verdict.  The PUT enqueue lives in
+     the proxy (owns the Request + outbound), a cleaner split than
+     DESIGN's "tracker enqueues" sketch — same net effect.  See T30
+     status + verify/t30/.
 
 8. **T40 — F2 hint emitter** (DESIGN §10 F2):
    - re-score `D_t` units per event, push all to sglang

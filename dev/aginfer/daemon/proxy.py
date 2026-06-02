@@ -137,6 +137,70 @@ def _extract_program_id(
     return None
 
 
+# ---------------------------------------------------------------- F1 gate race
+
+
+# T30 (#183, DESIGN §10 F1): per-request disconnect-detection poll
+# interval.  This is NOT policy polling (the cross-cutting "no
+# polling in policy/scheduler/admission/event_worker" invariant) —
+# it's per-request TCP-disconnect detection in the proxy coroutine,
+# the standard Starlette idiom.  Starlette exposes no pure
+# await-until-disconnect, so we poll is_disconnected() on this
+# cadence only while a request is actually parked in the gate.
+_DISCONNECT_POLL_S = 0.1
+
+
+async def _until_disconnected(raw: Request) -> None:
+    """Resolve when the client's TCP connection drops.  Used to race
+    the gate-wait; for a connected client this never returns (the
+    caller cancels it when the gate wins)."""
+    while True:
+        if await raw.is_disconnected():
+            return
+        await asyncio.sleep(_DISCONNECT_POLL_S)
+
+
+async def _gate_or_disconnect(
+    wait_awaitable: "Awaitable[bool]",
+    disconnect_awaitable: "Awaitable[None]",
+) -> str:
+    """T30 F1: race the gate-wait against client disconnect.
+    Whichever fires first wins (DESIGN §10 "no timer, no fallback").
+
+    Returns one of:
+      * ``"proceed"``    — gate released, forward the request
+      * ``"ended"``      — gate released with the 499 verdict
+                           (SESSION_END while gated, F5)
+      * ``"disconnect"`` — client dropped while parked → 499 + the
+                           caller must enqueue PUT {ENDED}
+
+    Pure w.r.t. its two awaitables so the verify can drive it with
+    stubs (no real ASGI connection needed)."""
+    wait_task = asyncio.ensure_future(wait_awaitable)
+    disc_task = asyncio.ensure_future(disconnect_awaitable)
+    try:
+        done, _pending = await asyncio.wait(
+            {wait_task, disc_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for t in (wait_task, disc_task):
+            if not t.done():
+                t.cancel()
+        # Drain the cancelled loser so its CancelledError doesn't
+        # surface as an "exception never retrieved" warning.
+        for t in (wait_task, disc_task):
+            if t.cancelled():
+                continue
+            try:
+                t.exception()
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                pass
+    if wait_task in done and not wait_task.cancelled():
+        return "proceed" if wait_task.result() else "ended"
+    return "disconnect"
+
+
 # ---------------------------------------------------------------- app factory
 
 
@@ -264,15 +328,30 @@ def create_app(
         tracker: ProgramTracker = app.state.program_tracker
         client: httpx.AsyncClient = app.state.http_client
 
-        # 1. Gate on pause/resume.
+        # 1. Gate on pause/resume — racing client disconnect (F1).
         if pid is not None:
-            # T41 (#185 F5): wait_if_paused returns False iff this
-            # program was ENDED (SESSION_END) while the request sat
-            # in the gate.  The client closed the session, so the
-            # parked request is implicitly cancelled — respond 499
-            # (client closed request) instead of forwarding.
-            should_proceed = await tracker.wait_if_paused(pid)
-            if not should_proceed:
+            # T30/T41 (#183 F1 + #185 F5): the gate-wait races the
+            # client's TCP disconnect; whichever fires first wins
+            # (DESIGN §10 "no timer, no fallback").  Three outcomes:
+            #   * proceed    → gate released, forward
+            #   * ended      → SESSION_END landed while parked (F5)
+            #                  → 499
+            #   * disconnect → client dropped while parked (F1) →
+            #                  transition ENDED + enqueue PUT {ENDED}
+            #                  + 499
+            verdict = await _gate_or_disconnect(
+                tracker.wait_if_paused(pid),
+                _until_disconnected(raw),
+            )
+            if verdict == "disconnect":
+                tracker.client_disconnected(pid)
+                outbound = getattr(app.state, "outbound", None)
+                if outbound is not None:
+                    outbound.enqueue_program_paused(
+                        pid=pid, state="ENDED", pre_pause_state=None,
+                    )
+                return Response(status_code=499)
+            if verdict == "ended":
                 return Response(status_code=499)
 
             # 2. Emit arrival-side paper §4 events.
