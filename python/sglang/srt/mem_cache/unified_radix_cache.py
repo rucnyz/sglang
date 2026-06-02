@@ -175,6 +175,18 @@ def _load_write_through_policy():
             e,
         )
         return _default_should_write_through
+
+
+# T27 (#188): the sentinel SGLANG_KV_POLICY_MODULE value that selects the
+# aginfer hint-AWARE eviction scorer (a cache-bound method reading
+# _aginfer_hints, not a free module:callable).  Distinct from
+# `baselines.sglang_adapter:ours_greedy_score` (hint-UNAWARE, derives
+# p_hat from hits/age) and from default_lru.
+_AGINFER_HINT_SCORER_SPEC = "aginfer:hint_v_u"
+# Birth-seed lambda for a newborn unit ("near-term expected-use", DESIGN
+# §6): the unit was just created so a reuse is plausibly imminent.  Same
+# order as the daemon's ACTING lambda default.
+_AGINFER_BIRTH_LAMBDA = 0.2
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
@@ -497,9 +509,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.reset()
         # aginfer: pluggable eviction scorer (default = LRU-equivalent
-        # V_u, #177) + write-through trigger (default = hit_count >=
-        # threshold, #178).  See module-level _load_* above.
-        self._eviction_scorer = _load_eviction_scorer()
+        # V_u, #177; aginfer:hint_v_u = hint-aware, T27 #188) + write-
+        # through trigger (default = hit_count >= threshold, #178).
+        self._init_aginfer_eviction_scoring()
         self._write_through_policy = _load_write_through_policy()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
@@ -1103,6 +1115,13 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         child.last_access_time = get_and_increase_time_counter()
 
+        # T27 (#188, DESIGN §3 "covers every live unit"): the split's
+        # new INTERNAL node is a newly-live unit (the shared prefix);
+        # birth-seed it too.  The child keeps its hint — split moves the
+        # prefix hashes to new_node but the child's last hash
+        # (get_last_hash_value) is unchanged, so its key is stable.
+        self._aginfer_seed_birth(new_node)
+
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
         return new_node
@@ -1126,6 +1145,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+
+        # T27 (#188, DESIGN §3): a unit is born here (post-commit leaf).
+        # Seed its hint (p_hat≈1) so the hint-aware scorer never sees an
+        # absent entry and the table covers every live unit.  No-op
+        # unless hint-aware; never clobbers a daemon hint.  Seed AFTER
+        # hash_value is set so the key matches the daemon's view.
+        self._aginfer_seed_birth(new_node)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
@@ -1349,6 +1375,14 @@ class UnifiedRadixCache(BasePrefixCache):
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
+        # T27 (#188, DESIGN §10 'Hint clear ordering'): this is the one
+        # death/commit chokepoint (device-evict-death / host-evict /
+        # tombstone cascade / migrate-DROP all funnel here).  Clear the
+        # unit's hint AFTER the detach above — scorer-read (heap build)
+        # happens-before evict-commit (this pop) happens-before clear.
+        # Guarded on a non-empty table so non-aginfer mode pays nothing.
+        if getattr(self, "_aginfer_hints", None):
+            self.clear_aginfer_hint(self._aginfer_unit_hash(node))
 
     def _evict_component_and_detach_lru(
         self,
@@ -2866,10 +2900,80 @@ class UnifiedRadixCache(BasePrefixCache):
     def clear_aginfer_hint(self, uhash: str) -> bool:
         """T40 (#184, DESIGN §10 'Hint clear ordering'): drop the hint
         entry for a unit on its death (eviction / drop).  Returns True
-        if an entry was removed.  The EVICTION-PATH ordering that calls
-        this (scorer read → evict commit → hint clear) is wired
-        separately (T27); this is the primitive only."""
+        if an entry was removed.  Called by ``_remove_leaf_from_parent``
+        (T27 #188) — the single death/commit chokepoint — AFTER the node
+        is detached (scorer read → evict commit → hint clear)."""
         return self._aginfer_hints.pop(uhash, None) is not None
+
+    # ---- T27 (#188): hint-table CONSUMER (DESIGN §3 / §10) ----
+
+    def _aginfer_unit_hash(self, node) -> str:
+        """The hint-table key for a node — IDENTICAL to the unit ``hash``
+        the daemon receives in ``/aginfer/state`` (``hash_value[-1]`` or
+        the ``node-{id}`` fallback for transient nodes).  Keeping this
+        in lockstep with ``_dump_aginfer_state_*`` is what lets the
+        scorer / clear find the entry the daemon PUT."""
+        hv = node.get_last_hash_value()
+        return hv if hv is not None else f"node-{node.id}"
+
+    def _init_aginfer_eviction_scoring(self) -> None:
+        """Resolve the eviction scorer (T27 #188 extends #177's
+        ``_load_eviction_scorer``).  The sentinel
+        ``SGLANG_KV_POLICY_MODULE=aginfer:hint_v_u`` selects the hint-
+        AWARE scorer — a cache-bound method reading ``_aginfer_hints``
+        (a free ``module:callable`` can't reach the cache's dict).  Any
+        other spec resolves through ``_load_eviction_scorer`` (default
+        LRU / a custom module).  Always sets ``_aginfer_hint_aware`` so
+        birth-seeding can gate on it.  Failure to import the adapter's
+        ``hint_v_u`` falls back to LRU (logged) rather than crashing
+        launch."""
+        self._aginfer_hint_aware = False
+        self._aginfer_hint_v_u_fn = None
+        spec = os.environ.get("SGLANG_KV_POLICY_MODULE", "").strip()
+        if spec == _AGINFER_HINT_SCORER_SPEC:
+            try:
+                from baselines.sglang_adapter import hint_v_u
+                self._aginfer_hint_v_u_fn = hint_v_u
+                self._eviction_scorer = self._aginfer_eviction_score
+                self._aginfer_hint_aware = True
+                logger.info("[aginfer] kv_policy_loaded=%s", spec)
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[aginfer] kv_policy_loaded=default_lru "
+                    "(load_failed:%r exception=%s)", spec, e,
+                )
+                self._eviction_scorer = _default_eviction_score
+                return
+        self._eviction_scorer = _load_eviction_scorer()
+
+    def _aginfer_eviction_score(self, node, layer) -> float:
+        """T27 (#188): hint-aware eviction heap key.  Looks up the
+        node's daemon hint and computes the paper-§7 V_u via the adapter
+        (one V_u formula — no reimplementation/drift).  Absent hint →
+        the adapter falls back to the local hits/age derivation (never
+        bare LRU).  Single-threaded scheduler → the dict read needs no
+        lock (DESIGN §10 'Hint atomicity' satisfied by serialisation)."""
+        hint = self._aginfer_hints.get(self._aginfer_unit_hash(node))
+        return self._aginfer_hint_v_u_fn(node, layer, hint)
+
+    def _aginfer_seed_birth(self, node) -> None:
+        """T27 (#188, DESIGN §3 'Hint table covers every live unit'):
+        seed a fresh-access entry (``p_hat = 1.0``) for a newborn unit
+        so the scorer never sees an absent hint and the table tracks the
+        live-unit set.  No-op unless hint-aware.  Never clobbers an
+        existing (daemon-pushed or already-seeded) entry — overwrite-by-
+        stamp is the daemon's job (#184); birth only fills the gap."""
+        if not getattr(self, "_aginfer_hint_aware", False):
+            return
+        uhash = self._aginfer_unit_hash(node)
+        if uhash in self._aginfer_hints:
+            return
+        self._aginfer_hints[uhash] = {
+            "p_hat": 1.0,
+            "lambda": _AGINFER_BIRTH_LAMBDA,
+            "stamp": int(node.last_access_time),
+        }
 
     def _aginfer_overlay_program_states(self, per_program: dict) -> dict:
         """T21 (#181): overlay daemon-pushed program states onto the

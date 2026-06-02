@@ -346,15 +346,36 @@ Order roughly by dependency.
 11. **T27 — Hint clear ordering** (DESIGN §10 R3):
     - scorer's heap-iteration read happens-before eviction commit
       happens-before hint clear
-    - **Status (#184 — 2026-06-02)**: UNBLOCKED.  T40 (#184) landed
-      the hint table (`UnifiedRadixCache._aginfer_hints` +
-      `set_aginfer_hints` / `get_aginfer_hint` / `clear_aginfer_hint`).
-      The clear-ordering invariant (scorer heap-read happens-before
-      evict-commit happens-before `clear_aginfer_hint`) applies once
-      the inline scorer CONSUMES the table — wire it together with
-      that consumer (T28 #178 / #177).  `clear_aginfer_hint` is the
-      primitive; the ordering at the eviction callsite is the open
-      work.
+    - **Status (#188 closure — 2026-06-02)**: DONE — the full hint-
+      table CONSUMER (scorer-reads + birth-seed + clear ordering).
+      * **Hint-aware scorer**: `SGLANG_KV_POLICY_MODULE=aginfer:hint_v_u`
+        binds `UnifiedRadixCache._aginfer_eviction_score` (a cache-
+        bound method reading `_aginfer_hints` by node hash) which
+        computes the §7 V_u via the adapter's `hint_v_u` (shares
+        `_v_u_from_unit` with `ours_greedy_score` → one formula, no
+        drift; A2 drift guard).  Absent hint → local fallback, never
+        bare LRU.
+      * **Birth-seed**: `_aginfer_seed_birth` (p_hat≈1, no clobber)
+        from BOTH `_add_new_node` (leaf) AND `_split_node` (internal) —
+        the e2e showed split nodes were uncovered without the latter;
+        with it `n_aginfer_hints == live_units` (full DESIGN §3
+        coverage).
+      * **Clear ordering**: `clear_aginfer_hint` from
+        `_remove_leaf_from_parent` (the single death/commit chokepoint
+        for device-evict-death / host-evict / tombstone / migrate-
+        DROP), AFTER the detach → DESIGN §10 ordering.  Bounds the
+        table to live units (e2e: 300 churned prefixes → bounded, no
+        leak).
+      * **Atomicity** (DESIGN §10 seqlock): satisfied trivially —
+        single-threaded scheduler serialises the PUT handler and the
+        eviction path; no CAS needed (DESIGN-vs-code note in
+        verify/t27).
+      * verify/t27/: 13 stages + live GPU e2e (kv_policy_loaded,
+        full coverage gap=0, clear-bounded, hint PUT round-trip).
+        Regression: T28 / T38 / T40 / integration_stress green.
+      * **Deferred**: the V_u-aware WRITE-THROUGH (`V_u(res∪{DRAM}) >
+        V_u(res)`, the #178 hook's aginfer registration) — sibling of
+        the eviction scorer, same hint table.
 
 12. **T28 — `should_write_through(node)` plugin point** (DESIGN §3
     superset framing):

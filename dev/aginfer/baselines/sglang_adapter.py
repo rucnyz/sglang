@@ -193,9 +193,18 @@ def ours_greedy_score(node: Any, layer: Any) -> float:
     leaf -- the one whose contribution to future hit-rate is smallest --
     is popped first.  Higher V_u stays in the cache.
     """
-    layer_name = layer.name.upper()
-    now = _current_time_counter()
-    u = _node_to_unit(node, layer_name, now)
+    u = _node_to_unit(node, layer.name.upper(), _current_time_counter())
+    return _v_u_from_unit(u)
+
+
+def _v_u_from_unit(u: ReuseUnit) -> float:
+    """Paper §7 eviction value of a unit at its (single) residence tier.
+    Heap key: lower = evict first; higher V_u stays in the cache.
+
+    Shared by ``ours_greedy_score`` (p_hat/lambda derived from the
+    node's hits/age) and ``hint_v_u`` (p_hat/lambda from the daemon's
+    pushed hint) so the two CANNOT drift — there is exactly one V_u
+    formula (verify/t27 A2 is the drift guard)."""
     pi_u = _PI_U
     tier = u.authoritative_tier
     # Saved prefill at current tier (vs DROP) -- bigger = more valuable to keep.
@@ -209,5 +218,23 @@ def ours_greedy_score(node: Any, layer: Any) -> float:
     h_base = _COSTS.h_base[tier]
     hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
     hold = h_base * u.n_bytes * hold_time
-    value = save_prefill - hold
-    return float(value)
+    return float(save_prefill - hold)
+
+
+def hint_v_u(node: Any, layer: Any, hint: Any) -> float:
+    """T27 (#188, DESIGN §3/§10) hint-aware eviction value.  Same paper-
+    §7 V_u as ``ours_greedy_score``, but ``p_hat`` / ``lambda`` come
+    from the daemon's pushed ``hint`` ({"p_hat", "lambda", "stamp"})
+    instead of the local hits/age proxy — so daemon hints actually
+    change eviction order.
+
+    ``hint=None`` (no daemon entry for this unit yet) → graceful
+    fallback to the local hits/age derivation (== ``ours_greedy_score``;
+    NEVER bare LRU — DESIGN §3 "eviction never falls back to LRU on
+    absent hints").  With unit-birth seeding (the cache seeds p_hat≈1
+    on creation) absent hints are rare in practice."""
+    u = _node_to_unit(node, layer.name.upper(), _current_time_counter())
+    if hint is not None:
+        u.p_hat = float(hint["p_hat"])
+        u.lambda_rate = float(hint["lambda"])
+    return _v_u_from_unit(u)
