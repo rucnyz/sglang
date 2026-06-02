@@ -266,7 +266,14 @@ def create_app(
 
         # 1. Gate on pause/resume.
         if pid is not None:
-            await tracker.wait_if_paused(pid)
+            # T41 (#185 F5): wait_if_paused returns False iff this
+            # program was ENDED (SESSION_END) while the request sat
+            # in the gate.  The client closed the session, so the
+            # parked request is implicitly cancelled — respond 499
+            # (client closed request) instead of forwarding.
+            should_proceed = await tracker.wait_if_paused(pid)
+            if not should_proceed:
+                return Response(status_code=499)
 
             # 2. Emit arrival-side paper §4 events.
             #    - First-ever request for pid -> SESSION_ARRIVAL.

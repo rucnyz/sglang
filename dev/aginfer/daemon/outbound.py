@@ -57,8 +57,17 @@ class OutboundBatch:
     endpoint: str
     body: Dict[str, Any]
     enqueue_ts: float
+    # HTTP verb for the worker.  migrate is POST; program_paused +
+    # thresholds are PUT (T41 #185 / T22).  Default POST keeps every
+    # existing call site unchanged.
+    method: str = "POST"
 
     def __post_init__(self) -> None:
+        if self.method not in ("POST", "PUT"):
+            raise ValueError(
+                f"OutboundBatch.method must be POST or PUT; "
+                f"got {self.method!r}"
+            )
         if self.enqueue_ts <= 0.0:
             raise ValueError(
                 f"OutboundBatch.enqueue_ts must be > 0 (wall-clock "
@@ -192,6 +201,36 @@ class OutboundQueue:
         batch = OutboundBatch(
             batch_id=batch_id, endpoint="migrate",
             body=body, enqueue_ts=time.time(),
+        )
+        self.queue.put_nowait(batch)
+        return batch_id
+
+    def enqueue_program_paused(
+        self,
+        *,
+        pid: str,
+        state: str,
+        pre_pause_state: Optional[str] = None,
+    ) -> str:
+        """T41 (#185) / DESIGN §6: enqueue a ``PUT /aginfer/program_
+        paused`` body.  Fire-and-forget like migrate.  Used by the
+        SESSION_END handler (transition to ENDED) and F1 disconnect
+        (#183).  Returns the batch_id for correlation.
+
+        sglang's PUT handler stores (state, pre_pause_state) and
+        echoes it in the next /aginfer/state dump (T21 #181).
+        """
+        import time
+        batch_id = str(uuid.uuid4())
+        body = {
+            "pid": pid,
+            "state": state,
+            "pre_pause_state": pre_pause_state,
+            "batch_id": batch_id,
+        }
+        batch = OutboundBatch(
+            batch_id=batch_id, endpoint="program_paused",
+            body=body, enqueue_ts=time.time(), method="PUT",
         )
         self.queue.put_nowait(batch)
         return batch_id
@@ -334,7 +373,15 @@ class OutboundQueue:
         assert self._client is not None
         url = f"{self.sglang_base_url}/aginfer/{batch.endpoint}"
         try:
-            r = await self._client.post(url, json=batch.body)
+            if batch.method == "POST":
+                # Keep the POST path on .post() so existing
+                # POST-only test stubs (and the migrate hot path)
+                # are byte-identical to pre-#185.
+                r = await self._client.post(url, json=batch.body)
+            else:
+                r = await self._client.request(
+                    batch.method, url, json=batch.body,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "outbound %s batch %s: POST raised: %s",

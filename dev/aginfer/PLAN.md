@@ -482,8 +482,26 @@ generalization.
 9. **T41 — F5 SESSION_END-for-PAUSED handler** (DESIGN §11 F5):
    - on SESSION_END for PAUSED program: release gate with HTTP
      499, transition ENDED, enqueue PUT
-   - **Status (#170 audit — 2026-06-01)**: OPEN, blocks on #181
-     (PUT program_paused endpoint).  Tracked as **#185**.
+   - **Status (#185 closure — 2026-06-02)**: DONE.
+     * `ProgramTracker.State.ENDED` + `end(pid)` (returns prior
+       state; releases the gate + marks the 499 verdict if PAUSED)
+     * `wait_if_paused(pid) -> bool` verdict (False = ended-while-
+       gated → proxy 499); read-once so re-arrival isn't aborted
+     * `proxy.py` returns `Response(499)` on a False verdict
+     * `OutboundBatch.method` (default POST) + `_post_one` dispatch
+       (POST byte-identical; PUT via `.request`); `OutboundQueue.
+       enqueue_program_paused`
+     * `EventKind.SESSION_END` + `make_session_end_handler` +
+       `attach_session_end_handler` (wired in main.py after
+       kv_scheduler so F5 owns SESSION_END)
+     * verify/t41/: 14 stages, all green
+     * **Scope boundary**: this handler owns the F5 state-transition
+       + gate-release + PUT.  The SESSION_END migrate D_t
+       (`session_scoped_units` demote/drop, DESIGN §7) is the
+       kv_scheduler's "SESSION_END normal path" — `_build_decision_
+       set` returns [] for SESSION_END today; wiring it is a
+       separate follow-on (**#187**).
+   - Regression: T6 / T36 / T164 / T21 / T24 / T4 all green.
 
 10. **T42 — Observability logging** (DESIGN §10 F3):
     - state-fetch latency p50 / p95 / p99

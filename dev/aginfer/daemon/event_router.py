@@ -369,6 +369,66 @@ def attach_hash_collision_handler(router: "EventRouter") -> None:
     router.set_handler(EventKind.HASH_COLLISION, _hash_collision_handler)
 
 
+def make_session_end_handler(tracker, outbound):
+    """T41 (#185, DESIGN §11 F5 + §4 SESSION_END): build the
+    SESSION_END handler closure.
+
+    On SESSION_END for program ``p``:
+      * ``tracker.end(p)`` transitions p to ENDED.  If p was PAUSED
+        with a request parked in the proxy gate, end() releases the
+        gate so ``wait_if_paused`` wakes and the proxy responds 499
+        (the F5 PAUSED branch — client closed the session).
+      * Enqueue ``PUT /aginfer/program_paused {state: ENDED}`` so
+        sglang clears the program's per_program_usage state on the
+        next dump.
+
+    The migrate D_t for SESSION_END (session_scoped_units demote/
+    drop, DESIGN §7 table) is the kv_scheduler's concern — NOT
+    wired here; this handler owns only the F5 state-transition +
+    gate-release + PUT.  See PLAN §4 T41 status note.
+
+    Closure holds ``tracker`` + ``outbound`` (the same pattern
+    kv_scheduler/admission use) since the handler signature is
+    ``(event, router)`` and the router doesn't expose them.
+    """
+    async def _session_end_handler(event: Event, router: "EventRouter") -> None:
+        pid = event.session
+        if pid is None:
+            logger.warning("SESSION_END with no session id; ignoring")
+            return
+        prev = tracker.end(pid)
+        # Enqueue the PUT regardless of prior state (idempotent on
+        # sglang side; ENDED-no-units entries are GC'd at dump time
+        # per #186).
+        outbound.enqueue_program_paused(
+            pid=pid, state="ENDED", pre_pause_state=None,
+        )
+        from ._metrics import m as _m
+        _m(
+            "session_end",
+            pid=pid,
+            prev_state=prev.value if prev is not None else "NONE",
+        )
+        logger.info(
+            "SESSION_END handled: pid=%s prev=%s → ENDED + PUT enqueued",
+            pid, prev,
+        )
+
+    return _session_end_handler
+
+
+def attach_session_end_handler(router: "EventRouter", tracker, outbound) -> None:
+    """Register the T41 SESSION_END handler.  Wired at daemon startup
+    AFTER kv_scheduler (which blanket-attaches every EventKind) so
+    this F5 handler owns SESSION_END.  kv_scheduler's SESSION_END
+    decision_set is empty today anyway (``_build_decision_set``
+    returns [] for it), so nothing is lost."""
+    router.set_handler(
+        EventKind.SESSION_END,
+        make_session_end_handler(tracker, outbound),
+    )
+
+
 async def _noop_handler(event: Event, router: "EventRouter") -> None:
     """Default handler used when T7 / T8 haven't registered one yet.
 

@@ -86,6 +86,12 @@ class State(str, enum.Enum):
     REASONING = "REASONING"
     ACTING = "ACTING"
     PAUSED = "PAUSED"
+    # T41 (#185, DESIGN §11 F5 / §4 SESSION_END): terminal state.
+    # The client signalled SESSION_END; no more arrivals expected.
+    # Its session-scoped units become demote/drop candidates and it
+    # contributes 0 to future p_hat.  A program reaches ENDED only
+    # via end() (harbor's out-of-band /aginfer/session_end signal).
+    ENDED = "ENDED"
 
 
 class ProgramTracker:
@@ -98,6 +104,12 @@ class ProgramTracker:
         # created it is set (so wait_if_paused returns immediately for
         # untracked programs).
         self._events: Dict[str, asyncio.Event] = {}
+        # T41 (#185): pids that were end()'d while a request sat in
+        # the gate.  ``wait_if_paused`` checks this on wake so the
+        # proxy can respond 499 (client closed) instead of forwarding
+        # a request for a session the client already ended.  Consumed
+        # (cleared) on read.
+        self._ended_while_gated: set = set()
 
     # ---- queries ----
 
@@ -190,11 +202,50 @@ class ProgramTracker:
         logger.info("program_tracker: resumed %s (state stays %s until next arrival)",
                     pid, self._states.get(pid))
 
+    # ---- SESSION_END hook (T41 #185, DESIGN §11 F5) ----
+
+    def end(self, pid: str) -> Optional[State]:
+        """Transition ``pid`` to ENDED (terminal) on SESSION_END.
+
+        Returns the PRIOR state (so the caller can branch — the F5
+        PAUSED path releases the gate with 499; other prior states
+        just transition).
+
+        If the program was PAUSED with a request sitting in the
+        gate, ``end()`` marks ``_ended_while_gated`` and releases
+        the gate event so ``wait_if_paused`` wakes and returns the
+        "abort with 499" verdict.  Idempotent: ending an already-
+        ENDED program is a no-op returning ENDED.
+        """
+        prev = self._states.get(pid)
+        if prev is State.ENDED:
+            return State.ENDED
+        was_paused = prev is State.PAUSED
+        self._states[pid] = State.ENDED
+        if was_paused:
+            # A request may be parked in the gate; tell wait_if_paused
+            # to abort it (499) rather than forward, then release.
+            self._ended_while_gated.add(pid)
+            self._event(pid).set()
+        from ._metrics import m as _m
+        _m(
+            "program_state",
+            pid=pid,
+            from_=prev.value if prev is not None else "NONE",
+            to="ENDED",
+        )
+        logger.info("program_tracker: ended %s (prev=%s)", pid, prev)
+        return prev
+
     # ---- proxy hook ----
 
-    async def wait_if_paused(self, pid: str) -> None:
-        """Async-block while ``pid`` is paused.  Returns immediately for
-        un-paused programs (no event yet, or event is set).
+    async def wait_if_paused(self, pid: str) -> bool:
+        """Async-block while ``pid`` is paused.  Returns ``True`` to
+        proceed (forward the request) or ``False`` if the program was
+        ENDED while this request sat in the gate (T41 #185 F5: the
+        proxy should respond 499 — the client closed the session).
+
+        Un-paused programs return ``True`` immediately.
 
         Defensive against direct-state-mutation tests: if a caller
         wrote ``_states[pid] = PAUSED`` without going through
@@ -208,8 +259,21 @@ class ProgramTracker:
                 e = asyncio.Event()  # default: cleared
                 self._events[pid] = e
             else:
-                return
+                # Fast path: never gated.  But still honour an end()
+                # that raced in (ENDED-while-untracked is rare but
+                # the verdict must be consistent).
+                return not self._consume_ended_while_gated(pid)
         await e.wait()
+        return not self._consume_ended_while_gated(pid)
+
+    def _consume_ended_while_gated(self, pid: str) -> bool:
+        """Pop + return whether ``pid`` was ENDED while gated.  Read-
+        once (cleared) so a later re-arrival of the same pid is not
+        spuriously aborted."""
+        if pid in self._ended_while_gated:
+            self._ended_while_gated.discard(pid)
+            return True
+        return False
 
     # ---- internal ----
 

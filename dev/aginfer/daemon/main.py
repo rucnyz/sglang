@@ -28,6 +28,7 @@ from .admission_controller import AdmissionController, attach_admission_controll
 from .event_router import (
     attach_apply_failed_handler,
     attach_hash_collision_handler,
+    attach_session_end_handler,
 )
 from .kv_scheduler import KvScheduler, attach_kv_scheduler
 from .outbound import OutboundQueue
@@ -214,6 +215,13 @@ def main(argv=None) -> None:
     # dedupes pair-by-pair, so a persistent collision fires exactly
     # one daemon fatal per (node_a, node_b) pair).
     attach_hash_collision_handler(router)
+
+    # T41 (#185) — SESSION_END handler.  Attached AFTER kv_scheduler
+    # so this F5 handler owns SESSION_END (transitions ENDED,
+    # releases the proxy gate with 499 for a parked PAUSED request,
+    # enqueues PUT /aginfer/program_paused {ENDED}).  Needs tracker
+    # + outbound (held in the closure).
+    attach_session_end_handler(router, tracker, outbound)
 
     # T9 startup-invariant markers — single grep-friendly line.
     logger.info(

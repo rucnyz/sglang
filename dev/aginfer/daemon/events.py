@@ -34,6 +34,13 @@ class EventKind(str, enum.Enum):
     TOOL_CALL_END = "tool_call_end"
     SUB_DISPATCH_BLOCKING = "sub_dispatch_blocking"
     SUB_DISPATCH_ASYNC = "sub_dispatch_async"
+    # T41 (#185, DESIGN §4 / §11 F5): harbor signals end-of-session
+    # out-of-band (harbor's /aginfer/session_end → daemon
+    # /aginfer/event with kind=session_end).  Handler transitions
+    # the program to ENDED, releases the proxy gate with 499 if a
+    # request was parked (F5 PAUSED branch), and enqueues the
+    # PUT /aginfer/program_paused {ENDED} to inform sglang.
+    SESSION_END = "session_end"
     # ---- sglang webhook (T5) ----
     MEMORY_PRESSURE = "memory_pressure"
     PRESSURE_RESOLVED = "pressure_resolved"
