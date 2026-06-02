@@ -159,12 +159,28 @@ def default_policy_score(node: Any, layer: Any) -> float:
     §3 uses hit_count only in the WRITE-THROUGH trigger
     (``should_write_through`` / #178).  (#177 removed an earlier
     ``+ hit_count·2^-50`` eviction tie-break — it was non-functional
-    below the float64 ULP at realistic ``last_access_time`` AND moot,
-    since the cache spaces every node's ``last_access_time`` distinctly
-    (same-batch prefix nodes are 1e-5 apart), so exact ties never
-    occur.)
+    below the float64 ULP at realistic ``last_access_time`` AND near-
+    pointless: the cache stamps ancestor nodes 1e-5 apart, so exact
+    ties are effectively absent for realistic counters; only at extreme
+    counter magnitudes (≳2^40, where the 1e-5 spacing ULP-collapses) do
+    ties occur, and there stock LRU ties arbitrarily too.)
     """
     return float(node.last_access_time)
+
+
+def default_policy_should_write_through(node: Any, threshold: int) -> bool:
+    """T28/#178 default-policy WRITE-THROUGH trigger — the adapter-side
+    mirror of sglang's in-process ``_default_should_write_through``.
+    Completes the DESIGN §3 "default policy module" on the adapter side
+    (eviction = ``default_policy_score``; write-through = this).
+
+    Signature ``(node, threshold) -> bool`` matches the
+    ``SGLANG_WRITE_THROUGH_MODULE`` plugin contract.  Default behaviour
+    is the historical ``hit_count >= write_through_threshold``.  An
+    aginfer V_u-aware version (``V_u(res ∪ {DRAM}) > V_u(res)``) plugs
+    into the same hook once the hint-table consumer exists (T27 #188).
+    """
+    return int(node.hit_count) >= int(threshold)
 
 
 def ours_greedy_score(node: Any, layer: Any) -> float:

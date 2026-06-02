@@ -170,6 +170,15 @@ def stage_a3_cross_tree_drift_guard() -> None:
                 f"default_policy_score at (la={la}, hc={hc}): "
                 f"sglang={a!r} adapter={b!r}"
             )
+        # Spec pin (not just mutual equality): the shared value MUST be
+        # bare float(last_access_time) — catches the case where BOTH
+        # trees drift together (e.g. both grow a hit_count term).
+        if a != float(la):
+            raise StageFail(
+                f"default eviction score must be bare last_access_time; "
+                f"at (la={la}, hc={hc}) both trees gave {a!r} != {float(la)!r} "
+                f"— hit_count leaked back into the eviction score"
+            )
 
 
 def stage_a4_plugin_override_resolves() -> None:
@@ -223,14 +232,28 @@ def stage_b1_load_default() -> None:
 
 
 def stage_b2_load_override_and_failure() -> None:
-    # valid override
-    spec = "baselines.sglang_adapter:default_policy_score"  # any importable callable
+    # valid override — a REAL (node, threshold) -> bool write-through
+    # policy (not a wrong-signature eviction scorer); assert it both
+    # RESOLVES and DECIDES correctly when invoked (audit D12: the prior
+    # fixture used a (node, layer) -> float scorer, which resolves but
+    # returns a float that silently mis-decides at the callsite).
+    from baselines.sglang_adapter import default_policy_should_write_through
+    spec = "baselines.sglang_adapter:default_policy_should_write_through"
     old = os.environ.get("SGLANG_WRITE_THROUGH_MODULE")
     os.environ["SGLANG_WRITE_THROUGH_MODULE"] = spec
     try:
         fn = _load_write_through_policy()
         if fn is _default_should_write_through:
             raise StageFail("valid override should NOT fall back to default")
+        if fn is not default_policy_should_write_through:
+            raise StageFail(f"override should resolve to the spec'd callable; got {fn!r}")
+        # it must actually behave as a (node, threshold) -> bool policy
+        verdict = fn(_Node(last_access_time=0, hit_count=3), 2)
+        if verdict is not True:
+            raise StageFail(
+                f"resolved write-through policy must DECIDE (hit 3 >= thr 2 "
+                f"→ True); got {verdict!r} (wrong-signature callable?)"
+            )
         # malformed spec → default
         os.environ["SGLANG_WRITE_THROUGH_MODULE"] = "no_colon_here"
         fn2 = _load_write_through_policy()

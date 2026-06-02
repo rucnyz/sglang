@@ -93,6 +93,14 @@ if grep -E "kv_policy_loaded=baselines\\." "$SGLANG_LOG_REAL" >/dev/null 2>&1; t
 fi
 echo "[lru]   ✓ kv_policy_loaded=LRU (no aginfer module)"
 
+# LRU invariant (#178 T9 parity): write-through must also be the
+# default (no aginfer module) — the historical hit_count trigger.
+if grep -E "write_through_loaded=baselines\\." "$SGLANG_LOG_REAL" >/dev/null 2>&1; then
+    echo "[lru] HALT — write_through_loaded is aginfer (should be default)" >&2
+    exit 5
+fi
+echo "[lru]   ✓ write_through_loaded=default (no aginfer module)"
+
 echo "[lru] starting harbor (direct → sglang :30000)..."
 HARBOR_RESULTS="$RESULTS_DIR/harbor_jobs"
 mkdir -p "$HARBOR_RESULTS"

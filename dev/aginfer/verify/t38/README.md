@@ -49,11 +49,14 @@ eviction tie-break.  #177 **removed** it:
 1. **Non-functional** — `2^-50 ≈ 9e-16` is below the float64 ULP at any
    realistic `last_access_time` (ULP ≈ `2^-42` at `last_access=1000`),
    so `1000.0 + hit·2^-50 == 1000.0`; the bonus was silently dropped.
-2. **Moot** — the cache assigns a DISTINCT `last_access_time` to every
-   node (same-batch prefix nodes spaced `1e-5` apart via
-   `cur_time -= 0.00001`), so exact `last_access_time` ties — the only
-   case a tie-break could act on — never occur.  The "ties are common
-   under batched prefill" premise the bonus was built on is false.
+2. **Near-pointless** — the match path stamps ancestor nodes `1e-5`
+   apart (`cur_time -= 0.00001`), so exact `last_access_time` ties —
+   the only case a tie-break could act on — are effectively absent for
+   realistic counter values.  (Only at extreme counter magnitudes
+   ≳2^40, where the `1e-5` spacing ULP-collapses, do ancestor nodes
+   tie — and there stock LRU ties arbitrarily too.)  The "ties are
+   common under batched prefill" premise the bonus was built on is
+   false.
 
 A precision-safe (tuple-keyed) eviction tie-break could be added later
 if a workload ever needs one; the lossy float version is gone.

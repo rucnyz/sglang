@@ -164,11 +164,14 @@ Two physical plugin points carry this:
   (last_access as p_hat surrogate).  Aginfer registers its
   hint-table-aware V_u.
 * **Write-through trigger**: sglang's HiCache invokes a
-  `should_write_through(node)` function (new plugin point) when
-  considering write_through_selective.  Default implementation
-  is the historical `hit_count >= write_through_threshold`.
-  Aginfer registers a V_u-aware version that triggers when
-  `V_u(residence ∪ {DRAM}) > V_u(residence)`.
+  `should_write_through(node, threshold)` function (new plugin
+  point, env `SGLANG_WRITE_THROUGH_MODULE`) when considering
+  write_through_selective.  Default implementation is the
+  historical `hit_count >= write_through_threshold` (the
+  `threshold` arg carries the cache's configured value).  Aginfer
+  registers a V_u-aware version that triggers when
+  `V_u(residence ∪ {DRAM}) > V_u(residence)` (and may ignore
+  `threshold`).
 
 The same plugin pattern can be extended to future decision points
 (predictive load_back, mooncake archive trigger) without

@@ -75,11 +75,15 @@ import importlib
 # the WRITE-THROUGH trigger (_default_should_write_through / #178), not
 # in eviction ordering.  (An earlier attempt at a `+ hit_count·2^-50`
 # eviction tie-break was both non-functional — the bonus is below the
-# float64 ULP at any realistic last_access_time — and pointless: the
-# cache assigns DISTINCT last_access_time to every node, even same-batch
-# prefix nodes are spaced 1e-5 apart, so exact ties never occur.  See
-# #177.)  verify/t28 stage A3 is the cross-tree drift guard that pins
-# this == the adapter's default_policy_score.
+# float64 ULP at any realistic last_access_time — and near-pointless:
+# the match path stamps ancestor nodes at cur_time, cur_time-1e-5, …
+# (see update path), so exact last_access_time ties are effectively
+# absent for realistic counter values.  At extreme counter magnitudes
+# (≳2^40 cumulative accesses, where the 1e-5 spacing itself falls below
+# the ULP) ancestor nodes DO tie — but there stock-sglang bare LRU ties
+# arbitrarily too, so this is no regression vs stock.  See #177.)
+# verify/t28 stage A3 is the cross-tree drift guard that pins this ==
+# the adapter's default_policy_score.
 def _default_eviction_score(node, layer) -> float:
     return float(node.last_access_time)
 
@@ -1793,6 +1797,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # is the historical hit_count >= threshold; aginfer can
         # register a V_u-aware version.  `not node.backuped` stays a
         # hard precondition (no point re-backing-up an existing copy).
+        # SCOPE: only THIS cache (UnifiedRadixCache) routes the trigger
+        # through the hook.  The sibling HiRadixCache / HiMambaRadixCache
+        # `_inc_hit_count` still hardcode `hit_count >= threshold` — they
+        # are out of aginfer scope because aginfer always launches with
+        # SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 (only UnifiedRadixCache emits
+        # the aginfer schema / honours the plugins).  Migrating them is
+        # tracked separately (#178 audit B6).
         if not node.backuped and self._write_through_policy(
             node, self.write_through_threshold
         ):

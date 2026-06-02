@@ -28,10 +28,14 @@ to the eviction score.  #177 **removed** it, for two reasons:
    at any realistic `last_access_time` (at `last_access_time=1000 ≈
    2^10` the ULP is `2^-42 ≈ 2e-13`), so `1000.0 + hit·2^-50 == 1000.0`
    — the bonus is silently dropped.  The tie-break never fired.
-2. **Moot.** The cache assigns a DISTINCT `last_access_time` to every
-   node — `unified_radix_cache.py` spaces same-batch prefix nodes
-   `1e-5` apart (`cur_time -= 0.00001`) — so exact `last_access_time`
-   ties, the only case a tie-break could act on, never occur.
+2. **Near-pointless.** The match path stamps ancestor nodes `1e-5`
+   apart (`cur_time -= 0.00001`), so exact `last_access_time` ties —
+   the only case a tie-break could act on — are effectively absent for
+   realistic counter values.  At extreme counter magnitudes (≳2^40
+   cumulative accesses, where the `1e-5` spacing itself ULP-collapses)
+   ancestor nodes DO tie — but there stock-sglang bare LRU ties
+   arbitrarily too, so dropping the (dead) tie-break is no regression
+   vs stock.
 
 DESIGN §3 places `hit_count` in the **write-through** trigger, not
 eviction ordering — which is exactly what #178 implements.  A real
@@ -86,7 +90,39 @@ Pure-Python; ~0.3 s.  No GPU.  Imports sglang's
 **PASSED** — all 10 stages.
 
 * date: 2026-06-02
-* raw log: `results/20260602_t28_initial_pass.log`
+* raw logs: `results/20260602_t28_initial_pass.log`,
+  `results/20260602_t28_post_audit_pass.log`
+
+## AUDIT CLOSURE (2026-06-02)
+
+Adversarial audit found NO correctness bug or regression; closed
+five honesty/parity/test-depth items:
+
+* **D11 (parity)** — `write_through_loaded=` was an orphan log line
+  (claimed "T9 grep parity" but nothing grepped it).  Now the three
+  startup-invariant harnesses that grep `kv_policy_loaded=` also grep
+  `write_through_loaded=`: `scenarios/_shared/run_k.sh` +
+  `daemon_overhead/run_direct.sh` assert `default_hitcount` (pins that
+  the V_u-aware write-through is NOT yet active → update when #188
+  lands), `run_lru.sh` asserts no-aginfer-module.  Parity is now real.
+* **A2 (honesty)** — softened the "exact ties never occur" claim:
+  ties are effectively absent for realistic counter values, but at
+  ≳2^40 the 1e-5 ancestor spacing ULP-collapses and ties DO occur —
+  where stock bare LRU ties arbitrarily too, so dropping the dead
+  tie-break is no regression vs stock.
+* **D12 (weak test)** — B2's "valid override" used a wrong-signature
+  `(node, layer)->float` scorer (resolved but never invoked, would
+  silently mis-decide).  Now uses the real
+  `default_policy_should_write_through(node, threshold)->bool` and
+  asserts it DECIDES correctly when invoked.
+* **A3 (spec pin)** — the cross-tree drift guard now also pins the
+  shared value == `float(last_access_time)` (catches BOTH trees
+  drifting together, e.g. a hit_count term creeping back).
+* **B6 (scope)** — documented at the callsite that the plugin covers
+  UnifiedRadixCache only (aginfer pins it); HiRadixCache /
+  HiMambaRadixCache still hardcode the trigger — tracked as #192.
+* **B7 (DESIGN)** — reconciled DESIGN §3 to the `(node, threshold)`
+  signature.
 
 ## REGRESSION SANITY
 

@@ -105,6 +105,14 @@ if ! grep -E "kv_policy_loaded=baselines.sglang_adapter:ours_greedy_score" "$SGL
 fi
 echo "[h_prime]   ✓ kv_policy_loaded=ours_greedy_score"
 
+# #178 T9 parity: write-through trigger is the default hit_count
+# (the V_u-aware version is deferred — T27 #188).
+if ! grep -E "write_through_loaded=default_hitcount" "$SGLANG_LOG_REAL" >/dev/null; then
+    echo "[h_prime] HALT — write_through_loaded did not match" >&2
+    exit 5
+fi
+echo "[h_prime]   ✓ write_through_loaded=default_hitcount"
+
 # No daemon — harbor talks directly to sglang :30000.
 
 echo "[h_prime] starting harbor (direct → sglang :30000, NO daemon)..."

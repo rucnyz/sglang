@@ -223,6 +223,17 @@ if ! grep -E "kv_policy_loaded=baselines.sglang_adapter:ours_greedy_score" "$SGL
 fi
 echo "[run_k:$VARIANT]   ✓ kv_policy_loaded=baselines.sglang_adapter:ours_greedy_score"
 
+# 3b. write_through_loaded grep (#178 T9 parity) — MUST be the default
+# hit_count trigger.  The daemon V_u-aware write-through is deferred
+# (T27 #188); this pins that it is NOT yet active.  Update to the
+# aginfer module here when #188 wires SGLANG_WRITE_THROUGH_MODULE.
+if ! grep -E "write_through_loaded=default_hitcount" "$SGLANG_LOG_REAL" >/dev/null; then
+    echo "[run_k:$VARIANT] HALT — write_through_loaded did not match" >&2
+    grep "write_through_loaded=" "$SGLANG_LOG_REAL" | head -1 >&2 || echo "  (line not found at all)" >&2
+    exit 5
+fi
+echo "[run_k:$VARIANT]   ✓ write_through_loaded=default_hitcount"
+
 # 3b. tree_cache invariant.  Best-effort grep — sglang doesn't have a
 # single canonical "UnifiedRadixCache" log line, but
 # SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 must be set (env, not log).
