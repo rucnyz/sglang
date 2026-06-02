@@ -10,25 +10,25 @@ daemon is attached.  Per DESIGN §3:
     policy module: the policy module that runs when no daemon is
     attached.
 
-Concrete contract:
+Concrete contract (post-#177):
   * Same callable signature as the other scorers in
     ``baselines/sglang_adapter`` (``(node, layer) -> float``);
     pluggable via ``SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter
     :default_policy_score``.
-  * Base value = ``last_access_time`` — identical to ``lru_score``
-    when ``hit_count == 0``.
-  * Hit-count tie-break bonus = ``hit_count × 2^-31`` — strictly
-    smaller than the minimum gap (1.0) between two distinct
-    ``last_access_time`` integers, so age dominates whenever ages
-    differ.
-  * Tied ages → higher ``hit_count`` ranks higher (kept longer).
+  * Eviction value = **bare ``last_access_time``** — the LRU-
+    equivalent V_u ("last_access as p_hat surrogate", DESIGN §3).
+    Identical to ``lru_score`` for ALL inputs, and byte-identical to
+    sglang's in-process ``_default_eviction_score`` (one code path).
+  * ``hit_count`` does NOT affect the eviction score.  DESIGN §3 puts
+    hit_count in the WRITE-THROUGH trigger (``should_write_through``
+    / #178), not eviction ordering.
 
-Why hit-count-aware tie-break: sglang's eviction touches multiple
-leaves in the same scheduler step.  Those leaves can share
-``last_access_time`` (refreshed in the same batch).  Pure LRU
-picks ties arbitrarily; the bonus makes the choice deterministic
-AND prefers hot leaves (mirroring sglang's
-``hit_count >= write_through_threshold`` historical signal).
+#177 removed an earlier ``+ hit_count·2^-50`` eviction tie-break: it
+was non-functional (the bonus sits below the float64 ULP at any
+realistic ``last_access_time``) AND moot — the cache assigns a
+DISTINCT ``last_access_time`` to every node (same-batch prefix nodes
+are spaced 1e-5 apart), so exact ties never occur.  The hit_count
+write-through behaviour it was loosely mirroring lives in T28 (#178).
 """
 from __future__ import annotations
 
@@ -44,7 +44,6 @@ if str(_AGINFER_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGINFER_ROOT))
 
 from baselines.sglang_adapter import (  # noqa: E402
-    _DEFAULT_HIT_COUNT_BONUS,
     default_policy_score,
     lru_score,
 )
@@ -104,25 +103,25 @@ def stage_a1_zero_hits_equals_lru() -> None:
 # ============================================================ B. ordering
 
 
-def stage_b0_age_dominates_arbitrary_hit_count() -> None:
-    """For ANY hit_counts (within 32-bit range), if last_access_time
-    differs by at least 1 the ordering must match lru_score.
-
-    Adversarial fixture: older node has hit_count=2^30 (huge bonus),
-    newer node has hit_count=0.  The 2^-31 bonus cap guarantees age
-    wins."""
-    older = _StubNode(last_access_time=10, hit_count=2 ** 30)
-    newer = _StubNode(last_access_time=11, hit_count=0)
-    if not (default_policy_score(older, _LAYER_HBM)
-            < default_policy_score(newer, _LAYER_HBM)):
-        raise StageFail(
-            "older < newer must hold regardless of hit_count; "
-            f"got older={default_policy_score(older, _LAYER_HBM)} vs "
-            f"newer={default_policy_score(newer, _LAYER_HBM)}"
-        )
-    # Sanity: lru_score agrees.
-    if not (lru_score(older, _LAYER_HBM) < lru_score(newer, _LAYER_HBM)):
-        raise StageFail("lru_score ordering broken in fixture")
+def stage_b0_hit_count_does_not_affect_score() -> None:
+    """Post-#177 contract: the eviction score is hit_count-INDEPENDENT.
+    At a fixed last_access_time, ANY hit_count (including the unbounded
+    2^32+ that sglang's `node.hit_count += 1` allows by construction)
+    yields the SAME score == lru_score.  hit_count's job is the
+    write-through trigger (#178), not eviction."""
+    for hc in (0, 1, 50, 2 ** 30, 2 ** 32, 10 ** 18):
+        n = _StubNode(last_access_time=777, hit_count=hc)
+        d = default_policy_score(n, _LAYER_HBM)
+        if d != float(777):
+            raise StageFail(
+                f"eviction score must be bare last_access_time "
+                f"regardless of hit_count; hit={hc} gave {d} (expected 777.0)"
+            )
+        if d != lru_score(n, _LAYER_HBM):
+            raise StageFail(
+                f"default must equal lru_score for hit={hc}; "
+                f"default={d} lru={lru_score(n, _LAYER_HBM)}"
+            )
 
 
 def stage_b1_uniform_hit_count_matches_lru_order() -> None:
@@ -147,58 +146,21 @@ def stage_b1_uniform_hit_count_matches_lru_order() -> None:
         )
 
 
-def stage_b2_tied_age_hit_count_breaks() -> None:
-    """Two nodes at the SAME last_access_time → higher hit_count
-    has the higher (= keep-longer) score."""
+def stage_b2_tied_age_identical_score_no_tiebreak() -> None:
+    """Post-#177: the eviction default does NOT tie-break by
+    hit_count.  Two nodes at the SAME last_access_time get the SAME
+    score regardless of hit_count (a deliberate non-feature — the
+    cache never produces exact last_access_time ties anyway, spacing
+    every node distinctly, and the float tie-break was non-functional).
+    A future hit-aware refinement, if ever wanted, belongs in a real
+    (tuple-keyed) scorer, not a lossy float sum."""
     a = _StubNode(last_access_time=100, hit_count=1)
     b = _StubNode(last_access_time=100, hit_count=50)
-    s_a = default_policy_score(a, _LAYER_HBM)
-    s_b = default_policy_score(b, _LAYER_HBM)
-    if not (s_a < s_b):
+    if default_policy_score(a, _LAYER_HBM) != default_policy_score(b, _LAYER_HBM):
         raise StageFail(
-            f"tied age: higher hit_count should win; got "
-            f"hit=1 score={s_a} vs hit=50 score={s_b}"
-        )
-    # LRU would tie (same value); confirm the bonus is what's
-    # breaking the tie, not some other effect.
-    if lru_score(a, _LAYER_HBM) != lru_score(b, _LAYER_HBM):
-        raise StageFail("lru_score should tie at identical age")
-
-
-def stage_b3_bonus_under_min_age_gap_at_int32_max() -> None:
-    """Max bonus at int32 max must be STRICTLY LESS THAN 1.0 (the
-    minimum gap between distinct integer ``last_access_time``s)."""
-    max_int32 = 2 ** 31 - 1
-    max_bonus = max_int32 * _DEFAULT_HIT_COUNT_BONUS
-    if not (max_bonus < 1.0):
-        raise StageFail(
-            f"max bonus at int32 {max_bonus} must be < 1.0 to "
-            f"preserve age ordering; tune _DEFAULT_HIT_COUNT_BONUS"
-        )
-
-
-def stage_b4_age_dominates_under_unbounded_hit_count() -> None:
-    """Audit #169-round2: `node.hit_count` in sglang is an UNBOUNDED
-    Python int (no cap, no reset — see unified_radix_cache.py:1703
-    `node.hit_count += 1`).  The 32-bit assumption in the comment
-    was wrong.  Under sustained hot-prefix traffic, a single node
-    can accumulate > 2^31 hits.
-
-    Adversarial pin: older node with 2^32 hits MUST still evict
-    before a newer node with 0 hits — same invariant as B0 but
-    with a hit_count value the int32 assumption can't handle."""
-    older = _StubNode(last_access_time=10, hit_count=2 ** 32)
-    newer = _StubNode(last_access_time=11, hit_count=0)
-    if not (default_policy_score(older, _LAYER_HBM)
-            < default_policy_score(newer, _LAYER_HBM)):
-        raise StageFail(
-            f"older < newer must hold for ANY hit_count (including "
-            f"hit_count > 2^31, which sglang allows by construction); "
-            f"got older(hit=2^32, age=10)="
-            f"{default_policy_score(older, _LAYER_HBM)} vs "
-            f"newer(hit=0, age=11)={default_policy_score(newer, _LAYER_HBM)}.  "
-            f"Pick a smaller _DEFAULT_HIT_COUNT_BONUS so the max "
-            f"realistic bonus stays << 1.0."
+            "same last_access_time must give the SAME eviction score "
+            "(no hit_count tie-break in the eviction default — that is "
+            "the write-through trigger's job, #178)"
         )
 
 
@@ -268,11 +230,9 @@ def stage_c1_sglang_resolver_loads_it() -> None:
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A0 default_policy_score returns float",       stage_a0_returns_float),
     ("A1 hit_count=0 equals lru_score exactly",     stage_a1_zero_hits_equals_lru),
-    ("B0 age dominates regardless of hit_count",    stage_b0_age_dominates_arbitrary_hit_count),
+    ("B0 hit_count does NOT affect eviction score (incl 2^32+)", stage_b0_hit_count_does_not_affect_score),
     ("B1 uniform hit ordering matches LRU",         stage_b1_uniform_hit_count_matches_lru_order),
-    ("B2 tied age → higher hit_count keeps longer", stage_b2_tied_age_hit_count_breaks),
-    ("B3 max bonus at int32 < 1.0",                 stage_b3_bonus_under_min_age_gap_at_int32_max),
-    ("B4 age dominates under unbounded hit_count",  stage_b4_age_dominates_under_unbounded_hit_count),
+    ("B2 tied age → identical score (no tie-break)", stage_b2_tied_age_identical_score_no_tiebreak),
     ("C0 module:callable spec resolvable",          stage_c0_module_spec_resolvable),
     ("C1 sglang _resolve_kv_policy_module loads it", stage_c1_sglang_resolver_loads_it),
 ]

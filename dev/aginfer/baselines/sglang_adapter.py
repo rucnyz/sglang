@@ -142,55 +142,29 @@ def recency_freq_score(node: Any, layer: Any) -> float:
     return float(hits) / float(age)
 
 
-# T38 (#169) + #176 audit-2: hit-count tie-break bonus.  Small
-# enough that age always dominates — for any pair where
-# last_access_time differs by even 1, the bonus can't flip
-# ordering.
-#
-# `node.hit_count` in sglang is an UNBOUNDED Python int (see
-# unified_radix_cache.py:1703 `node.hit_count += 1` with no cap).
-# A long-running deployment can plausibly accumulate hit_counts of
-# 2^32 or higher on a hot shared prefix.  Pick a bonus exponent
-# that keeps the realistic max bonus << 1.0:
-#
-#   * 2^-50 gives max bonus 2^50 * 2^-50 = 1.0 (HARD CAP at
-#     2^50 ≈ 10^15 hits — still 5e4× below float64's 2^53
-#     precision limit on last_access_time addition).
-#   * For practical hit_counts (< 2^40, ~ 10^12), max bonus is
-#     2^40 * 2^-50 = 2^-10 ≈ 0.001 — six orders of magnitude
-#     below the 1.0 minimum age gap.
-#
-# Round-1 used 2^-31 assuming a 32-bit cap that doesn't exist;
-# B4 (round-2) is the regression pin.
-_DEFAULT_HIT_COUNT_BONUS = 2.0 ** -50
-
-
 def default_policy_score(node: Any, layer: Any) -> float:
-    """T38 (#169) default-policy scorer — the policy module that
-    runs when no daemon is attached.  DESIGN §3 superset framing:
-    sglang's historical LRU + hit_count-write-through behavior is
-    expressed as aginfer's default policy module.
+    """T38 (#169) default-policy scorer — the policy module that runs
+    when no daemon is attached.  DESIGN §3 superset framing: sglang's
+    historical eviction heuristic IS aginfer's default policy module.
 
-    Semantics:
-      * Base score = ``last_access_time`` (identical to ``lru_score``
-        → matches stock sglang behavior in the limit).
-      * Hit-count tie-break bonus: ``hit_count * 2^-31``.  Strictly
-        smaller than 1.0 (the minimum gap between two distinct
-        ``last_access_time`` integers), so two nodes with different
-        ``last_access_time`` are ordered by age regardless of hits.
-        Two nodes at the SAME ``last_access_time`` (a tie in the
-        baseline scorer) are ordered with the higher-hit one kept
-        longer.
+    The default eviction value is **bare ``last_access_time``** — the
+    LRU-equivalent V_u ("last_access as p_hat surrogate", DESIGN §3).
+    Lower score = evict first, so the oldest leaf leaves first, exactly
+    like stock sglang.  This MUST stay byte-identical to sglang's
+    in-process ``_default_eviction_score`` so "aginfer disabled" and
+    "aginfer default policy" are one code path (verify/t28 A3 is the
+    cross-tree drift guard).
 
-    Lower score = evict first.  The bonus is conservative on purpose:
-    we want LRU-equivalent behavior in 99% of cases AND a sensible
-    tie-break for hot leaves whose access timestamp happens to
-    coincide (e.g. shared prefix nodes refreshed in the same batch).
+    hit_count is intentionally NOT part of the eviction score: DESIGN
+    §3 uses hit_count only in the WRITE-THROUGH trigger
+    (``should_write_through`` / #178).  (#177 removed an earlier
+    ``+ hit_count·2^-50`` eviction tie-break — it was non-functional
+    below the float64 ULP at realistic ``last_access_time`` AND moot,
+    since the cache spaces every node's ``last_access_time`` distinctly
+    (same-batch prefix nodes are 1e-5 apart), so exact ties never
+    occur.)
     """
-    return (
-        float(node.last_access_time)
-        + float(node.hit_count) * _DEFAULT_HIT_COUNT_BONUS
-    )
+    return float(node.last_access_time)
 
 
 def ours_greedy_score(node: Any, layer: Any) -> float:

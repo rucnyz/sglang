@@ -10,82 +10,73 @@ T38 provides that default policy as a CALLABLE that plugs into
 sglang's `SGLANG_KV_POLICY_MODULE` env var.  Operators (or
 ablation harnesses) flip one env var to select it.
 
-## SCOPE BOUNDARIES (audit #176-round1)
+## STATUS (post-#177 / #178)
 
-This commit ships the CALLABLE half of T38 only.  Two
-DESIGN §3 spec items remain open as follow-on work:
+The two DESIGN §3 follow-on items this module's first cut deferred are
+now **DONE** (see `verify/t28/`):
 
-1. **Default-on-no-env-var wiring**: sglang's
-   `_load_eviction_scorer` (`unified_radix_cache.py:69`) still
-   falls back to `_default_eviction_score` (pure LRU) when
-   `SGLANG_KV_POLICY_MODULE` is unset.  To realise the "one code
-   path" claim, the fallback needs to be `default_policy_score`.
-   That's a real sglang patch + an ablation regression check
-   against stock behavior — tracked separately (see PLAN §3 T38
-   follow-on note).
-2. **`should_write_through(node)` plugin point**: DESIGN §3 names
-   write-through policy as the OTHER half of the default-policy
-   module (alongside eviction scoring).  Not implemented here.
-   Tracked separately.
+* **#177 — default-on-no-env wiring**: sglang's in-process
+  `_default_eviction_score` is now byte-identical to
+  `default_policy_score` (both **bare `last_access_time`**), so
+  "aginfer disabled" (no env var) and "aginfer default policy" are
+  literally one code path.
+* **#178 — `should_write_through(node, threshold)` plugin point**:
+  the OTHER half of the default-policy module, factored out of the
+  hardcoded `hit_count >= write_through_threshold` check.
 
-In the current state of the world, "aginfer disabled" mode (no
-env var) runs sglang's internal `_default_eviction_score` (pure
-LRU, no hit-count tie-break).  Setting
-`SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:default_policy_score`
-runs T38's default-policy module instead.  The two differ ONLY
-when two leaves share the same `last_access_time` — see
-"ABLATION USAGE" below.
-
-## CONTRACT
+## CONTRACT (post-#177)
 
 `baselines/sglang_adapter.py:default_policy_score(node, layer) -> float`
 
 | Inputs | Output |
 |---|---|
-| `node.last_access_time: int` | `float(last_access_time) + hit_count * 2^-50` |
-| `node.hit_count: int` | (lower = evict first) |
+| `node.last_access_time` | `float(last_access_time)` |
+| (`hit_count` ignored) | (lower = evict first) |
 
 Properties:
-* `hit_count == 0` → byte-identical to `lru_score` → stock sglang
-  behavior in the limit.
-* Two nodes with different `last_access_time` → age dominates
-  for any practical `hit_count`.  `hit_count` is an unbounded
-  Python int (`unified_radix_cache.py:1703`), but the bonus
-  exponent `2^-50` keeps max bonus under 1.0 for hit_counts up
-  to 2^50 ≈ 10^15 — well beyond any realistic deployment.
-* Two nodes with the SAME `last_access_time` → higher
-  `hit_count` ranks higher (kept longer).  Mirrors sglang's
-  historical `hit_count >= write_through_threshold` signal.
+* **Bare LRU** — the LRU-equivalent V_u ("last_access as p_hat
+  surrogate", DESIGN §3).  Byte-identical to `lru_score` for ALL
+  inputs and to sglang's in-process `_default_eviction_score`.
+* **`hit_count` does NOT affect the eviction score.**  DESIGN §3 uses
+  `hit_count` in the WRITE-THROUGH trigger (`should_write_through` /
+  #178), not in eviction ordering.
 
-## WHY hit-count tie-break
+## THE REMOVED TIE-BREAK (#177)
 
-Pure LRU breaks ties arbitrarily (heap insertion order).  Under
-batched prefill the same scheduler step refreshes multiple leaves
-to identical `last_access_time`, so ties are common in practice
-— and the arbitrary choice has been blamed for unstable eviction
-trajectories in past Run K traces.  The 2^-31 bonus makes the
-choice deterministic AND prefers hot leaves; safe by construction
-(can't flip age-distinct pairs).
+The first cut (#169) and its #176 audit added a `hit_count·2^-50`
+eviction tie-break.  #177 **removed** it:
 
-## STAGES (8)
+1. **Non-functional** — `2^-50 ≈ 9e-16` is below the float64 ULP at any
+   realistic `last_access_time` (ULP ≈ `2^-42` at `last_access=1000`),
+   so `1000.0 + hit·2^-50 == 1000.0`; the bonus was silently dropped.
+2. **Moot** — the cache assigns a DISTINCT `last_access_time` to every
+   node (same-batch prefix nodes spaced `1e-5` apart via
+   `cur_time -= 0.00001`), so exact `last_access_time` ties — the only
+   case a tie-break could act on — never occur.  The "ties are common
+   under batched prefill" premise the bonus was built on is false.
+
+A precision-safe (tuple-keyed) eviction tie-break could be added later
+if a workload ever needs one; the lossy float version is gone.
+
+## STAGES (7)
 
 ```
 A. Shape
   A0 returns float
-  A1 hit_count=0 byte-identical to lru_score (no hidden offset)
-B. Ordering invariants
-  B0 age dominates regardless of hit_count (adversarial: older
-     node has hit=2^30 bonus, newer has hit=0; older still wins)
-  B1 uniform hit_count → ordering matches lru_score over 10
-     random nodes
-  B2 tied last_access_time → higher hit_count wins
-  B3 max bonus across full int32 range < 1.0 (the invariant that
-     makes B0 hold for ALL hit_counts)
+  A1 hit_count=0 byte-identical to lru_score (and now for ALL hits)
+B. Ordering invariants (bare-LRU contract)
+  B0 hit_count does NOT affect the eviction score — fixed
+     last_access_time + any hit_count (incl. 2^32+) → same score
+     == lru_score
+  B1 uniform hit_count → ordering matches lru_score over 10 random
+     nodes
+  B2 tied last_access_time → IDENTICAL score (no hit_count tie-break;
+     that is the write-through trigger's job, #178)
 C. Plugin shape
-  C0 `baselines.sglang_adapter:default_policy_score` importable
-     via the SGLANG_KV_POLICY_MODULE format
-  C1 sglang's own `_load_eviction_scorer` resolves the spec end-
-     to-end (catches env-var format / import-path drift)
+  C0 `baselines.sglang_adapter:default_policy_score` importable via
+     the SGLANG_KV_POLICY_MODULE format
+  C1 sglang's own `_load_eviction_scorer` resolves the spec end-to-end
+     (catches env-var format / import-path drift)
 ```
 
 ## REPRODUCING
@@ -96,59 +87,36 @@ cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t38/verify.py
 ```
 
-Runs in ~0.5 s.  Pure-Python; no sglang launch needed (stage C1
-just imports the resolver).
+Runs in ~0.5 s.  Pure-Python; no sglang launch needed.
 
 ## RESULTS
 
-**PASSED** — all 8 stages.
+**PASSED** — all 7 stages.
 
-* date: 2026-06-01
-* raw log: `results/20260601_t38_initial_pass.log`
-* implementation: 8 LoC in `baselines/sglang_adapter.py`
-  (`_DEFAULT_HIT_COUNT_BONUS` + `default_policy_score`)
-
-| Stage | Result |
-|---|---|
-| A0 returns float | PASS |
-| A1 hit=0 ≡ lru_score | PASS |
-| B0 age dominates over any hit_count | PASS |
-| B1 uniform hit ordering = LRU | PASS |
-| B2 tied age → hit wins | PASS |
-| B3 max bonus at int32 < 1.0 | PASS |
-| B4 age dominates under unbounded hit_count (#176 regression pin) | PASS |
-| C0 module:callable importable | PASS |
-| C1 sglang resolver loads it | PASS |
+* date: 2026-06-02 (reworked from the 9-stage tie-break version for
+  the #177 bare-LRU contract)
+* raw logs: `results/20260602_t38_post_177_bare_lru.log` (current),
+  `results/20260601_t38_initial_pass.log` (pre-#177 tie-break history)
 
 ## ABLATION USAGE
 
-To launch sglang with T38's default policy:
-
 ```bash
+# default policy (== stock sglang LRU, post-#177):
+python -m sglang.launch_server ...            # no env var
 SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:default_policy_score \
-  python -m sglang.launch_server ...
-```
-
-To launch with the ours-greedy V_u (paper §7):
-
-```bash
+  python -m sglang.launch_server ...          # identical to the above
+# ours-greedy V_u (paper §7):
 SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:ours_greedy_score \
   python -m sglang.launch_server ...
 ```
 
-**Caveat (audit #176)**: stock sglang with NO env var runs
-`_default_eviction_score` (pure LRU, no hit-count tie-break), NOT
-this module.  So:
-
 | launch | eviction key |
 |---|---|
-| no env var | `last_access_time` (sglang's `_default_eviction_score`) |
-| `SGLANG_KV_POLICY_MODULE=…:default_policy_score` (T38) | `last_access_time + hit_count × 2^-50` |
-| `SGLANG_KV_POLICY_MODULE=…:ours_greedy_score` (paper §7) | V_u(node) — saved-prefill − holding tax |
+| no env var | `last_access_time` (`_default_eviction_score`) |
+| `…:default_policy_score` (T38) | `last_access_time` — **identical** (post-#177) |
+| `…:ours_greedy_score` (paper §7) | V_u(node) — saved-prefill − holding tax |
 
-The first two only differ in the **tied-`last_access_time`** case
-(which is common under batched prefill, where many leaves
-refresh together in the same scheduler step).  For Run K
-ablations comparing T38 vs ours-greedy, this is the right
-denominator.  For Run K ablations comparing against historical
-sglang, use NO env var so the comparison is byte-identical.
+Post-#177 the first two are byte-identical, so a Run K baseline can use
+either form interchangeably; the meaningful ablation is default vs
+`ours_greedy_score`.  See `verify/t28/` for the #177/#178 plugin-point
+verification.

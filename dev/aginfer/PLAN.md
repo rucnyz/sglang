@@ -362,8 +362,14 @@ Order roughly by dependency.
       into a pluggable hook
     - default implementation preserves current behaviour
     - aginfer registers a V_u-aware version when daemon is attached
-    - **Status (#170 audit — 2026-06-01)**: OPEN.  Hardcoded check
-      at `unified_radix_cache.py:1704`.  Tracked as **#178**.
+    - **Status (#178 closure — 2026-06-02)**: DONE (plugin point +
+      default).  `_load_write_through_policy()` +
+      `_default_should_write_through(node, threshold)` +
+      `self._write_through_policy` wired into `_inc_hit_count`
+      (`SGLANG_WRITE_THROUGH_MODULE` env override, T9 startup line).
+      Default = historical `hit_count >= threshold`, byte-identical.
+      verify/t28/.  The daemon V_u-aware version (`V_u(res ∪ {DRAM})
+      > V_u(res)`) is the consumer side, deferred with T27 (#188).
 
 13. **T29 — `SGLANG_KV_POLICY_MODULE` eviction scorer plugin**
     (DESIGN §3 superset framing — partially exists):
@@ -478,24 +484,37 @@ generalization.
    - matches sglang's historical scorer exactly when daemon is
      absent or hints are uninitialized
 
-   **Status (#169 + #176 audit closure — 2026-06-01)**:
+   **Status (#169 + #176 + #177/#178 closure — 2026-06-02)**:
    * **DONE** in `verify/t38/`: callable
      `baselines.sglang_adapter:default_policy_score(node, layer)`
-     = `last_access_time + hit_count × 2^-50`; pluggable via
-     `SGLANG_KV_POLICY_MODULE`; 9 verify stages (A0/A1 shape, B0–
-     B4 ordering invariants incl. unbounded `hit_count`, C0/C1
-     plugin resolution).
-   * **DEFERRED — follow-on tasks**:
-     * **#177 — Wire `default_policy_score` as the in-process
-       default** in `unified_radix_cache.py:_load_eviction_scorer`
-       (currently falls back to `_default_eviction_score`).  This
-       realises DESIGN §3's "one code path" claim.  Needs an
-       ablation regression check vs stock sglang to confirm no
-       behavioral change on the no-tied-age path.
-     * **#178 — `should_write_through(node)` plugin point**.
-       DESIGN §3 names this as the OTHER half of the default-
-       policy module.  Mirrors the eviction-scorer plugin point
-       but for write-through decisions.
+     = bare `last_access_time` (the LRU-equivalent V_u); pluggable
+     via `SGLANG_KV_POLICY_MODULE`; 7 verify stages.
+   * **#177/#178 closure (verify/t28/, 2026-06-02)**:
+     * **#177 — default scorer settled as bare LRU.**  sglang's
+       in-process `_default_eviction_score` and the adapter
+       `default_policy_score` are both `float(last_access_time)`,
+       byte-identical → DESIGN §3 "one code path" (no-env baseline
+       == default policy module).  The `hit_count·2^-50` eviction
+       tie-break from #169/#176 was REMOVED: non-functional (below
+       the float64 ULP at realistic `last_access_time`) and moot
+       (the cache spaces every node's `last_access_time` distinctly,
+       so exact ties never occur).  `hit_count`'s role per DESIGN §3
+       is the write-through trigger, not eviction (→ #178).
+     * **#178 — `should_write_through(node, threshold)` plugin
+       point** added (`SGLANG_WRITE_THROUGH_MODULE`, mirrors
+       `_load_eviction_scorer` incl. the T9 `write_through_loaded=`
+       startup line).  `_inc_hit_count` now calls
+       `self._write_through_policy`; the default
+       (`_default_should_write_through`) is the historical
+       `hit_count >= write_through_threshold`, byte-identical to
+       pre-#178 (verify/t28 B4).
+     * verify/t28/: 10 stages (A eviction default + cross-tree drift
+       guard, B write-through plugin incl. callsite integration),
+       all green.  Regression: T38 (7) + integration_stress.
+   * **DEFERRED — the daemon-attached V_u-aware versions** of both
+     plugins (hint-table-aware eviction scorer; V_u-aware
+     write-through `V_u(res ∪ {DRAM}) > V_u(res)`) are the consumer
+     side, wired with the hint-table consumer (T27 #188).
 
 7. **T39 — F1 proxy-gate disconnect handler** (DESIGN §10 F1):
    - `program_tracker.client_disconnected(p)` API

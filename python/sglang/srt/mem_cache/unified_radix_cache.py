@@ -62,8 +62,34 @@ import os
 import importlib
 
 
+# #177 (T38 follow-on, DESIGN §3 "one code path"): the in-process
+# eviction DEFAULT is the LRU-equivalent V_u — bare last_access_time
+# ("last_access as p_hat surrogate", DESIGN §3).  This is byte-for-byte
+# stock sglang LRU AND literally the same function as the daemon-side
+# default policy module
+# (dev/aginfer/baselines/sglang_adapter.py:default_policy_score), so
+# "aginfer disabled" and "aginfer default policy" are one code path —
+# baseline-vs-ours ablations flip a policy parameter, not a path.
+#
+# hit_count is deliberately NOT used here: DESIGN §3 places hit_count in
+# the WRITE-THROUGH trigger (_default_should_write_through / #178), not
+# in eviction ordering.  (An earlier attempt at a `+ hit_count·2^-50`
+# eviction tie-break was both non-functional — the bonus is below the
+# float64 ULP at any realistic last_access_time — and pointless: the
+# cache assigns DISTINCT last_access_time to every node, even same-batch
+# prefix nodes are spaced 1e-5 apart, so exact ties never occur.  See
+# #177.)  verify/t28 stage A3 is the cross-tree drift guard that pins
+# this == the adapter's default_policy_score.
 def _default_eviction_score(node, layer) -> float:
     return float(node.last_access_time)
+
+
+def _default_should_write_through(node, threshold) -> bool:
+    """#178 (T28, DESIGN §3 write-through plugin) DEFAULT: the
+    historical ``hit_count >= write_through_threshold`` trigger.
+    Preserves stock sglang behaviour exactly when no daemon-/env-
+    supplied policy is registered."""
+    return node.hit_count >= threshold
 
 
 def _load_eviction_scorer():
@@ -104,6 +130,47 @@ def _load_eviction_scorer():
             e,
         )
         return _default_eviction_score
+
+
+def _load_write_through_policy():
+    """#178 (T28, DESIGN §3): resolve the write-through trigger per
+    ``SGLANG_WRITE_THROUGH_MODULE="pkg.module:callable"``.  The callable
+    signature is ``(node: UnifiedTreeNode, threshold: int) -> bool`` —
+    True = create the host backup now.  Mirrors ``_load_eviction_scorer``
+    exactly: emits one canonical ``write_through_loaded=<spec>`` startup
+    line (T9 grep), and any failure falls back to the historical
+    ``hit_count >= threshold`` default (logged as a load_failed so T9
+    can HALT a misconfigured run rather than run baseline silently).
+
+    Aginfer registers a V_u-aware version (fires when
+    ``V_u(residence ∪ {DRAM}) > V_u(residence)``, DESIGN §3) once the
+    in-process hint-table consumer exists; until then the default is
+    the only policy and behaviour is identical to stock sglang."""
+    spec = os.environ.get("SGLANG_WRITE_THROUGH_MODULE", "").strip()
+    if not spec:
+        logger.info("[aginfer] write_through_loaded=default_hitcount")
+        return _default_should_write_through
+    if ":" not in spec:
+        logger.warning(
+            "[aginfer] write_through_loaded=default_hitcount "
+            "(load_failed:malformed_spec=%r; expected module:callable)",
+            spec,
+        )
+        return _default_should_write_through
+    mod_name, attr = spec.split(":", 1)
+    try:
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, attr)
+        logger.info("[aginfer] write_through_loaded=%s", spec)
+        return fn
+    except Exception as e:
+        logger.warning(
+            "[aginfer] write_through_loaded=default_hitcount "
+            "(load_failed:%r exception=%s)",
+            spec,
+            e,
+        )
+        return _default_should_write_through
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
@@ -425,9 +492,11 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
-        # aginfer: pluggable eviction scorer (default = LRU).  See module-level
-        # _load_eviction_scorer above.
+        # aginfer: pluggable eviction scorer (default = LRU-equivalent
+        # V_u, #177) + write-through trigger (default = hit_count >=
+        # threshold, #178).  See module-level _load_* above.
         self._eviction_scorer = _load_eviction_scorer()
+        self._write_through_policy = _load_write_through_policy()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def reset(self) -> None:
@@ -1720,7 +1789,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller.write_policy == "write_back":
             return
         node.hit_count += 1
-        if not node.backuped and node.hit_count >= self.write_through_threshold:
+        # #178 (DESIGN §3): pluggable write-through trigger.  Default
+        # is the historical hit_count >= threshold; aginfer can
+        # register a V_u-aware version.  `not node.backuped` stays a
+        # hard precondition (no point re-backing-up an existing copy).
+        if not node.backuped and self._write_through_policy(
+            node, self.write_through_threshold
+        ):
             self.write_backup(node)
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
