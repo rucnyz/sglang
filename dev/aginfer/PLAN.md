@@ -258,9 +258,17 @@ Order roughly by dependency.
      * tokenizer_control_mixin fan-out across DP ranks
      * http_server PUT /aginfer/program_paused
      * Idempotent (applied=0 on re-apply at same value)
-     * verify/t21/: 10 stages, all green (incl. setter validation,
-       idempotency, dump-path echo, unit-less programs, legacy-
-       cache rejection)
+     * verify/t21/: 13 stages, all green (setter validation,
+       idempotency, REAL overlay-helper echo, ENDED-GC, unit-less
+       programs, legacy-cache rejection, HTTP body validation)
+     * **#186 audit closure**: factored the dump-path overlay into
+       a single `_aginfer_overlay_program_states` helper (both
+       paths call it — no divergence by construction); added lazy
+       GC of ENDED-no-units entries (was unbounded growth); fixed
+       HTTP `str(pid)` coercion that bypassed the empty-pid guard
+       (now `_validate_program_paused_body` type-checks first);
+       converted the previously-fake replica tests to call real
+       production code.
      * Unblocks #183 (T30+T39 proxy disconnect) and #185 (T41
        SESSION_END for PAUSED handler).
 

@@ -150,49 +150,19 @@ def stage_a5_none_pre_pause_valid() -> None:
 # ---- B. dump-path echo ----
 
 
-class _TestNode:
-    """Minimum tree-node shape the dump code reads."""
-    def __init__(self, *, hash_id, n_tokens, residence, session_ids):
-        from sglang.srt.mem_cache.unified_cache_components import (
-            BASE_COMPONENT_TYPE,
-        )
-        self.id = hash_id
-        self.hash_value = [f"hash-{hash_id}"]
-        self.session_ids = session_ids
-        # ... but we don't actually need to run the full dump; the
-        # state-echo logic runs AFTER unit aggregation.  We can test
-        # the echo logic in isolation.
+def stage_b0_real_helper_overlays_state() -> None:
+    """#186 audit: call the REAL production overlay helper
+    (`_aginfer_overlay_program_states`) — both dump paths invoke
+    THIS exact method, so testing it is testing production code,
+    not a hand-copied replica.
 
-
-def _dump_with_program_states(cache, prebuilt_per_program: dict) -> dict:
-    """Run JUST the per-program state-merge logic from the dict-path
-    dump, given a prebuilt `per_program` dict.  Returns the same dict
-    after the setter overlay (same code path as in
-    _dump_aginfer_state_dict)."""
-    # Replicate the inline loop verbatim — this is the contract.
-    per_program = dict(prebuilt_per_program)
-    for pid, stored in cache._aginfer_program_states.items():
-        e = per_program.setdefault(pid, {
-            "hbm":  {"committed": {}, "inflight": {}},
-            "dram": {"committed": {}},
-            "state": "REASONING",
-            "pre_pause_state": None,
-            "unit_hashes": [],
-        })
-        e["state"] = stored["state"]
-        e["pre_pause_state"] = stored["pre_pause_state"]
-    return per_program
-
-
-def stage_b0_dict_path_echoes_state() -> None:
-    """Existing program in the dump (from unit aggregation) gets its
-    state OVERLAID by the daemon's PUT."""
+    Existing program (from unit aggregation) gets its state
+    OVERLAID by the daemon's PUT; non-state fields preserved."""
     cache = _new_cache()
     cache.set_aginfer_program_state(
         pid="p1", state="PAUSED", pre_pause_state="ACTING",
     )
-    # Synthetic prebuilt per_program (post-unit-walk, pre-overlay).
-    base = {
+    per_program = {
         "p1": {
             "hbm":  {"committed": {"kv": 1024}, "inflight": {}},
             "dram": {"committed": {}},
@@ -201,38 +171,35 @@ def stage_b0_dict_path_echoes_state() -> None:
             "unit_hashes": ["h0", "h1"],
         }
     }
-    out = _dump_with_program_states(cache, base)
+    out = cache._aginfer_overlay_program_states(per_program)
+    if out is not per_program:
+        raise StageFail("overlay should mutate + return the same dict")
     if out["p1"]["state"] != "PAUSED":
         raise StageFail(f"state not overlaid: {out['p1']!r}")
     if out["p1"]["pre_pause_state"] != "ACTING":
         raise StageFail(f"pre_pause not overlaid: {out['p1']!r}")
-    # Non-state fields preserved (no clobber on hbm/dram/unit_hashes).
     if out["p1"]["hbm"]["committed"]["kv"] != 1024:
         raise StageFail(f"hbm clobbered: {out['p1']!r}")
     if out["p1"]["unit_hashes"] != ["h0", "h1"]:
         raise StageFail(f"unit_hashes clobbered: {out['p1']!r}")
 
 
-def stage_b1_bytes_path_same_overlay() -> None:
-    """Bytes-path uses the same overlay logic; pin that the FORMULA
-    in both paths is identical by sharing this stage's expected output
-    with B0."""
-    cache = _new_cache()
-    cache.set_aginfer_program_state(
-        pid="p2", state="ENDED", pre_pause_state=None,
-    )
-    base = {
-        "p2": {
-            "hbm":  {"committed": {}, "inflight": {}},
-            "dram": {"committed": {}},
-            "state": "REASONING",
-            "pre_pause_state": None,
-            "unit_hashes": ["h0"],
-        }
-    }
-    out = _dump_with_program_states(cache, base)
-    if out["p2"]["state"] != "ENDED":
-        raise StageFail(f"state not ENDED: {out['p2']!r}")
+def stage_b1_both_dump_paths_call_shared_helper() -> None:
+    """#186 audit: the divergence risk between dict-path and bytes-
+    path is eliminated by construction — both must call the single
+    `_aginfer_overlay_program_states` method.  Pin that via source
+    inspection so a future edit that re-inlines one path (and risks
+    drift) fails loud here."""
+    import inspect
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    for meth in ("_dump_aginfer_state_dict", "_dump_aginfer_state_bytes"):
+        src = inspect.getsource(getattr(UnifiedRadixCache, meth))
+        if "_aginfer_overlay_program_states" not in src:
+            raise StageFail(
+                f"{meth} does not call the shared overlay helper — "
+                f"the two dump paths can diverge again.  Both MUST "
+                f"call self._aginfer_overlay_program_states(per_program)."
+            )
 
 
 def stage_b2_pid_with_no_units_still_appears() -> None:
@@ -242,8 +209,7 @@ def stage_b2_pid_with_no_units_still_appears() -> None:
     cache.set_aginfer_program_state(
         pid="ghost", state="PAUSED", pre_pause_state="REASONING",
     )
-    base = {}  # no units cited this pid
-    out = _dump_with_program_states(cache, base)
+    out = cache._aginfer_overlay_program_states({})  # no units cited
     if "ghost" not in out:
         raise StageFail(
             "unit-less PAUSED program should still appear; got "
@@ -252,9 +218,59 @@ def stage_b2_pid_with_no_units_still_appears() -> None:
     g = out["ghost"]
     if g["state"] != "PAUSED" or g["pre_pause_state"] != "REASONING":
         raise StageFail(f"ghost state wrong: {g!r}")
-    # Default empty residue.
     if g["hbm"]["committed"] != {} or g["unit_hashes"] != []:
         raise StageFail(f"ghost should be empty residue: {g!r}")
+
+
+def stage_b3_ended_no_units_gc() -> None:
+    """#186 audit (unbounded-growth fix): an ENDED program with NO
+    live units is GC'd from _aginfer_program_states during the dump
+    AND not echoed.  Without this the dict grows forever."""
+    cache = _new_cache()
+    cache.set_aginfer_program_state(
+        pid="done", state="ENDED", pre_pause_state="REASONING",
+    )
+    if "done" not in cache._aginfer_program_states:
+        raise StageFail("setup: ENDED state not stored")
+    out = cache._aginfer_overlay_program_states({})  # no units
+    if "done" in out:
+        raise StageFail(
+            f"ENDED-no-units program should NOT be echoed; got {out!r}"
+        )
+    if "done" in cache._aginfer_program_states:
+        raise StageFail(
+            "ENDED-no-units program should be GC'd from storage; "
+            f"still present: {cache._aginfer_program_states!r}"
+        )
+
+
+def stage_b4_ended_with_units_kept() -> None:
+    """ENDED program that STILL has residual units IS echoed (the
+    daemon needs to see the terminal state while cleanup runs) and
+    NOT GC'd."""
+    cache = _new_cache()
+    cache.set_aginfer_program_state(
+        pid="ending", state="ENDED", pre_pause_state=None,
+    )
+    per_program = {
+        "ending": {
+            "hbm":  {"committed": {"kv": 512}, "inflight": {}},
+            "dram": {"committed": {}},
+            "state": "REASONING",
+            "pre_pause_state": None,
+            "unit_hashes": ["h0"],
+        }
+    }
+    out = cache._aginfer_overlay_program_states(per_program)
+    if out.get("ending", {}).get("state") != "ENDED":
+        raise StageFail(
+            f"ENDED-with-units should be echoed ENDED; got "
+            f"{out.get('ending')!r}"
+        )
+    if "ending" not in cache._aginfer_program_states:
+        raise StageFail(
+            "ENDED-with-units should NOT be GC'd (cleanup ongoing)"
+        )
 
 
 # ---- C. scheduler handler shape ----
@@ -287,6 +303,56 @@ def stage_c0_unsupported_tree_cache_rejected() -> None:
         raise StageFail(f"applied must be 0 on failure; got {out.applied}")
 
 
+# ---- D. HTTP body validation (the #186 coercion-bypass fix) ----
+
+
+def stage_d0_http_body_validation() -> None:
+    """#186 audit: the HTTP route previously did `str(body["pid"])`,
+    silently coercing JSON null/number to the strings "None"/"123"
+    — bypassing the setter's empty-pid guard.  The route now calls
+    `_validate_program_paused_body` which type-checks BEFORE
+    coercion.  Pin all the reject + accept cases on that pure
+    function."""
+    from sglang.srt.entrypoints.http_server import (
+        _validate_program_paused_body as _v,
+    )
+
+    # Accept: well-formed body.
+    pid, state, pre = _v({
+        "pid": "p", "state": "PAUSED", "pre_pause_state": "ACTING",
+    })
+    if (pid, state, pre) != ("p", "PAUSED", "ACTING"):
+        raise StageFail(f"valid body mis-parsed: {(pid, state, pre)}")
+    # Accept: pre_pause_state omitted → None.
+    _, _, pre2 = _v({"pid": "p", "state": "ENDED"})
+    if pre2 is not None:
+        raise StageFail(f"omitted pre_pause should be None; got {pre2!r}")
+
+    # Reject cases — each MUST raise ValueError.
+    bad_bodies = [
+        ("non-dict", "not a dict"),
+        ("missing pid", {"state": "PAUSED"}),
+        ("missing state", {"pid": "p"}),
+        ("null pid (coercion bypass)", {"pid": None, "state": "PAUSED"}),
+        ("numeric pid (coercion bypass)", {"pid": 123, "state": "PAUSED"}),
+        ("empty pid", {"pid": "", "state": "PAUSED"}),
+        ("null state", {"pid": "p", "state": None}),
+        ("numeric state", {"pid": "p", "state": 5}),
+        ("empty state", {"pid": "p", "state": ""}),
+        ("numeric pre_pause", {"pid": "p", "state": "PAUSED",
+                               "pre_pause_state": 7}),
+    ]
+    for label, body in bad_bodies:
+        try:
+            _v(body)
+        except ValueError:
+            continue
+        raise StageFail(
+            f"body '{label}' should raise ValueError; got no raise "
+            f"(body={body!r})"
+        )
+
+
 # ---- run ----
 
 
@@ -297,11 +363,16 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A3 invalid pre_pause_state rejected",         stage_a3_invalid_pre_pause_rejected),
     ("A4 empty/None pid rejected",                  stage_a4_empty_pid_rejected),
     ("A5 None pre_pause_state valid",               stage_a5_none_pre_pause_valid),
-    ("B0 dict-path dump echoes overlaid state",     stage_b0_dict_path_echoes_state),
-    ("B1 bytes-path overlay parity",                stage_b1_bytes_path_same_overlay),
+    ("B0 REAL overlay helper echoes state",         stage_b0_real_helper_overlays_state),
+    ("B1 both dump paths call shared helper (source pin)",
+                                                    stage_b1_both_dump_paths_call_shared_helper),
     ("B2 unit-less PAUSED program still appears",   stage_b2_pid_with_no_units_still_appears),
+    ("B3 ENDED + no units → GC'd, not echoed",      stage_b3_ended_no_units_gc),
+    ("B4 ENDED + residual units → kept + echoed",   stage_b4_ended_with_units_kept),
     ("C0 unsupported tree cache → ok=False with type-name reason",
                                                     stage_c0_unsupported_tree_cache_rejected),
+    ("D0 HTTP body validation (coercion-bypass fix)",
+                                                    stage_d0_http_body_validation),
 ]
 
 

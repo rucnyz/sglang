@@ -2715,6 +2715,50 @@ class UnifiedRadixCache(BasePrefixCache):
         self._aginfer_program_states[pid] = new_entry
         return (True, "ok", 1)
 
+    def _aginfer_overlay_program_states(self, per_program: dict) -> dict:
+        """T21 (#181): overlay daemon-pushed program states onto the
+        unit-walk-derived ``per_program`` dict, IN PLACE.
+
+        Shared by ``_dump_aginfer_state_dict`` and
+        ``_dump_aginfer_state_bytes`` so the two dump paths cannot
+        diverge by construction (the #181 audit flagged that the
+        previous duplicated loops were a divergence risk + that the
+        verify only tested a hand-copied replica).
+
+        Two jobs:
+          1. **Overlay**: for every stored pid, set the dump entry's
+             ``state`` / ``pre_pause_state`` to the daemon's view.
+             Programs with no live units still get an (empty-residue)
+             entry so the daemon can read its own PAUSED-with-no-
+             residue bookkeeping.
+          2. **Lazy GC** (#181 audit — unbounded-growth fix): an
+             ENDED program with NO live units needs no daemon
+             bookkeeping; drop it from ``_aginfer_program_states``
+             instead of echoing it forever.  Without this, every
+             program ever PUT would accumulate and pollute every
+             subsequent dump's ``per_program_usage``.  ENDED programs
+             that still have residual units ARE echoed (the daemon
+             needs to see the terminal state while cleanup completes).
+        """
+        unit_pids = set(per_program.keys())  # pids with live units
+        ended_no_units: list = []
+        for pid, stored in self._aginfer_program_states.items():
+            if stored["state"] == "ENDED" and pid not in unit_pids:
+                ended_no_units.append(pid)
+                continue
+            e = per_program.setdefault(pid, {
+                "hbm":  {"committed": {}, "inflight": {}},
+                "dram": {"committed": {}},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": [],
+            })
+            e["state"] = stored["state"]
+            e["pre_pause_state"] = stored["pre_pause_state"]
+        for pid in ended_no_units:
+            del self._aginfer_program_states[pid]
+        return per_program
+
     def _aginfer_node_summary(self, node) -> dict:
         """T24 (#182): compact summary of a radix-tree node for the
         HASH_COLLISION webhook payload.  Daemon-side fatal()
@@ -3195,22 +3239,10 @@ class UnifiedRadixCache(BasePrefixCache):
                     for sp, bytes_total in sp_dict.items():
                         bucket[sp] = bucket.get(sp, 0) + bytes_total // n_holders
 
-        # T21 (#181): merge daemon-pushed program states.  PUT
-        # /aginfer/program_paused stores into self._aginfer_program_
-        # states; we echo the stored (state, pre_pause_state) here.
-        # Programs that have no live units still appear in the dump
-        # so the daemon can read its own PAUSED-with-no-residue
-        # bookkeeping.
-        for pid, stored in self._aginfer_program_states.items():
-            e = per_program.setdefault(pid, {
-                "hbm":  {"committed": {}, "inflight": {}},
-                "dram": {"committed": {}},
-                "state": "REASONING",
-                "pre_pause_state": None,
-                "unit_hashes": [],
-            })
-            e["state"] = stored["state"]
-            e["pre_pause_state"] = stored["pre_pause_state"]
+        # T21 (#181): overlay daemon-pushed program states + GC
+        # terminal entries.  Shared helper so dict-path and bytes-
+        # path can NEVER diverge (#181 audit).
+        self._aginfer_overlay_program_states(per_program)
 
         return {
             "time_counter": int(peek_time_counter()),
@@ -3383,23 +3415,10 @@ class UnifiedRadixCache(BasePrefixCache):
             }
             for pid, e in pp.items()
         }
-        # T21 (#181): overlay daemon-pushed program states (PAUSED /
-        # ACTING / ENDED) on top.  Programs with no live units still
-        # appear in the dump so the daemon can read its own PAUSED-
-        # with-no-residue bookkeeping.
-        for pid, stored in self._aginfer_program_states.items():
-            e = per_program.get(pid)
-            if e is None:
-                e = {
-                    "hbm":  {"committed": {}, "inflight": {}},
-                    "dram": {"committed": {}},
-                    "state": "REASONING",
-                    "pre_pause_state": None,
-                    "unit_hashes": [],
-                }
-                per_program[pid] = e
-            e["state"] = stored["state"]
-            e["pre_pause_state"] = stored["pre_pause_state"]
+        # T21 (#181): overlay daemon-pushed program states + GC
+        # terminal entries.  SAME helper the dict-path calls — the
+        # two cannot diverge by construction (#181 audit).
+        self._aginfer_overlay_program_states(per_program)
 
         # ---- assemble final wire JSON ----
         import orjson

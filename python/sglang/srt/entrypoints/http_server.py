@@ -896,6 +896,33 @@ async def aginfer_thresholds_put(raw_request: Request):
     return ORJSONResponse({"ok": True, "ranks": len(responses)})
 
 
+def _validate_program_paused_body(body):
+    """T21 (#181) + #186 audit: validate a PUT /aginfer/program_paused
+    body.  Returns ``(pid, state, pre_pause_state)`` or raises
+    ``ValueError`` with a 400-able message.
+
+    Pure function (no FastAPI deps) so verify/t21 can unit-test the
+    type checks directly.  Type-validate BEFORE coercion — a prior
+    ``str(body["pid"])`` silently turned JSON null/number into
+    "None"/"123", bypassing the setter's empty-pid guard.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("body must be a JSON object")
+    for k in ("pid", "state"):
+        if k not in body:
+            raise ValueError(f"missing required field: {k!r}")
+    pid = body["pid"]
+    if not isinstance(pid, str) or not pid:
+        raise ValueError("pid must be a non-empty string")
+    state = body["state"]
+    if not isinstance(state, str) or not state:
+        raise ValueError("state must be a non-empty string")
+    pre = body.get("pre_pause_state")
+    if pre is not None and not isinstance(pre, str):
+        raise ValueError("pre_pause_state must be string or null")
+    return pid, state, pre
+
+
 # T21 (#181): daemon → sglang program-state broadcast.  Body is
 # {pid, state, pre_pause_state?}.  Sglang stores per-pid on each
 # rank's tree cache (set_aginfer_program_state); the next
@@ -908,29 +935,16 @@ async def aginfer_program_paused_put(raw_request: Request):
         body = await raw_request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail="invalid JSON") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(
-            status_code=400, detail="body must be a JSON object",
-        )
-    required = ("pid", "state")
-    missing = [k for k in required if k not in body]
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"missing required field(s): {missing}",
-        )
     from sglang.srt.managers.io_struct import (
         UpdateAginferProgramPausedReq,
     )
-    pre = body.get("pre_pause_state")
-    if pre is not None and not isinstance(pre, str):
-        raise HTTPException(
-            status_code=400,
-            detail="pre_pause_state must be string or null",
-        )
+    try:
+        pid, state, pre = _validate_program_paused_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     req = UpdateAginferProgramPausedReq(
-        pid=str(body["pid"]),
-        state=str(body["state"]),
+        pid=pid,
+        state=state,
         pre_pause_state=pre,
     )
     responses = (
