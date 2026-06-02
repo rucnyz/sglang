@@ -605,7 +605,15 @@ def build_paper_state(
         any_alive = False
         for sid in session_ids:
             st = tracker.state(sid)
-            if st is not None:
+            # T187 (#187, DESIGN §4 SESSION_END / §7): an ENDED holder
+            # contributes 0 to future p_hat — the program terminated,
+            # it will issue no more requests against this unit.  So
+            # ENDED does NOT count as "alive" (a unit held ONLY by
+            # ended programs falls back to the workload-prior
+            # hits/age, which makes session_scoped_units of the ending
+            # program demote/drop candidates).  A still-live co-holder
+            # keeps p_hat high (the unit survives the ended program).
+            if st is not None and st is not State.ENDED:
                 any_alive = True
             if sid not in program_lambda:
                 program_lambda[sid] = (
@@ -754,6 +762,19 @@ def _build_decision_set(
         # Only shared platform / tool_def — child's tail isn't visible
         # to the daemon's state snapshot yet.
         return _shared_prefix_units(units)
+    if kind == EventKind.SESSION_END:
+        # T187 (#187, DESIGN §7 decision_set table): session_scoped_
+        # units(p) = units held ONLY by the ending program (holders ==
+        # {p}).  After END these have no other holder, so the policy
+        # demotes them to the cheapest tier with nonzero workload-prior
+        # p_hat, or DROPs them.  Units p SHARED with another program
+        # have holders ⊋ {p} → excluded here → untouched (they survive
+        # p).  `_units_for_session` already implements the exclusive
+        # (holders == {session}) form.  Pairs with the p_hat ENDED-
+        # exclusion above: the ending program's SESSION_END handler
+        # transitions it to ENDED BEFORE this runs, so these units
+        # score with the workload-prior p_hat, not 1.0.
+        return _units_for_session(units, session)
     if kind in (EventKind.MEMORY_PRESSURE, EventKind.PRESSURE_RESOLVED):
         # Top-k by regret (paper §7.1).
         return _top_k_by_regret(units, _DEFAULT_MEMORY_PRESSURE_TOPK)

@@ -369,37 +369,57 @@ def attach_hash_collision_handler(router: "EventRouter") -> None:
     router.set_handler(EventKind.HASH_COLLISION, _hash_collision_handler)
 
 
-def make_session_end_handler(tracker, outbound):
-    """T41 (#185, DESIGN §11 F5 + §4 SESSION_END): build the
-    SESSION_END handler closure.
+def make_session_end_handler(tracker, outbound, kv_scheduler=None):
+    """T41 (#185, DESIGN §11 F5) + T187 (#187, DESIGN §4 / §7
+    SESSION_END normal path): build the SESSION_END handler closure.
 
-    On SESSION_END for program ``p``:
-      * ``tracker.end(p)`` transitions p to ENDED.  If p was PAUSED
-        with a request parked in the proxy gate, end() releases the
-        gate so ``wait_if_paused`` wakes and the proxy responds 499
-        (the F5 PAUSED branch — client closed the session).
-      * Enqueue ``PUT /aginfer/program_paused {state: ENDED}`` so
-        sglang clears the program's per_program_usage state on the
-        next dump.
+    On SESSION_END for program ``p`` the handler runs three steps,
+    IN THIS ORDER:
 
-    The migrate D_t for SESSION_END (session_scoped_units demote/
-    drop, DESIGN §7 table) is the kv_scheduler's concern — NOT
-    wired here; this handler owns only the F5 state-transition +
-    gate-release + PUT.  See PLAN §4 T41 status note.
+      1. **State transition + gate release (F5)** — ``tracker.end(p)``
+         transitions p to ENDED.  If p was PAUSED with a request
+         parked in the proxy gate, end() releases the gate so
+         ``wait_if_paused`` wakes and the proxy responds 499 (client
+         closed the session).
+      2. **Migrate D_t (T187)** — if a ``kv_scheduler`` is wired, run
+         its ``handle(event, router)`` for the SESSION_END event.
+         Because step 1 already set p to ENDED, ``build_paper_state``
+         scores p's units with the workload-prior p_hat (not 1.0),
+         and ``_build_decision_set`` returns ``session_scoped_units(p)``
+         (units held only by p) — so the policy demotes/drops p's
+         exclusive units while units shared with live programs are
+         untouched (DESIGN §7 table + "SESSION_END normal path").
+         Ordering is load-bearing: end() MUST precede handle() or the
+         scorer would see p still alive (p_hat=1.0) and keep the
+         units.  handle() is fire-and-forget + swallows its own
+         downstream errors, so it cannot break step 3.
+      3. **PUT (F5)** — enqueue ``PUT /aginfer/program_paused
+         {state: ENDED}`` so sglang clears p's per_program_usage
+         state on the next dump (idempotent; ENDED-no-units entries
+         GC'd at dump time per #186).  Enqueued AFTER the migrate
+         batch, matching DESIGN's on_session_end (migrate then PUT).
 
-    Closure holds ``tracker`` + ``outbound`` (the same pattern
-    kv_scheduler/admission use) since the handler signature is
-    ``(event, router)`` and the router doesn't expose them.
+    Closure holds ``tracker`` / ``outbound`` / ``kv_scheduler`` (the
+    same pattern kv_scheduler/admission use) since the handler
+    signature is ``(event, router)`` and the router doesn't expose
+    them.  ``kv_scheduler=None`` keeps the pure F5 behaviour (tests
+    that don't exercise the migrate path).
     """
     async def _session_end_handler(event: Event, router: "EventRouter") -> None:
         pid = event.session
         if pid is None:
             logger.warning("SESSION_END with no session id; ignoring")
             return
+        # 1. F5 state transition + gate release.  MUST happen before
+        #    the migrate decision so the scorer sees p as ENDED.
         prev = tracker.end(pid)
-        # Enqueue the PUT regardless of prior state (idempotent on
-        # sglang side; ENDED-no-units entries are GC'd at dump time
-        # per #186).
+        # 2. T187 migrate D_t = session_scoped_units(p).  Reuses the
+        #    full kv_scheduler.handle pipeline (fetch state → build →
+        #    decide → dispatch migrate + hints), now that p is ENDED.
+        if kv_scheduler is not None:
+            await kv_scheduler.handle(event, router)
+        # 3. F5 PUT — after the migrate batch (DESIGN: migrate, then
+        #    PUT), regardless of prior state.
         outbound.enqueue_program_paused(
             pid=pid, state="ENDED", pre_pause_state=None,
         )
@@ -408,24 +428,29 @@ def make_session_end_handler(tracker, outbound):
             "session_end",
             pid=pid,
             prev_state=prev.value if prev is not None else "NONE",
+            migrate=kv_scheduler is not None,
         )
         logger.info(
-            "SESSION_END handled: pid=%s prev=%s → ENDED + PUT enqueued",
-            pid, prev,
+            "SESSION_END handled: pid=%s prev=%s → ENDED + migrate(%s) "
+            "+ PUT enqueued",
+            pid, prev, kv_scheduler is not None,
         )
 
     return _session_end_handler
 
 
-def attach_session_end_handler(router: "EventRouter", tracker, outbound) -> None:
-    """Register the T41 SESSION_END handler.  Wired at daemon startup
-    AFTER kv_scheduler (which blanket-attaches every EventKind) so
-    this F5 handler owns SESSION_END.  kv_scheduler's SESSION_END
-    decision_set is empty today anyway (``_build_decision_set``
-    returns [] for it), so nothing is lost."""
+def attach_session_end_handler(
+    router: "EventRouter", tracker, outbound, kv_scheduler=None,
+) -> None:
+    """Register the SESSION_END handler.  Wired at daemon startup
+    AFTER kv_scheduler's blanket attach so this composite OWNS
+    SESSION_END (it internally invokes ``kv_scheduler.handle`` for
+    the migrate D_t — T187 — rather than letting the blanket handler
+    run on its own, which would skip the F5 state-transition + gate
+    release + PUT)."""
     router.set_handler(
         EventKind.SESSION_END,
-        make_session_end_handler(tracker, outbound),
+        make_session_end_handler(tracker, outbound, kv_scheduler),
     )
 
 

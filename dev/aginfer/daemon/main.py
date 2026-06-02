@@ -216,12 +216,15 @@ def main(argv=None) -> None:
     # one daemon fatal per (node_a, node_b) pair).
     attach_hash_collision_handler(router)
 
-    # T41 (#185) — SESSION_END handler.  Attached AFTER kv_scheduler
-    # so this F5 handler owns SESSION_END (transitions ENDED,
-    # releases the proxy gate with 499 for a parked PAUSED request,
-    # enqueues PUT /aginfer/program_paused {ENDED}).  Needs tracker
-    # + outbound (held in the closure).
-    attach_session_end_handler(router, tracker, outbound)
+    # T41 (#185) + T187 (#187) — SESSION_END handler.  Attached AFTER
+    # kv_scheduler so this composite owns SESSION_END: it transitions
+    # ENDED + releases the proxy gate with 499 for a parked PAUSED
+    # request (F5), then runs the migrate D_t = session_scoped_units(p)
+    # via kv_scheduler.handle (T187), then enqueues PUT
+    # /aginfer/program_paused {ENDED}.  Passing ``sched`` (None when
+    # --kv-scheduler=disabled) wires the migrate step; without it the
+    # handler is pure F5.
+    attach_session_end_handler(router, tracker, outbound, sched)
 
     # T9 startup-invariant markers — single grep-friendly line.
     logger.info(

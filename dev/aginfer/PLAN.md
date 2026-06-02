@@ -563,10 +563,34 @@ generalization.
      * **Scope boundary**: this handler owns the F5 state-transition
        + gate-release + PUT.  The SESSION_END migrate D_t
        (`session_scoped_units` demote/drop, DESIGN §7) is the
-       kv_scheduler's "SESSION_END normal path" — `_build_decision_
-       set` returns [] for SESSION_END today; wiring it is a
-       separate follow-on (**#187**).
+       kv_scheduler's "SESSION_END normal path" — DONE in #187
+       (the handler now composes F5 + the migrate).
    - Regression: T6 / T36 / T164 / T21 / T24 / T4 all green.
+
+   - **T187 (#187) — SESSION_END migrate D_t** (DESIGN §4 / §7
+     "SESSION_END normal path"): DONE.  The data-plane half of
+     SESSION_END (the demote/drop of the ending program's exclusive
+     KV), wired onto the same handler as F5.
+     * `_build_decision_set` SESSION_END → `session_scoped_units(p)`
+       (units with holders == {p}; shared units excluded → survive p).
+     * `build_paper_state` p_hat: an ENDED holder no longer counts as
+       "alive" — a unit held only by ended programs falls back to the
+       workload-prior `min(1, hits/age)` (was stuck at 1.0 forever
+       post-#185 because `State.ENDED != None`).  A live co-holder
+       still pins p_hat=1.0.  This is the DESIGN §4 "contributes 0 to
+       future p_hat" rule; also a latent-bug fix (ended programs'
+       units no longer pinned in HBM).
+     * SESSION_END handler composes: `end()` FIRST (so the scorer sees
+       ENDED), THEN `kv_scheduler.handle` (migrate D_t = session_
+       scoped, now low p_hat → demote/drop), THEN PUT {ENDED}.
+       `make_session_end_handler`/`attach_session_end_handler` take an
+       optional `kv_scheduler` (main.py passes `sched`; None → pure
+       F5, back-compat).
+     * verify/t187/: 10 stages (decision_set / p_hat ENDED carve-out /
+       composed handler / composed router / real-policy keep-value /
+       shared-survives), all green.
+     * Regression: kv_scheduler_value_rule / T41 / T40 / T6 /
+       integration_stress green.
 
 10. **T42 — Observability logging** (DESIGN §10 F3):
     - state-fetch latency p50 / p95 / p99
