@@ -979,6 +979,7 @@ def _validate_hints_body(body):
     eviction order: ``p_hat`` ∈ [0, 1], ``lambda`` ≥ 0, ``stamp`` a
     non-negative int.
     """
+    import math
     if not isinstance(body, dict):
         raise ValueError("body must be a JSON object")
     hints = body.get("hints")
@@ -992,14 +993,22 @@ def _validate_hints_body(body):
         if not isinstance(uhash, str) or not uhash:
             raise ValueError(f"hints[{i}].hash must be a non-empty string")
         # bool is an int subclass — reject it explicitly for numerics.
+        # Reject non-finite (NaN/inf) at the door: the validator is the
+        # safety boundary for the inline scorer's eviction order; a
+        # NaN p_hat / inf lambda would silently corrupt comparisons
+        # downstream (audit A4).
         p_hat = h.get("p_hat")
         if isinstance(p_hat, bool) or not isinstance(p_hat, (int, float)):
             raise ValueError(f"hints[{i}].p_hat must be a number")
+        if not math.isfinite(p_hat):
+            raise ValueError(f"hints[{i}].p_hat must be finite; got {p_hat}")
         if not (0.0 <= float(p_hat) <= 1.0):
             raise ValueError(f"hints[{i}].p_hat must be in [0, 1]; got {p_hat}")
         lam = h.get("lambda")
         if isinstance(lam, bool) or not isinstance(lam, (int, float)):
             raise ValueError(f"hints[{i}].lambda must be a number")
+        if not math.isfinite(lam):
+            raise ValueError(f"hints[{i}].lambda must be finite; got {lam}")
         if float(lam) < 0.0:
             raise ValueError(f"hints[{i}].lambda must be >= 0; got {lam}")
         stamp = h.get("stamp")

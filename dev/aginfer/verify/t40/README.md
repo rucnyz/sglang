@@ -64,14 +64,16 @@ This task is the emitter + storage + overwrite contract.  NOT here:
   the eviction callsite is the open work);
 * cross-rank hint fan-out atomicity (#174 / probed in T15).
 
-## STAGES (14)
+## STAGES (18 — 14 initial + 4 from the audit)
 
 ```
 A. daemon outbound
   A0 enqueue_hints → {hints:[...], batch_id}, endpoint=hints, PUT
 B. daemon kv_scheduler emitter (drives handle())
   B0 non-empty D_t → one hint per unit, EXACT p_hat/lambda +
-     stamp == time_counter
+     stamp == time_counter; + literal pin p_hat == 1.0 (alive
+     holder) so a zero-everything regression can't pass via the
+     same-source `exp` (audit B0-tautology)
   B1 push UNCONDITIONAL: policy declines migrate → hints still pushed
   B1b hints pushed alongside a migrate (both enqueued, independent)
   B2 empty D_t (LLM_PREFILL) → no hints, no migrate
@@ -81,21 +83,39 @@ C. sglang validator
   C0 _validate_hints_body accepts well-formed, returns normalized
   C1 rejects: not-dict / missing hints / hint-not-dict / missing or
      empty hash / non-numeric p_hat·lambda / non-int·negative stamp /
-     p_hat out of [0,1] / negative lambda
+     p_hat out of [0,1] / negative lambda / NON-FINITE p_hat·lambda
+     (NaN, inf — audit A4)
 D. sglang storage — set_aginfer_hints overwrite-by-stamp
   D0 first push applies (applied == n), values readable
   D1 idempotent re-push (same stamp) → applied 0
   D2 newer stamp overwrites → applied counts, value updated
   D3 stale (older) stamp rejected → applied 0, value unchanged
+  D4 MIXED batch (newer + equal + new) → applied counts ONLY the
+     advanced hashes, not len(batch)/1 (audit A5 — the real D_t
+     re-push case)
+  D5 clear_aginfer_hint present → True+gone, absent → False (audit
+     A11; the eviction-ORDERING that calls it is deferred to T27)
 E. wire round-trip
   E0 the EXACT body the daemon emits passes sglang's
      _validate_hints_body AND set_aginfer_hints (catches a
      "lambda" vs "lambda_rate" / "stamp" vs "seq" field mismatch)
+G. dump-path parity
+  G0 BOTH _dump_aginfer_state_dict and _dump_aginfer_state_bytes
+     emit n_aginfer_hints from self._aginfer_hints (audit #1 — the
+     #181 dump-divergence bug class; the live /aginfer/state uses
+     the BYTES path, F0 exercises it, but a typo in either path's
+     key would otherwise ship green)
+H. outbound routing
+  H0 the outbound worker's _post_one routes endpoint=hints via PUT
+     to /aginfer/hints (NOT .post(); audit #2 — the one dispatch
+     branch t36/t41 don't cover for hints)
 F. e2e (env-gated AGINFER_VERIFY_BASE)
   F0 LIVE PUT /aginfer/hints against a real sglang → applied≥2;
-     idempotent re-apply → applied 0; newer stamp → applied 2;
-     /aginfer/state n_aginfer_hints ≥ 2 (unique per-run stamp+hashes
-     so repeated runs against a persistent server stay independent)
+     idempotent re-apply → applied 0; newer stamp → applied ≥2
+     (>= so it stays correct at TP>1 where the HTTP layer sums
+     applied across ranks — audit A7); /aginfer/state
+     n_aginfer_hints ≥ 2 (unique per-run stamp+hashes so repeated
+     runs against a persistent server stay independent)
 ```
 
 ## REPRODUCING
@@ -123,11 +143,32 @@ AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
 
 ## RESULTS
 
-**PASSED** — all 14 stages (incl. F0 live e2e against real sglang).
+**PASSED** — all 18 stages (incl. F0 live e2e against real sglang).
 
 * date: 2026-06-02
-* raw log: `results/20260602_t40_initial_pass.log`
+* raw logs: `results/20260602_t40_initial_pass.log` (14),
+  `results/20260602_t40_post_audit_pass.log` (18)
 * F0 ran twice back-to-back (cross-run idempotency) — green both.
+
+## AUDIT CLOSURE (2026-06-02)
+
+Adversarial audit found NO correctness bug in the shipped logic;
+five test-depth findings + one validator hardening, all closed:
+
+* **A4 → C1**: `_validate_hints_body` now rejects non-finite
+  (`math.isfinite`) p_hat / lambda — the validator is the inline
+  scorer's safety boundary.  (The daemon never emits NaN/inf, so
+  this is defense-in-depth, not a live-bug fix.)
+* **#1 → G0**: dump-path parity guard (the live state dump uses the
+  BYTES path — the audit's "dict-only" claim was backwards; F0 in
+  fact exercises bytes end-to-end).
+* **#2 → H0**: outbound worker PUT routing for `hints`.
+* **A5 → D4**: mixed-batch `applied` accounting.
+* **A11 → D5** + **B0 literal pin** + **A7** F0 `applied >= 2`
+  (TP>1-safe).
+* **A6** (unbounded `_aginfer_hints` growth) is an ACKNOWLEDGED
+  deferral — eviction-time clear is T27; `clear_aginfer_hint` is the
+  primitive (tested in D5).  Tracked in PLAN.md.
 
 ## REGRESSION SANITY
 

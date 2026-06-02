@@ -102,6 +102,24 @@ class _DummyHttp:
     async def aclose(self): return None
 
 
+class _RecordingHttp:
+    """Records every (verb, url, body) so a stage can assert the
+    outbound worker routed a batch to the right endpoint + HTTP verb."""
+    def __init__(self):
+        self.calls: List[Tuple[str, str, Any]] = []
+
+    async def post(self, url, json=None):
+        self.calls.append(("POST", url, json))
+        return _Resp()
+
+    async def request(self, method, url, json=None):
+        self.calls.append((method, url, json))
+        return _Resp()
+
+    async def aclose(self):
+        return None
+
+
 def _new_outbound() -> OutboundQueue:
     return OutboundQueue(
         sglang_base_url="http://unused", http_client=_DummyHttp(),
@@ -279,6 +297,12 @@ def stage_b0_emit_one_hint_per_dt_unit() -> None:
     exp = _expected_hints(sched_state)
     if set(got) != set(exp):
         raise StageFail(f"hint hashes: got {set(got)} exp {set(exp)}")
+    # Literal anchor (audit B0-tautology): the fixture is deterministic
+    # — an alive REASONING holder gives p_hat == 1.0 exactly.  Pin it
+    # so a regression that zeroes every hint can't pass by also
+    # zeroing the `exp` derived from the same build_paper_state.
+    if abs(float(got["u0"]["p_hat"]) - 1.0) > 1e-9:
+        raise StageFail(f"u0 p_hat must be exactly 1.0 (alive holder); got {got['u0']}")
     for uid, e in exp.items():
         g = got[uid]
         if g.get("stamp") != e["stamp"]:
@@ -419,6 +443,12 @@ def stage_c1_validator_rejects() -> None:
         ("stamp negative", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": 0.0, "stamp": -1}]}),
         ("p_hat out of range", {"hints": [{"hash": "u", "p_hat": 2.0, "lambda": 0.0, "stamp": 1}]}),
         ("lambda negative", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": -0.1, "stamp": 1}]}),
+        # audit A4: non-finite must be rejected at the door (the
+        # validator is the safety boundary for the inline scorer).
+        ("p_hat nan", {"hints": [{"hash": "u", "p_hat": float("nan"), "lambda": 0.0, "stamp": 1}]}),
+        ("p_hat inf", {"hints": [{"hash": "u", "p_hat": float("inf"), "lambda": 0.0, "stamp": 1}]}),
+        ("lambda inf", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": float("inf"), "stamp": 1}]}),
+        ("lambda nan", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": float("nan"), "stamp": 1}]}),
     ]
     for label, body in bad_cases:
         try:
@@ -489,6 +519,92 @@ def stage_d3_stale_stamp_rejected() -> None:
     got = cache.get_aginfer_hint("u0")
     if abs(got["p_hat"] - 0.9) > 1e-9 or got["stamp"] != 150:
         raise StageFail(f"stale push must not clobber newer value: {got!r}")
+
+
+def stage_d4_mixed_batch_applied_count() -> None:
+    """audit A5: the realistic daemon case — a re-push of D_t where
+    only SOME units advanced.  `applied` must count ONLY the hashes
+    whose stamp strictly advanced (not len(batch), not 1)."""
+    cache = _fresh_cache()
+    cache.set_aginfer_hints([
+        {"hash": "u0", "p_hat": 0.2, "lambda": 0.1, "stamp": 100},
+        {"hash": "u1", "p_hat": 0.3, "lambda": 0.2, "stamp": 100},
+    ])
+    ok, reason, applied = cache.set_aginfer_hints([
+        {"hash": "u0", "p_hat": 0.9, "lambda": 0.7, "stamp": 150},  # newer → apply
+        {"hash": "u1", "p_hat": 0.9, "lambda": 0.7, "stamp": 100},  # equal → skip
+        {"hash": "u2", "p_hat": 0.5, "lambda": 0.5, "stamp": 100},  # new   → apply
+    ])
+    if not ok or applied != 2:
+        raise StageFail(f"mixed batch should apply exactly 2 (u0 newer + u2 new); got applied={applied} reason={reason!r}")
+    if abs(cache.get_aginfer_hint("u0")["p_hat"] - 0.9) > 1e-9:
+        raise StageFail("u0 should have advanced")
+    if abs(cache.get_aginfer_hint("u1")["p_hat"] - 0.3) > 1e-9:
+        raise StageFail("u1 (equal stamp) must NOT have changed")
+    if cache.get_aginfer_hint("u2") is None:
+        raise StageFail("u2 (new) should have been stored")
+
+
+def stage_d5_clear_aginfer_hint() -> None:
+    """audit A11: clear_aginfer_hint primitive — present → True +
+    entry gone; not-present → False."""
+    cache = _fresh_cache()
+    cache.set_aginfer_hints([{"hash": "u0", "p_hat": 1.0, "lambda": 0.5, "stamp": 100}])
+    if cache.clear_aginfer_hint("u0") is not True:
+        raise StageFail("clearing a present hint should return True")
+    if cache.get_aginfer_hint("u0") is not None:
+        raise StageFail("entry should be gone after clear")
+    if cache.clear_aginfer_hint("u0") is not False:
+        raise StageFail("clearing an absent hint should return False")
+
+
+# ============================================================ G. dump-path parity
+
+
+def stage_g0_dump_paths_both_echo_count() -> None:
+    """audit #1: guard the dump-path-divergence bug class (#181).  The
+    live /aginfer/state uses the BYTES path (get_aginfer_state →
+    dump_aginfer_state_bytes when available) — F0 exercises it end-to-
+    end — but the DICT path (in-process callers) must echo the same
+    key, and a typo/omission in either path's `n_aginfer_hints` write
+    would otherwise ship green.  Both must reference the SAME source
+    (`self._aginfer_hints`) and emit the key."""
+    import inspect
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    for meth in ("_dump_aginfer_state_dict", "_dump_aginfer_state_bytes"):
+        src = inspect.getsource(getattr(UnifiedRadixCache, meth))
+        if "n_aginfer_hints" not in src:
+            raise StageFail(f"{meth} does not emit n_aginfer_hints (dump-path divergence)")
+        if "_aginfer_hints" not in src:
+            raise StageFail(f"{meth} does not read self._aginfer_hints")
+
+
+# ============================================================ H. outbound routing
+
+
+def stage_h0_worker_routes_hints_to_put() -> None:
+    """audit #2: the outbound worker's PUT dispatch for endpoint=hints.
+    A0 only checks the enqueued body shape; this drives the batch
+    through `_post_one` and asserts it issues a PUT to /aginfer/hints
+    (NOT a POST — the migrate hot path stays on .post()).  Closes the
+    one dispatch branch t36/t41 don't cover for hints."""
+    async def _go():
+        rec = _RecordingHttp()
+        ob = OutboundQueue(sglang_base_url="http://sg", http_client=rec)
+        ob.enqueue_hints([{"hash": "u0", "p_hat": 1.0, "lambda": 0.5, "stamp": 1}])
+        batch = ob.queue.get_nowait()
+        await ob._post_one(batch)
+        return rec.calls
+    calls = asyncio.run(_go())
+    if len(calls) != 1:
+        raise StageFail(f"expected exactly one HTTP call; got {calls!r}")
+    verb, url, body = calls[0]
+    if verb != "PUT":
+        raise StageFail(f"hints must dispatch via PUT (not {verb}); migrate stays on .post()")
+    if not url.endswith("/aginfer/hints"):
+        raise StageFail(f"wrong URL: {url!r}")
+    if "hints" not in (body or {}):
+        raise StageFail(f"PUT body missing 'hints': {body!r}")
 
 
 # ============================================================ E. wire round-trip
@@ -570,11 +686,14 @@ def stage_f0_e2e_live_put_readback() -> None:
     _, out2 = _req("PUT", "/aginfer/hints", {"hints": hints, "batch_id": "e2e2"})
     if out2.get("applied", -1) != 0:
         raise StageFail(f"live idempotent re-apply should be applied=0: {out2!r}")
-    # newer stamp overwrites → applied 2
+    # newer stamp overwrites → applied advances for both hashes.
+    # NOTE: the HTTP layer SUMS applied across ranks, so a 2-hint PUT
+    # returns applied == 2 * n_ranks (==2 at TP=1).  Assert >= 2 so
+    # this stays correct at TP>1 (audit A7).
     newer = [dict(h, stamp=run + 1, p_hat=0.1) for h in hints]
     _, out3 = _req("PUT", "/aginfer/hints", {"hints": newer, "batch_id": "e2e3"})
-    if out3.get("applied", -1) != 2:
-        raise StageFail(f"live newer-stamp re-apply should be applied=2: {out3!r}")
+    if out3.get("applied", -1) < 2:
+        raise StageFail(f"live newer-stamp re-apply should advance both (>=2): {out3!r}")
     # read back the count via /aginfer/state
     _, state = _req("GET", "/aginfer/state")
     n = state.get("n_aginfer_hints")
@@ -602,7 +721,11 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("D1 idempotent re-apply (same stamp) → 0",     stage_d1_idempotent_same_stamp),
     ("D2 newer stamp overwrites",                   stage_d2_newer_stamp_overwrites),
     ("D3 stale stamp rejected",                     stage_d3_stale_stamp_rejected),
+    ("D4 mixed batch → applied counts only advanced", stage_d4_mixed_batch_applied_count),
+    ("D5 clear_aginfer_hint present/absent",        stage_d5_clear_aginfer_hint),
     ("E0 daemon wire body round-trips sglang validator+setter", stage_e0_wire_round_trip),
+    ("G0 both dump paths echo n_aginfer_hints (no divergence)", stage_g0_dump_paths_both_echo_count),
+    ("H0 outbound worker routes hints → PUT /aginfer/hints", stage_h0_worker_routes_hints_to_put),
     ("F0 e2e live PUT /aginfer/hints + state readback", stage_f0_e2e_live_put_readback),
 ]
 
