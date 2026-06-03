@@ -80,10 +80,35 @@ Pure-Python; ~0.3 s.  No GPU, no sglang.
 
 ## RESULTS
 
-**PASSED** — all 12 stages.
+**PASSED** — all 15 stages (12 + E0/E1/E2 from the audit).
 
 * date: 2026-06-03
-* raw log: `results/20260603_t34_initial_pass.log`
+* raw logs: `results/20260603_t34_initial_pass.log` (12),
+  `results/20260603_t34_post_audit_pass.log` (15)
+
+## AUDIT CLOSURE (2026-06-03)
+
+Adversarial audit verified the DP CORE correct (~270k randomized
+trials incl. the parent-pointer reconstruction, bs>1 multi-axis, ties,
+over-relief clamping) — no correctness bug.  Closed the findings:
+
+* **#9 (the real one) — performance/DoS**: the auditor broke the
+  "microseconds" claim (|dp| → ~1.8M cells / 34 s with large distinct
+  deltas; no guard).  Added a ``max_dp_cells`` ceiling (default
+  10×10⁵): past it the DP raises ``KnapsackBudgetExceededError`` (→
+  ``fatal`` in ``joint_decide``, crash-only) instead of stalling the
+  event loop.  Stage **E1** trips it; DESIGN §9 "microseconds" claim
+  corrected.
+* **#8** — ``KnapsackInfeasibleError.context`` now carries the
+  candidate ``items`` (per DESIGN's ``fatal(candidates=…)``), so ops
+  can see WHICH candidates were available (top-k undersizing vs a
+  filter drop).  C0 asserts it.
+* **#10 / #11 / #12** — added **E0** (exact-vs-brute at bucket>1 with
+  MULTIPLE relief AND cap axes — the original A2 was 1+1 at bucket=1)
+  and **E2** (empty items / zero need / zero budget).
+* **contract / NIT** — docstrings now state the phase precondition
+  (min-cost takes Migrate/Pause, max-value takes Resume),
+  ``bucket_size > 0``, and the safe-direction quantisation-halt note.
 
 ## SCOPE BOUNDARY (deferred)
 

@@ -2069,8 +2069,17 @@ touched axes and r = 0 on untouched axes, the upper-bound product
 is `30 × 3² ≈ 270` *new* cells per item, capped at `K × ∏ buckets`
 along touched axes per item — empirically ≤ 10⁵ reachable cells
 on T9 / T11 runs (see PLAN §1 for the calibration task).  At K_MAX
-= 256 this scales to ~10⁶ in the worst case; still microseconds
-per `joint_decide`.
+= 256 this scales to ~10⁶ in the worst case.
+
+**Cost is NOT "microseconds" at the upper end (#156 audit #9).**
+Python materialises ~50 k cells/sec, so the 10⁶-cell worst case is
+≈ 20 s — a real event-loop stall, reached when candidates carry
+large, DISTINCT relief/acquire bucket-deltas across many axes (the
+regime the worked example assumes away).  The implementation guards
+with a ``max_dp_cells`` ceiling (default 10×10⁵): past it the DP
+FAILS LOUD (``KnapsackBudgetExceededError`` → ``fatal(
+"joint_decide_dp_blowup")``, crash-only) rather than stalling — a
+blow-up means the candidate set / quantisation is misconfigured.
 
 ```python
 def _bk(n, bucket_size):                            # round-down quantisation

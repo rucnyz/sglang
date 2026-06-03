@@ -90,10 +90,29 @@ class Resume:
     pid: Any = None
 
 
+# Sparse-DP cell ceiling (#156 audit #9).  DESIGN §9 estimates ≤10^5
+# reachable cells on real T9/T11 workloads and ~10^6 worst case; Python
+# materialises ~50k cells/sec, so 10^6 cells ≈ 20 s — a real event-loop
+# stall, NOT "microseconds".  The state space is the cross-product of
+# per-axis reachable bucket counts; it blows up when candidates carry
+# large, DISTINCT relief/acquire bucket-deltas across many axes (e.g.
+# large units against small page_bytes, or wide destination caps).  We
+# FAIL LOUD past this ceiling rather than stall silently: the primitive
+# raises ``KnapsackBudgetExceededError`` and the daemon's ``joint_decide``
+# maps it to ``fatal()`` (crash-only, DESIGN §10) — a blow-up means the
+# candidate set / quantisation is misconfigured (top-k undersized at the
+# wrong granularity), an operator bug, not a workload reality.  Generous
+# default (10× DESIGN's real-case estimate); override per call.
+_MAX_DP_CELLS = 1_000_000
+
+
 class KnapsackInfeasibleError(Exception):
     """Raised by ``knapsack_min_cost_multi`` when no subset satisfies
     every relief target under the destination caps.  Carries a forensic
-    ``context`` dict; the daemon's ``joint_decide`` re-raises it as
+    ``context`` dict (including the candidate ``items`` per DESIGN §9's
+    ``fatal(candidates=…)``, so ops can see WHICH candidates were
+    available — diagnosing top-k undersizing vs a filter dropping a
+    needed candidate); the daemon's ``joint_decide`` re-raises it as
     ``fatal("joint_decide_infeasible", **context)`` (DESIGN §9/§10)."""
     def __init__(self, context: Dict[str, Any]):
         self.context = context
@@ -103,6 +122,23 @@ class KnapsackInfeasibleError(Exception):
             f"(bytes_needed={context.get('bytes_needed')}, "
             f"cap_left={context.get('cap_left')}, "
             f"items={context.get('n_items')}, dp_size={context.get('dp_size')})"
+        )
+
+
+class KnapsackBudgetExceededError(Exception):
+    """Raised when the sparse DP's reachable-cell count exceeds
+    ``max_dp_cells`` (#156 audit #9).  Carries a forensic ``context``;
+    ``joint_decide`` maps it to ``fatal("joint_decide_dp_blowup", …)`` —
+    a pathological candidate set (excess relief/acquire variance at the
+    chosen quantisation), not a workload reality."""
+    def __init__(self, context: Dict[str, Any]):
+        self.context = context
+        super().__init__(
+            f"joint_decide DP blew up: {context.get('dp_size')} reachable "
+            f"cells > max_dp_cells={context.get('max_dp_cells')} at item "
+            f"{context.get('item_index')}/{context.get('n_items')} "
+            f"(axes={context.get('axes')}) — candidate set / quantisation "
+            f"misconfigured"
         )
 
 
@@ -148,15 +184,31 @@ def knapsack_min_cost_multi(
     bucket_size: Dict[Any, int],
     *,
     context: Dict[str, Any] = None,
+    max_dp_cells: int = _MAX_DP_CELLS,
 ) -> List[Any]:
     """0/1 knapsack: subset S minimising Σ cost(s∈S) s.t.
       (a) every (HBM, sp) relief axis:  Σ relief >= bytes_needed
       (b) every (DRAM|DISK, sp) cap axis: Σ acquired <= cap_left
 
+    ``items`` are pressure-phase candidates (``Migrate`` / ``Pause``) —
+    each must expose ``.cost`` + ``.relief`` (and ``Migrate.acquired``).
+    Passing a ``Resume`` is a caller bug (``joint_decide`` enforces the
+    phase split); it raises ``AttributeError`` rather than silently
+    mis-scoring.
+
     ``bucket_size`` keyed by axis (tier, sp) — each axis at its own page
-    granularity.  Relief rounds down; destination consumption rounds up.
+    granularity; values MUST be > 0 (sourced from
+    ``pool_usage[τ].subpools[sp].page_bytes``).  Relief rounds DOWN
+    (never over-claims), destination consumption rounds UP (never
+    under-counts).  NOTE (#156 audit B): the round-UP target +
+    round-DOWN relief can report a marginally raw-feasible instance
+    (sub-page residual need) as INFEASIBLE → ``joint_decide`` halts;
+    this is the intended safe direction (halt-loud over under-free).
+
     Raises ``KnapsackInfeasibleError`` if no subset satisfies (a) under
-    (b).  Returns the chosen candidate list (subset of ``items``)."""
+    (b); ``KnapsackBudgetExceededError`` if the reachable-cell count
+    exceeds ``max_dp_cells``.  Returns the chosen candidate list
+    (subset of ``items``)."""
     relief_axes = list(bytes_needed.keys())          # [(HBM, sp), ...]
     cap_axes = list(cap_left.keys())                 # [(DRAM|DISK, sp), ...]
     W = {a: _bk_up(bytes_needed[a], bucket_size[a]) for a in relief_axes}
@@ -199,6 +251,14 @@ def knapsack_min_cost_multi(
                 new_dp[s_new] = new_cost
                 parent[(k, s_new)] = s
         dp = new_dp
+        if len(dp) > max_dp_cells:
+            ctx = dict(context or {})
+            ctx.update({
+                "dp_size": len(dp), "max_dp_cells": max_dp_cells,
+                "item_index": k, "n_items": K,
+                "axes": relief_axes + cap_axes, "items": list(items),
+            })
+            raise KnapsackBudgetExceededError(ctx)
 
     full_r = tuple(W[a] for a in relief_axes)
     feasible = [(c, s) for s, c in dp.items() if s[:n] == full_r]
@@ -209,6 +269,7 @@ def knapsack_min_cost_multi(
             "cap_left": dict(cap_left),
             "bucket_size": dict(bucket_size),
             "n_items": K,
+            "items": list(items),          # #156 audit #8: which candidates
             "dp_size": len(dp),
         })
         raise KnapsackInfeasibleError(ctx)
@@ -228,11 +289,19 @@ def knapsack_max_value_multi(
     items: List[Any],
     budget: Dict[Any, int],
     bucket_size: Dict[Any, int],
+    *,
+    context: Dict[str, Any] = None,
+    max_dp_cells: int = _MAX_DP_CELLS,
 ) -> List[Any]:
     """0/1 knapsack: subset S maximising Σ gain(s∈S) s.t. every
     (HBM, sp) axis:  Σ re_use <= budget.  ``re_use`` rounds up (safe for
     <=).  Same sparse multi-axis DP shape as ``knapsack_min_cost_multi``.
-    Returns the chosen candidate list."""
+
+    ``items`` are headroom-phase candidates (``Resume``) — each must
+    expose ``.gain`` + ``.re_use``; passing a ``Migrate``/``Pause`` is a
+    caller bug (raises ``AttributeError``).  ``bucket_size`` values MUST
+    be > 0.  Raises ``KnapsackBudgetExceededError`` if the reachable-cell
+    count exceeds ``max_dp_cells``.  Returns the chosen candidate list."""
     axes = list(budget.keys())
     W = {a: _bk(budget[a], bucket_size[a]) for a in axes}
     K = len(items)
@@ -255,6 +324,14 @@ def knapsack_max_value_multi(
                 new_dp[s_new] = new_gain
                 parent[(k, s_new)] = s
         dp = new_dp
+        if len(dp) > max_dp_cells:
+            ctx = dict(context or {})
+            ctx.update({
+                "dp_size": len(dp), "max_dp_cells": max_dp_cells,
+                "item_index": k, "n_items": K, "axes": axes,
+                "items": list(items),
+            })
+            raise KnapsackBudgetExceededError(ctx)
 
     s_pick = max(dp, key=dp.get)
     chosen: List[Any] = []
