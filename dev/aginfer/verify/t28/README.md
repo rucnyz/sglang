@@ -120,7 +120,13 @@ five honesty/parity/test-depth items:
   drifting together, e.g. a hit_count term creeping back).
 * **B6 (scope)** — documented at the callsite that the plugin covers
   UnifiedRadixCache only (aginfer pins it); HiRadixCache /
-  HiMambaRadixCache still hardcode the trigger — tracked as #192.
+  HiMambaRadixCache still hardcode the trigger.  **Resolved out-of-
+  scope (#192)**: the siblings carry ZERO aginfer surface and aginfer
+  cannot run on them (every endpoint → `unsupported_tree_cache`), so
+  plugging them would add isolated aginfer machinery to code aginfer
+  never instantiates.  The default is byte-identical to their
+  hardcoded check (B4), so the no-daemon baseline is unchanged.  See
+  DESIGN §3 (plugin-points scope note).
 * **B7 (DESIGN)** — reconciled DESIGN §3 to the `(node, threshold)`
   signature.
 

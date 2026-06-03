@@ -173,6 +173,20 @@ Two physical plugin points carry this:
   `V_u(residence ∪ {DRAM}) > V_u(residence)` (and may ignore
   `threshold`).
 
+Both plugin points live ONLY on `UnifiedRadixCache` — the cache
+aginfer requires.  The entire aginfer surface (`/aginfer/state`
+schema, hint table, migrate/program_paused/hints endpoints) is
+UnifiedRadixCache-only; on any other tree cache every aginfer
+endpoint returns `unsupported_tree_cache` unless
+`SGLANG_ENABLE_UNIFIED_RADIX_TREE=1`.  The sibling stock caches
+(`HiRadixCache`, `HiMambaRadixCache`) keep their hardcoded
+`hit_count >= write_through_threshold` and stock LRU — they carry no
+aginfer state and aginfer never instantiates them, so plugging them
+would bolt isolated aginfer machinery onto code aginfer can't run on
+(#192, resolved out-of-scope).  The plugin DEFAULTS are byte-identical
+to the siblings' hardcoded behaviour, so the no-daemon baseline is the
+same regardless of cache.
+
 The same plugin pattern can be extended to future decision points
 (predictive load_back, mooncake archive trigger) without
 restructuring the framework.

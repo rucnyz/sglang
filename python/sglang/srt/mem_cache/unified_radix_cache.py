@@ -1839,13 +1839,17 @@ class UnifiedRadixCache(BasePrefixCache):
         # is the historical hit_count >= threshold; aginfer can
         # register a V_u-aware version.  `not node.backuped` stays a
         # hard precondition (no point re-backing-up an existing copy).
-        # SCOPE: only THIS cache (UnifiedRadixCache) routes the trigger
-        # through the hook.  The sibling HiRadixCache / HiMambaRadixCache
-        # `_inc_hit_count` still hardcode `hit_count >= threshold` — they
-        # are out of aginfer scope because aginfer always launches with
-        # SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 (only UnifiedRadixCache emits
-        # the aginfer schema / honours the plugins).  Migrating them is
-        # tracked separately (#178 audit B6).
+        # SCOPE (#192, resolved out-of-scope): only THIS cache
+        # (UnifiedRadixCache) routes the trigger through the hook.  The
+        # sibling HiRadixCache / HiMambaRadixCache `_inc_hit_count` keep
+        # the hardcoded `hit_count >= threshold` BY DESIGN — they carry
+        # ZERO aginfer surface (no _aginfer_hints, no eviction scorer,
+        # no /aginfer/state schema) and aginfer CANNOT run on them:
+        # every aginfer endpoint returns `unsupported_tree_cache` unless
+        # SGLANG_ENABLE_UNIFIED_RADIX_TREE=1.  So the aginfer plugins
+        # live only where aginfer runs; the siblings stay stock-sglang.
+        # The default here is byte-identical to their hardcoded check
+        # (verify/t28 B4), so the no-daemon baseline is unchanged.
         if not node.backuped and self._write_through_policy(
             node, self.write_through_threshold
         ):
