@@ -164,26 +164,19 @@ def stage_a2_drift_guard_vs_ours_greedy() -> None:
     """hint_v_u(hint=None) MUST equal ours_greedy_score for the same
     node — they share the §7 V_u math (no reimplementation/drift).
 
-    Freeze the time counter: both scorers call _current_time_counter()
-    which INCREMENTS the global counter (pre-existing — ours_greedy_score
-    already does this), so calling both back-to-back would otherwise see
-    a different `now`/age.  In production each node is scored once, so
-    this only matters for the side-by-side equality check."""
-    import baselines.sglang_adapter as adp
-    orig = adp._current_time_counter
-    adp._current_time_counter = lambda: 1_000_000
-    try:
-        for la, hc, nt in [(0, 1, 100), (50, 7, 400), (0, 0, 10)]:
-            n = _Node(last_access_time=la, hit_count=hc, n_tokens=nt)
-            a = hint_v_u(n, _LAYER, None)
-            b = ours_greedy_score(n, _LAYER)
-            if a != b:
-                raise StageFail(
-                    f"hint_v_u(None) must == ours_greedy_score (no drift); "
-                    f"at (la={la},hc={hc},nt={nt}) got {a} vs {b}"
-                )
-    finally:
-        adp._current_time_counter = orig
+    No counter freeze needed (#193): the scorers PEEK the time counter
+    (non-mutating), so two back-to-back calls see the same `now` and
+    the side-by-side compare is naturally fair.  (Pre-#193 this freeze
+    was required because the scorers advanced the counter per call.)"""
+    for la, hc, nt in [(0, 1, 100), (50, 7, 400), (0, 0, 10)]:
+        n = _Node(last_access_time=la, hit_count=hc, n_tokens=nt)
+        a = hint_v_u(n, _LAYER, None)
+        b = ours_greedy_score(n, _LAYER)
+        if a != b:
+            raise StageFail(
+                f"hint_v_u(None) must == ours_greedy_score (no drift); "
+                f"at (la={la},hc={hc},nt={nt}) got {a} vs {b}"
+            )
 
 
 def stage_a3_monotonic_in_p_hat() -> None:
@@ -194,6 +187,34 @@ def stage_a3_monotonic_in_p_hat() -> None:
         if prev is not None and not (v >= prev):
             raise StageFail(f"V_u must be monotonic in p_hat; p={p} v={v} < prev={prev}")
         prev = v
+
+
+def stage_a4_scorer_does_not_advance_counter() -> None:
+    """#193: the eviction scorer is a READ — it must NOT advance the
+    global time counter.  Scoring K leaves in one heap build with a
+    mutating clock makes node[i]'s `now` = base+i, so the heap key is
+    ORDER-DEPENDENT (two same-(last_access,hits) nodes score
+    differently by iteration position) AND scoring pollutes the access
+    clock published as `time_counter`.  With `peek_time_counter` both
+    go away: scoring the same node twice is deterministic and the
+    counter is unchanged."""
+    from sglang.srt.mem_cache.unified_cache_components import peek_time_counter
+    n = _Node(last_access_time=0, hit_count=3, n_tokens=100)
+    before = int(peek_time_counter())
+    s1 = hint_v_u(n, _LAYER, None)
+    s2 = hint_v_u(n, _LAYER, None)
+    after = int(peek_time_counter())
+    if after != before:
+        raise StageFail(
+            f"scoring must NOT advance the global time counter (#193); "
+            f"{before} → {after} (a mutating clock makes the heap key "
+            f"order-dependent + pollutes time_counter)"
+        )
+    if s1 != s2:
+        raise StageFail(
+            f"scoring the same node twice must be deterministic; "
+            f"{s1} != {s2} (the clock advanced between calls)"
+        )
 
 
 # ============================================================ B. selection + scorer
@@ -404,6 +425,7 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A1 no hint → local fallback (float)",            stage_a1_no_hint_fallback),
     ("A2 drift guard: hint_v_u(None) == ours_greedy",  stage_a2_drift_guard_vs_ours_greedy),
     ("A3 V_u monotonic in hint p_hat",                 stage_a3_monotonic_in_p_hat),
+    ("A4 scorer does not advance the time counter (#193)", stage_a4_scorer_does_not_advance_counter),
     ("B0 sentinel binds the hint-aware scorer",        stage_b0_sentinel_binds_hint_scorer),
     ("B1 scorer reads _aginfer_hints by node hash",    stage_b1_scorer_reads_hint_table),
     ("B2 default spec → not hint-aware",               stage_b2_normal_spec_not_hint_aware),

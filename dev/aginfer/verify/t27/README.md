@@ -60,9 +60,13 @@ A. adapter hint_v_u (the V_u math)
   A0 hint p_hat drives the score (high-p_hat hint → higher keep-value)
   A1 no hint → local fallback, returns float (never crashes)
   A2 drift guard: hint_v_u(None) == ours_greedy_score for the same
-     node (shared _v_u_from_unit; counter frozen so the side-by-side
-     compare is fair — both scorers advance the global time counter)
+     node (shared _v_u_from_unit; no counter freeze needed post-#193 —
+     the scorers peek, so back-to-back calls see the same `now`)
   A3 V_u monotonic in hint p_hat
+  A4 scorer does NOT advance the global time counter (#193): scoring
+     the same node twice is deterministic + time_counter unchanged
+     (peek, not get_and_increase — else the heap key is order-dependent
+     and scoring pollutes the published clock)
 B. sglang scorer selection + bound method
   B0 sentinel aginfer:hint_v_u → bound _aginfer_eviction_score,
      _aginfer_hint_aware True, kv_policy_loaded line
@@ -122,9 +126,9 @@ Confirmed live (2026-06-02):
 
 ## RESULTS
 
-**PASSED** — all 15 stages (13 + B3/C3 from the audit) + live e2e.
+**PASSED** — all 16 stages (13 + B3/C3 audit + A4/#193) + live e2e.
 
-* date: 2026-06-02
+* date: 2026-06-02 (A4 + the #193 peek fix added 2026-06-03)
 * raw log: `results/20260602_t27_initial_pass.log`
 
 ## AUDIT CLOSURE (2026-06-02)

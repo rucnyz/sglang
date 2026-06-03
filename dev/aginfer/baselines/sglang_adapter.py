@@ -116,10 +116,19 @@ def _get_ours() -> OursGreedyPolicy:
 # when this module is loaded as a side effect of `import baselines` in the
 # offline simulator.
 def _current_time_counter() -> int:
+    # #193: PEEK, not get_and_increase.  The eviction scorers are READS
+    # ("what is the eviction cost of this node now?"); advancing the
+    # global counter once per scored node would (a) make the V_u heap
+    # key order-dependent (node i scored at now=base+i, so two
+    # same-(last_access,hits) nodes score differently by iteration
+    # position) and (b) pollute the access clock published as
+    # `time_counter` in /aginfer/state.  peek_time_counter gives all
+    # nodes in one heap build the SAME `now` → deterministic ordering,
+    # no clock pollution.
     from sglang.srt.mem_cache.unified_cache_components import (
-        get_and_increase_time_counter,
+        peek_time_counter,
     )
-    return int(get_and_increase_time_counter())
+    return int(peek_time_counter())
 
 
 # ----------------------------- public scorers -----------------------------
