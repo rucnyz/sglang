@@ -550,6 +550,37 @@ def stage_f0_shared_unit_survives() -> None:
         )
 
 
+# ============================================================ G. tracker GC
+
+
+def stage_g0_handle_gcs_ended_no_units() -> None:
+    """#190: kv_scheduler.handle reclaims an ENDED program once its KV
+    has fully cleared from the snapshot.  Drives the REAL handle →
+    build_paper_state → gc_ended path: p-dead is ENDED and holds no
+    unit in the dump → reclaimed; p-live still holds a unit → kept."""
+    async def _go():
+        tracker = ProgramTracker()
+        tracker.observe_arrival("p-live")
+        tracker.observe_arrival("p-dead")
+        tracker.end("p-dead")            # ENDED, but no unit cites it
+        ob = _new_outbound()
+        sched = _sched(tracker, ob, _DemoteAllPolicy())
+        sj = _state_json(units=[
+            _unit(uhash="u", residence=["HBM"], holders=["p-live"]),
+        ])
+        await sched.handle(Event(EventKind.LLM_PREFILL, session="p-live"),
+                           _FakeRouter(sj))
+        return tracker
+    tracker = asyncio.run(_go())
+    if tracker.state("p-dead") is not None:
+        raise StageFail(
+            "handle() must GC an ENDED program with no live units "
+            f"(#190); got {tracker.state('p-dead')}"
+        )
+    if tracker.state("p-live") is not State.REASONING:
+        raise StageFail("a live unit-holding program must NOT be GC'd")
+
+
 # ============================================================ run
 
 
@@ -566,6 +597,7 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("D0 composed router runs migrate AND F5", stage_d0_composed_router_runs_migrate_and_f5),
     ("E0 real policy: ENDED lowers keep-value + demotes", stage_e0_real_policy_keep_value_lower_for_ended),
     ("F0 shared unit survives via D_t exclusion", stage_f0_shared_unit_survives),
+    ("G0 handle() GCs ENDED-no-units program (#190 bounded tracker)", stage_g0_handle_gcs_ended_no_units),
 ]
 
 

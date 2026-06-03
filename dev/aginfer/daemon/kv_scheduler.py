@@ -989,6 +989,17 @@ class KvScheduler:
             logger.exception("kv_scheduler: build_paper_state raised; skip")
             _m("kv_decide", kind=event.kind.value, outcome="build_state_raised")
             return
+        # #190 (bounded tracker): reclaim ENDED programs whose KV has
+        # fully cleared from the snapshot.  `live_pids` = every pid that
+        # still holds a unit in THIS fresh dump; an ENDED pid absent from
+        # it has no residual KV and no bookkeeping left.  Runs every
+        # event on the fresh state (cheap dict scan), mirroring sglang's
+        # ENDED-no-units dump-GC (#186) so the daemon tracker stays
+        # bounded by the live-unit set.
+        live_pids = {
+            sid for u in sched_state.units.values() for sid in u.holders
+        }
+        self.tracker.gc_ended(live_pids)
         self.last_decision_set_size = len(sched_state.decision_set)
         if not sched_state.decision_set:
             # Nothing to decide on (e.g. LLM_PREFILL or empty top-k).

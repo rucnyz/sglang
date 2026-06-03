@@ -360,6 +360,64 @@ def step_no_wallclock_heuristic_in_source() -> None:
                 )
 
 
+async def step_gc_ended_bounds_tracker() -> None:
+    """[9] #190: gc_ended(live_pids) reclaims ENDED programs that no
+    longer hold any live unit, keeping the tracker bounded by the
+    live-unit set instead of growing one entry per session forever."""
+    pt = ProgramTracker()
+    # live programs (various states) + ended ones
+    pt.observe_arrival("p-reason")                       # REASONING
+    pt.observe_arrival("p-act"); pt.observe_completion("p-act")  # ACTING
+    pt.pause("p-pause")                                  # PAUSED
+    pt.observe_arrival("p-ended-units"); pt.end("p-ended-units")   # ENDED, has units
+    pt.observe_arrival("p-ended-gone");  pt.end("p-ended-gone")    # ENDED, no units
+    assert pt.size() == 5, pt.size()
+
+    # live_pids = the pids that still appear in the /aginfer/state dump
+    # (any unit's holders).  p-ended-gone is absent → reclaimable.
+    live = {"p-reason", "p-act", "p-pause", "p-ended-units"}
+    reclaimed = pt.gc_ended(live)
+    assert reclaimed == 1, reclaimed
+    assert pt.state("p-ended-gone") is None, pt.state("p-ended-gone")
+    # everything else survives
+    assert pt.state("p-ended-units") is State.ENDED
+    assert pt.state("p-reason") is State.REASONING
+    assert pt.state("p-act") is State.ACTING
+    assert pt.state("p-pause") is State.PAUSED
+    assert pt.size() == 4
+
+    # ONLY ENDED is GC'd: with NOTHING live, the live programs
+    # (REASONING / ACTING / PAUSED) are still kept; only the remaining
+    # ENDED pid (p-ended-units) is reclaimed.
+    reclaimed2 = pt.gc_ended(set())
+    assert reclaimed2 == 1, reclaimed2
+    assert pt.state("p-ended-units") is None, "ENDED + not-live → reclaimed"
+    assert pt.state("p-reason") is State.REASONING, "must NOT GC a REASONING pid"
+    assert pt.state("p-act") is State.ACTING, "must NOT GC an ACTING pid"
+    assert pt.state("p-pause") is State.PAUSED, "must NOT GC a PAUSED pid"
+    assert pt.size() == 3
+
+    # an ENDED pid with a request still PARKED in the gate is NOT GC'd
+    pt2 = ProgramTracker()
+    pt2.observe_arrival("p-gated"); pt2.pause("p-gated")
+    waiter = asyncio.create_task(pt2.wait_if_paused("p-gated"))
+    await asyncio.sleep(0.02)  # let it park
+    pt2.end("p-gated", release_gate=False)   # ENDED, but a waiter is parked
+    reclaimed_gated = pt2.gc_ended(set())    # not in live set, but gated
+    assert reclaimed_gated == 0, "must NOT GC an ENDED pid with a parked waiter"
+    assert pt2.state("p-gated") is State.ENDED
+    # release + drain so the test doesn't leak the task
+    pt2.resume("p-gated"); await asyncio.wait_for(waiter, timeout=2.0)
+
+    # reused pid after GC: a new session reusing the id resurrects fresh
+    pt3 = ProgramTracker()
+    pt3.observe_arrival("reuse"); pt3.end("reuse")
+    pt3.gc_ended(set())
+    assert pt3.state("reuse") is None
+    pt3.observe_arrival("reuse")     # reused
+    assert pt3.state("reuse") is State.REASONING, "reused pid must resurrect"
+
+
 async def main() -> None:
     print("=== T6 verify: program_tracker state machine ===")
     print()
@@ -399,6 +457,10 @@ async def main() -> None:
     step_no_wallclock_heuristic_in_source()
     print("[8] contract: NO time.* or loop.time in transition path "
           "(AST grep clean) ✓")
+
+    await step_gc_ended_bounds_tracker()
+    print("[9] #190: gc_ended reclaims ENDED-no-units pids (bounded "
+          "tracker); keeps live + gated + ENDED-with-units; reuse resurrects ✓")
 
     dur_ms = (time.perf_counter() - t0) * 1000
     print()

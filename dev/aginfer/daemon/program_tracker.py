@@ -67,10 +67,15 @@ thread-safe — do NOT call from FastAPI sync handlers running in a
 threadpool, or any other off-loop thread; ``asyncio.Event.set()``
 from a non-loop thread is undefined.
 
-v1 has NO GC / cap.  Each unique program_id occupies ~300 bytes
-(state string + asyncio.Event).  10k programs ≈ 3 MB; 100k ≈ 30 MB.
-T8 / T9 may add an LRU cap if profiling shows churn-driven memory
-growth in production.
+Bounded by the live-unit set (#190): ``gc_ended(live_pids)`` reclaims
+ENDED programs whose KV has fully cleared from the latest
+``/aginfer/state`` snapshot (called by ``kv_scheduler.handle`` each
+event).  So ``_states`` tracks (live programs) + (ENDED programs with
+residual units) — NOT one entry per session ever seen.  Each unique
+program_id occupies ~300 bytes (state string + asyncio.Event).  A
+LIVE program that never signals SESSION_END (REASONING/ACTING/PAUSED
+forever) is still kept — an LRU/idle cap for that case is future work,
+gated on profiling.
 """
 from __future__ import annotations
 
@@ -297,6 +302,45 @@ class ProgramTracker:
         logger.info("program_tracker: client_disconnected %s (prev=%s)",
                     pid, prev)
         return prev
+
+    def gc_ended(self, live_pids) -> int:
+        """#190 (bounded tracker): reclaim ENDED programs that no longer
+        hold any live unit.  ``live_pids`` is the set of program_ids
+        present in the current ``/aginfer/state`` snapshot (the union of
+        every unit's holders).  An ENDED pid absent from it has no
+        residual KV and no daemon bookkeeping left, so it is dropped
+        from every tracker structure — mirroring sglang's ENDED-no-units
+        GC (#186) so ``_states`` stays bounded by the live-unit set
+        rather than growing one entry per session forever.
+
+        Only ENDED is GC'd (REASONING / ACTING / PAUSED are LIVE
+        programs and are kept even when they hold no radix units yet).
+        An ENDED pid with a request still PARKED in the gate
+        (``_gated_count > 0``) is kept — there is a waiter to release.
+
+        Safe w.r.t. pid reuse: a new session reusing an old id is
+        resurrected to REASONING by its next ``observe_arrival``
+        regardless of whether the old entry was GC'd, so GC can never
+        strand a live session.  Called by ``kv_scheduler.handle`` each
+        event with the live pids from the fresh snapshot.
+
+        Returns the number of pids reclaimed.
+        """
+        stale = [
+            pid for pid, st in self._states.items()
+            if st is State.ENDED
+            and pid not in live_pids
+            and self._gated_count.get(pid, 0) == 0
+        ]
+        for pid in stale:
+            self._states.pop(pid, None)
+            self._events.pop(pid, None)
+            self._ended_while_gated.discard(pid)
+            self._gated_count.pop(pid, None)
+        if stale:
+            from ._metrics import m as _m
+            _m("program_gc_ended", reclaimed=len(stale))
+        return len(stale)
 
     # ---- proxy hook ----
 
