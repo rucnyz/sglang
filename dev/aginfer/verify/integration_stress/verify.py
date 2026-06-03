@@ -583,6 +583,140 @@ def stage_e(stack_h: StackHandles) -> None:
         )
 
 
+# ============================================================ G. SESSION_END migrate e2e
+
+
+async def _flavor_g_session_end_migrate(stack_h: StackHandles) -> Dict[str, Any]:
+    """#191 (closes #187 audit G3): the LIVE SESSION_END seam end-to-
+    end — webhook `POST /aginfer/event {session_end}` → the daemon's
+    composed handler (end → kv_scheduler.handle migrate D_t → PUT
+    {ENDED}) → sglang's `per_program_usage[pid].state` reflects ENDED.
+
+    Deterministic assertion: the ENDED state PROPAGATES (the F5 PUT
+    round-trip).  The actual demote/drop of the session-scoped units is
+    policy + cost-model dependent (cold-start `h_max≈0` makes V_u(keep)
+    positive, so the policy may decline) — so demotion is OBSERVED and
+    logged, not hard-gated.  Both terminal shapes count as success:
+    (a) ENDED echoed with units still resident (policy declined), or
+    (b) the units fully dropped + the entry GC'd (#186) — the stronger
+    "migrate dropped everything" outcome."""
+    SGLANG_BASE = f"{SGLANG_HOST}:{SGLANG_PORT}"
+    DAEMON_BASE = f"{DAEMON_HOST}:{DAEMON_PORT}"
+    pid = f"sessend-{uuid.uuid4().hex[:8]}"
+
+    async def get_state(cli: httpx.AsyncClient) -> Dict[str, Any]:
+        r = await cli.get(f"http://{SGLANG_BASE}/aginfer/state", timeout=30.0)
+        r.raise_for_status()
+        return r.json()
+
+    def _units_of(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [u for u in state.get("units", []) if pid in u.get("session_ids", [])]
+
+    def _hbm(units: List[Dict[str, Any]]) -> int:
+        return sum(1 for u in units if "HBM" in u.get("residence", []))
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=5, read=60, write=10, pool=5),
+    ) as cli:
+        # 1. Tag EXCLUSIVE units with pid — unique prompts, direct to
+        #    sglang (the session_id_passthrough path), so the units are
+        #    p's alone (holders == {pid}) → they ARE its session_scoped
+        #    set at SESSION_END.
+        for n in range(6):
+            body = {
+                "model": MODEL,
+                "messages": [
+                    {"role": "system",
+                     "content": f"{_PAD} (sessend {pid} {n} {uuid.uuid4().hex[:8]})"},
+                    {"role": "user",
+                     "content": f"reply 'ack' ({pid} {n} {uuid.uuid4().hex[:12]})"},
+                ],
+                "max_tokens": 8, "temperature": 0.0,
+                "program_id": pid,
+            }
+            r = await cli.post(
+                f"http://{SGLANG_BASE}/v1/chat/completions", json=body, timeout=60.0,
+            )
+            r.raise_for_status()
+
+        st = await get_state(cli)
+        units_before = _units_of(st)
+        ppu_before = st.get("per_program_usage", {}).get(pid)
+        hbm_before = _hbm(units_before)
+
+        # 2. Fire SESSION_END at the DAEMON.
+        ev = await cli.post(
+            f"http://{DAEMON_BASE}/aginfer/event",
+            json={"kind": "session_end", "session": pid}, timeout=10.0,
+        )
+        event_accepted = ev.status_code == 200
+
+        # 3. Poll sglang for the terminal SESSION_END shape (~10s).
+        ended = False
+        gc_dropped = False
+        units_after = units_before
+        hbm_after = hbm_before
+        for _ in range(50):
+            await asyncio.sleep(0.2)
+            st = await get_state(cli)
+            ppu = st.get("per_program_usage", {}).get(pid)
+            units_after = _units_of(st)
+            hbm_after = _hbm(units_after)
+            if ppu and ppu.get("state") == "ENDED":
+                ended = True
+                break
+            if ppu is None and not units_after and ppu_before is not None:
+                # fully ended → units dropped → entry GC'd (#186)
+                ended = True
+                gc_dropped = True
+                break
+
+    return {
+        "pid": pid,
+        "units_before": len(units_before),
+        "ppu_before_state": (ppu_before or {}).get("state"),
+        "event_accepted": event_accepted,
+        "ended": ended,
+        "gc_dropped": gc_dropped,
+        "hbm_before": hbm_before,
+        "hbm_after": hbm_after,
+        "units_after": len(units_after),
+        "demoted": (hbm_after < hbm_before) or (len(units_after) < len(units_before)),
+        "sglang_alive": stack_h.sglang_proc.poll() is None,
+        "daemon_alive": stack_h.daemon_proc.poll() is None,
+    }
+
+
+def stage_g(stack_h: StackHandles) -> None:
+    res = asyncio.run(_flavor_g_session_end_migrate(stack_h))
+    demote_note = (
+        "GC'd (units dropped)" if res["gc_dropped"]
+        else (f"demoted {res['hbm_before']}→{res['hbm_after']} HBM units"
+              if res["demoted"] else "policy declined (cold-start V_u; units kept)")
+    )
+    print(f"  [G] pid={res['pid']} units_before={res['units_before']} "
+          f"ppu_before={res['ppu_before_state']} → ENDED={res['ended']} "
+          f"| migrate: {demote_note}")
+    if not res["sglang_alive"]:
+        raise StageFail("sglang died mid-flavor-G")
+    if not res["daemon_alive"]:
+        raise StageFail("daemon died mid-flavor-G")
+    if res["units_before"] == 0:
+        raise StageFail(
+            "no units tagged with the SESSION_END pid — program_id "
+            "tagging or launch config broken (driver precondition)"
+        )
+    if not res["event_accepted"]:
+        raise StageFail("daemon rejected the SESSION_END webhook")
+    if not res["ended"]:
+        raise StageFail(
+            "SESSION_END did not propagate to sglang: "
+            "per_program_usage[pid].state never became ENDED (and the "
+            "units were not dropped+GC'd) — the webhook→daemon→PUT→"
+            "sglang seam is broken"
+        )
+
+
 # ============================================================ F. escalate-to-fatal
 
 
@@ -778,6 +912,7 @@ def main() -> int:
                 ("C event-router fan-in throughput", stage_c),
                 ("D migrate under traffic",         stage_d),
                 ("E threshold PUT atomicity",       stage_e),
+                ("G SESSION_END migrate e2e",       stage_g),
             ]:
                 try:
                     print(f"[stage {label}] starting…")
@@ -814,7 +949,7 @@ def main() -> int:
         print(f"  {_red('FAIL')} stage F: "
               f"unexpected {type(exc).__name__}: {exc}")
 
-    n_total = 6
+    n_total = 7
     if failures:
         print(_red(
             f"\nintegration_stress FAILED ({len(failures)}/{n_total}): "

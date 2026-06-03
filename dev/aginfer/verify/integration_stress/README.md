@@ -7,9 +7,9 @@ cross-component interaction on the same wire path Run K uses.
 
 ## SCOPE
 
-Six flavors A–F.  Run sequentially against a single shared
-sglang + daemon launched at the start (except F, which uses its
-own daemon against a dead sglang port — see below).
+Seven flavors A–E + G + F.  A–E and G run sequentially against a
+single shared sglang + daemon launched at the start; F uses its own
+daemon against a dead sglang port (see below).
 
 | flavor | exercises | pass criteria |
 |---|---|---|
@@ -18,6 +18,7 @@ own daemon against a dead sglang port — see below).
 | **C** event-router fan-in throughput | /aginfer/event + event_router + kv_scheduler.handle | 200 webhook events fired; ≥99% accepted by daemon |
 | **D** migrate under traffic | sglang /aginfer/migrate + outbound batches | 12 concurrent chats + 200 migrate batches; both ≥95% OK |
 | **E** threshold PUT atomicity | sglang PUT + daemon GET /aginfer/thresholds + traffic | PUTs accepted ≥95%; daemon GETs always show `lo < hi < crit` (no torn read); daemon ≥10 successful GETs |
+| **G** SESSION_END migrate e2e (#191) | webhook → daemon composed handler (#185 F5 + #187 migrate) → sglang | tag exclusive units with a pid (direct chats, unique prompts) → fire `POST /aginfer/event {session_end}` → `per_program_usage[pid].state` becomes ENDED within ~10s (the F5 PUT round-trip), OR the units fully drop + the entry GC's (#186). Demote is OBSERVED + logged, not gated — cold-start `h_max≈0` ⇒ V_u(keep) ≥ 0 so the policy may decline (the per-action migrate WIRE is already e2e-covered by T20/T33; G covers the SESSION_END trigger→ENDED-propagation seam #187-audit G3 flagged untested) |
 | **F** dead-sglang resilience | low-traffic dead-sglang + #164 escalate threshold | separate daemon vs dead sglang port; daemon STAYS alive (no false-positive escalate-to-fatal) for 8 events at 1 Hz pacing with `--sustained-escalate-fails=5 --sustained-escalate-age-s=5` |
 
 **F is the complement of T164 stages B0/C0.**  T164 covers the
@@ -60,9 +61,17 @@ GPUs 5,6 by default (override via `T_INT_GPUS`).
 
 ## RESULTS
 
-**PASSED** — all 6 flavors green on a clean run (2026-06-01).
+**PASSED** — all 7 flavors green (2026-06-03, with the #191 G flavor).
 
-Raw log: `results/20260601_integration_stress_run4.log`.  Earlier runs:
+The G run confirmed the full SESSION_END seam live: a pid with 6
+tagged units (ppu state REASONING) → `POST /aginfer/event
+{session_end}` → `ENDED=True` AND the migrate actually fired
+(`demoted 6→5 HBM units` — under the real HiCache cost model the
+policy demoted, so both the F5 PUT and the #187 migrate half landed
+end-to-end).
+
+Earlier: all 6 flavors A–F green on a clean run (2026-06-01),
+`results/20260601_integration_stress_run4.log`.  Earlier runs:
 * `run1` — exposed missing `--aginfer-notify-url` and bad F event-trigger model
 * `run2` — fixed body for sglang PUT, demonstrated F isn't trivially triggerable from events
 * `run3` — added `--aginfer-notify-url` BUT had wrong launch order (sglang first); sglang halted on missing daemon
