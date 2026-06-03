@@ -1201,11 +1201,11 @@ def decision_set(event, state):
 |---|---|
 | `SESSION_ARRIVAL` | shared prefix candidates (preload before first prefill) |
 | `LLM_PREFILL` | ∅ (no migrate; the event still advances `program_tracker` to REASONING and admission re-evaluates) |
-| `TOOL_CALL_START` | session tail = demote candidate while idle; promote-ahead is scheduled here too, timed by the tool ETA so the unit lands before the next prefill |
-| `TOOL_CALL_END` | session tail = promote-now if ahead-of-time promote didn't catch up; otherwise no-op |
-| `SUB_DISPATCH_BLOCKING` | parent tail + shared prefix |
+| `TOOL_CALL_START` | caller's EXCLUSIVE tail = demote candidate while idle; promote-ahead is scheduled here too, timed by the tool ETA so the unit lands before the next prefill.  Shared prefix excluded — a per-program event doesn't touch fleet-shared resources (#189) |
+| `TOOL_CALL_END` | caller's EXCLUSIVE tail = promote-now if ahead-of-time promote didn't catch up; otherwise no-op |
+| `SUB_DISPATCH_BLOCKING` | parent's exclusive tail + shared prefix (disjoint union — the tail is exclusive, so no overlap) |
 | `SUB_DISPATCH_ASYNC` | shared prefix only |
-| `SUB_RETURN` | parent tail (promote candidate) + the child's output that just materialised as a new `subagent_ctx` unit (decide initial tier) |
+| `SUB_RETURN` | parent's exclusive tail (promote candidate) + the child's output that just materialised as a new `subagent_ctx` unit (decide initial tier) |
 | `SESSION_END` | session-scoped units of the ending program (demote or drop, depending on remaining holders) |
 | `MEMORY_PRESSURE`, `PRESSURE_CRITICAL`, `PRESSURE_RESOLVED` | top-k by regret across all units |
 
@@ -1219,12 +1219,24 @@ def shared_prefix_units(units):
     return frozenset(u for u in units if len(u.session_ids) >= 2)
 
 def session_tail(units, sid):
-    """The session's currently-held units, ordered by last access
-    descending.  These are the demote candidates while p is
-    ACTING (tool-bound) and the promote candidates ahead of p's
-    next prefill.  No fixed-K cap — the joint knapsack (§9) will
-    pick a subset under its byte budget."""
-    return frozenset(u for u in units if sid in u.session_ids)
+    """The caller's EXCLUSIVE tail — units held ONLY by `sid`
+    (`session_ids == {sid}`), ordered by last access descending.
+    These are the demote candidates while p is ACTING (tool-bound)
+    and the promote candidates ahead of p's next prefill.  No fixed-K
+    cap — the joint knapsack (§9) picks a subset under its byte budget.
+
+    EXCLUSIVE, not "every unit p touches" (#189): a TOOL_CALL is a
+    PER-PROGRAM event — only p's PRIVATE units changed value when p
+    went idle.  A SHARED prefix's value did not change just because one
+    of its many holders went tool-bound (the others still need it), so
+    a single program's tool call must NOT nominate a fleet-shared
+    resource for demotion.  Shared-prefix residence is driven by the
+    events that actually bear on it: `SESSION_ARRIVAL` (preload) and
+    `MEMORY_PRESSURE` (global `top_k_by_regret`).  Coincides with
+    `session_scoped_units` below (same predicate) — kept as two names
+    for the two event contexts.  Implemented as
+    `kv_scheduler._units_for_session`."""
+    return frozenset(u for u in units if u.session_ids == {sid})
 
 def session_scoped_units(units, sid):
     """Units held ONLY by this session — `session_ids == {sid}`.

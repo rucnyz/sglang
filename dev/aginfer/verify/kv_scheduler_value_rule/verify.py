@@ -394,6 +394,41 @@ def stage_b0_paper4_decision_set_all_kinds() -> None:
             )
 
 
+def stage_b0b_tool_call_exclusive_no_shared() -> None:
+    """#189 (DESIGN §7 reconciled to the code): a TOOL_CALL is a
+    PER-PROGRAM event → D_t is the caller's EXCLUSIVE tail; a SHARED
+    prefix the caller ALSO holds is EXCLUDED (its value didn't change
+    because one holder went tool-bound).  And the SUB_DISPATCH union
+    (`session_tail + shared_prefix`) is DISJOINT — no duplicate hashes
+    (a regression to the inclusive `session_tail` would double-list the
+    caller's shared units; b0 set()s those away, so pin it here on the
+    raw LIST)."""
+    units = [
+        _unit(uhash="u-shared",  residence=["HBM"], holders=["p1", "p2"]),
+        _unit(uhash="u-priv-p1", residence=["HBM"], holders=["p1"]),
+    ]
+    # p1 holds BOTH u-shared and u-priv-p1, but TOOL_CALL_START(p1) must
+    # nominate ONLY the exclusive u-priv-p1.
+    for kind in (EventKind.TOOL_CALL_START, EventKind.TOOL_CALL_END):
+        d_t = list(_build_d_t(kind, "p1", units))
+        if "u-shared" in d_t:
+            raise StageFail(
+                f"{kind.value}(p1) must EXCLUDE the shared prefix p1 also "
+                f"holds (#189 exclusive contract); got {d_t}"
+            )
+        if d_t != ["u-priv-p1"]:
+            raise StageFail(f"{kind.value}(p1) D_t should be [u-priv-p1]; got {d_t}")
+    # SUB_DISPATCH union must be a disjoint LIST (no dup of u-shared).
+    sub = list(_build_d_t(EventKind.SUB_DISPATCH_BLOCKING, "p1", units))
+    if len(sub) != len(set(sub)):
+        raise StageFail(
+            f"SUB_DISPATCH D_t must have no duplicate hashes (disjoint "
+            f"union — the tail is exclusive); got {sub}"
+        )
+    if set(sub) != {"u-priv-p1", "u-shared"}:
+        raise StageFail(f"SUB_DISPATCH(p1) should be private tail + shared; got {sub}")
+
+
 def stage_b1_memory_pressure_topk_by_regret() -> None:
     """``MEMORY_PRESSURE`` D_t is bounded by ``top_k`` and ranked by
     ascending regret (lowest keep-value first → best demote
@@ -908,6 +943,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                               stage_a4_h_max_partial_zero_fatals),
     ("B0 paper §4 D_t per EventKind (6 kinds)",
                               stage_b0_paper4_decision_set_all_kinds),
+    ("B0b TOOL_CALL exclusive tail, shared excluded, disjoint union (#189)",
+                              stage_b0b_tool_call_exclusive_no_shared),
     ("B1 memory_pressure top-k by ascending regret",
                               stage_b1_memory_pressure_topk_by_regret),
     ("C0 ACTING program → λ clamped to [1/30, 1/1]",

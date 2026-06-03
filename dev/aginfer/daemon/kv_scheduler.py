@@ -663,12 +663,22 @@ def build_paper_state(
 def _units_for_session(
     units: Dict[str, ReuseUnit], session: Optional[str]
 ) -> List[str]:
-    """Caller's exclusive tail — units held ONLY by this session.
+    """Caller's exclusive tail — units held ONLY by this session
+    (``holders == {session}``).  This is DESIGN §7's ``session_tail``
+    (TOOL_CALL_START/END, SUB_DISPATCH parent tail) AND
+    ``session_scoped_units`` (SESSION_END) — the same exclusive
+    predicate, one helper.
 
-    Per paper §4 table: TOOL_CALL_START / TOOL_CALL_END operate on the
-    caller's tail (demote / promote), NOT the shared platform/tool_def
-    prefix (which stays HBM because it's high-value to other programs).
-    Concretely: a unit whose ``holders`` is exactly ``{session}``.
+    EXCLUSIVE is intentional (#189, DESIGN §7 reconciled to match):
+    a TOOL_CALL is a PER-PROGRAM event, so it nominates only p's
+    PRIVATE units — the ones whose value changed when p went idle.  A
+    SHARED platform/tool_def prefix's value did NOT change because one
+    of its many holders went tool-bound (the others still need it), so
+    it stays HBM and is NOT a candidate here; its residence is driven by
+    SESSION_ARRIVAL (preload) + MEMORY_PRESSURE (global top-k).  Keeping
+    the tail exclusive also makes the SUB_DISPATCH union
+    (``_units_for_session + _shared_prefix_units``) disjoint — no
+    double-scored hashes.
     """
     if session is None:
         return []
