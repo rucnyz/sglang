@@ -2254,6 +2254,21 @@ apply path reads `acquired.keys()` directly to decide which
 destination subpools absorb which bytes of the unit, without
 needing a separate `target_subpool` field.
 
+**Reconstruction (#156 / T34 correction).** The traceback above
+subtracts each taken item's quantised delta to recover the
+predecessor state.  That is WRONG for the pressure phase: the relief
+axis is capped via `min(W, …)` on the forward step, so the state is
+non-invertible once a transition saturates the cap, and the subtract
+reconstruction returns a wrong (often infeasible, too-cheap) subset —
+while the DP `dp[s_pick]` COST stays correct.  The implementation
+(`baselines/knapsack.py`) instead records the **predecessor state per
+improving transition** (`parent[(k, s_new)] = s`) and follows those
+pointers, which is exact regardless of capping.  Verified against an
+exhaustive brute-force oracle in `verify/t34/` (stage A2 caught the
+subtract bug).  Infeasibility is raised as `KnapsackInfeasibleError`
+(forensic context) and mapped to `fatal("joint_decide_infeasible")`
+by `joint_decide`, keeping the primitive pure + testable.
+
 #### Why exact DP, not greedy
 
 LP-relaxation greedy (sort by `cost/relief`, take cheapest-per-byte

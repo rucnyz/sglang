@@ -478,6 +478,27 @@ generalization.
      §10; this is an algorithm bug — DROP + Pause are always
      feasible so reaching here means top-k under-sized or a
      filter dropped a candidate it shouldn't have
+   - **Status (#156 closure — 2026-06-03)**: DONE (the DP primitives).
+     `baselines/knapsack.py`: `knapsack_min_cost_multi` /
+     `knapsack_max_value_multi` (sparse multi-axis, per-axis
+     `bucket_size`, string-tier (tier,sp) axes) + the candidate
+     contract (`Migrate(cost,relief,acquired)` / `Pause(cost,relief)`
+     / `Resume(gain,re_use)`).  Infeasibility raises
+     `KnapsackInfeasibleError` (forensic ctx) for `joint_decide` to map
+     to `fatal()` — pure + testable.  **DESIGN-vs-code**: replaced the
+     DESIGN's subtract-the-delta traceback with PARENT-POINTER
+     reconstruction — the relief `min(W,·)` cap is non-invertible, so
+     subtracting recovers a wrong subset (cost stays right); verify/t34
+     A2 caught it via a brute-force oracle.  verify/t34/: 12 stages
+     (exact-vs-brute over 120 random fixtures + quantisation +
+     infeasibility + Pause-always-feasible), all green.
+   - **DEFERRED — joint_decide integration**: wiring these primitives
+     into the live decision path (replace the greedy
+     `OursGreedyPolicy.decide` single-axis check + the sequential
+     admission `_on_pressure`/`_on_resolved` "Gauss-Seidel decompose"
+     with one `joint_decide` building Migrate/Pause/Resume candidates +
+     forecast/bytes_needed + flat→nested normalisation).  Large rewire
+     of the live path; tracked separately.
 
 3. **T35 — `authoritative_tier(residence)`** (DESIGN §7):
    - HBM if present else DRAM else DISK
