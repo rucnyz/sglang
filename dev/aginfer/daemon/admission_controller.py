@@ -28,6 +28,7 @@ reads ``pool_usage`` — no tracker join.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Optional
 
 from baselines.base import ReuseUnit, SchedulerState, Tier
@@ -141,7 +142,20 @@ def expected_remaining_tokens(
     """
     pu = state.per_program_usage.get(pid, {})
     v = pu.get("expected_remaining_tokens")
-    return float(v) if v is not None else None
+    if v is None:
+        return None
+    # Defensive coercion (#199 audit): a malformed value (NaN / inf /
+    # negative / non-numeric) must NOT slip past the downstream guards
+    # (``nan <= 0`` is False) and poison the forecast or crash
+    # ``int(nan)`` in pause_relief.  Treat any non-finite-or-negative as
+    # "no estimate" → None (the program is skipped, never bootstrapped).
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f < 0.0:
+        return None
+    return f
 
 
 def _program_inflight_growth(
@@ -169,14 +183,20 @@ def _program_inflight_growth(
     program returns ``{}`` and the trajectory term vanishes — forecast
     degrades to ``used_bytes``.
     """
-    dt = float(decode_per_program.get(pid, 0.0))
-    if dt <= 0.0:
+    # Defensive coercion (#199 audit): a malformed decode rate (NaN / inf
+    # / negative / non-numeric) must not pass the ``<= 0`` guard
+    # (``nan <= 0`` is False) and produce a NaN demand.
+    try:
+        dt = float(decode_per_program.get(pid, 0.0))
+    except (TypeError, ValueError):
         return {}
-    e_rem = expected_remaining_tokens(pid, state)
+    if not math.isfinite(dt) or dt <= 0.0:
+        return {}
+    e_rem = expected_remaining_tokens(pid, state)  # already finite or None
     if e_rem is None:
         return {}
     growth_tokens = min(e_rem, horizon_s * dt)
-    if growth_tokens <= 0.0:
+    if not math.isfinite(growth_tokens) or growth_tokens <= 0.0:
         return {}
     inflight = pu.get("hbm", {}).get("inflight", {})
     out: Dict[str, float] = {}
@@ -211,6 +231,13 @@ def forecast_inflight_demand(
         return {}
     dbpt = state.tier_usage.decode_bytes_per_token.get(Tier.HBM, {})
     demand: Dict[str, float] = {}
+    # No program-STATE filter — DESIGN §8 is explicit that the physical
+    # signal "is subpool sp growing for p RIGHT NOW" is answered by
+    # ``inflight[sp] > 0`` (inside `_program_inflight_growth`), NOT by
+    # ``state == REASONING`` (a just-resumed REASONING program with no
+    # in-flight request must not be forecast).  A PAUSED/ENDED program is
+    # off-GPU, so sglang reports ``inflight[sp] == 0`` for it and it
+    # contributes nothing here — the inflight signal is authoritative.
     for pid, pu in state.per_program_usage.items():
         for sp, g in _program_inflight_growth(
             pid, pu, state, decode, dbpt, horizon_s
@@ -224,18 +251,21 @@ def forecast(state: SchedulerState, heartbeat_s: float) -> Dict[str, float]:
     the next event if no action is taken:
     ``pool_usage.HBM.subpools[sp].used_bytes + forecast_inflight_demand[sp]``.
 
-    The inflight term is 0 under the current schema (see
-    :func:`forecast_inflight_demand`), so today ``forecast[sp] ==
-    used_bytes[sp]`` and §9's pressure/headroom triggers reduce exactly
-    to the allocator-truth HBM occupancy the admission loop used before
-    the joint rewrite — behaviour-preserving, and trajectory-aware once
-    the inflight inputs are wired.
+    The inflight (trajectory) term is 0 while its inputs are sglang
+    placeholders (decode throughput / per-program inflight unmeasured),
+    so today ``forecast[sp] == used_bytes[sp]`` and §9's pressure /
+    headroom triggers reduce exactly to allocator-truth HBM occupancy —
+    behaviour-preserving, and trajectory-aware once T26/T11 wire the
+    inputs (#199 / #200 / #126).
     """
     horizon = forecast_horizon(state, heartbeat_s)
     demand = forecast_inflight_demand(state, horizon)
     used = state.tier_usage.pool_used.get(Tier.HBM, {})
-    return {sp: float(used_bytes) + float(demand.get(sp, 0.0))
-            for sp, used_bytes in used.items()}
+    # Iterate the UNION (#199 audit): a demand subpool absent from
+    # pool_used would otherwise be silently dropped before §9 ever sees
+    # it (used_bytes defaults to 0 for such a subpool).
+    return {sp: float(used.get(sp, 0)) + float(demand.get(sp, 0.0))
+            for sp in (set(used) | set(demand))}
 
 
 # ----------------------------------------------- §8 program candidates

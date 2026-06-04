@@ -334,8 +334,63 @@ def stage_trajectory() -> None:
     st_idle = _st(decode={"A": 100.0}, inflight={"full": 0})
     if adm.forecast_inflight_demand(st_idle, 5.0) != {}:
         raise StageFail("trajectory: inflight[sp]==0 → no projected growth")
+
+    # --- malformed inputs must NOT crash or poison (#199 audit) ---
+    for bad in (float("nan"), float("inf"), -5.0, "oops", None):
+        st_bad = _st(decode={"A": 100.0}, e_rem=bad)
+        try:
+            dem_bad = adm.forecast_inflight_demand(st_bad, 5.0)
+        except Exception as e:  # noqa: BLE001
+            raise StageFail(f"trajectory: e_rem={bad!r} must not raise, got {e!r}")
+        if dem_bad != {}:
+            raise StageFail(f"trajectory: malformed e_rem={bad!r} must yield 0, "
+                            f"got {dem_bad}")
+        try:
+            adm.pause_candidates(st_bad, heartbeat_s=5.0)  # must not crash
+        except Exception as e:  # noqa: BLE001
+            raise StageFail(f"trajectory: pause_candidates must survive e_rem="
+                            f"{bad!r}, got {e!r}")
+    # malformed decode_throughput too
+    for bad_dt in (float("nan"), float("inf"), -3.0, "x"):
+        st_bd = _st(decode={"A": bad_dt})
+        if adm.forecast_inflight_demand(st_bd, 5.0) != {}:
+            raise StageFail(f"trajectory: malformed decode={bad_dt!r} must yield 0")
+
+    # --- Σ over multiple programs + full(nonzero)+mamba(0) in ONE state ---
+    tracker.observe_arrival("B")
+    sj_multi = _state_json(
+        units=[_unit(uhash="uA", residence=["HBM"], holders=["A"]),
+               _unit(uhash="uB", residence=["HBM"], holders=["B"])],
+        programs={
+            "A": _program("REASONING", inflight={"full": 1 * MB, "mamba": 9 * MB},
+                          committed={"full": 2 * MB}, unit_hashes=["uA"],
+                          expected_remaining_tokens=1e9),
+            "B": _program("REASONING", inflight={"full": 1 * MB},
+                          unit_hashes=["uB"], expected_remaining_tokens=1e9),
+        },
+        hbm={"full": _sp(1 * GB, 10 * GB, decode_bpt=DBPT),
+             "mamba": _sp(1 * GB, 9 * GB, decode_bpt=0)},  # Mamba: 0 per-token
+        decode_per_program={"A": 100.0, "B": 100.0})
+    st_m = _build(sj_multi, tracker,
+                  Event(kind=EventKind.MEMORY_PRESSURE, session="A"))
+    dem_m = adm.forecast_inflight_demand(st_m, horizon_s=5.0)
+    # full: (A growth 500×DBPT) + (B growth 500×DBPT) = 1000×DBPT; mamba: 0
+    # (decode_bpt=0) even though A has 9MB mamba inflight.
+    if dem_m != {"full": 1000.0 * DBPT}:
+        raise StageFail(f"trajectory: Σ over A+B on full, Mamba excluded; "
+                        f"got {dem_m}")
+    # pause_relief for A: snapshot (inflight 1MB+9MB + committed 2MB) +
+    # future-savings (full 500×DBPT; mamba 0).
+    pcs_m = adm.pause_candidates(st_m, heartbeat_s=5.0)
+    pa_m = next(p for p in pcs_m if p.pid == "A")
+    if pa_m.relief.get("full") != 1 * MB + 2 * MB + int(500.0 * DBPT):
+        raise StageFail(f"trajectory: A full relief = inflight+committed+growth; "
+                        f"got {pa_m.relief}")
+    if pa_m.relief.get("mamba") != 9 * MB:  # snapshot only; no per-token growth
+        raise StageFail(f"trajectory: A mamba relief = snapshot 9MB (no growth); "
+                        f"got {pa_m.relief}")
     print(_green("  [trajectory] §8 demand/future_inflight_savings + full "
-                 "T26/T11/Mamba gating OK"))
+                 "T26/T11/Mamba gating + Σ-over-programs + malformed-input OK"))
 
 
 _STAGES = [

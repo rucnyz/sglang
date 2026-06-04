@@ -644,6 +644,22 @@ async def _flavor_g_session_end_migrate(stack_h: StackHandles) -> Dict[str, Any]
         ppu_before = st.get("per_program_usage", {}).get(pid)
         hbm_before = _hbm(units_before)
 
+        # #199 audit: assert the REAL sglang dump emits decode_bytes_per_
+        # token on every HBM subpool (the daemon's forecast_inflight_demand
+        # input).  Without this, a silent regression in sglang's dump would
+        # leave the daemon defaulting to 0 forever and every other test
+        # would still pass.
+        hbm_subpools = st["pool_usage"]["HBM"]["subpools"]
+        decode_bpt_ok = bool(hbm_subpools) and all(
+            isinstance(e.get("decode_bytes_per_token"), int)
+            and e["decode_bytes_per_token"] >= 0
+            for e in hbm_subpools.values()
+        )
+        decode_bpt_sample = {
+            sp: e.get("decode_bytes_per_token")
+            for sp, e in hbm_subpools.items()
+        }
+
         # 2. Fire SESSION_END at the DAEMON.
         ev = await cli.post(
             f"http://{DAEMON_BASE}/aginfer/event",
@@ -682,6 +698,8 @@ async def _flavor_g_session_end_migrate(stack_h: StackHandles) -> Dict[str, Any]
         "hbm_after": hbm_after,
         "units_after": len(units_after),
         "demoted": (hbm_after < hbm_before) or (len(units_after) < len(units_before)),
+        "decode_bpt_ok": decode_bpt_ok,
+        "decode_bpt_sample": decode_bpt_sample,
         "sglang_alive": stack_h.sglang_proc.poll() is None,
         "daemon_alive": stack_h.daemon_proc.poll() is None,
     }
@@ -696,11 +714,17 @@ def stage_g(stack_h: StackHandles) -> None:
     )
     print(f"  [G] pid={res['pid']} units_before={res['units_before']} "
           f"ppu_before={res['ppu_before_state']} → ENDED={res['ended']} "
-          f"| migrate: {demote_note}")
+          f"| migrate: {demote_note} | decode_bpt={res['decode_bpt_sample']}")
     if not res["sglang_alive"]:
         raise StageFail("sglang died mid-flavor-G")
     if not res["daemon_alive"]:
         raise StageFail("daemon died mid-flavor-G")
+    # #199 audit: the real sglang dump must emit decode_bytes_per_token on
+    # every HBM subpool (the §8 forecast trajectory input).
+    if not res["decode_bpt_ok"]:
+        raise StageFail(
+            "sglang /aginfer/state HBM subpools missing decode_bytes_per_"
+            f"token (#199); got {res['decode_bpt_sample']}")
     if res["units_before"] == 0:
         raise StageFail(
             "no units tagged with the SESSION_END pid — program_id "
