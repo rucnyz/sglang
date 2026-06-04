@@ -73,18 +73,25 @@ def _unit(*, uhash, residence, holders, n_tokens=1000,
 
 
 def _program(state="REASONING", *, inflight=None, committed=None,
-             unit_hashes=None, pre_pause_state=None) -> Dict[str, Any]:
-    return {
+             unit_hashes=None, pre_pause_state=None,
+             expected_remaining_tokens=None) -> Dict[str, Any]:
+    pu = {
         "state": state, "pre_pause_state": pre_pause_state,
         "hbm": {"committed": committed or {}, "inflight": inflight or {}},
         "dram": {"committed": {}}, "unit_hashes": unit_hashes or [],
     }
+    if expected_remaining_tokens is not None:
+        pu["expected_remaining_tokens"] = expected_remaining_tokens
+    return pu
 
 
-def _sp(used, cap, page=64 * 1024) -> Dict[str, int]:
-    return {"used_bytes": used, "cap_bytes": cap,
-            "available_bytes": max(0, cap - used),
-            "evictable_bytes": used, "page_bytes": page}
+def _sp(used, cap, page=64 * 1024, decode_bpt=None) -> Dict[str, int]:
+    e = {"used_bytes": used, "cap_bytes": cap,
+         "available_bytes": max(0, cap - used),
+         "evictable_bytes": used, "page_bytes": page}
+    if decode_bpt is not None:
+        e["decode_bytes_per_token"] = decode_bpt
+    return e
 
 
 def _state_json(*, units, programs=None, hbm=None, dram=None, disk=None,
@@ -270,12 +277,74 @@ def stage_resume_candidates() -> None:
     print(_green("  [resume-cands] PAUSED only; gain/re_use; capacity_fits OK"))
 
 
+def stage_trajectory() -> None:
+    """#199: the §8 forecast trajectory term, assembled from the now-
+    exposed decode_bytes_per_token + synthetic decode_throughput +
+    E[remaining].  Proves the full product activates correctly, stays 0
+    under any missing input (T26/T11 degradation), and zeroes Mamba."""
+    DBPT = 2048   # bytes/token for the attention subpool
+    tracker = ProgramTracker()
+    tracker.observe_arrival("A")
+
+    def _st(*, decode=None, e_rem=1e9, dbpt=DBPT, inflight=None):
+        sj = _state_json(
+            units=[_unit(uhash="uA", residence=["HBM"], holders=["A"])],
+            programs={"A": _program("REASONING",
+                                    inflight=inflight if inflight is not None
+                                    else {"full": 5 * MB},
+                                    unit_hashes=["uA"],
+                                    expected_remaining_tokens=e_rem)},
+            hbm={"full": _sp(1 * GB, 10 * GB, decode_bpt=dbpt)},
+            decode_per_program=decode or {})
+        return _build(sj, tracker,
+                      Event(kind=EventKind.MEMORY_PRESSURE, session="A"))
+
+    # --- full activation: growth = min(E, horizon×dt) × decode_bpt ---
+    # horizon = heartbeat 5s, dt = 100 tok/s → horizon×dt = 500 tok;
+    # E=1e9 huge → min = 500 → demand = 500 × 2048 = 1,024,000 B.
+    st = _st(decode={"A": 100.0})
+    dem = adm.forecast_inflight_demand(st, horizon_s=5.0)
+    if dem != {"full": 500.0 * DBPT}:
+        raise StageFail(f"trajectory: demand must be 500×{DBPT}; got {dem}")
+    fc = adm.forecast(st, heartbeat_s=5.0)
+    if fc["full"] != float(1 * GB) + 500.0 * DBPT:
+        raise StageFail(f"trajectory: forecast must add the demand; got {fc}")
+    # pause_relief future_inflight_savings: inflight 5MB + growth.
+    pcs = adm.pause_candidates(st, heartbeat_s=5.0)
+    pa = next(p for p in pcs if p.pid == "A")
+    if pa.relief.get("full") != 5 * MB + int(500.0 * DBPT):
+        raise StageFail(f"trajectory: pause_relief must add future_inflight_"
+                        f"savings; got {pa.relief}")
+
+    # --- E[remaining] is the binding side of the min when small ---
+    st2 = _st(decode={"A": 100.0}, e_rem=10)   # min(10, 500) = 10
+    if adm.forecast_inflight_demand(st2, 5.0) != {"full": 10.0 * DBPT}:
+        raise StageFail("trajectory: min must pick the smaller E[remaining]")
+
+    # --- gating: each missing input → 0 ---
+    if adm.forecast_inflight_demand(_st(decode={}), 5.0) != {}:
+        raise StageFail("trajectory: no decode_throughput (T26) → 0")
+    st_noe = _st(decode={"A": 100.0}, e_rem=None)
+    if adm.forecast_inflight_demand(st_noe, 5.0) != {}:
+        raise StageFail("trajectory: no E[remaining] (T11) → 0 (no bootstrap "
+                        "over-forecast)")
+    if adm.forecast_inflight_demand(_st(decode={"A": 100.0}, dbpt=0), 5.0) != {}:
+        raise StageFail("trajectory: Mamba/snapshot (decode_bpt=0) → 0 growth")
+    # inflight[sp]==0 → that subpool excluded
+    st_idle = _st(decode={"A": 100.0}, inflight={"full": 0})
+    if adm.forecast_inflight_demand(st_idle, 5.0) != {}:
+        raise StageFail("trajectory: inflight[sp]==0 → no projected growth")
+    print(_green("  [trajectory] §8 demand/future_inflight_savings + full "
+                 "T26/T11/Mamba gating OK"))
+
+
 _STAGES = [
     ("scoring", stage_scoring),
     ("forecast", stage_forecast),
     ("pause-cost", stage_pause_cost_relief),
     ("pause-cands", stage_pause_candidates),
     ("resume-cands", stage_resume_candidates),
+    ("trajectory", stage_trajectory),
 ]
 
 
@@ -299,7 +368,7 @@ def main() -> int:
     if failed:
         print(_red(f"FAILED: {', '.join(failed)}"))
         return 1
-    print(_green("admission_controller PASS — all 5 §8 stages green"))
+    print(_green("admission_controller PASS — all 6 §8 stages green"))
     return 0
 
 

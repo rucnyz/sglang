@@ -111,6 +111,13 @@ class TierUsage:
     pool_available: Dict[Tier, Dict[str, int]] = field(default_factory=dict)
     pool_evictable: Dict[Tier, Dict[str, int]] = field(default_factory=dict)
     page_bytes: Dict[Tier, Dict[str, int]] = field(default_factory=dict)
+    # DESIGN §8 bytes_per_token_in_subpool (#199): per-token HBM byte
+    # growth during decode, by subpool (attention = bpt, mamba = 0).
+    # Sourced from sglang's pool_usage[*].decode_bytes_per_token; the
+    # daemon's forecast_inflight_demand multiplies decode-token growth by
+    # this.  Defaults to {} (≡ 0) when an older sglang omits the field.
+    decode_bytes_per_token: Dict[Tier, Dict[str, int]] = field(
+        default_factory=dict)
     bw_free: Dict[Tuple[Tier, Tier], float] = field(default_factory=dict)
 
     def occupancy_ratio(self, tier: Tier) -> float:

@@ -515,11 +515,24 @@ generalization.
      `verify/joint_decide/` (5 stages incl. brute-force MCKP oracle) +
      `verify/integration_stress/` (7 flavors green on the real B300
      stack — stage D migrate-under-traffic, stage G SESSION_END demoted
-     6→5 HBM units, stage F no spurious fatal).  **Follow-on (gated on
-     T26/T11)**: `forecast_inflight_demand` + `future_inflight_savings`
-     are 0 until `decode_throughput` (T26), `E[remaining_tokens]` (T11/
-     #126), and `bytes_per_token_in_subpool` are wired — forecast
-     degrades to `used_bytes` (behaviour-preserving); see #199.
+     6→5 HBM units, stage F no spurious fatal).
+   - **Forecast trajectory term (#199 — DONE, 2026-06-04)**:
+     `forecast_inflight_demand` + `pause_relief.future_inflight_savings`
+     now assemble the full §8 product, gated per input.
+     `bytes_per_token_in_subpool` is exposed (sglang
+     `_aginfer_decode_bytes_per_token` →
+     `pool_usage[*].subpools[sp].decode_bytes_per_token`, attention=bpt /
+     Mamba=0; carried into `TierUsage.decode_bytes_per_token`).
+     `E[remaining_tokens]` reads an optional per-program field and returns
+     None (NOT the `max_completion_tokens` bootstrap) when absent —
+     skipping the program rather than over-pausing ~5× (§8 anti-pattern).
+     The term is 0 in production (decode_per_program / per-program inflight
+     are sglang placeholders → forecast = used_bytes, behaviour-
+     preserving); `verify/admission_controller` trajectory stage pins the
+     product + T26/T11/Mamba gating with synthetic inputs.  Remaining
+     activation gated on **T26 (#200)** — sglang decode-throughput /
+     prefill_bps / per-program inflight measurement — and **T11 (#126)**
+     populating `expected_remaining_tokens`.
 
 3. **T35 — `authoritative_tier(residence)`** (DESIGN §7):
    - HBM if present else DRAM else DISK

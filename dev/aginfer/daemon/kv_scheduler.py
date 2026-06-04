@@ -220,6 +220,10 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 "evictable_bytes": 0,
                 # page_bytes is static; take rank-0's value.
                 "page_bytes": int(rank0_subpools[sp]["page_bytes"]),
+                # decode_bytes_per_token (#199) is static (architecture
+                # constant); take rank-0.  Older sglang may omit it → 0.
+                "decode_bytes_per_token": int(
+                    rank0_subpools[sp].get("decode_bytes_per_token", 0)),
             }
         for rank in per_rank:
             rank_subpools = rank["pool_usage"][tier]["subpools"]
@@ -527,6 +531,7 @@ def build_paper_state(
         tier_usage.pool_available[tier] = {}
         tier_usage.pool_evictable[tier] = {}
         tier_usage.page_bytes[tier] = {}
+        tier_usage.decode_bytes_per_token[tier] = {}
         pool_pressure[tier] = {}
         for sp, fields in subpools.items():
             used = int(fields["used_bytes"])
@@ -536,6 +541,9 @@ def build_paper_state(
             tier_usage.pool_available[tier][sp] = int(fields["available_bytes"])
             tier_usage.pool_evictable[tier][sp] = int(fields["evictable_bytes"])
             tier_usage.page_bytes[tier][sp] = int(fields["page_bytes"])
+            # #199: optional (older sglang omits it) → default 0.
+            tier_usage.decode_bytes_per_token[tier][sp] = int(
+                fields.get("decode_bytes_per_token", 0))
             pool_pressure[tier][sp] = used / cap if cap > 0 else 0.0
     # bw_free derived from link_stats: peak when link is cold-idle,
     # else (peak - recent_throughput).  Negative bw_free clamps to 0.

@@ -120,7 +120,7 @@ def joint_decide(
         cands: List[Any] = migrate_candidates(state, state.decision_set,
                                               costs, pi_u)
         if admission_enabled:
-            cands += adm.pause_candidates(state)
+            cands += adm.pause_candidates(state, heartbeat_s=heartbeat_s)
         # Normalise Pause's flat {sp: bytes} relief into the nested
         # {"HBM": {...}} shape Migrate already uses (DESIGN §9).
         cands = [replace(c, relief={"HBM": c.relief}) if isinstance(c, Pause)

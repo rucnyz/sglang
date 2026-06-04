@@ -3136,6 +3136,26 @@ class UnifiedRadixCache(BasePrefixCache):
         """
         return str(ct).rsplit(".", 1)[-1].lower()
 
+    def _aginfer_decode_bytes_per_token(self, ct) -> int:
+        """Per-token HBM byte growth during DECODE for a subpool whose
+        component is ``ct`` (DESIGN §8 ``bytes_per_token_in_subpool``).
+
+        Attention components (full / SWA) grow monotonically: each
+        decoded token appends one token's worth of KV, so the per-token
+        decode growth is ``_aginfer_bytes_per_token()``.  Mamba state is
+        allocated ONCE per sequence at a snapshot boundary, NOT per
+        decoded token, so its in-flight decode growth is 0 — the daemon's
+        ``forecast_inflight_demand`` must not project Mamba growth from
+        decode throughput (it would over-forecast and over-pause).  This
+        is the only piece of the §8 forecast trajectory term the daemon
+        cannot derive itself (decode throughput + E[remaining_tokens] are
+        T26/T11); exposing it here lets the daemon assemble the product
+        once those measurements land (#199).
+        """
+        if ct == ComponentType.MAMBA:
+            return 0
+        return self._aginfer_bytes_per_token()
+
     def _aginfer_pool_usage(self) -> dict:
         """Per-(tier, subpool) allocator-truth occupancy (DESIGN §5).
 
@@ -3163,6 +3183,12 @@ class UnifiedRadixCache(BasePrefixCache):
         pool = self.token_to_kv_pool_allocator
         bpt = self._aginfer_bytes_per_token()
         page_bytes_default = int(self.page_size) * max(1, bpt)
+        # DESIGN §8 bytes_per_token_in_subpool (#199): per-token DECODE
+        # growth, by component.  Attention (full / SWA) = bpt; Mamba = 0
+        # (allocated per-sequence, not per-token).  DRAM/DISK carry bpt
+        # for schema-key uniformity but the daemon only reads HBM's.
+        dbpt_full = self._aginfer_decode_bytes_per_token(BASE_COMPONENT_TYPE)
+        dbpt_swa = self._aginfer_decode_bytes_per_token(ComponentType.SWA)
 
         hbm_subpools: dict = {}
         dram_subpools: dict = {}
@@ -3195,6 +3221,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     "available_bytes": full_avail * bpt,
                     "evictable_bytes": full_evictable * bpt,
                     "page_bytes": page_bytes_default,
+                    "decode_bytes_per_token": dbpt_full,
                 }
                 swa_sp = self._aginfer_subpool_name(ComponentType.SWA)
                 swa_size = int(getattr(pool, "size_swa", 0))
@@ -3207,6 +3234,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     "available_bytes": swa_avail * bpt,
                     "evictable_bytes": swa_evictable * bpt,
                     "page_bytes": page_bytes_default,
+                    "decode_bytes_per_token": dbpt_swa,
                 }
             else:
                 pool_size = int(getattr(pool, "size", 0))
@@ -3219,12 +3247,14 @@ class UnifiedRadixCache(BasePrefixCache):
                     "available_bytes": avail * bpt,
                     "evictable_bytes": evictable * bpt,
                     "page_bytes": page_bytes_default,
+                    "decode_bytes_per_token": dbpt_full,
                 }
         else:
             hbm_subpools[full_sp] = {
                 "used_bytes": 0, "cap_bytes": 0,
                 "available_bytes": 0, "evictable_bytes": 0,
                 "page_bytes": page_bytes_default,
+                "decode_bytes_per_token": dbpt_full,
             }
 
         # DRAM (HiCache host pool).  Treated as a single subpool
@@ -3246,6 +3276,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "available_bytes": dram_cap,  # patched
             "evictable_bytes": 0,         # patched
             "page_bytes": page_bytes_default,
+            "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
         }
 
         # DISK — Mooncake/SSD spill not yet wired (apply_aginfer_migrations
@@ -3255,6 +3286,7 @@ class UnifiedRadixCache(BasePrefixCache):
             "used_bytes": 0, "cap_bytes": 0,
             "available_bytes": 0, "evictable_bytes": 0,
             "page_bytes": page_bytes_default,
+            "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
         }}
 
         return {

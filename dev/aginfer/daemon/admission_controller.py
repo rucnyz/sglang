@@ -117,37 +117,106 @@ def forecast_horizon(state: SchedulerState, heartbeat_s: float) -> float:
     return float(heartbeat_s)
 
 
+def expected_remaining_tokens(
+    pid: str, state: SchedulerState
+) -> Optional[float]:
+    """DESIGN §8 ``E[remaining_tokens(p)]`` — expected residual decode
+    length for program ``pid``, conditional on its observable state.
+
+    Estimator priority (§8): (1) event-payload hint, (2) per-turn decode
+    history, (3) workload-prior fit, (4) bootstrap = ``max_completion_
+    tokens`` (cold-start only).  Levels 1-3 are the T11 estimator (#126);
+    none are wired yet, and the dump carries no ``max_completion_tokens``
+    for the bootstrap either.  We read an OPTIONAL per-program field
+    ``expected_remaining_tokens`` (which T11 / a future sglang dump will
+    populate) and return ``None`` when it is absent.
+
+    Returning ``None`` — rather than falling back to ``max_completion_
+    tokens`` — is deliberate: §8 warns that using the bootstrap ``max`` as
+    the steady-state rule over-forecasts by ~5× (``max/mean`` on agent
+    workloads) and makes admission over-pause.  So with no real estimate,
+    :func:`_program_inflight_growth` contributes 0 for that program rather
+    than projecting a worst-case decode.  The trajectory term thus stays
+    off until a genuine ``E[remaining]`` source exists.
+    """
+    pu = state.per_program_usage.get(pid, {})
+    v = pu.get("expected_remaining_tokens")
+    return float(v) if v is not None else None
+
+
+def _program_inflight_growth(
+    pid: str,
+    pu: Dict[str, Any],
+    state: SchedulerState,
+    decode_per_program: Dict[str, Any],
+    dbpt: Dict[str, int],
+    horizon_s: float,
+) -> Dict[str, float]:
+    """DESIGN §8 per-program near-term HBM growth (the term
+    :func:`forecast_inflight_demand` sums and ``pause_relief``'s
+    ``future_inflight_savings`` reuses):
+
+      growth[sp] = min(E[remaining], horizon × decode_throughput)
+                 × bytes_per_token_in_subpool[sp]    for sp with inflight[sp] > 0
+
+    Gated per input — the term is 0 (sp omitted) unless ALL hold:
+      * ``decode_throughput(p) > 0`` (T26 measurement),
+      * ``E[remaining_tokens(p))`` is a real estimate, not None (T11),
+      * ``inflight[sp] > 0`` (p is actively decoding in sp), and
+      * ``decode_bytes_per_token[sp] > 0`` (attention subpool; Mamba = 0,
+        so its snapshot state is never projected as per-token growth).
+    Under the current placeholders (decode empty, no E[remaining]) every
+    program returns ``{}`` and the trajectory term vanishes — forecast
+    degrades to ``used_bytes``.
+    """
+    dt = float(decode_per_program.get(pid, 0.0))
+    if dt <= 0.0:
+        return {}
+    e_rem = expected_remaining_tokens(pid, state)
+    if e_rem is None:
+        return {}
+    growth_tokens = min(e_rem, horizon_s * dt)
+    if growth_tokens <= 0.0:
+        return {}
+    inflight = pu.get("hbm", {}).get("inflight", {})
+    out: Dict[str, float] = {}
+    for sp, b in inflight.items():
+        if int(b) <= 0:
+            continue
+        bpt = int(dbpt.get(sp, 0))
+        if bpt <= 0:
+            continue
+        out[sp] = growth_tokens * bpt
+    return out
+
+
 def forecast_inflight_demand(
     state: SchedulerState, horizon_s: float
 ) -> Dict[str, float]:
     """DESIGN §8 ``forecast_inflight_demand`` — per-HBM-subpool expected
     byte growth before the next event, summed over programs actively
-    decoding in that subpool.
+    decoding in that subpool:
 
-    The formula is
       ``Σ_p min(E[remaining_tokens(p)], horizon × decode_throughput(p))
-            × bytes_per_token_in_subpool(p, sp)``
-    over ``p`` with ``inflight[sp] > 0``.  All THREE inputs are
-    currently unwired:
-      * ``decode_throughput(p)`` — T26 measurement (``decode_per_program``
-        ships empty pre-T26),
-      * ``E[remaining_tokens(p)]`` — the T11 estimator (#126),
-      * ``bytes_per_token_in_subpool(p, sp)`` — a model-architecture
-        constant not exposed in ``/aginfer/state``.
-    With any of them absent the term is 0, so ``forecast`` degrades to
-    the snapshot ``used_bytes`` (see :func:`forecast`).  This is the
-    honest cold-start state — the trajectory term activates when T26 +
-    T11 + the architecture constant are wired (tracked as a #194
-    follow-on).  Returns an empty dict (≡ 0 per subpool).
+            × bytes_per_token_in_subpool(p, sp)``    for p with inflight[sp]>0
+
+    Fully assembled from `_program_inflight_growth`; see its docstring for
+    the per-input gating.  Returns ``{}`` (≡ 0 per subpool) under the
+    current placeholders, so :func:`forecast` degrades to ``used_bytes``
+    — behaviour-preserving until T26 (decode throughput + per-program
+    inflight) and T11 (E[remaining]) wire the live inputs (#199 / #126).
     """
     decode = state.throughput_ema.get("decode_per_program", {}) or {}
     if not decode:
         return {}
-    # decode_per_program is populated but bytes_per_token_in_subpool /
-    # E[remaining_tokens] are still unavailable — we cannot complete the
-    # product, so the term remains 0.  Kept as an explicit branch so the
-    # wiring point is visible when those inputs land.
-    return {}
+    dbpt = state.tier_usage.decode_bytes_per_token.get(Tier.HBM, {})
+    demand: Dict[str, float] = {}
+    for pid, pu in state.per_program_usage.items():
+        for sp, g in _program_inflight_growth(
+            pid, pu, state, decode, dbpt, horizon_s
+        ).items():
+            demand[sp] = demand.get(sp, 0.0) + g
+    return demand
 
 
 def forecast(state: SchedulerState, heartbeat_s: float) -> Dict[str, float]:
@@ -197,18 +266,27 @@ def marginal_pause_cost(pu: Dict[str, Any], prefill_bps: float) -> float:
     return inflight_bytes / prefill_bps
 
 
-def pause_relief(pu: Dict[str, Any]) -> Dict[str, int]:
+def pause_relief(
+    pu: Dict[str, Any],
+    future_inflight_savings: Optional[Dict[str, float]] = None,
+) -> Dict[str, int]:
     """DESIGN §8 ``pause_relief`` — per-HBM-subpool bytes pausing p frees:
     ``snapshot_relief[sp] + future_inflight_savings[sp]`` where
     ``snapshot_relief = inflight[sp] + committed[sp]`` (p's in-flight
-    decode bytes + its exclusive radix share) and
-    ``future_inflight_savings`` mirrors :func:`forecast_inflight_demand`
-    (0 under the current schema)."""
+    decode bytes + its exclusive radix share).
+
+    ``future_inflight_savings`` is the near-term decode growth pausing p
+    averts — the same per-program term :func:`forecast_inflight_demand`
+    sums (computed by :func:`_program_inflight_growth`; 0 under the
+    current placeholders).  ``pause_candidates`` computes it and passes
+    it in; absent ⇒ snapshot relief only."""
     inflight = _program_inflight(pu)
     committed = _program_committed(pu)
+    fut = future_inflight_savings or {}
     relief: Dict[str, int] = {}
-    for sp in set(inflight) | set(committed):
-        v = inflight.get(sp, 0) + committed.get(sp, 0)
+    for sp in set(inflight) | set(committed) | set(fut):
+        v = (inflight.get(sp, 0) + committed.get(sp, 0)
+             + int(fut.get(sp, 0.0)))
         if v > 0:
             relief[sp] = v
     return relief
@@ -217,15 +295,19 @@ def pause_relief(pu: Dict[str, Any]) -> Dict[str, int]:
 def pause_candidates(
     state: SchedulerState,
     prefill_bps: Optional[float] = None,
+    heartbeat_s: float = 5.0,
 ) -> List[Any]:
     """DESIGN §8 ``pause_candidates`` — one ``Pause`` per REASONING /
     ACTING program (ENDED + PAUSED skipped).
 
       cost   = V_u_program(p) + marginal_pause_cost(p)     # work-loss (s)
-      relief = pause_relief(p)                             # HBM bytes (flat sp dict)
+      relief = snapshot_relief(p) + future_inflight_savings(p)   # HBM bytes
 
     ``relief`` is the flat ``{sp: bytes}`` shape; ``joint_decide``
     normalises it to ``{"HBM": {...}}`` before the DP (DESIGN §9).
+    ``future_inflight_savings`` (the near-term decode growth pausing p
+    averts) is 0 under the current placeholders, so ``relief`` is the
+    snapshot ``inflight + committed`` until T26/T11 land (#199).
     ``V_u_program`` uses the shared-aware aggregate (each unit's V_u
     split across holders) — the interim attribution under §7's binary
     p_hat; DESIGN's no-weight form is correct once T11's holder-product
@@ -234,12 +316,17 @@ def pause_candidates(
     from baselines.knapsack import Pause
     if prefill_bps is None:
         prefill_bps = float(state.throughput_ema.get("prefill_bps", 0.0))
+    horizon = forecast_horizon(state, heartbeat_s)
+    decode = state.throughput_ema.get("decode_per_program", {}) or {}
+    dbpt = state.tier_usage.decode_bytes_per_token.get(Tier.HBM, {})
     vprog = shared_aware_prog_scores(state)
     out: List[Any] = []
     for pid, pu in state.per_program_usage.items():
         if pu.get("state") not in _ACTIVE_STATES:
             continue
-        relief = pause_relief(pu)
+        fut = _program_inflight_growth(
+            pid, pu, state, decode, dbpt, horizon)
+        relief = pause_relief(pu, fut)
         cost = vprog.get(pid, 0.0) + marginal_pause_cost(pu, prefill_bps)
         out.append(Pause(cost=cost, relief=relief, pid=pid))
     return out

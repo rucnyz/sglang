@@ -1877,6 +1877,25 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
   use observed conditional distributions, not constant upper
   bounds.
 
+  **Implementation status (#199).** The daemon assembles the full
+  trajectory product (`forecast_inflight_demand` +
+  `pause_relief.future_inflight_savings`), but it is *gated per input*
+  and 0 today:
+  * `bytes_per_token_in_subpool` is now exposed —
+    `pool_usage[*].subpools[sp].decode_bytes_per_token` (attention =
+    bytes/token, Mamba = 0; sglang `_aginfer_decode_bytes_per_token`).
+  * `decode_throughput` = `throughput_ema.decode_per_program[p]` is the
+    T26 measurement (ships `{}`); 0 ⇒ the program contributes nothing.
+  * `E[remaining_tokens]` reads an optional per-program
+    `expected_remaining_tokens` field (T11 / a future dump will fill);
+    **absent ⇒ `None`, and the program is skipped — NOT bootstrapped to
+    `max_completion_tokens`.** Deliberate: per the `max`-vs-mean
+    argument above, projecting the bootstrap upper bound in steady state
+    would over-pause ~5×, so the term stays off until a real conditional
+    estimate exists rather than risk that regression. Synthetic-input
+    tests (`verify/admission_controller` trajectory stage) pin the
+    product + the gating; production stays at `forecast = used_bytes`.
+
   At `SESSION_ARRIVAL` the incoming program has no history; the
   workload prior provides the seed `E[remaining_tokens]` for
   programs of the same class.

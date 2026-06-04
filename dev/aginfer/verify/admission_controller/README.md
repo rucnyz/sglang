@@ -36,6 +36,10 @@ pause-cost    marginal_pause_cost (0 while prefill_bps=0) + pause_relief
               (inflight + committed snapshot)
 pause-cands   one Pause per REASONING/ACTING program (PAUSED+ENDED skipped)
 resume-cands  one Resume per PAUSED program; capacity_fits gates overflow
+trajectory    #199: the §8 forecast trajectory term — assembled from
+              decode_bytes_per_token (now exposed) × synthetic
+              decode_throughput × E[remaining]; proves the full product
+              + the per-input T26/T11/Mamba gating (0 when any absent)
 ```
 
 The §9 phase selection + live mixed-plan dispatch are pinned by
