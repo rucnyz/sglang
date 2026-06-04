@@ -654,6 +654,11 @@ def build_paper_state(
         event_session_id=event.session,
         decision_set=decision_set,
         pool_pressure=pool_pressure,
+        # DESIGN §8 program/forecast inputs carried verbatim from the
+        # (flattened) dump so the admission candidate generators read
+        # them the same way kv_scheduler reads pool_usage.
+        per_program_usage=state_json["per_program_usage"],
+        throughput_ema=state_json["throughput_ema"],
     )
 
 
@@ -898,11 +903,20 @@ class KvScheduler:
         # leave it None; tests that call ``_dispatch_migrate`` must
         # provide one.
         self.outbound = outbound
+        # DESIGN §9 (#194): when True, joint_decide includes the
+        # program-level Pause/Resume candidates (the full union action
+        # space).  When False, the joint decision is migrate-only (the
+        # kv-only ablation arm — Run K).  main.py sets it from the
+        # --admission-controller flag.
+        self.admission_enabled: bool = False
         # Telemetry for tests.
         self.decisions: int = 0
         self.migrate_calls: int = 0
+        self.pause_calls: int = 0    # #194: program pauses dispatched
+        self.resume_calls: int = 0   # #194: program resumes dispatched
         self.hint_calls: int = 0  # T40 (#184): hint PUTs enqueued
         self.last_action: Optional[Action] = None
+        self.last_plan: Optional[List[Any]] = None
         self.last_decision_set_size: int = 0
         # Audit round-2 R2-N2: per-instance unknown-tier log set so
         # cross-test / cross-restart state doesn't leak.
@@ -1017,12 +1031,26 @@ class KvScheduler:
         # daemon refreshes it every event.  No shadow cache (DESIGN
         # §10): re-pushes are absorbed by sglang's overwrite-by-stamp.
         await self._dispatch_hints(hints_from_state(sched_state))
-        action = self.policy.decide(sched_state)
+        # DESIGN §9 (#194): ONE joint decision over the union action
+        # space {migrate} ∪ {pause/resume}, replacing the old sequential
+        # greedy-decide-then-admission decompose.  Thresholds + horizon
+        # come from the router (the single source of truth, T22/§10);
+        # cost calibration from the shared policy instance.
+        from .joint_decide import joint_decide
+        plan = joint_decide(
+            sched_state, event,
+            costs=self.policy.costs,
+            pi_u=self.policy.pi_u,
+            theta_hi=router.theta_hi,
+            theta_lo=router.theta_lo,
+            heartbeat_s=router.heartbeat_s,
+            admission_enabled=self.admission_enabled,
+        )
         self.decisions += 1
-        self.last_action = action
-        if not action.assignments:
-            # Policy declined to migrate — paper §7 says this happens
-            # whenever Vt is non-positive for every alternative tier.
+        self.last_plan = plan
+        if not plan:
+            # Nothing to do this event — declined (every V_u-positive
+            # alternative loses) or the hysteresis dead-zone (§9).
             _m(
                 "kv_decide",
                 kind=event.kind.value,
@@ -1030,14 +1058,68 @@ class KvScheduler:
                 outcome="policy_declined",
             )
             return
+        await self._dispatch_plan(plan, sched_state)
+
+    async def _dispatch_plan(self, plan: List[Any], sched_state) -> None:
+        """Dispatch a §9 ``joint_decide`` mixed plan (#194).
+
+        Splits the chosen candidates by lever type and routes each:
+          * ``Migrate`` → the residence-set POST (same wire as before;
+            ``c.id`` is the ``(uid, add_tiers, remove_tiers)`` tuple
+            ``assignments_to_wire`` consumes).
+          * ``Pause``   → ``tracker.pause(pid)`` (gates the proxy) AND
+            ``PUT /aginfer/program_paused`` so sglang stores p's
+            ``pre_pause_state`` (the §8 resume counterfactual reads it).
+          * ``Resume``  → ``tracker.resume(pid)`` (releases the gate) AND
+            a ``PUT`` clearing the paused mark back to ``pre_pause_state``.
+        """
+        from .joint_decide import Migrate, Pause, Resume
+        from ._metrics import m as _m
+        migrates = [c for c in plan if isinstance(c, Migrate)]
+        pauses = [c for c in plan if isinstance(c, Pause)]
+        resumes = [c for c in plan if isinstance(c, Resume)]
         _m(
             "kv_decide",
-            kind=event.kind.value,
+            kind=sched_state.event_kind,
             dset_size=self.last_decision_set_size,
-            action_n=len(action.assignments),
+            migrates=len(migrates),
+            pauses=len(pauses),
+            resumes=len(resumes),
             outcome="dispatched",
         )
-        await self._dispatch_migrate(action.assignments)
+        if migrates:
+            await self._dispatch_migrate([m.id for m in migrates])
+        for c in pauses:
+            await self._dispatch_pause(c.pid, sched_state)
+        for c in resumes:
+            await self._dispatch_resume(c.pid, sched_state)
+
+    async def _dispatch_pause(self, pid: str, sched_state) -> None:
+        """Pause program ``pid``: gate the proxy + notify sglang with the
+        pre-pause state (DESIGN §6 / §8)."""
+        prior = sched_state.per_program_usage.get(pid, {}).get("state")
+        self.tracker.pause(pid)
+        self.pause_calls += 1
+        if self.outbound is not None:
+            self.outbound.enqueue_program_paused(
+                pid=pid, state="PAUSED", pre_pause_state=prior)
+        from ._metrics import m as _m
+        _m("admission_pause", pid=pid, pre_pause_state=prior)
+
+    async def _dispatch_resume(self, pid: str, sched_state) -> None:
+        """Resume program ``pid``: release the gate + clear the sglang
+        paused mark back to its pre-pause state (DESIGN §6 / §8)."""
+        pre = sched_state.per_program_usage.get(pid, {}).get("pre_pause_state")
+        self.tracker.resume(pid)
+        self.resume_calls += 1
+        if self.outbound is not None:
+            # Restore the program to whatever it was doing pre-pause; the
+            # paused mark is cleared (pre_pause_state=None on the resumed
+            # record).
+            self.outbound.enqueue_program_paused(
+                pid=pid, state=pre or "REASONING", pre_pause_state=None)
+        from ._metrics import m as _m
+        _m("admission_resume", pid=pid, restored_state=pre)
 
     async def _dispatch_migrate(
         self, assignments: List[Tuple[str, Tier]]

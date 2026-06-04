@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum, Enum
-from typing import Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 
 class Tier(IntEnum):
@@ -157,6 +157,18 @@ class SchedulerState:
     # admission_controller.gate keys per-subpool: ANY subpool crossing
     # theta_hi triggers a pause, not just the aggregate.
     pool_pressure: Dict[Tier, Dict[str, float]] = field(default_factory=dict)
+    # DESIGN §8 program-level inputs (the admission candidate generator
+    # iterates these): {pid: {"state", "pre_pause_state", "unit_hashes",
+    # "hbm": {"committed": {sp: bytes}, "inflight": {sp: bytes}},
+    # "dram": {"committed": {sp: bytes}}}}.  Authored by sglang's
+    # /aginfer/state per_program_usage (DESIGN §5/§8); the daemon reads
+    # it the same way it reads pool_usage — no tracker join.
+    per_program_usage: Dict[str, Any] = field(default_factory=dict)
+    # DESIGN §8 forecast inputs: {"prefill_bps": float,
+    # "decode_per_program": {pid: bytes_per_sec}}.  prefill_bps and
+    # decode rates are T26 measurement (ship as 0.0 placeholders
+    # pre-T26); forecast degrades to the snapshot term until then.
+    throughput_ema: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -492,13 +492,34 @@ generalization.
      A2 caught it via a brute-force oracle.  verify/t34/: 12 stages
      (exact-vs-brute over 120 random fixtures + quantisation +
      infeasibility + Pause-always-feasible), all green.
-   - **DEFERRED — joint_decide integration**: wiring these primitives
-     into the live decision path (replace the greedy
-     `OursGreedyPolicy.decide` single-axis check + the sequential
+   - **joint_decide integration (#194 — DONE, 2026-06-04)**: wired the
+     primitives into the live decision path.  `migrate_candidates`
+     (`baselines/ours_greedy.py`, §7), `forecast` / `pause_candidates` /
+     `resume_candidates` (`daemon/admission_controller.py`, §8), and
+     `joint_decide` (`daemon/joint_decide.py`, §9) replace the greedy
+     `OursGreedyPolicy.decide` single-axis check AND the sequential
      admission `_on_pressure`/`_on_resolved` "Gauss-Seidel decompose"
-     with one `joint_decide` building Migrate/Pause/Resume candidates +
-     forecast/bytes_needed + flat→nested normalisation).  Large rewire
-     of the live path; tracked separately.
+     (both removed).  `KvScheduler.handle` runs ONE joint decision and
+     `_dispatch_plan` routes the mixed plan (Migrate→POST, Pause→
+     tracker.pause+PUT, Resume→tracker.resume+PUT); admission is the §8
+     candidate generator gated by `KvScheduler.admission_enabled` (off =
+     kv-only Run K arm).  **Three DESIGN-vs-code corrections** (see
+     `verify/joint_decide/README.md`): (1) multiple-choice (at-most-one
+     per unit) over a unit's transitions, not plain 0/1 — plain 0/1
+     double-counts a unit's relief; (2) `cap_left` clamps to `max(0,·)`
+     — a negative (over-subscribed) destination budget spuriously
+     rejects zero-acquire DROP; (3) pressure infeasibility →
+     **best-effort** (free max relief, re-evaluate next event), NOT
+     `fatal` — in-flight-dominated pressure with no Pause candidate is a
+     workload reality (caught by `verify/integration_stress`).  Verified:
+     `verify/joint_decide/` (5 stages incl. brute-force MCKP oracle) +
+     `verify/integration_stress/` (7 flavors green on the real B300
+     stack — stage D migrate-under-traffic, stage G SESSION_END demoted
+     6→5 HBM units, stage F no spurious fatal).  **Follow-on (gated on
+     T26/T11)**: `forecast_inflight_demand` + `future_inflight_savings`
+     are 0 until `decode_throughput` (T26), `E[remaining_tokens]` (T11/
+     #126), and `bytes_per_token_in_subpool` are wired — forecast
+     degrades to `used_bytes` (behaviour-preserving); see #199.
 
 3. **T35 — `authoritative_tier(residence)`** (DESIGN §7):
    - HBM if present else DRAM else DISK

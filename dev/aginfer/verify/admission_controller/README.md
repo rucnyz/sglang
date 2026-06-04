@@ -1,226 +1,76 @@
-# admission_controller (daemon §8 event-driven pause/resume)
+# admission_controller — DESIGN §8 program-level candidate generator
 
-> **⚠️ STALE post-T33 (2026-05-31).  Does NOT pass against current
-> daemon.**
->
-> Same staleness as `kv_scheduler_value_rule/`: stub state JSONs
-> use the pre-round-9 `tier_usage` flat shape; assertions reference
-> `u.tier` (single tier; T33 replaced with residence-list) +
-> `_value_at_current_tier` (T33's `_value(u, next_residence, state)`
-> + `authoritative_tier(residence)`).  T33 also reworked
-> `admission_controller.py`'s `_hbm_occ` to per-subpool max;
-> probes that monkey-patch `pool_pressure` need to use
-> `Dict[Tier, Dict[str, float]]` not the old `Dict[Tier, float]`.
->
-> Running fails on the first stub state with
-> `KeyError: 'pool_usage'`.
->
-> G9 (theta mismatch between sglang webhook fire and daemon's
-> pause threshold) is closed by DESIGN round-9 via `GET
-> /aginfer/thresholds` + `PUT /aginfer/thresholds` broadcast
-> (PLAN T22).  The G9 OPEN WORK note that was here pre-round-9
-> is therefore moot; tracked under T22.
->
-> Rewrite tracked as #146 (same task as
-> `kv_scheduler_value_rule/`'s rewrite; the two share fixtures
-> and the rewrite is logically a single piece).  verify.py +
-> regression_probe.py kept as behavioural-spec reference.
+Admission is **not** an event-driven pause/resume loop anymore.  #194
+(DESIGN §9) replaced the sequential "run kv_scheduler, then run
+admission" decompose with ONE `joint_decide` over the union action
+space.  Admission is now the **program-level candidate generator** that
+`joint_decide` consumes, alongside §7's unit-level Migrate candidates.
 
-* **G1 — # of pauses per real harbor cycle never measured.**
-  daemon already logs `program_tracker: paused %s`; never
-  aggregated.  We don't know if admission has ever paused a
-  program on a real run.  Possible the mechanism never triggered.
-* **G9 — theta mismatch (sglang webhook ↔ daemon admission)**.
-  sglang's `classify(occ)` fires `memory_pressure` at
-  `theta_hi=0.7` (and `theta_crit=0.9`); daemon's
-  `admission_controller.theta_hi=0.85`.  Events for
-  `occ ∈ [0.7, 0.85)` reach the daemon, the daemon fetches
-  `/aginfer/state`, runs the V_u calc, decides nothing → wasted
-  RTT.  Either align both to one theta in the launch script, or
-  let the daemon suppress the fetch when its own theta wouldn't
-  act.  Noted during 2026-05-26 single-shot K-full inspection.
-* **G6 — shared-aware aggregation effect never measured on real
-  workload.**  T8 verify pins it numerically (audit M1) but in
-  the 4-arm matrix we have no audit that the system-prompt
-  prefix unit was actually protected from eviction vs the LRU
-  arm.  Migration-trace scan + system-prompt unit-hash
-  cross-reference would close this.
-* **Ideal fix**:
-  - parse daemon log for `paused %s` / `resumed %s` per cycle (G1)
-  - align thetas (G9: 1-line change in launch_sglang_v4flash.sh
-    or a launcher env var); then re-test on a known-pressure
-    workload
-  - per-tier hit-rate diff (G4 → G6 inference) via sglang patch
+The old `AdmissionController` class (FIFO of paused programs,
+`_on_pressure` / `_on_resolved` loops, `attach_admission_controller`
+composite) was **removed** in #194 — its job is subsumed by:
 
-## WHAT WE PROMISED
+* the §8 generator functions in `daemon/admission_controller.py`
+  (`pause_candidates`, `resume_candidates`, `forecast`,
+  `marginal_pause_cost`, `pause_relief`, `capacity_fits`,
+  `shared_aware_prog_scores`);
+* `joint_decide` (`daemon/joint_decide.py`) — phase selection + DP;
+* `KvScheduler._dispatch_plan` — executes the chosen Pauses/Resumes
+  (`tracker.pause`/`resume` + `PUT /aginfer/program_paused`).
 
-**Capability**
-* Reacts to `memory_pressure` and `pressure_resolved` events from
-  sglang's webhook (T5). **No periodic timer.**
-* On `memory_pressure`: score each active program by **shared-aware
-  aggregated `V_u`**:
-  ```
-  prog_score(p) = Σ V_u / |u.session_ids|   for u in p.units
-  ```
-  i.e. each unit's value is split across its holders so the shared
-  system prompt + tool definitions don't double-count. Pause the
-  programs with the **lowest** `prog_score` until HBM occ drops below
-  θ_hi. Pause is enforced at the proxy via
-  `program_tracker.pause(p)`.
-* On `pressure_resolved`: resume paused programs in FIFO order
-  (oldest pause first), draining progressively (re-poll
-  `/aginfer/state` between each resume) until either the FIFO is
-  empty OR HBM occ rises back to θ_lo (hysteresis gap = θ_hi − θ_lo).
-  Bounded by `max_pauses_per_event` per single event.  Note: sglang's
-  webhook is edge-triggered on HIGH→OK, so a single event must drain
-  as much as it safely can — round-1 N4 made one-resume-per-event
-  the bug; the drain-with-θ_lo-gate is the fix.
-* Uses the **same** `OursGreedyPolicy._value` from `baselines/ours_greedy.py`
-  — just aggregated per program. No separate heuristic.
+Thresholds (`theta_hi`/`theta_lo`) live on the EventRouter (the single
+source of truth, T22/§10); the paused set is read from sglang's
+`per_program_usage` state each event — no daemon FIFO, so a restart
+loses no admission bookkeeping.
 
-**Cost ceiling**
-* Per-event handler wall time at 32 programs: < 10 ms.
-* Pause/resume themselves are cheap dict updates on program_tracker.
-* `prog_score` aggregation uses pre-built program→units index (built
-  once on state fetch), not nested scans.
+## What this verify pins (post-#194)
 
-## HOW WE VERIFY
-
-Mechanism. `verify/t8_admission.py`:
+Pure functions over a post-T17 `SchedulerState`; no server, no event
+loop (the old Layer-A uvicorn harness is gone with the loop it tested):
 
 ```
-1. Reuse synthetic 4-program state from T7 (shared 1 k platform +
-   per-program 4 k tail).
-2. Drive a synthetic event stream against the event_worker:
-
-   2a. Fire memory_pressure {occ=0.92}. Assert:
-       - prog_score aggregation correctly down-weights shared units:
-         for the shared platform unit u with 4 holders,
-         u.contrib_to_prog(p) == V_u(u, HBM) / 4   (not full V_u).
-       - The program paused is the one with lowest aggregated score
-         — typically p3 or p4 (ACTING).
-       - HBM "should" drop on next state poll (we stub /aginfer/state
-         to confirm).
-   2b. Fire memory_pressure again with occ=0.95 (still over).
-       Assert: second pause fires.
-   2c. Fire pressure_resolved {occ=0.55}. Assert: FIFO resume
-       (oldest paused first), and only one resume per event
-       (hysteresis check before further resumes).
-
-3. Verify aggregation correctness with a hand-built degenerate state:
-   - 32 programs, all sharing one 1k-token unit (system prompt).
-   - Each program has 0 unique tail (everything is shared).
-   - With naive sum: every program scores identical (32 × V_share).
-   - With shared-aware aggregation: every program scores 1 × V_share.
-     Naive sum would make pick deterministic-by-Python-dict order
-     (wrong); shared-aware gives the same total, but proportional
-     to len(p.units) ratio — verify the correct program is picked.
-
-4. Anti-timer grep: no `asyncio.sleep`, no `time.sleep`, no
-   `loop.call_later` in admission_controller code path.
-
-5. Latency: time 10 admission_controller.on_pressure() calls at 32
-   programs; assert mean < 10 ms.
+scoring       shared_aware_prog_scores — V_u split across holders
+forecast      per-HBM-subpool used_bytes (+ inflight term, 0 under the
+              T26/T11 placeholders); forecast_horizon → heartbeat_s
+pause-cost    marginal_pause_cost (0 while prefill_bps=0) + pause_relief
+              (inflight + committed snapshot)
+pause-cands   one Pause per REASONING/ACTING program (PAUSED+ENDED skipped)
+resume-cands  one Resume per PAUSED program; capacity_fits gates overflow
 ```
 
-## CALIBRATION
+The §9 phase selection + live mixed-plan dispatch are pinned by
+`verify/joint_decide/` (5 stages) and `verify/integration_stress/`
+(flavors A/D/G on the real B300 stack).
 
-* `θ_hi` = 0.85, `θ_lo` = 0.70 (default watermarks).
-* Sensitivity sweep: rerun mini-Run-K with `(θ_hi, θ_lo) ∈
-  {(0.80, 0.65), (0.85, 0.70), (0.90, 0.75)}`; verify all three
-  produce per-trial mean within ± 10 % of each other (= the floor is
-  not pinned to a knife-edge watermark choice).
+## Honest degradation (gated on T26 / T11 — #199)
 
-## WORST CASE (forced, must actually run)
+`forecast_inflight_demand` and `pause_relief`'s `future_inflight_savings`
+term are 0 until `decode_throughput` (T26), `E[remaining_tokens]`
+(T11/#126), and `bytes_per_token_in_subpool` (architecture constant)
+are wired.  So `forecast[sp] == used_bytes[sp]` and `pause_relief =
+inflight + committed` (snapshot only) today — the §9 triggers reduce
+exactly to allocator-truth HBM occupancy (behaviour-preserving), and
+become trajectory-aware once those inputs are measured.
 
-| Failure mode | How to force | Predicted floor | Assertion |
-|---|---|---|---|
-| Aggregation picks adversarial victim | State where every program shares one 1k unit and has zero unique tail | With shared-aware aggregation, all 32 programs score identical → tie-break by FIFO; assert no exception, picks A program | inspect victim id |
-| memory_pressure event arrives but no program to pause | All programs already paused | admission logs "no eligible victim"; doesn't crash; on next pressure event, pick stays empty | log assertion |
-| pressure_resolved event arrives but no program to resume | All programs active | log "nothing to resume"; no exception | log assertion |
-| Rapid memory_pressure → pressure_resolved oscillation | Inject 10 cycles of (HIGH, OK, HIGH, OK ...) in 1 second | admission's pause/resume decisions stable; doesn't ping-pong; hysteresis prevents flapping (resume only when occ < θ_lo) | event log: at most 1 program paused, at most 1 resumed during oscillation |
-| Run K mini with `θ_hi=0.99` (effectively no admission) | env override | per-trial mean ≤ Run F' × 1.10 (= 960 s); proves admission's contribution is bounded above by gap to no-admission | mini harbor run |
+## Historical note (G1 / G9)
+
+* **G1** (number of pauses per real harbor cycle never measured) — the
+  pause decision now lives in `joint_decide`; `_dispatch_plan` emits an
+  `admission_pause` metric per dispatched Pause.
+* **G9** (theta mismatch between sglang's webhook fire and the daemon's
+  pause threshold) — closed by T22 (`GET`/`PUT /aginfer/thresholds`
+  broadcast from one source); both sides read the router's thresholds.
+
+## REPRODUCING
+
+```bash
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+cd /scratch/yuzhou/projects/sglang
+python dev/aginfer/verify/admission_controller/verify.py
+```
+
 ## RESULTS
 
-**PASSED (post audit round-1)** — 12 verify steps + 3 bisect probes,
-~7 s on agsched env.
+**PASSED** — all 5 §8-generator stages.
 
-### Audit round-1 findings + fixes
-
-The first audit caught 2 BLOCKER + 3 MAJOR + 4 MINOR + 2 NIT.
-Notably, B1 was a paper-§7 claim violation (admission's V_u was
-silent-missing the holding-tax term) and N4 was a design bug (FIFO
-strands forever because sglang's pressure_resolved is edge-
-triggered, not heartbeat).  All fixes follow the same bisect
-protocol: write probe → confirm pre-fix FAIL → apply fix →
-confirm post-fix PASS.
-
-| ID | Finding | Fix layer |
-|---|---|---|
-| **B1** | `_value_at_current_tier` passed `cap=0` to `holding_unit_cost` → short-circuit to 0.0 → holding tax silently dropped.  Admission's V_u was only `p_hat * saved_prefill`, breaking the paper-§7 claim README §22 explicitly made.  Effect: byte-heavy shared prefixes (low p_hat) scored same as small unique tails → pause victim picked wrong. | **Production**: thread `SchedulerState` into `_value_at_current_tier`; use real `used_bytes`/`cap_bytes` for the holding-tax term.  Matches `OursGreedyPolicy._value` exactly. |
-| **B2** | `attach_admission_controller` silently captured `prior=None` if called BEFORE `attach_kv_scheduler`; later kv_scheduler attach OVERWROTE the composite; admission never fired, no log. | **Production**: raise `RuntimeError` in attach if no prior handler exists for MEMORY_PRESSURE / PRESSURE_RESOLVED.  Fail-loud at bootstrap. |
-| **M1** | Step [1] only pinned ranking (prog-3 lowest).  A regression to "sum raw V_u, ignore holders" would pass. | **Test**: numerical pin — assert `score[prog-i] == V_tail_i + V_shared/4` (per-program), not just ranking. |
-| **M2** | Step [9] forced 16-pause spin under fixed state; HTTP RTTs dominated, algorithmic regression invisible. | **Test**: new step [12] uses state-mutator (drop occ after first pause) to measure the SINGLE-pause path; budget 5 ms (vs step [9]'s 10 ms with 16 iterations). |
-| **M3** | Step [11] asserted both side effects fired but NOT order.  A regression to admission-first → kv_scheduler-second would pass. | **Test**: monkey-patch admission.handle to append to a shared timeline; stub migrate to do same; assert `idx(kv_scheduler:migrate) < idx(admission:enter)`. |
-| **N1** | README §3 said "stop when next resume would cross θ_hi" but code uses θ_lo as the gate (correct hysteresis intent). | **Doc**: rewrote README §3 to "drain until either FIFO empty OR occ rises back to θ_lo (hysteresis gap = θ_hi − θ_lo)". |
-| **N2** | Step [10] only tested `theta_lo > theta_hi`.  Missing: equal, > 1, == 0, negatives. | **Test**: parameterize over 6 boundary cases; each asserts `ValueError` with "theta" in the message. |
-| **N3** | Step [8] asserted `<= 16`; a regression bumping the cap to 32 would still pass (16 ≤ 32 is false but cap-removed unbounded would also fail for different reason; the real concern is silent cap-loosening). | **Test**: tightened to `== 16` (exact).  Fixture has 20 programs + persistent pressure → cap MUST stop at 16. |
-| **N4** | `pressure_resolved` is edge-triggered on sglang's side (single fire on HIGH→OK).  Admission resumed 1 program per event → FIFO with N > 1 paused programs stranded forever. | **Production**: `_on_resolved` now DRAINS — loop up to `max_pauses_per_event` times, resume oldest each iter, re-fetch state, stop when `occ >= theta_lo` (hysteresis). |
-
-### Latency summary (multi-run, per memory:feedback-latency-multi-run)
-
-| stage | mean ± std | envelope (mean+3σ) | budget |
-|---|---|---|---|
-| handler @ 32 programs (step [9], 16-pause spin) | 4.18 ± 0.17 ms | 4.67 ms | < 10 ms |
-| **single-pause** @ 32 programs (step [12], algorithmic path) | 4.10 ± 0.05 ms | 4.27 ms | **< 5 ms** |
-
-Single-pause is dominated by 2× HTTP RTT (one to trigger pause,
-one to see occ dropped + exit); algorithmic work (~score + pick)
-is sub-ms.
-
-* raw logs:
-  * `results/20260526_120256_run1.log` — v1 (pre-audit)
-  * `results/<YYYYMMDD_HHMMSS>_run2_audit1.log` — post audit round-1
-  * `results/<YYYYMMDD_HHMMSS>_regression_probe.log` — bisect demos
-    for B1, B2, N4
-
-* date: 2026-05-26
-* daemon code: ~280 LoC `daemon/admission_controller.py` (new);
-  reuses `OursGreedyPolicy` value functions from `baselines/` and
-  `build_paper_state` from T7's `daemon/kv_scheduler.py`.
-* prog_score down-weights shared units: ✓ [1] — each unit's V_u
-  divided by `|holders|` so the platform/tool_def prefix doesn't
-  inflate a single program's score.
-* shared-aware passes degenerate test: ✓ [2] — 32 programs sharing
-  one unit with zero unique tails → identical scores (max-min < 1e-9).
-* lowest-score paused first: ✓ [3] — `prog-3` (lowest hit_count
-  tail) paused under occ=0.95 / theta_hi=0.5.
-* FIFO resume: ✓ [4] — pressure_resolved resumes ONE program at a
-  time in the order they were paused.
-* Hysteresis: ✓ [5] — pressure_resolved with `occ >= theta_lo` does
-  NOT resume (waits for occ to drop further).
-* No-victim-when-all-paused: ✓ [6] — pre-paused state +
-  memory_pressure: `pause_decisions == 0`, no crash.
-* Anti-timer contract (AST grep): ✓ [7] — zero `sleep` /
-  `call_later` / `call_at` / `perf_counter` in source.
-* Max-pauses cap: ✓ [8] — persistent pressure bounded at 16
-  pauses/event (no runaway).
-* Invalid watermark rejection: ✓ [10] — `theta_lo >= theta_hi`
-  raises `ValueError` at construction.
-* Composition with T7: ✓ [11] — on memory_pressure,
-  `kv_scheduler.handle` fires first (migrate POST), then
-  `admission.handle` (pause re-check); both side-effects observable.
-
-### Latency (multi-run, per memory:feedback-latency-multi-run)
-
-5 independent trials at 32 programs (no actual pause; theta_hi=0.99).
-
-| stage | mean ± std | budget |
-|---|---|---|
-| admission `handle()` end-to-end | **4.16 ± 0.15 ms** (mean+3σ 4.60 ms) | < 10 ms |
-
-Assertion uses `mean + 3σ < 10 ms` (current envelope leaves ~2×
-headroom; catches a 2× regression).
-
-* raw logs:
-  * `results/20260526_120256_run1.log` — v1 (pre-audit)
+* date: 2026-06-04 (#194 rewrite — was stale pre-T33)

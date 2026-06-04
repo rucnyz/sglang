@@ -10,7 +10,9 @@ CLI:
         --theta-hi=0.85 \\
         --theta-lo=0.70
 
-Composes: proxy + EventRouter + (optionally) KvScheduler + AdmissionController.
+Composes: proxy + EventRouter + (optionally) KvScheduler.  Admission is
+the §8 candidate generator inside KvScheduler's joint_decide (#194), not
+a separate composed layer; the flag toggles KvScheduler.admission_enabled.
 
 Emits the T9 startup invariants the run_k.sh grep depends on:
 * ``kv_scheduler=<enabled|disabled>``
@@ -24,7 +26,9 @@ import sys
 
 import uvicorn
 
-from .admission_controller import AdmissionController, attach_admission_controller
+# #194: admission is now the §8 candidate generator consumed by
+# kv_scheduler's joint_decide, not a separate composed handler — no
+# AdmissionController / attach_admission_controller import needed.
 from .event_router import (
     attach_apply_failed_handler,
     attach_hash_collision_handler,
@@ -155,7 +159,6 @@ def main(argv=None) -> None:
     # Attach layers per flags.  Order matters (T8 R2-M2 guard enforces
     # this): kv_scheduler MUST attach BEFORE admission_controller.
     sched = None
-    admission = None
     # T36 (DESIGN §6 B4): shared outbound queue for all fire-and-forget
     # dispatches.  Mandatory — KvScheduler._dispatch_migrate raises if
     # outbound is None.  Lifecycle tied to FastAPI startup / shutdown
@@ -188,17 +191,16 @@ def main(argv=None) -> None:
         if not enable_kv:
             raise SystemExit(
                 "--admission-controller=enabled requires "
-                "--kv-scheduler=enabled (admission's composite wraps "
-                "kv_scheduler's handler)"
+                "--kv-scheduler=enabled (admission is the program-level "
+                "candidate generator inside kv_scheduler's joint_decide)"
             )
-        admission = AdmissionController(
-            tracker=tracker,
-            theta_hi=args.theta_hi,
-            theta_lo=args.theta_lo,
-            max_pauses_per_event=args.max_pauses_per_event,
-        )
-        attach_admission_controller(router, admission)
-        app.state.admission_controller = admission
+        # #194 / DESIGN §9: admission is no longer a separate handler
+        # composed on top of kv_scheduler — it is the program-level
+        # candidate generator (§8) consumed by the SINGLE joint_decide
+        # the kv_scheduler handler runs.  Enabling it just turns on the
+        # Pause/Resume levers in that joint decision (the kv-only arm
+        # leaves them off).  Thresholds come from the router (§10).
+        sched.admission_enabled = True
 
     # T37 — APPLY_FAILED handler is unconditional (no kv_scheduler /
     # admission flag gates it; the webhook arrives regardless of which

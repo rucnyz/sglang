@@ -1,87 +1,43 @@
-"""Aginfer daemon admission_controller (T8).
+"""Aginfer admission — the program-level candidate generator (DESIGN §8).
 
-Event-driven program-level pause/resume for back-pressure.  Reacts
-to sglang's webhook events (``memory_pressure`` / ``pressure_resolved``);
-**no periodic timer**.
+Admission does NOT run its own decision loop.  Per DESIGN §9 (#194)
+the daemon makes ONE joint decision per event over the union action
+space ``{unit migrate} ∪ {program pause/resume}``; admission's job is
+to produce the program-level half of the candidate set that
+``joint_decide`` (``daemon/joint_decide.py``) consumes:
 
-For each ``memory_pressure`` event:
+  * ``pause_candidates(state)``  — one ``Pause(cost, relief)`` per
+    REASONING / ACTING program (work-loss cost + HBM relief).
+  * ``resume_candidates(state)`` — one ``Resume(gain, re_use)`` per
+    PAUSED program that ``capacity_fits``.
+  * ``forecast(state)`` — per-HBM-subpool predicted bytes at the next
+    event (the §9 pressure / headroom trigger input).
 
-1. Fetch a fresh ``/aginfer/state``.
-2. If ``HBM_occ < theta_hi``: do nothing (the watermark is gone).
-3. Score every program holding HBM-resident units by **shared-aware
-   aggregate V_u** (paper §7 unit value divided by holder count, so
-   the platform / tool_def prefix doesn't double-count across
-   programs that share it).
-4. Pause the program with the LOWEST aggregate score via
-   ``program_tracker.pause(pid)``.
-5. Re-poll ``/aginfer/state`` to see if the migrate side (T7 +
-   sglang's eviction) already cleared the pressure.  If not, loop;
-   re-score and pause again.  Bound the iteration at ``max_pauses``
-   per event so a single tick can't pause the whole world.
+The old event-driven ``_on_pressure`` / ``_on_resolved`` pause loops
+(the "Gauss-Seidel decompose" that ran admission as a separate handler
+composed on top of kv_scheduler) are superseded by ``joint_decide``
+and were removed in #194.  Thresholds (theta_hi / theta_lo) live on the
+EventRouter (the single source of truth, T22 / §10); the paused set is
+read from sglang's ``per_program_usage`` state each event — no daemon
+FIFO, so a restart loses no admission bookkeeping.
 
-For each ``pressure_resolved`` event:
-
-1. Resume programs in FIFO order (oldest pause first) ONE at a time.
-2. After each resume, re-poll state; if HBM occ would cross
-   ``theta_hi`` again, stop (hysteresis).
-3. No timer / no sleep — the next ``pressure_resolved`` event will
-   resume the next program.
-
-Composition with kv_scheduler (T7): the EventRouter's MEMORY_PRESSURE
-and PRESSURE_RESOLVED handlers are WRAPPED.  T7's kv_scheduler.handle
-runs first (issues the migrate POST), then T8's admission.handle
-runs (re-checks occ after the migrate landed and pauses if needed).
-
-Design constraints (verify/t8/README.md):
-
-* No ``asyncio.sleep`` / ``time.sleep`` / ``loop.call_later`` in this
-  module.  Pure reactive.
-* Per-event handler wall time: < 10 ms at 32 programs.  The
-  ``prog_score`` aggregation builds a single program→units index in
-  O(N) and iterates programs in O(P log P) (sort).
-* FIFO state lives on the controller instance, not module-global, so
-  a daemon restart resets cleanly (same pattern as
-  ``KvScheduler._unknown_tier_log``).
+All inputs come from sglang's ``/aginfer/state`` (``per_program_usage``
++ ``pool_usage`` + ``throughput_ema``), read the same way kv_scheduler
+reads ``pool_usage`` — no tracker join.
 """
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, List, Optional
-
-import httpx
 
 from baselines.base import ReuseUnit, SchedulerState, Tier
 from baselines.costs import default_costs
 from baselines.ours_greedy import (
-    OursGreedyPolicy,
     holding_unit_cost,
     reload_cost,
 )
 
-from .events import Event, EventBus, EventKind
-from .kv_scheduler import _env_float, build_paper_state
-from .program_tracker import ProgramTracker, State
-
 logger = logging.getLogger(__name__)
-
-
-# ----------------------------------------------------------------- calibration
-
-# Hysteresis watermarks.  theta_hi is the pause trigger; theta_lo is
-# the resume trigger so we don't ping-pong on a single occupancy
-# fluctuation.  Default 0.85 / 0.70 (16 pp gap = ~1.3 GiB on a B300
-# HBM tier of ~8 GiB usable cache).
-_DEFAULT_THETA_HI = _env_float("AGINFER_ADMISSION_THETA_HI", "0.85")
-_DEFAULT_THETA_LO = _env_float("AGINFER_ADMISSION_THETA_LO", "0.70")
-
-# Max pauses per single memory_pressure event.  Without a cap, a
-# single oscillation could pause every program in sight.  16 is
-# enough to react to a real burst (e.g., 32 programs and the lowest
-# half are clearly idle) without runaway.
-_DEFAULT_MAX_PAUSES_PER_EVENT = int(
-    os.environ.get("AGINFER_ADMISSION_MAX_PAUSES_PER_EVENT", "16")
-)
 
 
 # ----------------------------------------------------------------- scoring
@@ -139,267 +95,207 @@ def shared_aware_prog_scores(
     return scores
 
 
-# ----------------------------------------------------------------- controller
+# ----------------------------------------------------------- §8 forecast
 
 
-class AdmissionController:
-    """Per-instance admission controller.
+# Active program states that emit a Pause candidate (DESIGN §8:
+# "one Pause for every REASONING or ACTING program"; ENDED + PAUSED
+# skipped).
+_ACTIVE_STATES = ("REASONING", "ACTING")
 
-    State (telemetry + FIFO) lives on the instance so a daemon restart
-    resets cleanly.  No module-level mutable state.
+
+def forecast_horizon(state: SchedulerState, heartbeat_s: float) -> float:
+    """DESIGN §8 ``forecast_horizon`` — expected seconds to the next
+    event: ``min(heartbeat_s, 1 / recent_event_rate)``.
+
+    ``recent_event_rate`` is not yet tracked by the daemon (it needs an
+    event-timestamp EMA — a T26-adjacent measurement), so this returns
+    the cold-start value ``heartbeat_s`` (the next *guaranteed* event
+    arrival is sglang's heartbeat).  That is the correct upper bound;
+    once the event-rate EMA lands the horizon shrinks under load.
     """
-
-    def __init__(
-        self,
-        *,
-        tracker: ProgramTracker,
-        theta_hi: float = _DEFAULT_THETA_HI,
-        theta_lo: float = _DEFAULT_THETA_LO,
-        max_pauses_per_event: int = _DEFAULT_MAX_PAUSES_PER_EVENT,
-    ) -> None:
-        if not 0.0 < theta_lo < theta_hi < 1.0:
-            raise ValueError(
-                f"admission watermarks must satisfy "
-                f"0 < theta_lo < theta_hi < 1; got "
-                f"theta_hi={theta_hi}, theta_lo={theta_lo}"
-            )
-        self.tracker = tracker
-        self.theta_hi = theta_hi
-        self.theta_lo = theta_lo
-        self.max_pauses_per_event = max_pauses_per_event
-        # FIFO of paused programs (oldest at index 0).
-        self._paused_fifo: List[str] = []
-        # Telemetry for tests.
-        self.pause_decisions: int = 0
-        self.resume_decisions: int = 0
-        # Per-instance log set for any one-shot warnings (mirrors
-        # KvScheduler's pattern).
-        self._unknown_tier_log: set = set()
-
-    # ---- inspectors (for tests / observability) ----
-
-    def paused(self) -> List[str]:
-        """Return the FIFO of currently-paused programs (oldest first)."""
-        return list(self._paused_fifo)
-
-    # ---- handler ----
-
-    async def handle(self, event: Event, router) -> None:  # noqa: ANN001
-        """Single entry point.  Routed to MEMORY_PRESSURE +
-        PRESSURE_RESOLVED via :func:`attach_admission_controller`."""
-        if event.kind == EventKind.MEMORY_PRESSURE:
-            await self._on_pressure(event, router)
-        elif event.kind == EventKind.PRESSURE_RESOLVED:
-            await self._on_resolved(event, router)
-        # All other kinds are routed elsewhere (T7); ignore here.
-
-    async def _on_pressure(self, event: Event, router) -> None:  # noqa: ANN001
-        """Pause the lowest-scoring program(s) until HBM occ < theta_hi."""
-        from ._metrics import m as _m
-        n_paused_this_event = 0
-        for _ in range(self.max_pauses_per_event):
-            try:
-                state_json = await router.fetch_state()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "admission: state fetch failed for %s: %r",
-                    event.kind.value, exc,
-                )
-                return
-            sched_state = build_paper_state(
-                state_json,
-                event=event,
-                tracker=self.tracker,
-                unknown_tier_log=self._unknown_tier_log,
-            )
-            occ = self._hbm_occ(sched_state)
-            if occ < self.theta_hi:
-                # Pressure cleared by the migrate (T7) or natural eviction.
-                # G9 — this branch quantifies "wasted RTT" when sglang's
-                # webhook fires at theta_hi=0.7 but admission only acts at
-                # theta_hi=0.85: occ in [0.7, 0.85) ⇒ we fetched state and
-                # declined here.
-                _m(
-                    "admission_pressure",
-                    occ=occ,
-                    theta_hi=self.theta_hi,
-                    will_act="false",
-                    paused_this_event=n_paused_this_event,
-                )
-                return
-            scores = shared_aware_prog_scores(sched_state)
-            # Filter out already-paused programs.
-            eligible = {
-                pid: s for pid, s in scores.items()
-                if self.tracker.state(pid) != State.PAUSED
-            }
-            if not eligible:
-                logger.info(
-                    "admission: occ=%.3f >= theta_hi=%.3f but no "
-                    "eligible victim (all programs already paused)",
-                    occ, self.theta_hi,
-                )
-                _m(
-                    "admission_pressure",
-                    occ=occ,
-                    theta_hi=self.theta_hi,
-                    will_act="false",
-                    reason="no_eligible_victim",
-                )
-                return
-            # Pick the LOWEST scoring program.  Tie-break by pid for
-            # determinism (= FIFO of program_id string order, which
-            # the test fixtures exploit).
-            victim = min(eligible.items(), key=lambda kv: (kv[1], kv[0]))[0]
-            self.tracker.pause(victim)
-            self._paused_fifo.append(victim)
-            self.pause_decisions += 1
-            n_paused_this_event += 1
-            logger.info(
-                "admission: paused %s (score=%.4g; HBM occ=%.3f >= %.3f)",
-                victim, eligible[victim], occ, self.theta_hi,
-            )
-            _m(
-                "admission_pause",
-                pid=victim,
-                score=float(eligible[victim]),
-                occ=occ,
-                theta_hi=self.theta_hi,
-            )
-
-    async def _on_resolved(self, event: Event, router) -> None:  # noqa: ANN001
-        """Drain the paused FIFO while ``occ < theta_lo`` (paper §9
-        hysteresis: pause at theta_hi, resume at theta_lo to prevent
-        flapping).
-
-        Audit round-1 N4: sglang's webhook fires ``pressure_resolved``
-        ONCE on the HIGH→OK edge transition; there's no
-        ``still_resolved`` heartbeat.  Round-1 admission resumed only
-        one program per event, so any FIFO with N > 1 programs left
-        N-1 stranded indefinitely.  Now we drain until either the
-        FIFO is empty OR ``occ >= theta_lo`` (so we leave the
-        configured hysteresis gap of ``theta_hi - theta_lo`` of
-        headroom).  Re-fetch state between each resume so the gate
-        check sees the live occupancy.
-        """
-        for _ in range(self.max_pauses_per_event):
-            # Prune dead pids each iteration (an external resume() may
-            # have cleared a state we still hold in the FIFO).
-            self._paused_fifo = [
-                pid for pid in self._paused_fifo
-                if self.tracker.state(pid) == State.PAUSED
-            ]
-            if not self._paused_fifo:
-                logger.info(
-                    "admission: pressure_resolved drained; nothing left to resume"
-                )
-                return
-
-            try:
-                state_json = await router.fetch_state()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "admission: state fetch failed for %s: %r",
-                    event.kind.value, exc,
-                )
-                return
-            sched_state = build_paper_state(
-                state_json,
-                event=event,
-                tracker=self.tracker,
-                unknown_tier_log=self._unknown_tier_log,
-            )
-            occ = self._hbm_occ(sched_state)
-            if occ >= self.theta_lo:
-                # Hysteresis: stop resuming once we're back into the
-                # caution zone.  Programs still in the FIFO will be
-                # resumed on a future pressure_resolved event (when
-                # occ has dropped further); if no such event ever
-                # comes, sglang's still_high heartbeat will fire
-                # pause+migrate cycles that eventually free HBM and
-                # transition state back to OK.
-                logger.info(
-                    "admission: pressure_resolved halted at occ=%.3f >= "
-                    "theta_lo=%.3f; %d programs still paused",
-                    occ, self.theta_lo, len(self._paused_fifo),
-                )
-                return
-            # Resume the oldest paused program.
-            victim = self._paused_fifo.pop(0)
-            self.tracker.resume(victim)
-            self.resume_decisions += 1
-            logger.info(
-                "admission: resumed %s (oldest in FIFO; occ=%.3f < theta_lo=%.3f)",
-                victim, occ, self.theta_lo,
-            )
-            from ._metrics import m as _m
-            _m(
-                "admission_resume",
-                pid=victim,
-                occ=occ,
-                theta_lo=self.theta_lo,
-                fifo_remaining=len(self._paused_fifo),
-            )
-
-    # ---- helpers ----
-
-    @staticmethod
-    def _hbm_occ(state: SchedulerState) -> float:
-        """Effective HBM pressure for admission gating.
-
-        DESIGN §5: admission acts when ANY HBM subpool crosses
-        theta_hi, not when the aggregate does (a Mamba pool at 95 %
-        with attention at 60 % is the failure mode the aggregate
-        view hides).  Max-over-subpools is the right occupancy signal.
-
-        Direct subscript: pool_pressure is populated by
-        build_paper_state from sglang's allocator-truth pool_usage;
-        a missing tier entry is a schema-contract violation worth
-        surfacing.  (If sglang doesn't expose pool_usage post-T17,
-        kv_scheduler.build_paper_state raises before we get here.)
-        """
-        per_subpool = state.pool_pressure[Tier.HBM]
-        return max(per_subpool.values(), default=0.0)
+    return float(heartbeat_s)
 
 
-# ----------------------------------------------------------------- attach
+def forecast_inflight_demand(
+    state: SchedulerState, horizon_s: float
+) -> Dict[str, float]:
+    """DESIGN §8 ``forecast_inflight_demand`` — per-HBM-subpool expected
+    byte growth before the next event, summed over programs actively
+    decoding in that subpool.
 
-
-def attach_admission_controller(
-    router, admission: AdmissionController  # noqa: ANN001
-) -> None:
-    """Wrap T7's MEMORY_PRESSURE / PRESSURE_RESOLVED handlers so both
-    kv_scheduler.handle AND admission.handle fire on each pressure
-    event.  kv_scheduler runs FIRST (migrate POST may relieve the
-    pressure); admission re-checks state and pauses only if needed.
-
-    Composition order matters: if admission ran first, it would over-
-    pause based on stale (pre-migrate) state.
-
-    **Required order:** call ``attach_kv_scheduler(router, ...)``
-    BEFORE this function.  Audit round-1 B2: previously this silently
-    captured ``prior=None`` if called first, and a later
-    ``attach_kv_scheduler`` would OVERWRITE the composite — admission
-    never fires, no log.  Now we raise loudly to catch the
-    bootstrap-ordering bug at registration time.
+    The formula is
+      ``Σ_p min(E[remaining_tokens(p)], horizon × decode_throughput(p))
+            × bytes_per_token_in_subpool(p, sp)``
+    over ``p`` with ``inflight[sp] > 0``.  All THREE inputs are
+    currently unwired:
+      * ``decode_throughput(p)`` — T26 measurement (``decode_per_program``
+        ships empty pre-T26),
+      * ``E[remaining_tokens(p)]`` — the T11 estimator (#126),
+      * ``bytes_per_token_in_subpool(p, sp)`` — a model-architecture
+        constant not exposed in ``/aginfer/state``.
+    With any of them absent the term is 0, so ``forecast`` degrades to
+    the snapshot ``used_bytes`` (see :func:`forecast`).  This is the
+    honest cold-start state — the trajectory term activates when T26 +
+    T11 + the architecture constant are wired (tracked as a #194
+    follow-on).  Returns an empty dict (≡ 0 per subpool).
     """
-    for kind in (EventKind.MEMORY_PRESSURE, EventKind.PRESSURE_RESOLVED):
-        prior = router._handlers.get(kind.value)
-        if prior is None:
-            raise RuntimeError(
-                f"attach_admission_controller: no prior handler for "
-                f"EventKind.{kind.name}.  Call attach_kv_scheduler() "
-                f"first (round-1 B2: silent overwrite would otherwise "
-                f"break admission)."
-            )
+    decode = state.throughput_ema.get("decode_per_program", {}) or {}
+    if not decode:
+        return {}
+    # decode_per_program is populated but bytes_per_token_in_subpool /
+    # E[remaining_tokens] are still unavailable — we cannot complete the
+    # product, so the term remains 0.  Kept as an explicit branch so the
+    # wiring point is visible when those inputs land.
+    return {}
 
-        async def _composite(evt, r, _prior=prior, _adm=admission):
-            await _prior(evt, r)
-            await _adm.handle(evt, r)
 
-        # Audit T8 round-2 R2-M2 sentinel: mark this handler as a
-        # wrapped composite so `EventRouter.set_handler` refuses to
-        # overwrite it without an explicit force=True.  Symmetric to
-        # the round-1 B2 ordering guard.
-        _composite._aginfer_wrap = True  # type: ignore[attr-defined]
-        router.set_handler(kind, _composite, force=True)
+def forecast(state: SchedulerState, heartbeat_s: float) -> Dict[str, float]:
+    """DESIGN §8 ``forecast(state)`` — per-HBM-subpool predicted bytes at
+    the next event if no action is taken:
+    ``pool_usage.HBM.subpools[sp].used_bytes + forecast_inflight_demand[sp]``.
+
+    The inflight term is 0 under the current schema (see
+    :func:`forecast_inflight_demand`), so today ``forecast[sp] ==
+    used_bytes[sp]`` and §9's pressure/headroom triggers reduce exactly
+    to the allocator-truth HBM occupancy the admission loop used before
+    the joint rewrite — behaviour-preserving, and trajectory-aware once
+    the inflight inputs are wired.
+    """
+    horizon = forecast_horizon(state, heartbeat_s)
+    demand = forecast_inflight_demand(state, horizon)
+    used = state.tier_usage.pool_used.get(Tier.HBM, {})
+    return {sp: float(used_bytes) + float(demand.get(sp, 0.0))
+            for sp, used_bytes in used.items()}
+
+
+# ----------------------------------------------- §8 program candidates
+
+
+def _program_inflight(pu: Dict[str, Any]) -> Dict[str, int]:
+    return {sp: int(b) for sp, b in pu.get("hbm", {}).get("inflight", {}).items()}
+
+
+def _program_committed(pu: Dict[str, Any]) -> Dict[str, int]:
+    return {sp: int(b) for sp, b in pu.get("hbm", {}).get("committed", {}).items()}
+
+
+def marginal_pause_cost(pu: Dict[str, Any], prefill_bps: float) -> float:
+    """DESIGN §8 ``marginal_pause_cost`` — work lost pausing p NOW vs at
+    its next natural off-GPU boundary: p's in-flight decoded-so-far
+    bytes (summed across HBM subpools) re-prefilled on resume, divided
+    by the prefill throughput.
+
+    ``prefill_bps`` is T26 measurement (ships 0.0 pre-T26); a
+    non-positive rate means "no measurement yet", so the term is 0 and
+    Pause.cost reduces to the snapshot ``V_u_program`` — the same
+    interim degradation as :func:`forecast`.
+    """
+    if prefill_bps <= 0.0:
+        return 0.0
+    inflight_bytes = sum(_program_inflight(pu).values())
+    return inflight_bytes / prefill_bps
+
+
+def pause_relief(pu: Dict[str, Any]) -> Dict[str, int]:
+    """DESIGN §8 ``pause_relief`` — per-HBM-subpool bytes pausing p frees:
+    ``snapshot_relief[sp] + future_inflight_savings[sp]`` where
+    ``snapshot_relief = inflight[sp] + committed[sp]`` (p's in-flight
+    decode bytes + its exclusive radix share) and
+    ``future_inflight_savings`` mirrors :func:`forecast_inflight_demand`
+    (0 under the current schema)."""
+    inflight = _program_inflight(pu)
+    committed = _program_committed(pu)
+    relief: Dict[str, int] = {}
+    for sp in set(inflight) | set(committed):
+        v = inflight.get(sp, 0) + committed.get(sp, 0)
+        if v > 0:
+            relief[sp] = v
+    return relief
+
+
+def pause_candidates(
+    state: SchedulerState,
+    prefill_bps: Optional[float] = None,
+) -> List[Any]:
+    """DESIGN §8 ``pause_candidates`` — one ``Pause`` per REASONING /
+    ACTING program (ENDED + PAUSED skipped).
+
+      cost   = V_u_program(p) + marginal_pause_cost(p)     # work-loss (s)
+      relief = pause_relief(p)                             # HBM bytes (flat sp dict)
+
+    ``relief`` is the flat ``{sp: bytes}`` shape; ``joint_decide``
+    normalises it to ``{"HBM": {...}}`` before the DP (DESIGN §9).
+    ``V_u_program`` uses the shared-aware aggregate (each unit's V_u
+    split across holders) — the interim attribution under §7's binary
+    p_hat; DESIGN's no-weight form is correct once T11's holder-product
+    conditional p_hat lands (#126).
+    """
+    from baselines.knapsack import Pause
+    if prefill_bps is None:
+        prefill_bps = float(state.throughput_ema.get("prefill_bps", 0.0))
+    vprog = shared_aware_prog_scores(state)
+    out: List[Any] = []
+    for pid, pu in state.per_program_usage.items():
+        if pu.get("state") not in _ACTIVE_STATES:
+            continue
+        relief = pause_relief(pu)
+        cost = vprog.get(pid, 0.0) + marginal_pause_cost(pu, prefill_bps)
+        out.append(Pause(cost=cost, relief=relief, pid=pid))
+    return out
+
+
+def capacity_fits(
+    forecast_dict: Dict[str, float],
+    re_use: Dict[str, int],
+    hbm_subpools: Dict[str, Dict[str, int]],
+    theta_hi: float,
+) -> bool:
+    """DESIGN §8 ``capacity_fits`` — true iff for EVERY HBM subpool:
+    ``forecast[sp] + re_use[sp] ≤ theta_hi × cap[sp]``."""
+    for sp, fields in hbm_subpools.items():
+        cap = float(fields["cap_bytes"])
+        proj = forecast_dict.get(sp, 0.0) + float(re_use.get(sp, 0))
+        if proj > theta_hi * cap:
+            return False
+    return True
+
+
+def resume_candidates(
+    state: SchedulerState,
+    heartbeat_s: float,
+    theta_hi: float,
+) -> List[Any]:
+    """DESIGN §8 ``resume_candidates`` — one ``Resume`` per PAUSED program
+    that passes :func:`capacity_fits`.
+
+      gain   = V_u_program_if_active(p, pre_pause_state)   # counterfactual (s)
+      re_use = expected_peak_hbm_after_resume(p)           # HBM bytes (flat sp dict)
+
+    The counterfactual ``gain`` overrides p's state to its
+    ``pre_pause_state``; under §7's binary p_hat a PAUSED holder already
+    counts as alive (only ENDED zeroes p_hat in ``build_paper_state``),
+    so the override is a no-op today and ``gain`` is the same shared-aware
+    aggregate as the Pause cost.  It becomes a true counterfactual once
+    T11's conditional p_hat zeroes paused holders' contribution (#126).
+    ``re_use`` is the flat ``{sp: bytes}`` shape; ``joint_decide``
+    normalises it to ``{"HBM": {...}}``.
+    """
+    from baselines.knapsack import Resume
+    from ._admission_math import expected_peak_hbm_after_resume
+    hbm_subpools = state.tier_usage.pool_cap.get(Tier.HBM, {})
+    # cap dict in the {sp: {"cap_bytes": ...}} shape capacity_fits wants.
+    cap_view = {sp: {"cap_bytes": cap} for sp, cap in hbm_subpools.items()}
+    fc = forecast(state, heartbeat_s)
+    vprog = shared_aware_prog_scores(state)
+    out: List[Any] = []
+    for pid, pu in state.per_program_usage.items():
+        if pu.get("state") != "PAUSED":
+            continue
+        re_use = expected_peak_hbm_after_resume(
+            pu.get("unit_hashes", []), state.units)
+        if not capacity_fits(fc, re_use, cap_view, theta_hi):
+            continue
+        out.append(Resume(gain=vprog.get(pid, 0.0), re_use=re_use, pid=pid))
+    return out
+

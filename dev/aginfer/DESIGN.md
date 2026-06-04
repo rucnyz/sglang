@@ -2278,6 +2278,38 @@ subtract bug).  Infeasibility is raised as `KnapsackInfeasibleError`
 (forensic context) and mapped to `fatal("joint_decide_infeasible")`
 by `joint_decide`, keeping the primitive pure + testable.
 
+**Three further corrections (#194 — live integration).** Wiring the DP
+into the live path surfaced three more deviations from the pseudocode
+above, all verified in `verify/joint_decide/` + `verify/integration_stress/`:
+
+1. **Multiple-choice, not plain 0/1, over a unit's transitions.**
+   `migrate_candidates` emits several transitions per unit (evict /
+   spill / DROP).  A plain 0/1 knapsack can take TWO of them, which is
+   physically incoherent — the relief double-counts the unit's bytes
+   and the costs aren't additive (each is scored as a marginal change
+   from the unit's ORIGINAL residence).  The DP treats candidates
+   sharing a `group` key (= unit hash) as **at-most-one**
+   (multiple-choice); Pause/Resume are ungrouped (one per program).
+2. **`cap_left` clamps to `max(0, cap − used)`.**  A destination tier
+   can be over-subscribed (`cap − used < 0`).  A negative budget makes
+   the DP reject even zero-acquire DROP candidates (the cap accumulator
+   starts at 0, already `>` a negative bound), spuriously infeasible.
+   No room is 0 room, never less than zero.
+3. **Pressure infeasibility → best-effort, not `fatal`.**  The claim
+   above that infeasibility "is an algorithm bug, not a workload
+   reality" is FALSE for **in-flight-dominated pressure**: when most of
+   HBM is decode bytes (tiny radix footprint) that migration can't
+   touch, and no Pause candidate is available (e.g. `per_program_usage`
+   not yet measurement-populated), no subset reaches `bytes_needed` —
+   a workload reality.  Crashing the daemon on transient over-pressure
+   contradicts §6's fire-and-forget "re-evaluate on the next event"
+   recovery and §10's reactive backstop (sglang's own eviction).  The
+   pressure phase frees the **max-relief subset** (`best_effort`) and
+   logs the shortfall; `fatal` is reserved for the genuine
+   misconfiguration (the `max_dp_cells` DP blow-up).  The
+   `fatal("joint_decide_infeasible")` call above is therefore not on
+   the live path.
+
 #### Why exact DP, not greedy
 
 LP-relaxation greedy (sort by `cost/relief`, take cheapest-per-byte

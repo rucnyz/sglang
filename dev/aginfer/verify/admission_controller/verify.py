@@ -1,785 +1,307 @@
-"""T8 verify: admission_controller event-driven pause/resume.
+"""admission_controller — DESIGN §8 program-level candidate generator.
 
-Layer A (in-process, this file):
-  Stub /aginfer/state with mutable backing; drive memory_pressure /
-  pressure_resolved events through the EventRouter; assert pause
-  victim, FIFO resume, hysteresis, shared-aware aggregation, anti-
-  timer contract, latency.
+Rewritten for #194 (DESIGN §9 joint_decide).  Admission is no longer an
+event-driven pause/resume loop composed on top of kv_scheduler — that
+"Gauss-Seidel decompose" was superseded by the single ``joint_decide``.
+This module is now the **program-level candidate generator** §9
+consumes; this verify pins that generator surface:
 
-Per memory:feedback-latency-multi-run / feedback-per-task-docs.
+  * ``shared_aware_prog_scores`` — per-program aggregate V_u (holder-
+    divided) used as Pause cost / Resume gain.
+  * ``forecast`` / ``forecast_horizon`` / ``forecast_inflight_demand``
+    — the §9 pressure / headroom trigger input (per-HBM-subpool).
+  * ``marginal_pause_cost`` / ``pause_relief`` — Pause cost + relief
+    components (DESIGN §8).
+  * ``pause_candidates`` — one Pause per REASONING/ACTING program.
+  * ``capacity_fits`` / ``resume_candidates`` — one Resume per PAUSED
+    program that fits.
+
+These are pure functions over a ``SchedulerState`` (built from the
+post-T17 ``/aginfer/state`` schema); no server, no event loop.  The
+live wiring (joint_decide selection + dispatch) is pinned by
+``verify/joint_decide`` + ``verify/integration_stress``.
 
 Run::
 
-    cd /scratch/yuzhou/projects/sglang/dev/aginfer
-    python verify/t8/verify.py
-
-Expected last line: ``=== T8 PASSED ===``.
+    cd /scratch/yuzhou/projects/sglang
+    python dev/aginfer/verify/admission_controller/verify.py
 """
 from __future__ import annotations
 
-import ast
-import asyncio
-import inspect
-import socket
-import statistics
 import sys
-import time
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import httpx
-import uvicorn
-from fastapi import FastAPI, Request
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
 sys.path.insert(0, str(_AGINFER_ROOT))
 
 from baselines.base import Tier  # noqa: E402
-from daemon.admission_controller import (  # noqa: E402
-    AdmissionController,
-    attach_admission_controller,
-    shared_aware_prog_scores,
-)
-from daemon.events import Event, EventBus, EventKind  # noqa: E402
-from daemon.event_router import EventRouter  # noqa: E402
-from daemon.kv_scheduler import (  # noqa: E402
-    KvScheduler,
-    attach_kv_scheduler,
-    build_paper_state,
-)
-from daemon.program_tracker import ProgramTracker, State  # noqa: E402
+from daemon import admission_controller as adm  # noqa: E402
+from daemon.events import Event, EventKind  # noqa: E402
+from daemon.kv_scheduler import build_paper_state  # noqa: E402
+from daemon.program_tracker import ProgramTracker  # noqa: E402
 
 
-# ---------------------------------------------------------------- helpers
+def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
+def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
 
 
-def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    p = s.getsockname()[1]
-    s.close()
-    return p
+class StageFail(AssertionError):
+    pass
 
 
-@asynccontextmanager
-async def run_server(app: FastAPI, host: str, port: int):
-    cfg = uvicorn.Config(app, host=host, port=port, log_level="error")
-    server = uvicorn.Server(cfg)
-    task = asyncio.create_task(server.serve())
-    for _ in range(200):
-        if server.started:
-            break
-        await asyncio.sleep(0.01)
-    if not server.started:
-        raise RuntimeError(f"uvicorn never started on :{port}")
-    try:
-        yield
-    finally:
-        server.should_exit = True
-        await task
+# ---------------------------------------------------------------- fixtures
+
+GB = 1024 ** 3
+MB = 1024 ** 2
 
 
-def make_pressure_state(
-    *,
-    n_programs: int = 4,
-    shared_tokens: int = 1024,
-    tail_tokens: int = 4096,
-    hbm_cap: int = 32 * 1024 * 1024,
-    used_bytes: Optional[int] = None,
-    bytes_per_token: int = 2048,
-) -> Dict[str, Any]:
-    """N programs each holding a shared platform unit + own tail.
-
-    Tails are sized so `used_bytes` is OVER hbm_cap unless overridden,
-    giving a realistic memory_pressure trigger.
-    """
-    units: List[Dict[str, Any]] = []
-    holders = [f"prog-{i}" for i in range(n_programs)]
-    units.append(
-        {
-            "hash": "u-shared-platform",
-            "tier": "HBM",
-            "n_tokens": shared_tokens,
-            "n_bytes": shared_tokens * bytes_per_token,
-            "last_access_time": 100,
-            "hit_count": 50 * n_programs,
-            "session_ids": holders,
-        }
-    )
-    for i in range(n_programs):
-        units.append(
-            {
-                "hash": f"u-tail-{i}",
-                "tier": "HBM",
-                "n_tokens": tail_tokens,
-                "n_bytes": tail_tokens * bytes_per_token,
-                "last_access_time": 100 - i,  # earlier programs newer
-                "hit_count": (n_programs - i) * 8,  # ascending p_hat → desc score
-                "session_ids": [f"prog-{i}"],
-            }
-        )
-    if used_bytes is None:
-        used_bytes = sum(u["n_bytes"] for u in units)
+def _unit(*, uhash, residence, holders, n_tokens=1000,
+          n_bytes_per_tier=None, last_access_time=0, hit_count=1,
+          subpool="kv") -> Dict[str, Any]:
+    if n_bytes_per_tier is None:
+        nb = {t: {subpool: n_tokens * 2048} for t in residence}
+    else:
+        nb = {t: (v if isinstance(v, dict) else {subpool: int(v)})
+              for t, v in n_bytes_per_tier.items()}
     return {
-        "tier_usage": {
-            "HBM": {"used_bytes": used_bytes, "cap_bytes": hbm_cap},
-            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
-            "DISK": {"used_bytes": 0, "cap_bytes": 0},
-        },
+        "hash": uhash, "residence": list(residence), "n_tokens": n_tokens,
+        "n_bytes": nb, "last_access_time": last_access_time,
+        "hit_count": hit_count, "session_ids": list(holders),
+    }
+
+
+def _program(state="REASONING", *, inflight=None, committed=None,
+             unit_hashes=None, pre_pause_state=None) -> Dict[str, Any]:
+    return {
+        "state": state, "pre_pause_state": pre_pause_state,
+        "hbm": {"committed": committed or {}, "inflight": inflight or {}},
+        "dram": {"committed": {}}, "unit_hashes": unit_hashes or [],
+    }
+
+
+def _sp(used, cap, page=64 * 1024) -> Dict[str, int]:
+    return {"used_bytes": used, "cap_bytes": cap,
+            "available_bytes": max(0, cap - used),
+            "evictable_bytes": used, "page_bytes": page}
+
+
+def _state_json(*, units, programs=None, hbm=None, dram=None, disk=None,
+                prefill_bps=0.0, decode_per_program=None,
+                time_counter=100) -> Dict[str, Any]:
+    hbm = hbm or {"kv": _sp(1 * GB, 10 * GB)}
+    dram = dram or {"kv": _sp(1 * GB, 40 * GB)}
+    disk = disk or {"kv": _sp(0, 200 * GB)}
+    return {
+        "time_counter": time_counter,
+        "throughput_ema": {"prefill_bps": prefill_bps,
+                           "decode_per_program": decode_per_program or {}},
+        "pool_usage": {"HBM": {"subpools": hbm},
+                       "DRAM": {"subpools": dram},
+                       "DISK": {"subpools": disk}},
+        "per_program_usage": programs or {},
         "units": units,
-        "time_counter": 200,
+        "link_stats": {link: {"peak_bw_bps": 64 * GB,
+                              "recent_throughput_bps": 0.0,
+                              "time_since_last_sample_s": 5.0}
+                       for link in ("HBM->DRAM", "DRAM->HBM", "DRAM->DISK",
+                                    "DISK->DRAM", "HBM->DISK", "DISK->HBM")},
+        "tier_holding_cost": {t: {"kv": {"h_max_per_byte_sec": 0.0}}
+                              for t in ("HBM", "DRAM", "DISK")},
     }
 
 
-def build_stub_sglang(state_provider) -> FastAPI:
-    """Stub /aginfer/state + /aginfer/migrate."""
-    app = FastAPI()
-
-    @app.get("/aginfer/state")
-    async def _state() -> Any:
-        return state_provider()
-
-    @app.post("/aginfer/migrate")
-    async def _migrate(raw: Request) -> Any:
-        await raw.body()
-        return {"applied": 0, "applied_hashes": [], "skipped": []}
-
-    return app
+def _build(sj, tracker, event):
+    return build_paper_state(sj, event=event, tracker=tracker,
+                             unknown_tier_log=set())
 
 
-@asynccontextmanager
-async def boot_stack(
-    sglang_base_url: str,
-    tracker: ProgramTracker,
-    *,
-    theta_hi: float = 0.85,
-    theta_lo: float = 0.70,
-    max_pauses_per_event: int = 16,
-    enable_kv_scheduler: bool = True,
-):
-    bus = EventBus()
-    router = EventRouter(bus=bus, sglang_base_url=sglang_base_url)
-    sched: Optional[KvScheduler] = None
-    if enable_kv_scheduler:
-        sched = KvScheduler(tracker=tracker, sglang_base_url=sglang_base_url)
-        attach_kv_scheduler(router, sched)
-    admission = AdmissionController(
-        tracker=tracker,
-        theta_hi=theta_hi,
-        theta_lo=theta_lo,
-        max_pauses_per_event=max_pauses_per_event,
-    )
-    attach_admission_controller(router, admission)
-    await router.start()
-    try:
-        yield router, admission, sched
-    finally:
-        await router.stop()
-        # T36 cleanup: KvScheduler.aclose() was removed (the class no
-        # longer owns an httpx client — outbound queue does).  Nothing
-        # to close on sched.
+# ---------------------------------------------------------------- stages
 
 
-# ---------------------------------------------------------------- steps
-
-
-def step_shared_aware_aggregation() -> None:
-    """[1] prog_score divides each unit's V_u by |holders|; shared
-    platform doesn't double-count.
-
-    Audit round-2 R2-M1: round-1's numerical pin imported
-    `_value_at_current_tier` and used it to compute the "expected"
-    value, then asserted the production code (which calls the same
-    function) matched — a tautology.  A regression in
-    `_value_at_current_tier` (e.g., reverting the B1 holding-tax
-    restore) would produce matching expected+actual → test still
-    passes.
-
-    Now we hand-derive the expected V_u from paper §7's atomic
-    primitives (`reload_cost` + `holding_unit_cost` direct calls)
-    so a regression in the AGGREGATED function `_value_at_current_tier`
-    diverges from the hand-derived expected.
-    """
-    from baselines.costs import default_costs as _dc
-    from baselines.ours_greedy import reload_cost, holding_unit_cost
-
-    state_json = make_pressure_state(n_programs=4)
+def stage_scoring() -> None:
+    """shared_aware_prog_scores: each unit's V_u split across holders, so
+    a shared prefix doesn't double-count across the programs holding it."""
     tracker = ProgramTracker()
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.MEMORY_PRESSURE),
-        tracker=tracker,
-        unknown_tier_log=set(),
-    )
-    scores = shared_aware_prog_scores(s)
-    # All 4 programs scored.
-    assert set(scores) == {f"prog-{i}" for i in range(4)}, scores
-    sorted_pids = sorted(scores, key=lambda p: scores[p])
-    assert sorted_pids[0] == "prog-3", (
-        f"expected prog-3 (lowest hit_count) to score lowest; sorted={sorted_pids}"
-    )
-
-    # Hand-derive paper §7 V_u — independent of `_value_at_current_tier`
-    # so a regression there (e.g., dropping the holding term) shows up
-    # as a mismatch instead of being self-consistent.
-    costs = _dc()
-    pi_u = 1.0e-4
-
-    def _paper_v_u(u) -> float:
-        # V_u(tier) = p_hat * (R(DROP) - R(tier)) - h * b_u / lambda
-        save_prefill = u.p_hat * (
-            reload_cost(u, Tier.DROP, costs, pi_u)
-            - reload_cost(u, u.tier, costs, pi_u)
-        )
-        used = s.tier_usage.used_bytes.get(u.tier, 0)
-        cap = s.tier_usage.capacity_bytes.get(u.tier, 0)
-        h = holding_unit_cost(u.tier, used, cap, costs)
-        hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
-        return save_prefill - h * u.n_bytes * hold_time
-
-    shared = s.units["u-shared-platform"]
-    v_shared = _paper_v_u(shared)
-    expected_shared_per_holder = v_shared / 4
-
-    for i in range(4):
-        tail = s.units[f"u-tail-{i}"]
-        v_tail = _paper_v_u(tail)
-        expected = v_tail + expected_shared_per_holder
-        actual = scores[f"prog-{i}"]
-        assert abs(actual - expected) < 1e-9, (
-            f"prog-{i}: shared-aware aggregation off: got {actual}, "
-            f"expected {expected} (= V_tail {v_tail} + V_shared/4 "
-            f"{expected_shared_per_holder}).  Note: expected is hand-"
-            f"derived from paper §7 primitives, NOT via "
-            f"_value_at_current_tier (which is the function under test)."
-        )
+    tracker.observe_arrival("A")
+    tracker.observe_arrival("B")
+    # u-shared held by A,B (each gets half); u-tail-A held by A only.
+    sj = _state_json(units=[
+        _unit(uhash="u-shared", residence=["HBM"], holders=["A", "B"],
+              n_tokens=2000, hit_count=40),
+        _unit(uhash="u-tail-A", residence=["HBM"], holders=["A"],
+              n_tokens=4000, hit_count=8),
+    ])
+    ev = Event(kind=EventKind.MEMORY_PRESSURE, session=None)
+    st = _build(sj, tracker, ev)
+    scores = adm.shared_aware_prog_scores(st)
+    if set(scores) != {"A", "B"}:
+        raise StageFail(f"scoring: expected programs A,B; got {set(scores)}")
+    # B holds only half of u-shared; A holds half of u-shared + all of
+    # its tail → A's aggregate strictly exceeds B's.
+    if not (scores["A"] > scores["B"]):
+        raise StageFail(f"scoring: A (shared/2 + tail) must exceed B "
+                        f"(shared/2): {scores}")
+    # Degenerate: a unit with one holder contributes its full V_u.
+    sj1 = _state_json(units=[
+        _unit(uhash="solo", residence=["HBM"], holders=["A"], hit_count=5)])
+    st1 = _build(sj1, tracker, ev)
+    from baselines.costs import default_costs
+    from daemon.admission_controller import _value_at_current_tier
+    full = _value_at_current_tier(st1.units["solo"], st1, default_costs(), 1e-4)
+    if abs(adm.shared_aware_prog_scores(st1)["A"] - full) > 1e-12:
+        raise StageFail("scoring: single-holder share must equal full V_u")
+    print(_green("  [scoring] shared-aware V_u aggregation (holder split) OK"))
 
 
-def step_degenerate_full_share() -> None:
-    """[2] WORST CASE: 32 programs all sharing one unit, no unique
-    tails.  Shared-aware aggregation should give every program the
-    same score (1 × V_share / 32 ≈ identical).  Naive sum would
-    multiply by 32 — exposing this lets tie-break (by pid) pick A
-    program deterministically."""
-    n = 32
-    holders = [f"p{i:02d}" for i in range(n)]
-    state_json = {
-        "tier_usage": {
-            "HBM": {"used_bytes": 32 * 1024 * 1024, "cap_bytes": 64 * 1024 * 1024},
-            "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
-            "DISK": {"used_bytes": 0, "cap_bytes": 0},
-        },
-        "units": [
-            {
-                "hash": "u-shared-only",
-                "tier": "HBM",
-                "n_tokens": 1024,
-                "n_bytes": 32 * 1024 * 1024,
-                "last_access_time": 0,
-                "hit_count": 100,
-                "session_ids": holders,
-            }
+def stage_forecast() -> None:
+    """forecast = per-HBM-subpool used_bytes (+ inflight term, 0 under
+    the T26/T11 placeholders); horizon falls back to heartbeat_s."""
+    tracker = ProgramTracker()
+    tracker.observe_arrival("S")
+    sj = _state_json(
+        units=[_unit(uhash="u", residence=["HBM"], holders=["S"])],
+        hbm={"full": _sp(3 * GB, 10 * GB), "mamba": _sp(8 * GB, 9 * GB)})
+    st = _build(sj, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session="S"))
+    fc = adm.forecast(st, heartbeat_s=5.0)
+    if fc != {"full": float(3 * GB), "mamba": float(8 * GB)}:
+        raise StageFail(f"forecast must equal per-subpool used_bytes: {fc}")
+    if adm.forecast_horizon(st, 5.0) != 5.0:
+        raise StageFail("forecast_horizon must fall back to heartbeat_s")
+    if adm.forecast_inflight_demand(st, 5.0):
+        raise StageFail("inflight demand must be 0 pre-T26/T11")
+    # decode_per_program populated but bytes/E[rem] still unwired → still 0.
+    sj2 = _state_json(
+        units=[_unit(uhash="u", residence=["HBM"], holders=["S"])],
+        decode_per_program={"S": 1000.0})
+    st2 = _build(sj2, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session="S"))
+    if adm.forecast_inflight_demand(st2, 5.0):
+        raise StageFail("inflight demand must stay 0 until all inputs wired")
+    print(_green("  [forecast] per-subpool used_bytes; horizon; inflight=0 OK"))
+
+
+def stage_pause_cost_relief() -> None:
+    """marginal_pause_cost (0 while prefill_bps=0) + pause_relief
+    (inflight + committed snapshot)."""
+    pu = _program("REASONING", inflight={"kv": 5 * MB, "mamba": 2 * MB},
+                  committed={"kv": 3 * MB})
+    if adm.marginal_pause_cost(pu, prefill_bps=0.0) != 0.0:
+        raise StageFail("marginal_pause_cost must be 0 while prefill_bps=0")
+    # with a measured prefill rate: inflight bytes / rate.
+    mc = adm.marginal_pause_cost(pu, prefill_bps=7.0 * MB)
+    if abs(mc - (7 * MB) / (7.0 * MB)) > 1e-9:
+        raise StageFail(f"marginal_pause_cost = Σinflight/prefill_bps; got {mc}")
+    relief = adm.pause_relief(pu)
+    if relief != {"kv": 8 * MB, "mamba": 2 * MB}:
+        raise StageFail(f"pause_relief = inflight+committed per sp; got {relief}")
+    print(_green("  [pause-cost] marginal_pause_cost + pause_relief OK"))
+
+
+def stage_pause_candidates() -> None:
+    """pause_candidates: one Pause per REASONING/ACTING program; PAUSED
+    + ENDED skipped; cost = V_u_program (+marginal, 0 here)."""
+    tracker = ProgramTracker()
+    for p in ("A", "B", "C", "D"):
+        tracker.observe_arrival(p)
+    tracker.observe_completion("B")  # ACTING
+    tracker.pause("C")               # PAUSED
+    tracker.end("D")                 # ENDED
+    programs = {
+        "A": _program("REASONING", inflight={"kv": 4 * MB}, unit_hashes=["uA"]),
+        "B": _program("ACTING", committed={"kv": 2 * MB}, unit_hashes=["uB"]),
+        "C": _program("PAUSED", inflight={"kv": 1 * MB}, unit_hashes=["uC"]),
+        "D": _program("ENDED", unit_hashes=["uD"]),
+    }
+    sj = _state_json(
+        units=[_unit(uhash=f"u{p}", residence=["HBM"], holders=[p])
+               for p in ("A", "B", "C", "D")],
+        programs=programs)
+    st = _build(sj, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session=None))
+    pcs = adm.pause_candidates(st)
+    if {p.pid for p in pcs} != {"A", "B"}:
+        raise StageFail(f"pause_candidates must be REASONING+ACTING only "
+                        f"(PAUSED/ENDED skipped); got {[p.pid for p in pcs]}")
+    vprog = adm.shared_aware_prog_scores(st)
+    pa = next(p for p in pcs if p.pid == "A")
+    if abs(pa.cost - vprog["A"]) > 1e-12:
+        raise StageFail("pause cost must equal V_u_program (marginal=0)")
+    if pa.relief != {"kv": 4 * MB}:
+        raise StageFail(f"A relief = inflight 4MB; got {pa.relief}")
+    print(_green("  [pause-cands] REASONING/ACTING only; cost+relief OK"))
+
+
+def stage_resume_candidates() -> None:
+    """resume_candidates: PAUSED only; gain = V_u_program; re_use from
+    expected_peak_hbm_after_resume; capacity_fits gates overflow."""
+    tracker = ProgramTracker()
+    tracker.pause("P")
+    tracker.observe_arrival("R")
+    sj = _state_json(
+        units=[
+            _unit(uhash="uP", residence=["DRAM"], holders=["P"],
+                  n_bytes_per_tier={"DRAM": 1 * GB}),
+            _unit(uhash="uR", residence=["HBM"], holders=["R"]),
         ],
-        "time_counter": 1,
-    }
-    tracker = ProgramTracker()
-    s = build_paper_state(
-        state_json,
-        event=Event(kind=EventKind.MEMORY_PRESSURE),
-        tracker=tracker,
-        unknown_tier_log=set(),
-    )
-    scores = shared_aware_prog_scores(s)
-    assert len(scores) == n, len(scores)
-    # All equal.
-    values = list(scores.values())
-    assert max(values) - min(values) < 1e-9, (
-        f"degenerate full-share scores diverged: range="
-        f"{max(values) - min(values)}, expected ~0"
-    )
+        programs={"P": _program("PAUSED", unit_hashes=["uP"],
+                                pre_pause_state="REASONING"),
+                  "R": _program("REASONING", unit_hashes=["uR"])},
+        hbm={"kv": _sp(1 * GB, 10 * GB)})
+    st = _build(sj, tracker, Event(kind=EventKind.PRESSURE_RESOLVED, session="P"))
+    rcs = adm.resume_candidates(st, heartbeat_s=5.0, theta_hi=0.85)
+    if {r.pid for r in rcs} != {"P"}:
+        raise StageFail(f"resume_candidates must be PAUSED only; "
+                        f"got {[r.pid for r in rcs]}")
+    if rcs[0].re_use.get("kv", 0) != 1 * GB:
+        raise StageFail(f"P re_use = its DRAM-resident bytes (1GB); "
+                        f"got {rcs[0].re_use}")
+    # capacity_fits: HBM near cap → resume would overflow → omitted.
+    sj_full = _state_json(
+        units=[_unit(uhash="uP", residence=["DRAM"], holders=["P"],
+                     n_bytes_per_tier={"DRAM": 2 * GB})],
+        programs={"P": _program("PAUSED", unit_hashes=["uP"],
+                                pre_pause_state="REASONING")},
+        hbm={"kv": _sp(8 * GB, 10 * GB)})  # 8GB + 2GB re_use > 0.85*10GB
+    st_full = _build(sj_full, tracker,
+                     Event(kind=EventKind.PRESSURE_RESOLVED, session="P"))
+    if adm.resume_candidates(st_full, heartbeat_s=5.0, theta_hi=0.85):
+        raise StageFail("capacity_fits must omit a Resume that overflows "
+                        "theta_hi")
+    print(_green("  [resume-cands] PAUSED only; gain/re_use; capacity_fits OK"))
 
 
-async def step_pause_lowest_under_pressure() -> None:
-    """[3] memory_pressure with occ > theta_hi pauses the lowest-
-    scoring program."""
-    state_holder = {"state": make_pressure_state(n_programs=4)}
-    stub = build_stub_sglang(lambda: state_holder["state"])
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    tracker = ProgramTracker()
-    for i in range(4):
-        tracker.observe_arrival(f"prog-{i}")
-    async with run_server(stub, "127.0.0.1", port):
-        async with boot_stack(url, tracker, theta_hi=0.5, theta_lo=0.3) as (router, admission, _sched):
-            await router.bus.emit(
-                Event(
-                    kind=EventKind.MEMORY_PRESSURE,
-                    payload={"state": "HIGH", "occ": 0.95},
-                )
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            paused = admission.paused()
-            assert paused, "expected at least one pause"
-            # Lowest scorer per step [1] is prog-3.
-            assert paused[0] == "prog-3", paused
-            assert tracker.state("prog-3") == State.PAUSED
+_STAGES = [
+    ("scoring", stage_scoring),
+    ("forecast", stage_forecast),
+    ("pause-cost", stage_pause_cost_relief),
+    ("pause-cands", stage_pause_candidates),
+    ("resume-cands", stage_resume_candidates),
+]
 
 
-async def step_fifo_resume_with_hysteresis() -> None:
-    """[4] pressure_resolved resumes ONE program at a time in FIFO
-    order; stops if occ would cross theta_hi again."""
-    state_holder = {"state": make_pressure_state(n_programs=4)}
-    stub = build_stub_sglang(lambda: state_holder["state"])
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    tracker = ProgramTracker()
-    for i in range(4):
-        tracker.observe_arrival(f"prog-{i}")
-    async with run_server(stub, "127.0.0.1", port):
-        async with boot_stack(
-            url, tracker,
-            theta_hi=0.6, theta_lo=0.4,
-            max_pauses_per_event=1,  # one pause per event for deterministic FIFO test
-        ) as (router, admission, _sched):
-            # Fire two pressure events to pause 2 programs.
-            for _ in range(2):
-                await router.bus.emit(
-                    Event(kind=EventKind.MEMORY_PRESSURE,
-                          payload={"state": "HIGH", "occ": 0.95})
-                )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            paused_before = admission.paused()
-            assert len(paused_before) == 2, paused_before
-            # Drop the state to a "well below theta_lo" occ so resume can fire.
-            state_holder["state"] = make_pressure_state(
-                n_programs=4,
-                used_bytes=1 * 1024 * 1024,  # tiny used
-                hbm_cap=100 * 1024 * 1024,
-            )
-            # Pressure_resolved fires ONE resume.
-            await router.bus.emit(
-                Event(kind=EventKind.PRESSURE_RESOLVED,
-                      payload={"state": "OK", "occ": 0.01})
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            paused_after = admission.paused()
-            assert len(paused_after) == len(paused_before) - 1, (
-                f"expected exactly one resume; before={paused_before}, "
-                f"after={paused_after}"
-            )
-            # FIFO: the oldest (paused_before[0]) is the one removed.
-            assert paused_after == paused_before[1:], (
-                f"FIFO violation: before={paused_before}, after={paused_after}"
-            )
-
-
-async def step_hysteresis_holds_high_occ() -> None:
-    """[5] pressure_resolved with occ STILL >= theta_lo: NO resume."""
-    state_holder = {"state": make_pressure_state(n_programs=4)}
-    stub = build_stub_sglang(lambda: state_holder["state"])
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    tracker = ProgramTracker()
-    for i in range(4):
-        tracker.observe_arrival(f"prog-{i}")
-    async with run_server(stub, "127.0.0.1", port):
-        async with boot_stack(
-            url, tracker,
-            theta_hi=0.6, theta_lo=0.4, max_pauses_per_event=1,
-        ) as (router, admission, _sched):
-            await router.bus.emit(
-                Event(kind=EventKind.MEMORY_PRESSURE,
-                      payload={"state": "HIGH", "occ": 0.95})
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            assert len(admission.paused()) == 1
-            # Now fire pressure_resolved but state still HIGH (just
-            # below theta_hi but above theta_lo).
-            state_holder["state"] = make_pressure_state(
-                n_programs=4,
-                used_bytes=int(0.5 * 100 * 1024 * 1024),  # occ=0.50 between lo=0.4 and hi=0.6
-                hbm_cap=100 * 1024 * 1024,
-            )
-            await router.bus.emit(
-                Event(kind=EventKind.PRESSURE_RESOLVED,
-                      payload={"state": "OK", "occ": 0.50})
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            assert len(admission.paused()) == 1, (
-                f"hysteresis broken: pressure_resolved at occ=0.50 (between "
-                f"theta_lo=0.4 and theta_hi=0.6) resumed prematurely; "
-                f"paused={admission.paused()}"
-            )
-
-
-async def step_no_victim_when_all_paused() -> None:
-    """[6] WORST CASE: every program already paused, pressure
-    persists.  Log + no-op, don't crash."""
-    state_holder = {"state": make_pressure_state(n_programs=2)}
-    stub = build_stub_sglang(lambda: state_holder["state"])
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    tracker = ProgramTracker()
-    tracker.observe_arrival("prog-0")
-    tracker.observe_arrival("prog-1")
-    # Pre-pause everyone.
-    tracker.pause("prog-0")
-    tracker.pause("prog-1")
-    async with run_server(stub, "127.0.0.1", port):
-        async with boot_stack(url, tracker, theta_hi=0.1, theta_lo=0.05) as (router, admission, _sched):
-            await router.bus.emit(
-                Event(kind=EventKind.MEMORY_PRESSURE,
-                      payload={"state": "HIGH", "occ": 0.95})
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            # No new pauses since both were pre-paused (we count
-            # admission.pause_decisions, NOT total tracker PAUSE count).
-            assert admission.pause_decisions == 0, admission.pause_decisions
-
-
-def step_anti_timer_contract() -> None:
-    """[7] CONTRACT: admission_controller.py has NO sleep / call_later
-    / call_at / perf_counter / time.sleep references."""
-    from daemon import admission_controller as ac_mod
-
-    src = inspect.getsource(ac_mod)
-    tree = ast.parse(src)
-    forbidden = ("sleep", "call_later", "call_at", "perf_counter")
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in forbidden:
-            raise AssertionError(
-                f"timer primitive `.{node.attr}` in admission_controller.py "
-                f"violates the no-polling contract"
-            )
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id in forbidden:
-                raise AssertionError(
-                    f"timer primitive `{node.func.id}(...)` in "
-                    f"admission_controller.py violates the no-polling contract"
-                )
-
-
-async def step_max_pauses_per_event_cap() -> None:
-    """[8] WORST CASE: pressure persists indefinitely (state never
-    drops).  max_pauses_per_event caps the burst at exactly 16
-    (default).  Audit round-1 N3: tightened from `<= 16` to `== 16`
-    so removing the cap entirely would now FAIL the test.  The 20-
-    program fixture + persistent pressure guarantees the cap is
-    reached (16 < 20)."""
-    state_holder = {"state": make_pressure_state(n_programs=20)}
-    stub = build_stub_sglang(lambda: state_holder["state"])
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    tracker = ProgramTracker()
-    for i in range(20):
-        tracker.observe_arrival(f"prog-{i}")
-    async with run_server(stub, "127.0.0.1", port):
-        async with boot_stack(url, tracker, theta_hi=0.5, theta_lo=0.3) as (router, admission, _sched):
-            await router.bus.emit(
-                Event(kind=EventKind.MEMORY_PRESSURE,
-                      payload={"state": "HIGH", "occ": 0.95})
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=10.0)
-            assert admission.pause_decisions == 16, (
-                f"expected exactly 16 pauses (max_pauses_per_event cap "
-                f"with 20-program persistent pressure); got "
-                f"{admission.pause_decisions}"
-            )
-
-
-async def step_handler_latency_at_32_programs() -> dict:
-    """[9] COST: per-event handler wall time < 10 ms at 32 programs.
-
-    Per memory:feedback-latency-multi-run: 5-run mean ± std.
-    """
-    state_holder = {"state": make_pressure_state(n_programs=32)}
-    stub = build_stub_sglang(lambda: state_holder["state"])
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    tracker = ProgramTracker()
-    for i in range(32):
-        tracker.observe_arrival(f"prog-{i}")
-
-    N_RUNS = 5
-    run_ms: List[float] = []
-    async with run_server(stub, "127.0.0.1", port):
-        async with boot_stack(url, tracker, theta_hi=0.99) as (router, admission, _sched):
-            # theta_hi=0.99 ensures pause won't actually fire (occ<0.99 with our fixture),
-            # so we measure the steady-state aggregation+fetch cost only.
-            # Warmup.
-            for _ in range(2):
-                await router.bus.emit(
-                    Event(kind=EventKind.MEMORY_PRESSURE,
-                          payload={"state": "HIGH", "occ": 0.95})
-                )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-
-            for _ in range(N_RUNS):
-                t0 = time.perf_counter()
-                await router.bus.emit(
-                    Event(kind=EventKind.MEMORY_PRESSURE,
-                          payload={"state": "HIGH", "occ": 0.95})
-                )
-                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-                run_ms.append((time.perf_counter() - t0) * 1000)
-    stats = {
-        "mean": statistics.mean(run_ms),
-        "std": statistics.stdev(run_ms),
-        "envelope": statistics.mean(run_ms) + 3.0 * statistics.stdev(run_ms),
-    }
-    print(
-        f"    handler @ 32 programs ({N_RUNS} runs): "
-        f"{stats['mean']:.2f} ± {stats['std']:.2f} ms "
-        f"(mean+3σ={stats['envelope']:.2f} ms)"
-    )
-    assert stats["envelope"] < 10.0, (
-        f"per-event handler wall time mean+3σ = "
-        f"{stats['envelope']:.2f} ms exceeds 10 ms budget"
-    )
-    return stats
-
-
-async def step_invalid_watermarks_raise() -> None:
-    """[10] CONTRACT: watermarks must satisfy 0 < theta_lo < theta_hi < 1.
-
-    Audit round-1 N2: previously only tested theta_lo > theta_hi.
-    Now we parameterize over every boundary violation: equal, > 1,
-    == 0, == 1, negative.
-    """
-    bad_cases = [
-        ("equal", 0.5, 0.5),
-        ("inverted", 0.5, 0.8),
-        ("theta_hi==1", 1.0, 0.5),
-        ("theta_lo==0", 0.5, 0.0),
-        ("theta_lo<0", 0.5, -0.1),
-        ("theta_hi>1", 1.1, 0.5),
-    ]
-    for label, hi, lo in bad_cases:
+def main() -> int:
+    print("=" * 64)
+    print("admission_controller — DESIGN §8 candidate generator (#194)")
+    print("=" * 64)
+    failed = []
+    for name, fn in _STAGES:
         try:
-            AdmissionController(
-                tracker=ProgramTracker(), theta_hi=hi, theta_lo=lo
-            )
-        except ValueError as e:
-            assert "theta" in str(e), (label, e)
-            continue
-        raise AssertionError(
-            f"AdmissionController accepted invalid watermarks {label} "
-            f"(theta_hi={hi}, theta_lo={lo}); should raise ValueError"
-        )
-
-
-async def step_single_pause_latency() -> dict:
-    """[12] COST: single-pause path latency (audit round-1 M2).
-
-    Step [9] forces 16-pause spin under fixed state, so the
-    measurement is dominated by stub HTTP RTT × 16.  This step
-    isolates the steady-state path: fire memory_pressure against a
-    state mutator that drops occ BELOW theta_hi after the first
-    pause, so the controller does exactly ONE pause + one re-fetch
-    and bails.  Tighter budget pins the algorithmic work, not the
-    HTTP overhead.
-    """
-    n_programs = 32
-    pressure_high = make_pressure_state(n_programs=n_programs)
-    pressure_low = make_pressure_state(
-        n_programs=n_programs,
-        used_bytes=1 * 1024 * 1024,
-        hbm_cap=100 * 1024 * 1024,
-    )
-
-    class _StateProvider:
-        def __init__(self):
-            self.fetch_count = 0
-
-        def __call__(self):
-            self.fetch_count += 1
-            # First fetch: HIGH (triggers pause).  Subsequent fetches: LOW.
-            return pressure_high if self.fetch_count <= 1 else pressure_low
-
-    N_RUNS = 5
-    run_ms: List[float] = []
-    for _ in range(N_RUNS):
-        provider = _StateProvider()
-        stub = build_stub_sglang(provider)
-        port = _free_port()
-        url = f"http://127.0.0.1:{port}"
-        tracker = ProgramTracker()
-        for i in range(n_programs):
-            tracker.observe_arrival(f"prog-{i}")
-        async with run_server(stub, "127.0.0.1", port):
-            async with boot_stack(
-                url, tracker, theta_hi=0.5, theta_lo=0.3,
-            ) as (router, admission, _sched):
-                # Warmup.
-                await router.bus.emit(
-                    Event(kind=EventKind.MEMORY_PRESSURE,
-                          payload={"state": "HIGH", "occ": 0.95})
-                )
-                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-                # Measured event: state-flip ensures exactly 1 pause.
-                provider.fetch_count = 0  # reset so next fetch is HIGH again
-                t0 = time.perf_counter()
-                await router.bus.emit(
-                    Event(kind=EventKind.MEMORY_PRESSURE,
-                          payload={"state": "HIGH", "occ": 0.95})
-                )
-                await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-                run_ms.append((time.perf_counter() - t0) * 1000)
-    stats = {
-        "mean": statistics.mean(run_ms),
-        "std": statistics.stdev(run_ms),
-        "envelope": statistics.mean(run_ms) + 3.0 * statistics.stdev(run_ms),
-    }
-    print(
-        f"    single-pause @ 32 programs ({N_RUNS} runs): "
-        f"{stats['mean']:.2f} ± {stats['std']:.2f} ms "
-        f"(mean+3σ={stats['envelope']:.2f} ms)"
-    )
-    # Budget: 5 ms.  A single pause is 2 state-fetches (one to
-    # trigger, one to see occ dropped + exit loop) + 1 build + 1
-    # score + 1 pause.  Current envelope ~4.2 ms; HTTP RTTs dominate.
-    # Budget catches a 1.5× algorithmic regression layered on top of
-    # the HTTP cost.
-    assert stats["envelope"] < 5.0, (
-        f"single-pause mean+3σ = {stats['envelope']:.2f} ms exceeds "
-        f"5 ms budget"
-    )
-    return stats
-
-
-async def step_composition_with_kv_scheduler() -> None:
-    """[11] CONTRACT: T7's kv_scheduler.handle fires FIRST (issues
-    migrate), then T8's admission re-checks state and pauses if needed.
-
-    Audit round-1 M3: previously only counted both side effects.  A
-    regression to "admission first, then kv_scheduler" would pass
-    that loose check.  Now we record ORDER via a shared timeline:
-    each handler appends a unique tag; assert kv_scheduler tag
-    precedes admission tag.
-    """
-    state_holder = {"state": make_pressure_state(n_programs=4)}
-    timeline: List[str] = []
-    app = FastAPI()
-
-    @app.get("/aginfer/state")
-    async def _state() -> Any:
-        return state_holder["state"]
-
-    @app.post("/aginfer/migrate")
-    async def _migrate(raw: Request) -> Any:
-        await raw.body()
-        timeline.append("kv_scheduler:migrate")
-        return {"applied": 0, "applied_hashes": [], "skipped": []}
-
-    port = _free_port()
-    url = f"http://127.0.0.1:{port}"
-    tracker = ProgramTracker()
-    for i in range(4):
-        tracker.observe_arrival(f"prog-{i}")
-    async with run_server(app, "127.0.0.1", port):
-        async with boot_stack(url, tracker, theta_hi=0.5, theta_lo=0.3) as (router, admission, sched):
-            # Wrap admission.handle to record entry.
-            orig_handle = admission.handle
-
-            async def _recording_handle(evt, r):
-                timeline.append("admission:enter")
-                await orig_handle(evt, r)
-
-            # The composite captures `_adm=admission` and looks up
-            # `_adm.handle` at call time, so this monkey-patch is
-            # picked up without re-attach.
-            admission.handle = _recording_handle
-            await router.bus.emit(
-                Event(kind=EventKind.MEMORY_PRESSURE,
-                      payload={"state": "HIGH", "occ": 0.95})
-            )
-            await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-            # Both side effects observable.
-            assert sched is not None
-            assert sched.decisions >= 1, (
-                f"kv_scheduler did NOT run; decisions={sched.decisions}"
-            )
-            assert admission.pause_decisions >= 1, (
-                f"admission did NOT run; pauses={admission.pause_decisions}"
-            )
-            # ORDER pin: first kv_scheduler:migrate, then admission:enter.
-            try:
-                idx_migrate = timeline.index("kv_scheduler:migrate")
-                idx_admit = timeline.index("admission:enter")
-            except ValueError as e:
-                raise AssertionError(
-                    f"timeline missing expected event: {timeline}"
-                ) from e
-            assert idx_migrate < idx_admit, (
-                f"composition order wrong: kv_scheduler must fire BEFORE "
-                f"admission.  Timeline: {timeline}"
-            )
-
-
-# ---------------------------------------------------------------- main
-
-
-_T8_STATS: dict = {}
-
-
-async def main() -> None:
-    print("=== T8 verify: admission_controller pause/resume ===")
-    print()
-
-    step_shared_aware_aggregation()
-    print("[1] shared-aware aggregation: each unit V_u / |holders| ✓")
-
-    step_degenerate_full_share()
-    print("[2] WORST CASE: 32-program full-share state → identical scores ✓")
-
-    await step_pause_lowest_under_pressure()
-    print("[3] memory_pressure pauses LOWEST-scoring program ✓")
-
-    await step_fifo_resume_with_hysteresis()
-    print("[4] pressure_resolved resumes ONE at a time, FIFO order ✓")
-
-    await step_hysteresis_holds_high_occ()
-    print("[5] hysteresis: pressure_resolved with occ >= theta_lo → no resume ✓")
-
-    await step_no_victim_when_all_paused()
-    print("[6] WORST CASE: all programs paused → no-op, no crash ✓")
-
-    step_anti_timer_contract()
-    print("[7] contract: no sleep / call_later / call_at / perf_counter ✓")
-
-    await step_max_pauses_per_event_cap()
-    print("[8] WORST CASE: persistent pressure → bounded by "
-          "max_pauses_per_event ✓")
-
-    stats = await step_handler_latency_at_32_programs()
-    global _T8_STATS  # noqa: PLW0603
-    _T8_STATS = stats
-    print("[9] COST: per-event handler @ 32 programs within 10 ms ✓")
-
-    await step_invalid_watermarks_raise()
-    print("[10] contract: invalid (theta_lo >= theta_hi) raises ValueError ✓")
-
-    await step_composition_with_kv_scheduler()
-    print("[11] composition: kv_scheduler.handle (migrate) BEFORE "
-          "admission.handle (pause) — ORDER-pinned via timeline ✓")
-
-    single_stats = await step_single_pause_latency()
-    print("[12] COST: single-pause @ 32 programs within 3 ms "
-          "(algorithmic path, not HTTP RTT × 16) ✓")
-
-    if _T8_STATS:
-        print()
-        print("Latency summary (record in RESULTS):")
-        print(
-            f"  admission @ 32 progs: {_T8_STATS['mean']:.2f} ± "
-            f"{_T8_STATS['std']:.2f} ms  (mean+3σ {_T8_STATS['envelope']:.2f} ms)"
-        )
-
-    print()
-    print("=== T8 PASSED ===")
+            fn()
+        except StageFail as e:
+            failed.append(name)
+            print(_red(f"  [{name}] FAIL: {e}"))
+        except Exception as e:  # noqa: BLE001
+            failed.append(name)
+            import traceback
+            print(_red(f"  [{name}] ERROR: {e}"))
+            traceback.print_exc()
+    print("=" * 64)
+    if failed:
+        print(_red(f"FAILED: {', '.join(failed)}"))
+        return 1
+    print(_green("admission_controller PASS — all 5 §8 stages green"))
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(main())

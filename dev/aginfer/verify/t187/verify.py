@@ -133,8 +133,11 @@ def _unit(
 
 
 def _state_json(*, units: List[Dict[str, Any]], time_counter: int = 100,
-                subpool: str = "kv") -> Dict[str, Any]:
+                subpool: str = "kv", hbm_used: Optional[int] = None,
+                hbm_cap: int = 10 * 1024 ** 3) -> Dict[str, Any]:
     GB = 1024 * 1024 * 1024
+    if hbm_used is None:
+        hbm_used = 1 * GB
 
     def _pool(used: int, cap: int) -> Dict[str, Any]:
         return {"subpools": {subpool: {
@@ -146,7 +149,7 @@ def _state_json(*, units: List[Dict[str, Any]], time_counter: int = 100,
         "time_counter": time_counter,
         "throughput_ema": {"prefill_bps": 0.0, "decode_per_program": {}},
         "pool_usage": {
-            "HBM": _pool(1 * GB, 10 * GB),
+            "HBM": _pool(hbm_used, hbm_cap),
             "DRAM": _pool(1 * GB, 40 * GB),
             "DISK": _pool(0, 200 * GB),
         },
@@ -167,9 +170,14 @@ def _build(sj, event, tracker):
 
 
 class _FakeRouter:
-    def __init__(self, state_json):
+    def __init__(self, state_json, *, theta_hi=0.85, theta_lo=0.70,
+                 heartbeat_s=5.0):
         self._sj = state_json
         self.observability = None
+        # §9 thresholds the joint_decide handler reads (#194).
+        self.theta_hi = theta_hi
+        self.theta_lo = theta_lo
+        self.heartbeat_s = heartbeat_s
 
     async def fetch_state(self):
         return self._sj
@@ -336,16 +344,25 @@ def stage_b3_carve_out_is_event_agnostic() -> None:
 
 def stage_c0_handler_ends_migrates_puts() -> None:
     """The handler: end() → migrate (session_scoped) → PUT, with the
-    migrate batch enqueued BEFORE the PUT."""
+    migrate batch enqueued BEFORE the PUT.
+
+    #194: SESSION_END migration is now pressure-gated (§9 joint_decide).
+    The fixture sits just over theta_hi (HBM 85%+1MB → bytes_needed≈1MB)
+    so p's exclusive unit (2MB HBM) is the chosen demote candidate; the
+    shared unit is excluded from D_t (held by q too) so it survives."""
+    GB = 1024 ** 3
+    MB = 1024 ** 2
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p")
         ob = _new_outbound()
-        sched = _sched(tracker, ob, _DemoteAllPolicy())
-        sj = _state_json(units=[
-            _unit(uhash="excl-p", residence=["HBM"], holders=["p"]),
-            _unit(uhash="shared", residence=["HBM"], holders=["p", "q"]),
-        ])
+        sched = _sched(tracker, ob, None)   # real default OursGreedyPolicy
+        sj = _state_json(
+            units=[
+                _unit(uhash="excl-p", residence=["HBM"], holders=["p"]),
+                _unit(uhash="shared", residence=["HBM"], holders=["p", "q"]),
+            ],
+            hbm_used=int(8.5 * GB) + 1 * MB, hbm_cap=10 * GB)
         handler = make_session_end_handler(tracker, ob, sched)
         await handler(Event(EventKind.SESSION_END, session="p"),
                       _FakeRouter(sj))
@@ -434,13 +451,17 @@ def stage_d0_composed_router_runs_migrate_and_f5() -> None:
         tracker.observe_arrival("p")
         ob = _new_outbound()
         router = EventRouter(bus=EventBus(), sglang_base_url="http://unused")
-        sched = _sched(tracker, ob, _DemoteAllPolicy())
+        sched = _sched(tracker, ob, None)   # real default OursGreedyPolicy
         attach_kv_scheduler(router, sched)
         attach_session_end_handler(router, tracker, ob, sched)
         # Stub the router's state fetch so handle() builds a real D_t.
-        sj = _state_json(units=[
-            _unit(uhash="excl-p", residence=["HBM"], holders=["p"]),
-        ])
+        # Pressured just over the router's default theta_hi (0.7) so the
+        # joint_decide pressure phase demotes p's exclusive unit (#194).
+        GB = 1024 ** 3
+        MB = 1024 ** 2
+        sj = _state_json(
+            units=[_unit(uhash="excl-p", residence=["HBM"], holders=["p"])],
+            hbm_used=7 * GB + 1 * MB, hbm_cap=10 * GB)
         async def _fake_fetch():
             return sj
         router.fetch_state = _fake_fetch

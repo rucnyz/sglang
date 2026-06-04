@@ -39,16 +39,26 @@ flat ``{sp: bytes}`` (HBM-only) into the nested ``{HBM: {...}}`` shape
 before calling these primitives; the primitives operate purely on the
 nested contract.
 
+Mutual exclusion (#194): a unit emits SEVERAL migrate transitions
+(evict / spill / DROP) that are alternatives — applying two is
+physically incoherent (their relief double-counts the unit's bytes;
+their costs aren't additive).  Candidates sharing a non-None ``group``
+attribute are treated as **at-most-one** (multiple-choice knapsack);
+``group=None`` is an independent 0/1 item.  ``migrate_candidates``
+sets ``group = unit hash``; Pause / Resume leave it None (one per
+program).  This is a DESIGN §9 "exact 0/1 knapsack" correction — plain
+0/1 would double-count.
+
 Infeasibility (pressure phase): no subset hits every relief target
-under the destination caps.  DROP (``acquired={}``) and Pause
-(``acquired={}``) never consume destination capacity, so a feasible
-plan ALWAYS exists unless top-k under-sized the candidate set or a
-filter dropped a candidate it shouldn't have — i.e. an algorithm bug,
-not a workload reality.  The primitive raises
-``KnapsackInfeasibleError`` carrying a forensic context; the daemon's
-``joint_decide`` maps that to ``fatal("joint_decide_infeasible", ...)``
-(DESIGN §10) — kept as an exception here so the primitive stays pure
-and the infeasible path is unit-testable.
+under the destination caps.  The DESIGN claim that this is "always an
+algorithm bug" is FALSE in the common case (#194): in-flight-dominated
+pressure migration can't touch, with no Pause candidate available, is
+a *workload reality*.  Callers pass ``best_effort=True`` to free the
+max-relief subset and re-evaluate next event instead of crashing
+(``joint_decide`` does this); ``best_effort=False`` (the default) keeps
+raising ``KnapsackInfeasibleError`` so the infeasible path stays unit-
+testable.  ``cap_left`` is clamped to ≥ 0 by the caller (a negative
+budget = over-subscribed destination = 0 room).
 """
 from __future__ import annotations
 
@@ -64,30 +74,45 @@ class Migrate:
     """A residence-set transition candidate.  ``relief`` frees bytes on
     the source (HBM) tier; ``acquired`` consumes bytes on the
     destination (DRAM/DISK) tier.  A pure-evict (DROP) has
-    ``acquired={}``.  ``id`` is opaque (unit hash) for traceability."""
+    ``acquired={}``.  ``id`` is opaque (unit hash) for traceability.
+
+    ``group`` is the mutual-exclusion key (#194): two transitions of the
+    SAME unit are alternatives — applying both is physically incoherent
+    (their relief would double-count shared bytes and their costs are
+    not additive, since each candidate is scored as a marginal change
+    from the ORIGINAL residence).  The DP treats items sharing a
+    non-None ``group`` as at-most-one (multiple-choice knapsack).
+    ``group=None`` (the default) ⇒ an independent 0/1 item — preserving
+    the original single-item behaviour for callers that don't set it."""
     cost: float
     relief: Dict[str, Dict[str, int]] = field(default_factory=dict)
     acquired: Dict[str, Dict[str, int]] = field(default_factory=dict)
     id: Any = None
+    group: Any = None
 
 
 @dataclass
 class Pause:
     """A program-pause candidate.  Frees HBM bytes (``relief``), consumes
-    no destination capacity (no ``acquired`` — see ``_acquire_at``)."""
+    no destination capacity (no ``acquired`` — see ``_acquire_at``).
+    ``group`` (mutual exclusion) defaults to None: a program emits a
+    single Pause, so pauses are independent 0/1 items."""
     cost: float
     relief: Dict[str, Dict[str, int]] = field(default_factory=dict)
     pid: Any = None
+    group: Any = None
 
 
 @dataclass
 class Resume:
     """A program-resume candidate (headroom phase).  ``re_use`` is the
     per-(HBM, subpool) bytes that re-enter HBM on resume; ``gain`` is
-    the V_u recovered."""
+    the V_u recovered.  ``group`` defaults to None (one Resume per
+    program — independent 0/1 items)."""
     gain: float
     re_use: Dict[str, Dict[str, int]] = field(default_factory=dict)
     pid: Any = None
+    group: Any = None
 
 
 # Sparse-DP cell ceiling (#156 audit #9).  DESIGN §9 estimates ≤10^5
@@ -174,6 +199,29 @@ def _acquire_at(c: Any, tier: str, sp: str) -> int:
     return 0
 
 
+def _grouped(items: List[Any]) -> List[List[Any]]:
+    """Partition ``items`` into mutual-exclusion groups (#194).
+
+    Items sharing a non-None ``group`` attribute land in ONE group (the
+    DP takes at most one member — multiple-choice knapsack); an item
+    with ``group=None`` (or no such attribute) is its own singleton
+    group (independent 0/1 item, the original behaviour).  Insertion
+    order is preserved so reconstruction is deterministic.
+    """
+    groups: List[List[Any]] = []
+    index: Dict[Any, int] = {}
+    for it in items:
+        g = getattr(it, "group", None)
+        if g is None:
+            groups.append([it])
+        elif g in index:
+            groups[index[g]].append(it)
+        else:
+            index[g] = len(groups)
+            groups.append([it])
+    return groups
+
+
 # ------------------------------------------------------------- DP primitives
 
 
@@ -185,6 +233,7 @@ def knapsack_min_cost_multi(
     *,
     context: Dict[str, Any] = None,
     max_dp_cells: int = _MAX_DP_CELLS,
+    best_effort: bool = False,
 ) -> List[Any]:
     """0/1 knapsack: subset S minimising Σ cost(s∈S) s.t.
       (a) every (HBM, sp) relief axis:  Σ relief >= bytes_needed
@@ -202,11 +251,24 @@ def knapsack_min_cost_multi(
     (never over-claims), destination consumption rounds UP (never
     under-counts).  NOTE (#156 audit B): the round-UP target +
     round-DOWN relief can report a marginally raw-feasible instance
-    (sub-page residual need) as INFEASIBLE → ``joint_decide`` halts;
-    this is the intended safe direction (halt-loud over under-free).
+    (sub-page residual need) as INFEASIBLE; with ``best_effort`` the DP
+    frees as much as it can in that case (safe direction: under-free,
+    re-evaluate next event).
 
-    Raises ``KnapsackInfeasibleError`` if no subset satisfies (a) under
-    (b); ``KnapsackBudgetExceededError`` if the reachable-cell count
+    ``best_effort`` (#194): when no subset reaches the full relief target
+    (workload reality — e.g. in-flight-dominated pressure no migrate can
+    touch and no Pause candidate is available), return the reachable
+    cell with the MAXIMUM total relief, tie-broken by minimum cost,
+    instead of raising.  When the target IS reachable this is identical
+    to the strict optimum (full-relief cells have max total relief, and
+    min cost among them is the strict answer).  ``best_effort=False``
+    (the default, used by the t34 primitives test) raises
+    ``KnapsackInfeasibleError`` so the infeasible path stays unit-
+    testable.  ``cap_left`` should be pre-clamped to ≥ 0 by the caller
+    (a negative budget means the destination is over-subscribed = no
+    room = 0, never "less than zero room").
+
+    Raises ``KnapsackBudgetExceededError`` if the reachable-cell count
     exceeds ``max_dp_cells``.  Returns the chosen candidate list
     (subset of ``items``)."""
     relief_axes = list(bytes_needed.keys())          # [(HBM, sp), ...]
@@ -229,40 +291,58 @@ def knapsack_min_cost_multi(
     # Recording the predecessor state per IMPROVING transition makes the
     # readout exact regardless of capping.  (T34 verify A2 caught the
     # subtract version returning a too-cheap, infeasible subset.)
+    # Multiple-choice over mutual-exclusion groups (#194): each group
+    # contributes AT MOST ONE member.  Singleton groups (group=None)
+    # reproduce the original 0/1 behaviour exactly.  Each member is
+    # scored from the PRE-GROUP states (``base = dp``), never from a
+    # sibling-take, so two members of one group can't both be chosen.
+    grouped = _grouped(items)
     dp: Dict[tuple, float] = {zero_state(): 0.0}
-    parent: Dict[tuple, tuple] = {}                  # (k, s_new) -> s_pred
-    for k, c in enumerate(items, start=1):
-        d_relief = tuple(_bk(_relief_at(c, t, sp), bucket_size[(t, sp)])
-                         for (t, sp) in relief_axes)
-        d_cap = tuple(_bk_up(_acquire_at(c, t, sp), bucket_size[(t, sp)])
-                      for (t, sp) in cap_axes)
-        new_dp = dict(dp)
-        for s, cost in dp.items():
-            r_buckets, cap_buckets = s[:n], s[n:]
-            r_new = tuple(min(W[relief_axes[i]], r_buckets[i] + d_relief[i])
-                          for i in range(n))
-            cap_new = tuple(cap_buckets[i] + d_cap[i]
-                            for i in range(len(cap_axes)))
-            if any(cap_new[i] > Wcap[cap_axes[i]] for i in range(len(cap_axes))):
-                continue
-            s_new = r_new + cap_new
-            new_cost = cost + c.cost
-            if new_cost < new_dp.get(s_new, INF):
-                new_dp[s_new] = new_cost
-                parent[(k, s_new)] = s
+    # parent[(gi, s_new)] = (s_pred, member) — which member of group gi
+    # produced s_new; absent ⇒ group gi took none on the path to s_new.
+    parent: Dict[tuple, tuple] = {}
+    for gi, group in enumerate(grouped):
+        base = dp
+        new_dp = dict(dp)                            # option: take none
+        for member in group:
+            d_relief = tuple(_bk(_relief_at(member, t, sp), bucket_size[(t, sp)])
+                             for (t, sp) in relief_axes)
+            d_cap = tuple(_bk_up(_acquire_at(member, t, sp), bucket_size[(t, sp)])
+                          for (t, sp) in cap_axes)
+            for s, cost in base.items():
+                r_buckets, cap_buckets = s[:n], s[n:]
+                r_new = tuple(min(W[relief_axes[i]], r_buckets[i] + d_relief[i])
+                              for i in range(n))
+                cap_new = tuple(cap_buckets[i] + d_cap[i]
+                                for i in range(len(cap_axes)))
+                if any(cap_new[i] > Wcap[cap_axes[i]]
+                       for i in range(len(cap_axes))):
+                    continue
+                s_new = r_new + cap_new
+                new_cost = cost + member.cost
+                if new_cost < new_dp.get(s_new, INF):
+                    new_dp[s_new] = new_cost
+                    parent[(gi, s_new)] = (s, member)
         dp = new_dp
         if len(dp) > max_dp_cells:
             ctx = dict(context or {})
             ctx.update({
                 "dp_size": len(dp), "max_dp_cells": max_dp_cells,
-                "item_index": k, "n_items": K,
+                "item_index": gi, "n_items": K,
                 "axes": relief_axes + cap_axes, "items": list(items),
             })
             raise KnapsackBudgetExceededError(ctx)
 
     full_r = tuple(W[a] for a in relief_axes)
     feasible = [(c, s) for s, c in dp.items() if s[:n] == full_r]
-    if not feasible:
+    if feasible:
+        _, s_pick = min(feasible)                    # min cost among full-relief
+    elif best_effort:
+        # No subset reaches the full target — free as much as possible:
+        # max total relief (sum across capped axes), tie-broken by min
+        # cost.  The next event re-evaluates; sglang eviction backstops.
+        s_pick = max(dp, key=lambda s: (sum(s[:n]), -dp[s]))
+    else:
         ctx = dict(context or {})
         ctx.update({
             "bytes_needed": dict(bytes_needed),
@@ -274,14 +354,14 @@ def knapsack_min_cost_multi(
         })
         raise KnapsackInfeasibleError(ctx)
 
-    _, s_pick = min(feasible)                        # min over cost
     chosen: List[Any] = []
-    k = K
-    while k > 0:
-        if (k, s_pick) in parent:
-            chosen.append(items[k - 1])
-            s_pick = parent[(k, s_pick)]
-        k -= 1
+    gi = len(grouped)
+    while gi > 0:
+        gi -= 1
+        if (gi, s_pick) in parent:
+            s_pred, member = parent[(gi, s_pick)]
+            chosen.append(member)
+            s_pick = s_pred
     return chosen
 
 
@@ -307,38 +387,44 @@ def knapsack_max_value_multi(
     K = len(items)
     NEG = float("-inf")
 
-    # Parent-pointer reconstruction (uniform with knapsack_min_cost_multi;
-    # robust even though the headroom state has no cap-clamp).
+    # Parent-pointer reconstruction + multiple-choice grouping (#194),
+    # uniform with knapsack_min_cost_multi.  Singleton groups reproduce
+    # the original 0/1 behaviour.
+    grouped = _grouped(items)
     dp: Dict[tuple, float] = {tuple(0 for _ in axes): 0.0}
     parent: Dict[tuple, tuple] = {}
-    for k, c in enumerate(items, start=1):
-        d = tuple(_bk_up(c.re_use.get(t, {}).get(sp, 0), bucket_size[(t, sp)])
-                  for (t, sp) in axes)
-        new_dp = dict(dp)
-        for s, gain in dp.items():
-            s_new = tuple(s[i] + d[i] for i in range(len(axes)))
-            if any(s_new[i] > W[axes[i]] for i in range(len(axes))):
-                continue
-            new_gain = gain + c.gain
-            if new_gain > new_dp.get(s_new, NEG):
-                new_dp[s_new] = new_gain
-                parent[(k, s_new)] = s
+    for gi, group in enumerate(grouped):
+        base = dp
+        new_dp = dict(dp)                            # option: take none
+        for member in group:
+            d = tuple(_bk_up(member.re_use.get(t, {}).get(sp, 0),
+                             bucket_size[(t, sp)])
+                      for (t, sp) in axes)
+            for s, gain in base.items():
+                s_new = tuple(s[i] + d[i] for i in range(len(axes)))
+                if any(s_new[i] > W[axes[i]] for i in range(len(axes))):
+                    continue
+                new_gain = gain + member.gain
+                if new_gain > new_dp.get(s_new, NEG):
+                    new_dp[s_new] = new_gain
+                    parent[(gi, s_new)] = (s, member)
         dp = new_dp
         if len(dp) > max_dp_cells:
             ctx = dict(context or {})
             ctx.update({
                 "dp_size": len(dp), "max_dp_cells": max_dp_cells,
-                "item_index": k, "n_items": K, "axes": axes,
+                "item_index": gi, "n_items": K, "axes": axes,
                 "items": list(items),
             })
             raise KnapsackBudgetExceededError(ctx)
 
     s_pick = max(dp, key=dp.get)
     chosen: List[Any] = []
-    k = K
-    while k > 0:
-        if (k, s_pick) in parent:
-            chosen.append(items[k - 1])
-            s_pick = parent[(k, s_pick)]
-        k -= 1
+    gi = len(grouped)
+    while gi > 0:
+        gi -= 1
+        if (gi, s_pick) in parent:
+            s_pred, member = parent[(gi, s_pick)]
+            chosen.append(member)
+            s_pick = s_pred
     return chosen

@@ -738,9 +738,14 @@ def stage_d3_dispatch_routes_through_outbound() -> None:
 
 
 class _StubRouter:
-    """Minimal router stub for KvScheduler.handle()."""
-    def __init__(self, state_supplier):
+    """Minimal router stub for KvScheduler.handle().  Carries the §9
+    thresholds the handler reads for joint_decide (#194)."""
+    def __init__(self, state_supplier, *, theta_hi=0.85, theta_lo=0.70,
+                 heartbeat_s=5.0):
         self._supply = state_supplier
+        self.theta_hi = theta_hi
+        self.theta_lo = theta_lo
+        self.heartbeat_s = heartbeat_s
     async def fetch_state(self):
         return self._supply()
 
@@ -825,15 +830,15 @@ def stage_e1_empty_decision_set_no_migrate() -> None:
 
 
 def stage_e2_policy_declines_no_migrate() -> None:
-    """When ``decide()`` returns an empty Action (all V_t non-
-    positive), no migrate POST is enqueued."""
-    # All units are alive (p_hat=1) and HBM-only → policy should
-    # KEEP HBM (no migrate).
+    """§9 (#194): when joint_decide returns an empty plan (the
+    hysteresis dead-zone — forecast between theta_lo and theta_hi, with
+    no pause/resume work), the handler dispatches nothing."""
     tracker = ProgramTracker()
     tracker.observe_arrival("p")  # REASONING
     units = [_unit(uhash="u0", residence=["HBM"], holders=["p"],
                    hit_count=1000, last_access_time=99)]
-    sj = _state_json(units=units, hbm_used=1 * 1024**3,
+    # HBM at 78% — inside the [70%, 85%] hysteresis band → dead-zone.
+    sj = _state_json(units=units, hbm_used=int(7.8 * 1024**3),
                      hbm_cap=10 * 1024**3)
     async def _go():
         sched = kvs.KvScheduler(
@@ -850,17 +855,16 @@ def stage_e2_policy_declines_no_migrate() -> None:
         )
         return sched
     sched = asyncio.run(_go())
-    # The policy may or may not decline given the V signs at cold-
-    # start defaults; what we PIN is: if it does decline,
-    # migrate_calls stays 0.  We do not pin a specific outcome here.
-    if sched.decisions == 1 and sched.last_action is not None:
-        # Decision was made; check that empty assignments → no migrate.
-        if not sched.last_action.assignments:
-            if sched.migrate_calls != 0:
-                raise StageFail(
-                    f"empty assignments must not enqueue migrate; got "
-                    f"migrate_calls={sched.migrate_calls}"
-                )
+    if sched.decisions != 1:
+        raise StageFail(f"expected exactly one decision, got {sched.decisions}")
+    if sched.last_plan != []:
+        raise StageFail(f"dead-zone must yield an empty plan, got "
+                        f"{sched.last_plan}")
+    if sched.migrate_calls != 0 or sched.pause_calls != 0:
+        raise StageFail(
+            f"empty plan must dispatch nothing; got "
+            f"migrate_calls={sched.migrate_calls} "
+            f"pause_calls={sched.pause_calls}")
 
 
 # ============================================================ F. idempotence + latency

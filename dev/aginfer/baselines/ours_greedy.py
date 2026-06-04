@@ -21,6 +21,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .base import Action, ReuseUnit, SchedulerState, Tier
+from .knapsack import Migrate
+
+# String tier labels matching the §5 pool_usage / §6 wire (the
+# knapsack candidate contract keys relief/acquired by these strings).
+_TIER_LABEL = {Tier.HBM: "HBM", Tier.DRAM: "DRAM", Tier.DISK: "DISK"}
 
 
 @dataclass
@@ -120,6 +125,136 @@ def migration_cost_effective(
     return base * g
 
 
+def _authoritative_of(residence: List[Tier]) -> Tier:
+    """Highest-compute-readiness tier in ``residence`` (HBM > DRAM >
+    DISK); empty residence ≡ DROP (DESIGN §7 ``authoritative_tier``)."""
+    for t in (Tier.HBM, Tier.DRAM, Tier.DISK):
+        if t in residence:
+            return t
+    return Tier.DROP
+
+
+def value_residence(u: ReuseUnit, next_residence: List[Tier],
+                    state: SchedulerState, costs: TierCosts,
+                    pi_u: float) -> float:
+    """V_u over a candidate residence — paper §7 / DESIGN §7 ``_value``.
+
+    Module-level so the §9 ``migrate_candidates`` generator and the
+    admission program-value aggregation can share ONE V_u definition
+    with ``OursGreedyPolicy`` (DESIGN §9: one decision pipeline, one
+    value function).  The authoritative tier of ``next_residence``
+    drives both the reload cost (the tier that services the next read)
+    and the holding tax.
+    """
+    tier = _authoritative_of(next_residence)
+    save_prefill = u.p_hat * (
+        reload_cost(u, Tier.DROP, costs, pi_u)
+        - reload_cost(u, tier, costs, pi_u)
+    )
+    occ = state.tier_usage.occupancy_ratio(tier) if tier != Tier.DROP else 0.0
+    h = holding_unit_cost(tier, occ, costs)
+    hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
+    return save_prefill - h * u.n_bytes * hold_time
+
+
+def migrate_candidates(
+    state: SchedulerState,
+    decision_set: List[str],
+    costs: TierCosts,
+    pi_u: float = 1.0e-4,
+) -> List[Migrate]:
+    """DESIGN §7 / §9 unit-level candidate generator.
+
+    For each unit in ``decision_set``, enumerate the meaningful
+    residence-set transitions (the ``_TRANSITIONS`` table, DESIGN §7
+    transfer-window semantics) and emit one ``knapsack.Migrate`` per
+    pressure-relieving transition:
+
+        cost     = V_u(current) − V_u(next)            # value forgone
+                 + M_eff(current_auth → next_auth)     # link bandwidth
+                 + unavailability_cost (= 0 under write-through HiCache)
+        relief   = {tier_str: {sp: bytes}} freed on each removed tier
+        acquired = {tier_str: {sp: bytes}} consumed on each added tier
+        id       = (unit_id, add_tiers, remove_tiers)  # for dispatch
+
+    ``id`` carries the residence-set edit verbatim so §9's chosen
+    subset maps straight onto ``assignments_to_wire`` without a second
+    lookup.  Transitions whose ``relief`` is empty across every
+    (tier, subpool) are dropped (DESIGN §7: a meaningful candidate
+    frees bytes on at least one axis) — e.g. a pure write-through
+    ``add {DRAM}`` keeps HBM and relieves nothing.
+
+    Same-unit transitions are emitted as INDEPENDENT 0/1 items; the §9
+    DP must not pick two transitions of one unit (their relief would
+    double-count physically-shared bytes).  ``joint_decide`` enforces
+    this via per-unit grouping before the knapsack — see
+    ``daemon/joint_decide.py``.
+    """
+    out: List[Migrate] = []
+    for uid in decision_set:
+        u = state.units.get(uid)
+        if u is None:
+            continue
+        current = list(u.residence)
+        current_key = frozenset(current)
+        transitions = _TRANSITIONS.get(current_key)
+        if transitions is None:
+            # Residence the §7 6-transition table doesn't enumerate
+            # (e.g. {HBM, DISK}); skip rather than invent a transition
+            # — same contract as OursGreedyPolicy.decide.
+            continue
+        src = _authoritative_of(current)
+        for add_tiers, remove_tiers in transitions:
+            new_residence = [t for t in current if t not in remove_tiers] \
+                + list(add_tiers)
+            if frozenset(new_residence) == current_key:
+                continue  # no-op edit
+
+            cost = value_residence(u, current, state, costs, pi_u) \
+                - value_residence(u, new_residence, state, costs, pi_u)
+            # Migration (link) cost: each ADDED tier not already resident
+            # copies u's bytes from the source over the relevant link.
+            for t in add_tiers:
+                if t in current or t == Tier.DROP:
+                    continue
+                cost += migration_cost_effective(
+                    u, src, t, state.tier_usage.bw_free, costs)
+            # unavailability_cost == 0 under write-through HiCache
+            # (DESIGN §7); kept implicit (the +0 term).
+
+            relief: Dict[str, Dict[str, int]] = {}
+            for t in remove_tiers:
+                if t not in current or t == Tier.DROP:
+                    continue
+                sp_bytes = u.n_bytes_by_tier.get(t, {})
+                if sp_bytes:
+                    relief[_TIER_LABEL[t]] = {sp: int(b)
+                                              for sp, b in sp_bytes.items()}
+            if not any(b > 0 for sub in relief.values()
+                       for b in sub.values()):
+                continue  # no pressure relieved (DESIGN §7 filter)
+
+            acquired: Dict[str, Dict[str, int]] = {}
+            src_bytes = u.n_bytes_by_tier.get(src, {})
+            for t in add_tiers:
+                if t in current or t == Tier.DROP:
+                    continue
+                # Same physical bytes land on the destination tier
+                # (write-through copies bit-for-bit; subpool layout is
+                # architecture-fixed) — size from the source tier.
+                acquired[_TIER_LABEL[t]] = {sp: int(b)
+                                            for sp, b in src_bytes.items()}
+
+            out.append(Migrate(
+                cost=cost,
+                relief=relief,
+                acquired=acquired,
+                id=(u.id, list(add_tiers), list(remove_tiers)),
+                group=u.id,   # #194: a unit's transitions are alternatives
+            ))
+    return out
+
+
 class OursGreedyPolicy:
     name = "ours_greedy"
 
@@ -129,32 +264,10 @@ class OursGreedyPolicy:
 
     def _value(self, u: ReuseUnit, next_residence: List[Tier],
                state: SchedulerState) -> float:
-        """V_u over a candidate residence — paper §7.
-
-        Authoritative tier of `next_residence` drives the holding cost
-        and the reload cost (which tier services the next read).
-        """
-        if not next_residence:
-            # Empty residence ≡ DROP.
-            tier = Tier.DROP
-        else:
-            # Pick HBM if present else DRAM else DISK (same rule as
-            # ReuseUnit.authoritative_tier).
-            for t in (Tier.HBM, Tier.DRAM, Tier.DISK):
-                if t in next_residence:
-                    tier = t
-                    break
-            else:
-                tier = Tier.DROP
-
-        save_prefill = u.p_hat * (
-            reload_cost(u, Tier.DROP, self.costs, self.pi_u)
-            - reload_cost(u, tier, self.costs, self.pi_u)
-        )
-        occ = state.tier_usage.occupancy_ratio(tier) if tier != Tier.DROP else 0.0
-        h = holding_unit_cost(tier, occ, self.costs)
-        hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
-        return save_prefill - h * u.n_bytes * hold_time
+        """V_u over a candidate residence — delegates to the module-level
+        :func:`value_residence` so the greedy policy, ``migrate_candidates``
+        (§9), and admission share one value definition."""
+        return value_residence(u, next_residence, state, self.costs, self.pi_u)
 
     def _score_transition(self, u: ReuseUnit, next_residence: List[Tier],
                           state: SchedulerState) -> float:
