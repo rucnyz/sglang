@@ -1651,6 +1651,18 @@ Migrates; headroom phase uses Resumes.
   V_u we'd lose if p stops here).  The conditional p_hat from §7
   is already a holder-product, so shared-prefix attribution is
   built in; no `1/|session_ids|` weight is needed.
+
+  **Interim implementation (#194, until T11):** §7's `p_hat` is not yet
+  the holder-product — `build_paper_state` sets a *binary* `p_hat = 1`
+  whenever any non-ENDED holder exists (T11/#126 is the empirical
+  estimator).  Under that binary p_hat, the no-weight sum would charge
+  a shared prefix's FULL V_u to every program holding it, so pausing
+  any one of them looks as costly as losing the whole shared prefix —
+  wrong (the prefix survives via its other holders).  So the
+  implementation (`shared_aware_prog_scores`) uses the holder-divided
+  form `Σ_h V_u(h)/|holders(h)|` as the interim attribution; it
+  collapses to this no-weight definition once T11 lands the
+  holder-product p_hat.  Same applies to the Resume `gain` below.
 * `V_u_program_if_active(p, state, hypothetical_state)` —
   counterfactual: compute V_u as if p's state field were
   overridden to `hypothetical_state` (and all other holders'
@@ -2309,6 +2321,21 @@ above, all verified in `verify/joint_decide/` + `verify/integration_stress/`:
    misconfiguration (the `max_dp_cells` DP blow-up).  The
    `fatal("joint_decide_infeasible")` call above is therefore not on
    the live path.
+
+**SESSION_END migration is now pressure-gated (consequence of #194).**
+Pre-joint, the greedy `OursGreedyPolicy.decide` ran on every event with
+no pressure gate, so a SESSION_END always demoted/dropped the ended
+program's exclusive units (their `V(keep HBM) < V(DROP)` once `p_hat`
+drops).  Under `joint_decide`, migrate candidates are emitted only in
+the pressure phase, so SESSION_END demotes the ended units **only when
+HBM is pressured** — otherwise they stay resident.  This is correct
+under §9's pressure-driven model and benign under the §3 superset
+framing: the ended units carry the lowest V_u (hint-table broadcast),
+so they are the FIRST evicted under any pressure, and sglang's own
+inline eviction reclaims them when it needs the space regardless of the
+daemon.  The control-plane F5 path (gate release, ENDED transition,
+`PUT {ENDED}`) is unchanged; only the *eager* demotion of not-yet-
+pressured dead KV is dropped.
 
 #### Why exact DP, not greedy
 

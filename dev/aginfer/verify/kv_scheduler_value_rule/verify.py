@@ -797,8 +797,11 @@ class _Resp200:
 
 
 def stage_e1_empty_decision_set_no_migrate() -> None:
-    """``LLM_PREFILL`` → D_t is empty → handler returns without
-    calling ``decide()`` or dispatching."""
+    """§9 (#194): ``LLM_PREFILL`` D_t is empty → no migrate candidates,
+    but joint_decide STILL RUNS (admission may pause/resume from live
+    state).  Here (admission off, low occupancy) it yields an empty plan
+    and dispatches nothing — but the decision is NOT short-circuited on
+    the empty D_t (the greedy-era early-return bug)."""
     units = [_unit(uhash="u0", residence=["HBM"], holders=["p"])]
     sj = _state_json(units=units)
     async def _go():
@@ -816,17 +819,23 @@ def stage_e1_empty_decision_set_no_migrate() -> None:
         )
         return sched
     sched = asyncio.run(_go())
-    if sched.decisions != 0:
+    # joint_decide RAN (not short-circuited on the empty D_t) ...
+    if sched.decisions != 1:
         raise StageFail(
-            f"LLM_PREFILL has empty D_t → no decide() call; got "
-            f"decisions={sched.decisions}"
-        )
-    if sched.migrate_calls != 0:
-        raise StageFail(f"no migrate; got {sched.migrate_calls}")
+            f"LLM_PREFILL must still run joint_decide (admission may "
+            f"pause/resume); got decisions={sched.decisions}")
+    # ... D_t was empty (no migrate candidates) ...
     if sched.last_decision_set_size != 0:
         raise StageFail(
-            f"last_decision_set_size: {sched.last_decision_set_size}"
-        )
+            f"last_decision_set_size: {sched.last_decision_set_size}")
+    # ... and with admission off + low occupancy the plan is empty →
+    # nothing dispatched.
+    if sched.last_plan != []:
+        raise StageFail(f"empty D_t + admission off → empty plan; got "
+                        f"{sched.last_plan}")
+    if sched.migrate_calls != 0 or sched.pause_calls != 0:
+        raise StageFail(f"no dispatch; got migrate={sched.migrate_calls} "
+                        f"pause={sched.pause_calls}")
 
 
 def stage_e2_policy_declines_no_migrate() -> None:

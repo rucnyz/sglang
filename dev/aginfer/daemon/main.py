@@ -88,10 +88,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds between still_high heartbeats (default 5.0)",
     )
     p.add_argument(
-        "--max-pauses-per-event", type=int, default=16,
-        help="admission per-event pause/resume cap (default 16)",
-    )
-    p.add_argument(
         "--observability-summary-every-n", type=int, default=200,
         help=(
             "T42: emit one daemon_obs_summary line per N handled events "

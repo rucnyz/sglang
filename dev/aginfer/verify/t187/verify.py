@@ -183,23 +183,11 @@ class _FakeRouter:
         return self._sj
 
 
-class _DemoteAllPolicy:
-    """Drops every D_t unit from HBM (add=[], remove=[HBM])."""
-    def decide(self, state) -> Action:
-        plan = []
-        for uid in state.decision_set:
-            u = state.units.get(uid)
-            if u is not None and Tier.HBM in u.residence:
-                plan.append((uid, [], [Tier.HBM]))
-        return Action(assignments=plan)
-
-
-class _RaisingPolicy:
-    """decide() raises — models a downstream policy/dispatch error.
-    Used to prove the SESSION_END handler still enqueues the F5 PUT
-    even when the migrate step blows up (audit B1)."""
-    def decide(self, state) -> Action:
-        raise RuntimeError("simulated policy.decide failure")
+# (#194) The old _DemoteAllPolicy / _RaisingPolicy stubs are gone — the
+# post-joint handler runs joint_decide (not policy.decide), so the
+# migrate path is driven by the real default OursGreedyPolicy under
+# pressure, and the C2 "dispatch error" is injected at the outbound
+# enqueue (see stage_c2).
 
 
 def _sched(tracker, ob, policy):
@@ -413,15 +401,29 @@ def stage_c2_migrate_error_still_puts_ended() -> None:
     F5 PUT {ENDED} MUST still be enqueued — sglang has to learn the
     program ended even when the data-plane migrate decision blew up.
     The state transition (already done) and the PUT are the F5
-    contract; the migrate is best-effort on top."""
+    contract; the migrate is best-effort on top.
+
+    #194 audit: simulate a REAL migrate-DISPATCH error (the post-joint
+    handler no longer calls ``policy.decide``, so the old _RaisingPolicy
+    was never reached).  Pressured state → joint_decide yields a migrate
+    → ``_dispatch_migrate`` calls ``enqueue_migrate``, which we make
+    raise; the F5 PUT (a separate ``enqueue_program_paused``) must
+    survive."""
+    GB = 1024 ** 3
+    MB = 1024 ** 2
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p")
         ob = _new_outbound()
-        sched = _sched(tracker, ob, _RaisingPolicy())  # decide() raises
-        sj = _state_json(units=[
-            _unit(uhash="excl-p", residence=["HBM"], holders=["p"]),
-        ])
+        # Real dispatch failure: the migrate enqueue throws (e.g. queue
+        # full / serialisation error), but program_paused still works.
+        def _boom(*a, **k):
+            raise RuntimeError("simulated migrate dispatch failure")
+        ob.enqueue_migrate = _boom  # type: ignore[assignment]
+        sched = _sched(tracker, ob, None)   # real default OursGreedyPolicy
+        sj = _state_json(
+            units=[_unit(uhash="excl-p", residence=["HBM"], holders=["p"])],
+            hbm_used=int(8.5 * GB) + 1 * MB, hbm_cap=10 * GB)  # pressured
         handler = make_session_end_handler(tracker, ob, sched)
         # The handler must NOT propagate the migrate error.
         await handler(Event(EventKind.SESSION_END, session="p"),
@@ -585,7 +587,7 @@ def stage_g0_handle_gcs_ended_no_units() -> None:
         tracker.observe_arrival("p-dead")
         tracker.end("p-dead")            # ENDED, but no unit cites it
         ob = _new_outbound()
-        sched = _sched(tracker, ob, _DemoteAllPolicy())
+        sched = _sched(tracker, ob, None)   # real default OursGreedyPolicy
         sj = _state_json(units=[
             _unit(uhash="u", residence=["HBM"], holders=["p-live"]),
         ])

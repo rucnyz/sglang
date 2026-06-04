@@ -1015,22 +1015,22 @@ class KvScheduler:
         }
         self.tracker.gc_ended(live_pids)
         self.last_decision_set_size = len(sched_state.decision_set)
-        if not sched_state.decision_set:
-            # Nothing to decide on (e.g. LLM_PREFILL or empty top-k).
-            _m(
-                "kv_decide",
-                kind=event.kind.value,
-                dset_size=0,
-                outcome="empty_decision_set",
-            )
-            return
         # T40 (#184, F2): push the V_u hints for EVERY D_t unit,
-        # unconditionally, BEFORE (and independent of) the migrate
-        # decision.  The inline scorer reads the hint table at its
-        # allocation callsite and cannot wait for the daemon, so the
-        # daemon refreshes it every event.  No shadow cache (DESIGN
-        # §10): re-pushes are absorbed by sglang's overwrite-by-stamp.
+        # unconditionally, BEFORE (and independent of) the joint decision.
+        # The inline scorer reads the hint table at its allocation
+        # callsite and cannot wait for the daemon, so the daemon refreshes
+        # it every event.  No shadow cache (DESIGN §10): re-pushes are
+        # absorbed by sglang's overwrite-by-stamp.  An empty D_t ⇒ empty
+        # hint list ⇒ no-op push (handled in _dispatch_hints).
         await self._dispatch_hints(hints_from_state(sched_state))
+        # DESIGN §9 (#194): joint_decide runs on EVERY event, even when
+        # D_t is empty (LLM_PREFILL — D_t always ∅ — or an empty top-k).
+        # migrate_candidates yields nothing then, but the admission
+        # generators (pause/resume) still produce candidates from live
+        # state, so the joint decision must NOT be short-circuited on an
+        # empty decision_set.  (The greedy-era `if not decision_set:
+        # return` did exactly that, leaving admission inert on
+        # LLM_PREFILL — #194 audit, caught by verify/joint_decide stage F.)
         # DESIGN §9 (#194): ONE joint decision over the union action
         # space {migrate} ∪ {pause/resume}, replacing the old sequential
         # greedy-decide-then-admission decompose.  Thresholds + horizon
@@ -1122,7 +1122,7 @@ class KvScheduler:
         _m("admission_resume", pid=pid, restored_state=pre)
 
     async def _dispatch_migrate(
-        self, assignments: List[Tuple[str, Tier]]
+        self, assignments: List[Tuple[str, List[Tier], List[Tier]]]
     ) -> None:
         """T36 (DESIGN §6 B4) fire-and-forget enqueue.
 

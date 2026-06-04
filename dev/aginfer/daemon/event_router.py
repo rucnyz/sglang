@@ -111,11 +111,13 @@ class EventRouter:
         no log.  This is symmetric to the round-1 B2 ordering bug
         (which only caught the "before" direction).
 
-        Now: if the existing handler is a wrapped composite
-        (attribute ``_aginfer_wrap`` set by
-        ``attach_admission_controller``), refuse the overwrite
-        unless ``force=True``.  Pass ``force=True`` for legitimate
-        test re-attach.
+        Generic guard: if the existing handler is marked as a wrapped
+        composite (attribute ``_aginfer_wrap``), refuse the overwrite
+        unless ``force=True``.  No layer sets ``_aginfer_wrap`` since
+        #194 removed the admission composite (kv_scheduler is now the
+        sole joint handler), but the guard is kept so any future
+        compose-on-top layer is protected from silent clobbering.
+        Pass ``force=True`` for legitimate test re-attach.
         """
         prev = self._handlers.get(kind.value)
         if (
@@ -126,9 +128,8 @@ class EventRouter:
             raise RuntimeError(
                 f"set_handler({kind.name}): refusing to overwrite a "
                 f"wrapped composite handler.  Pass force=True if you "
-                f"intend to bypass admission_controller's wrap, OR "
-                f"call attach_<your_layer> BEFORE "
-                f"attach_admission_controller (which must be last)."
+                f"intend to bypass it, OR attach your layer BEFORE the "
+                f"wrapping layer."
             )
         self._handlers[kind.value] = fn
 

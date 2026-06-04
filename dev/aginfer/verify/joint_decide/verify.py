@@ -50,7 +50,9 @@ from baselines.knapsack import Migrate, Pause, Resume  # noqa: E402
 from daemon import kv_scheduler as kvs  # noqa: E402
 from daemon import admission_controller as adm  # noqa: E402
 from daemon.events import Event, EventKind  # noqa: E402
-from daemon.program_tracker import ProgramTracker  # noqa: E402
+from daemon.program_tracker import ProgramTracker, State  # noqa: E402
+from daemon.outbound import OutboundQueue  # noqa: E402
+import asyncio  # noqa: E402
 
 
 def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
@@ -642,6 +644,191 @@ def stage_e_dp_correctness() -> None:
                  "under-relief→best-effort (no fatal), blow-up→raise OK"))
 
 
+# ============================================================ Stage F
+
+
+class _DummyHttp:
+    async def post(self, url, *, json=None):  # noqa: ANN001
+        class _R:
+            status_code = 200
+            def json(self): return {}
+            text = ""
+        return _R()
+    async def put(self, url, *, json=None):  # noqa: ANN001
+        class _R:
+            status_code = 200
+            def json(self): return {}
+            text = ""
+        return _R()
+    async def aclose(self): return None
+
+
+class _StubRouter:
+    def __init__(self, sj, *, theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0):
+        self._sj = sj
+        self.theta_hi = theta_hi
+        self.theta_lo = theta_lo
+        self.heartbeat_s = heartbeat_s
+        self.observability = None
+    async def fetch_state(self):
+        return self._sj
+
+
+def _drain(ob):
+    out = []
+    while ob.queue.qsize():
+        out.append(ob.queue.get_nowait())
+    return out
+
+
+def stage_f_live_dispatch() -> None:
+    """The handler runs joint_decide and _dispatch_plan routes the mixed
+    plan: Pause → tracker.pause + PUT{PAUSED, pre_pause_state}; Resume →
+    tracker.resume + PUT{pre_pause_state}.  Brand-new dispatch code —
+    pinned end-to-end through KvScheduler.handle (admission ON)."""
+    GB = 1024 ** 3
+
+    # --- pressure → a Pause is dispatched ---
+    def _pause_case():
+        tracker = ProgramTracker()
+        tracker.observe_arrival("P")            # REASONING (prior state)
+        ob = OutboundQueue(sglang_base_url="http://unused",
+                           http_client=_DummyHttp())
+        sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
+                                outbound=ob)
+        sched.admission_enabled = True
+        sj = _state_json(
+            units=[_unit(uhash="uP", residence=["HBM"], holders=["P"],
+                         n_bytes_per_tier={"HBM": 1 * GB})],
+            programs={"P": _program("REASONING", inflight={"kv": 1 * GB},
+                                    unit_hashes=["uP"])},
+            hbm={"kv": _sp(9 * GB, 10 * GB)})
+        router = _StubRouter(sj)
+        asyncio.run(sched.handle(Event(EventKind.MEMORY_PRESSURE, session="P"),
+                                 router))
+        return tracker, sched, _drain(ob)
+
+    tracker, sched, batches = _pause_case()
+    if tracker.state("P") is not State.PAUSED:
+        raise StageFail("F: pressure → handler must tracker.pause(P)")
+    if sched.pause_calls != 1:
+        raise StageFail(f"F: pause_calls must be 1, got {sched.pause_calls}")
+    puts = [b for b in batches if b.endpoint == "program_paused"]
+    if not puts:
+        raise StageFail(f"F: pause must enqueue a program_paused PUT; "
+                        f"got {[b.endpoint for b in batches]}")
+    body = puts[0].body
+    if body.get("state") != "PAUSED" or body.get("pre_pause_state") != "REASONING":
+        raise StageFail(f"F: pause PUT body must be {{PAUSED, pre=REASONING}}; "
+                        f"got {body}")
+
+    # --- headroom → a Resume is dispatched, restoring pre_pause_state ---
+    def _resume_case():
+        tracker = ProgramTracker()
+        tracker.pause("R")                       # PAUSED
+        ob = OutboundQueue(sglang_base_url="http://unused",
+                           http_client=_DummyHttp())
+        sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
+                                outbound=ob)
+        sched.admission_enabled = True
+        sj = _state_json(
+            units=[_unit(uhash="uR", residence=["DRAM"], holders=["R"],
+                         n_bytes_per_tier={"DRAM": 1 * GB})],
+            programs={"R": _program("PAUSED", unit_hashes=["uR"],
+                                    pre_pause_state="ACTING")},
+            hbm={"kv": _sp(int(0.5 * GB), 10 * GB)})  # < theta_lo → headroom
+        router = _StubRouter(sj)
+        asyncio.run(sched.handle(Event(EventKind.PRESSURE_RESOLVED, session="R"),
+                                 router))
+        return tracker, sched, _drain(ob)
+
+    tracker, sched, batches = _resume_case()
+    if sched.resume_calls != 1:
+        raise StageFail(f"F: headroom → resume_calls must be 1, got "
+                        f"{sched.resume_calls}")
+    puts = [b for b in batches if b.endpoint == "program_paused"]
+    if not puts or puts[0].body.get("state") != "ACTING":
+        raise StageFail(f"F: resume PUT must restore pre_pause_state=ACTING; "
+                        f"got {[b.body for b in puts]}")
+
+    # --- admission OFF → no Pause even under pressure (kv-only arm) ---
+    def _kvonly_case():
+        tracker = ProgramTracker()
+        tracker.observe_arrival("P")
+        ob = OutboundQueue(sglang_base_url="http://unused",
+                           http_client=_DummyHttp())
+        sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
+                                outbound=ob)
+        # admission_enabled stays False (default)
+        sj = _state_json(
+            units=[_unit(uhash="uP", residence=["HBM", "DRAM"], holders=["P"],
+                         n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
+            programs={"P": _program("REASONING", inflight={"kv": 1 * GB},
+                                    unit_hashes=["uP"])},
+            hbm={"kv": _sp(9 * GB, 10 * GB)})
+        router = _StubRouter(sj)
+        asyncio.run(sched.handle(Event(EventKind.MEMORY_PRESSURE, session="P"),
+                                 router))
+        return tracker, sched
+    tracker, sched = _kvonly_case()
+    if sched.pause_calls != 0:
+        raise StageFail("F: admission OFF must dispatch no Pause (kv-only arm)")
+    if tracker.state("P") is State.PAUSED:
+        raise StageFail("F: admission OFF must not pause P")
+    print(_green("  [F] live dispatch: pause+PUT / resume+PUT / kv-only no-pause OK"))
+
+
+# ============================================================ Stage G
+
+
+def stage_g_robustness() -> None:
+    """#194 audit: the cap_left≥0 clamp (over-subscribed destination must
+    not reject zero-acquire DROP) + best_effort relieves ALL axes when
+    caps allow."""
+    from daemon import joint_decide as jd
+    from baselines.knapsack import knapsack_min_cost_multi
+    GB = 1024 ** 3
+
+    # --- cap_left clamp: DRAM over-subscribed (used > cap → cap_left<0).
+    #     A unit on {HBM,DRAM} can still evict-HBM (acquired={}) — the
+    #     clamp keeps that DROP/evict feasible instead of spuriously
+    #     infeasible. ---
+    tracker = ProgramTracker()
+    tracker.observe_arrival("S")
+    sj = _state_json(
+        units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
+                     n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
+        hbm={"kv": _sp(9 * GB, 10 * GB)},
+        dram={"kv": _sp(50 * GB, 40 * GB)})   # used > cap → cap_left = -10GB
+    ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
+    st = _build_state(sj, tracker, ev)
+    plan = jd.joint_decide(st, ev, costs=default_costs(), pi_u=1e-4,
+                           theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+    if not plan:
+        raise StageFail("G: over-subscribed DRAM must NOT make pressure "
+                        "infeasible — evict-HBM (acquired={}) is still valid")
+    relief = _hbm_relief(plan)
+    if relief.get("kv", 0) < int(0.5 * GB):
+        raise StageFail(f"G: clamp must let the HBM-freeing plan through; "
+                        f"freed {relief}")
+
+    # --- best_effort relieves BOTH pressured axes when caps allow (no
+    #     forced tradeoff): two DROPs, one per subpool, both chosen. ---
+    a = Migrate(cost=1.0, relief={"HBM": {"full": 100}}, acquired={},
+                id="a", group="ua")
+    b = Migrate(cost=1.0, relief={"HBM": {"mamba": 100}}, acquired={},
+                id="b", group="ub")
+    chosen = knapsack_min_cost_multi(
+        [a, b],
+        bytes_needed={("HBM", "full"): 100, ("HBM", "mamba"): 100},
+        cap_left={}, bucket_size={("HBM", "full"): 1, ("HBM", "mamba"): 1},
+        best_effort=True)
+    if {c.id for c in chosen} != {"a", "b"}:
+        raise StageFail(f"G: best_effort must relieve BOTH axes when caps "
+                        f"allow; got {[c.id for c in chosen]}")
+    print(_green("  [G] cap_left≥0 clamp; best_effort relieves all axes OK"))
+
+
 # ============================================================ runner
 
 _STAGES = [
@@ -650,6 +837,8 @@ _STAGES = [
     ("C", stage_c_program_candidates),
     ("D", stage_d_joint_decide_select),
     ("E", stage_e_dp_correctness),
+    ("F", stage_f_live_dispatch),
+    ("G", stage_g_robustness),
 ]
 
 

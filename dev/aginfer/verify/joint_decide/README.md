@@ -81,7 +81,38 @@ D joint_decide select — pressure / headroom / dead-zone; pressure
 E DP correctness      — no same-unit double-pick (MCKP) vs brute-force
                         oracle (40 fixtures); under-relievable pressure →
                         best-effort (no fatal); DP blow-up → still raises
+F live dispatch       — KvScheduler.handle → _dispatch_plan: pressure →
+                        Pause (tracker.pause + PUT{PAUSED,pre}); headroom
+                        → Resume (tracker.resume + PUT{pre_pause_state});
+                        admission OFF → no Pause (kv-only arm)
+G robustness          — cap_left≥0 clamp (over-subscribed destination
+                        keeps zero-acquire DROP feasible); best_effort
+                        relieves ALL pressured axes when caps allow
 ```
+
+## AUDIT CLOSURE (2026-06-04)
+
+Adversarial audit confirmed the DP core correct (MCKP at-most-one,
+parent-pointer reconstruction, negative costs, pressure-suppresses-
+headroom). It surfaced one **real bug** + test/doc gaps:
+
+* **BUG — `joint_decide` was never called when `D_t` was empty.**
+  `KvScheduler.handle` had a greedy-era `if not decision_set: return`
+  that short-circuited before the joint decision, so the admission
+  (pause/resume) half **never ran on LLM_PREFILL** (D_t always ∅) or any
+  empty-top-k event — directly violating DESIGN §9. Caught by the new
+  **stage F** (resume on an empty-D_t PRESSURE_RESOLVED returned
+  nothing). Fixed: the handler now always runs `joint_decide`; hints are
+  a no-op on empty D_t.
+* **test-gaps closed**: stage F (the mixed-plan dispatch — brand-new
+  code that had zero positive-path coverage); stage G (the cap_left
+  clamp + multi-axis best_effort); t187 C2 now injects a REAL migrate-
+  dispatch error (the old `_RaisingPolicy.decide` was never reached
+  post-joint) and the dead `_DemoteAllPolicy`/`_RaisingPolicy` stubs +
+  `--max-pauses-per-event` arg were removed.
+* **doc**: the SESSION_END pressure-gating (DESIGN §9) and the §8
+  holder-divided V_u interim (DESIGN §8) are now documented in DESIGN,
+  not just docstrings.
 
 ## Dependencies / honest degradation
 
