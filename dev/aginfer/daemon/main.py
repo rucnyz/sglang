@@ -243,8 +243,13 @@ def main(argv=None) -> None:
         from ._metrics import m as _m
         kv_calls = sched.migrate_calls if sched is not None else 0
         kv_decisions = sched.decisions if sched is not None else 0
-        adm_pauses = admission.pause_decisions if admission is not None else 0
-        adm_resumes = admission.resume_decisions if admission is not None else 0
+        # #194: admission is folded into joint_decide (no AdmissionController);
+        # pause/resume counters now live on the KvScheduler that dispatches
+        # the joint plan.  (Pre-#194 these read a deleted `admission` var —
+        # a NameError that aborted the whole shutdown handler, dropping the
+        # cycle_summary metric + the final observability summary.)
+        adm_pauses = sched.pause_calls if sched is not None else 0
+        adm_resumes = sched.resume_calls if sched is not None else 0
         _m(
             "cycle_summary",
             events_received=router.events_received,

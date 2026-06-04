@@ -393,6 +393,45 @@ def stage_trajectory() -> None:
                  "T26/T11/Mamba gating + Σ-over-programs + malformed-input OK"))
 
 
+def stage_disjoint_levers() -> None:
+    """Holistic-review #2: a Migrate(u) and a Pause(p∋u) must not BOTH
+    count u's HBM bytes as relief.  pause_relief drops the committed
+    (radix) bytes of units in THIS event's D_t — those are the migrate
+    lever's domain (DESIGN §9 'radix vs in-flight')."""
+    tracker = ProgramTracker()
+    tracker.observe_arrival("P")
+    # u1 exclusively held by P (committed share = full bytes); P also has
+    # in-flight decode bytes.  u1's HBM bytes = 500 tok × 2048 = 1,024,000.
+    u1_bytes = 500 * 2048
+    sj = _state_json(
+        units=[_unit(uhash="u1", residence=["HBM"], holders=["P"],
+                     n_tokens=500)],
+        programs={"P": _program("REASONING", inflight={"kv": 3 * MB},
+                                committed={"kv": u1_bytes},
+                                unit_hashes=["u1"])})
+    # MEMORY_PRESSURE → top-k D_t includes u1 → its committed is migrate's
+    # domain → excluded from the pause → relief = inflight only.
+    st_p = _build(sj, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session=None))
+    if "u1" not in st_p.decision_set:
+        raise StageFail("disjoint: precondition — u1 must be in MEMORY_PRESSURE D_t")
+    pc_p = adm.pause_candidates(st_p, heartbeat_s=5.0)
+    pp = next(c for c in pc_p if c.pid == "P")
+    if pp.relief != {"kv": 3 * MB}:
+        raise StageFail(f"disjoint: u1∈D_t → committed excluded from pause "
+                        f"(relief=inflight 3MB only); got {pp.relief}")
+    # LLM_PREFILL → D_t is empty → u1 NOT migrate's domain → committed kept.
+    st_q = _build(sj, tracker, Event(kind=EventKind.LLM_PREFILL, session="P"))
+    if st_q.decision_set:
+        raise StageFail("disjoint: precondition — LLM_PREFILL D_t must be empty")
+    pc_q = adm.pause_candidates(st_q, heartbeat_s=5.0)
+    pq = next(c for c in pc_q if c.pid == "P")
+    if pq.relief != {"kv": 3 * MB + u1_bytes}:
+        raise StageFail(f"disjoint: u1∉D_t → committed kept (relief=inflight+"
+                        f"committed); got {pq.relief}")
+    print(_green("  [disjoint] D_t-committed excluded from pause "
+                 "(no Migrate∩Pause double-count) OK"))
+
+
 _STAGES = [
     ("scoring", stage_scoring),
     ("forecast", stage_forecast),
@@ -400,6 +439,7 @@ _STAGES = [
     ("pause-cands", stage_pause_candidates),
     ("resume-cands", stage_resume_candidates),
     ("trajectory", stage_trajectory),
+    ("disjoint", stage_disjoint_levers),
 ]
 
 
@@ -423,7 +463,7 @@ def main() -> int:
     if failed:
         print(_red(f"FAILED: {', '.join(failed)}"))
         return 1
-    print(_green("admission_controller PASS — all 6 §8 stages green"))
+    print(_green("admission_controller PASS — all 7 §8 stages green"))
     return 0
 
 

@@ -294,14 +294,17 @@ def stage_c_program_candidates() -> None:
     tracker.observe_arrival("B")
     tracker.observe_completion("B")         # ACTING
     tracker.pause("P")                       # PAUSED
+    # NOTE: relief here uses inflight only (no committed) so this stage
+    # stays focused on candidate STRUCTURE (pid filtering, gain/re_use);
+    # the committed term + its D_t-exclusion (disjoint levers, #2) are
+    # pinned by verify/admission_controller stage_disjoint.
     programs = {
-        "A": _program("REASONING", inflight={"kv": 5 * MB},
-                      committed={"kv": 2 * MB}, unit_hashes=["uA"]),
-        "B": _program("ACTING", inflight={"kv": 0},
-                      committed={"kv": 3 * MB}, unit_hashes=["uB"]),
+        "A": _program("REASONING", inflight={"kv": 7 * MB},
+                      unit_hashes=["uA"]),
+        "B": _program("ACTING", inflight={"kv": 3 * MB},
+                      unit_hashes=["uB"]),
         "P": _program("PAUSED", inflight={"kv": 1 * MB},
-                      committed={"kv": 1 * MB}, unit_hashes=["uP"],
-                      pre_pause_state="REASONING"),
+                      unit_hashes=["uP"], pre_pause_state="REASONING"),
     }
     sj = _state_json(
         units=[
@@ -321,14 +324,14 @@ def stage_c_program_candidates() -> None:
         raise StageFail(f"C: pause_candidates must cover REASONING+ACTING "
                         f"only (not PAUSED/ENDED), got {pids}")
     pa = next(p for p in pcs if p.pid == "A")
-    # relief = inflight + committed (snapshot); future term 0.
+    # relief = inflight (snapshot); future term 0, no committed here.
     if pa.relief != {"kv": 7 * MB}:
-        raise StageFail(f"C: A pause_relief should be inflight+committed="
-                        f"7MB, got {pa.relief}")
+        raise StageFail(f"C: A pause_relief should be inflight=7MB, "
+                        f"got {pa.relief}")
     pb = next(p for p in pcs if p.pid == "B")
     if pb.relief != {"kv": 3 * MB}:
-        raise StageFail(f"C: B pause_relief (inflight 0 + committed 3MB) "
-                        f"should be 3MB, got {pb.relief}")
+        raise StageFail(f"C: B pause_relief (inflight 3MB) should be 3MB, "
+                        f"got {pb.relief}")
     # prefill_bps=0 placeholder → marginal_pause_cost 0 → cost = V_u_program.
     vprog = adm.shared_aware_prog_scores(st)
     if abs(pa.cost - vprog["A"]) > 1e-12:

@@ -296,9 +296,39 @@ def marginal_pause_cost(pu: Dict[str, Any], prefill_bps: float) -> float:
     return inflight_bytes / prefill_bps
 
 
+def _committed_in_dt(
+    pu: Dict[str, Any], state: SchedulerState
+) -> Dict[str, int]:
+    """Per-HBM-subpool committed (radix) bytes of p's units that are ALSO
+    in this event's decision_set (D_t) — the bytes the MIGRATE lever will
+    free (holistic-review #2).
+
+    Sized to match sglang's ``committed`` construction (``unit_hbm_bytes
+    // n_holders``) so subtracting it from ``pause_relief`` leaves the two
+    levers freeing physically-disjoint HBM (DESIGN §9 'radix vs
+    in-flight'): without this, a ``Migrate(u)`` and a ``Pause(p∋u)`` in
+    the same pressure plan both count u's bytes, the DP over-estimates
+    relief and under-frees.  A D_t unit that the DP does NOT migrate is
+    simply not credited to the pause either (conservative under-free,
+    recovered next event) — never double-counted."""
+    dt = set(state.decision_set)
+    out: Dict[str, int] = {}
+    for h in pu.get("unit_hashes", []):
+        if h not in dt:
+            continue
+        u = state.units.get(h)
+        if u is None:
+            continue
+        n_holders = max(1, len(u.holders))
+        for sp, b in u.n_bytes_by_tier.get(Tier.HBM, {}).items():
+            out[sp] = out.get(sp, 0) + int(b) // n_holders
+    return out
+
+
 def pause_relief(
     pu: Dict[str, Any],
     future_inflight_savings: Optional[Dict[str, float]] = None,
+    exclude_committed: Optional[Dict[str, int]] = None,
 ) -> Dict[str, int]:
     """DESIGN §8 ``pause_relief`` — per-HBM-subpool bytes pausing p frees:
     ``snapshot_relief[sp] + future_inflight_savings[sp]`` where
@@ -309,14 +339,20 @@ def pause_relief(
     averts — the same per-program term :func:`forecast_inflight_demand`
     sums (computed by :func:`_program_inflight_growth`; 0 under the
     current placeholders).  ``pause_candidates`` computes it and passes
-    it in; absent ⇒ snapshot relief only."""
+    it in; absent ⇒ snapshot relief only.
+
+    ``exclude_committed`` (holistic-review #2) is the committed (radix)
+    bytes of p's units that are in this event's D_t — subtracted so the
+    pause and the migrate lever free disjoint HBM (no double-count).
+    See :func:`_committed_in_dt`."""
     inflight = _program_inflight(pu)
     committed = _program_committed(pu)
     fut = future_inflight_savings or {}
+    excl = exclude_committed or {}
     relief: Dict[str, int] = {}
     for sp in set(inflight) | set(committed) | set(fut):
-        v = (inflight.get(sp, 0) + committed.get(sp, 0)
-             + int(fut.get(sp, 0.0)))
+        c = max(0, committed.get(sp, 0) - int(excl.get(sp, 0)))
+        v = inflight.get(sp, 0) + c + int(fut.get(sp, 0.0))
         if v > 0:
             relief[sp] = v
     return relief
@@ -356,7 +392,11 @@ def pause_candidates(
             continue
         fut = _program_inflight_growth(
             pid, pu, state, decode, dbpt, horizon)
-        relief = pause_relief(pu, fut)
+        # #2: drop the committed bytes of p's units that the migrate lever
+        # owns this event (units in D_t), so Migrate∩Pause don't double-
+        # count the same radix bytes.
+        excl = _committed_in_dt(pu, state)
+        relief = pause_relief(pu, fut, excl)
         cost = vprog.get(pid, 0.0) + marginal_pause_cost(pu, prefill_bps)
         out.append(Pause(cost=cost, relief=relief, pid=pid))
     return out

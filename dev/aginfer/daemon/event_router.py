@@ -382,8 +382,15 @@ def make_session_end_handler(tracker, outbound, kv_scheduler=None):
          parked in the proxy gate, end() releases the gate so
          ``wait_if_paused`` wakes and the proxy responds 499 (client
          closed the session).
-      2. **Migrate D_t (T187)** — if a ``kv_scheduler`` is wired, run
-         its ``handle(event, router)`` for the SESSION_END event.
+      2. **Joint decision (T187 + #194)** — if a ``kv_scheduler`` is
+         wired, run its ``handle(event, router)`` for the SESSION_END
+         event.  Post-#194 ``handle`` runs the full ``joint_decide``, so
+         on top of demoting p's exclusive units this can ALSO pause /
+         resume *unrelated* live programs if HBM is pressured at this
+         instant (admission's candidate generators iterate all programs,
+         not just p; ended p itself is skipped).  That is intended — §9's
+         entry point is uniform across all 13 event kinds; SESSION_END is
+         not special-cased.
          Because step 1 already set p to ENDED, ``build_paper_state``
          scores p's units with the workload-prior p_hat (not 1.0),
          and ``_build_decision_set`` returns ``session_scoped_units(p)``

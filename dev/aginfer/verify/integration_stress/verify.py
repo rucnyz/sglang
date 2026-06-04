@@ -926,8 +926,10 @@ def main() -> int:
     # shared stack is torn down so port reuse is clean).
     print("[integration_stress] launching shared sglang+daemon stack…")
     t_start = time.time()
+    daemon_log_path = None
     try:
         with stack(results_dir) as stack_h:
+            daemon_log_path = stack_h.daemon_log  # for the post-teardown check
             t_ready = time.time() - t_start
             print(f"[integration_stress] stack ready in {t_ready:.0f}s")
             for label, fn in [
@@ -957,6 +959,34 @@ def main() -> int:
     except Exception as exc:
         print(f"[integration_stress] shared stack failed: {exc}")
         failures.append("shared-stack-init")
+
+    # Stage H (post-teardown): the daemon's SIGTERM shutdown handler must
+    # run CLEAN — emit the cycle_summary metric + the final observability
+    # summary, with no traceback.  Regression guard for the #194 bug where
+    # _emit_cycle_summary referenced a deleted `admission` var → NameError
+    # aborted the whole shutdown handler and dropped the telemetry.
+    try:
+        print("[stage H] shutdown-handler clean…")
+        if daemon_log_path is None:
+            raise StageFail("no daemon log captured (stack never came up)")
+        txt = Path(daemon_log_path).read_text(errors="replace")
+        if "event=cycle_summary" not in txt:
+            raise StageFail(
+                "daemon never emitted event=cycle_summary on shutdown "
+                f"(handler crashed?); log={daemon_log_path}")
+        for bad in ("Application shutdown failed", "NameError",
+                    "Traceback (most recent call last)"):
+            # Only flag tracebacks in the shutdown region (after the
+            # cycle_summary attempt) — startup-phase noise is unrelated.
+            tail = txt.split("event=cycle_summary", 1)[-1]
+            if bad in tail:
+                raise StageFail(
+                    f"daemon shutdown handler error ({bad!r}); "
+                    f"log={daemon_log_path}")
+        print(f"  {_green('PASS')} stage H shutdown-handler clean")
+    except StageFail as exc:
+        failures.append("H")
+        print(f"  {_red('FAIL')} stage H: {exc}")
 
     # Stage F runs after the shared stack is down.
     try:

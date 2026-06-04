@@ -40,6 +40,11 @@ trajectory    #199: the §8 forecast trajectory term — assembled from
               decode_bytes_per_token (now exposed) × synthetic
               decode_throughput × E[remaining]; proves the full product
               + the per-input T26/T11/Mamba gating (0 when any absent)
+disjoint      holistic-review #2: a unit's committed (radix) bytes that
+              are in THIS event's D_t are excluded from pause_relief —
+              so Migrate(u) and Pause(p∋u) free disjoint HBM and the §9
+              DP can't double-count (under MEMORY_PRESSURE u∈D_t →
+              excluded; under LLM_PREFILL D_t=∅ → committed kept)
 ```
 
 The §9 phase selection + live mixed-plan dispatch are pinned by

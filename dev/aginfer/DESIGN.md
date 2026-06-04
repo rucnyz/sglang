@@ -1738,6 +1738,16 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
     * **committed[sp]** — p's exclusive share of subpool-sp radix
       bytes; if pausing p drops `len(session_ids)` of a node to 0
       on that subpool, the node becomes evictable on that subpool.
+      **Disjoint-lever exclusion (holistic-review #2):** committed
+      bytes of p's units that are in THIS event's `D_t` are the
+      *migrate* lever's domain, so they are SUBTRACTED here — otherwise
+      a `Migrate(u)` and a `Pause(p∋u)` in the same pressure plan both
+      count u's bytes, the §9 DP over-estimates relief (additive
+      across candidates) and under-frees. The two levers then attack
+      physically-disjoint HBM (radix-via-migrate vs in-flight-via-pause).
+      A D_t unit the DP does not migrate is simply uncredited to the
+      pause too (conservative under-free, recovered next event) — never
+      double-counted. (`pause_relief` ∖ `_committed_in_dt`.)
   * `future_inflight_savings(p, state)[sp]` — per-subpool projected
     growth pausing p averts.  Computed symmetrically to
     `forecast_inflight_demand` (below): cap `E[remaining_tokens(p)]`
