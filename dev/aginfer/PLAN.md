@@ -529,10 +529,24 @@ generalization.
      The term is 0 in production (decode_per_program / per-program inflight
      are sglang placeholders → forecast = used_bytes, behaviour-
      preserving); `verify/admission_controller` trajectory stage pins the
-     product + T26/T11/Mamba gating with synthetic inputs.  Remaining
-     activation gated on **T26 (#200)** — sglang decode-throughput /
-     prefill_bps / per-program inflight measurement — and **T11 (#126)**
-     populating `expected_remaining_tokens`.
+     product + T26/T11/Mamba gating with synthetic inputs.
+   - **T26 measurement (#200 — DONE, 2026-06-05)**: sglang now MEASURES
+     the three inputs (were `0.0`/`{}` placeholders).  The scheduler
+     keeps a per-program decode tokens/sec EMA + a prefill bytes/sec EMA
+     (sampled in `run_batch` — the forward strips the batch by
+     `process_batch_result` time) and computes per-program in-flight HBM
+     bytes (`kv_allocated_len × bpt`; `allocated − committed ≡ 0` in
+     sglang), pushing all three onto the cache before each dump
+     (`set_aginfer_runtime_metrics`).  Pure helpers in
+     `mem_cache/aginfer_metrics.py` (`verify/t26`); live-verified by
+     `verify/integration_stress` **stage T26** (real B300 stack:
+     `prefill_bps≈9e8`, `decode≈700 tok/s × 4`, inflight populated).
+     This ACTIVATES `marginal_pause_cost` (prefill_bps) + the in-flight
+     half of `pause_relief` (inflight) in production.  The forecast
+     **trajectory** term still waits on **T11 (#126)** to populate
+     `expected_remaining_tokens` (gated to avoid the bootstrap over-pause).
+     Follow-on **#205**: the inflight (full-KV) ∩ committed (radix)
+     snapshot overlap in `pause_relief` (bounded over-count).
 
 3. **T35 — `authoritative_tier(residence)`** (DESIGN §7):
    - HBM if present else DRAM else DISK

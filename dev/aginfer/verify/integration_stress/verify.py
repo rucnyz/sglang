@@ -741,6 +741,116 @@ def stage_g(stack_h: StackHandles) -> None:
         )
 
 
+# ============================================================ T26 measurement
+
+
+async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
+    """T26 (#200): under program-tagged decode load, the REAL sglang
+    /aginfer/state must now report measured throughput / in-flight (was
+    0.0/{} placeholders): ``throughput_ema.prefill_bps > 0``,
+    ``decode_per_program[pid] > 0`` for actively-decoding programs, and
+    ``per_program_usage[pid].hbm.inflight`` populated.
+
+    Fires a few PROGRAM-TAGGED chat requests with longer outputs (so
+    they decode for a while) straight at sglang, and polls /aginfer/state
+    concurrently, capturing the peak observed values."""
+    SGLANG_BASE = f"{SGLANG_HOST}:{SGLANG_PORT}"
+    N_PROGS = 4
+    DURATION = 25.0
+    prog_ids = [f"t26-{i}-{uuid.uuid4().hex[:6]}" for i in range(N_PROGS)]
+    deadline = time.time() + DURATION
+
+    seen = {
+        "prefill_bps_max": 0.0,
+        "decode_pos_pids": set(),     # pids ever seen with decode rate > 0
+        "inflight_polls": 0,          # polls with ≥1 program inflight populated
+        "polls": 0,
+    }
+
+    async def worker(pid: str) -> None:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5, read=120, write=10, pool=5),
+        ) as cli:
+            n = 0
+            while time.time() < deadline:
+                body = {
+                    "model": MODEL,
+                    "messages": [
+                        {"role": "system",
+                         "content": f"{_PAD} ({pid} {n} {uuid.uuid4().hex[:8]})"},
+                        {"role": "user",
+                         "content": (f"Count slowly from 1 to 40, one number "
+                                     f"per line. ({pid} {n} "
+                                     f"{uuid.uuid4().hex[:12]})")},
+                    ],
+                    # Longer decode so the request is observably in-flight.
+                    "max_tokens": 96, "temperature": 0.0,
+                    "program_id": pid,
+                }
+                try:
+                    await cli.post(
+                        f"http://{SGLANG_BASE}/v1/chat/completions",
+                        json=body, timeout=120.0)
+                except Exception:
+                    pass
+                n += 1
+
+    async def poller() -> None:
+        async with httpx.AsyncClient(timeout=10.0) as cli:
+            while time.time() < deadline:
+                try:
+                    r = await cli.get(f"http://{SGLANG_BASE}/aginfer/state")
+                    if r.status_code == 200:
+                        body = r.json()
+                        seen["polls"] += 1
+                        te = body.get("throughput_ema", {})
+                        seen["prefill_bps_max"] = max(
+                            seen["prefill_bps_max"],
+                            float(te.get("prefill_bps", 0.0)))
+                        for pid, rate in (te.get("decode_per_program", {}) or {}).items():
+                            if float(rate) > 0.0:
+                                seen["decode_pos_pids"].add(pid)
+                        ppu = body.get("per_program_usage", {}) or {}
+                        if any(
+                            (e.get("hbm", {}).get("inflight") or {})
+                            for e in ppu.values()
+                        ):
+                            seen["inflight_polls"] += 1
+                except Exception:
+                    pass
+                await asyncio.sleep(0.25)
+
+    await asyncio.gather(*(worker(p) for p in prog_ids), poller())
+    return {
+        "prefill_bps_max": seen["prefill_bps_max"],
+        "decode_pos_pids": len(seen["decode_pos_pids"]),
+        "inflight_polls": seen["inflight_polls"],
+        "polls": seen["polls"],
+        "sglang_alive": stack_h.sglang_proc.poll() is None,
+        "daemon_alive": stack_h.daemon_proc.poll() is None,
+    }
+
+
+def stage_t26(stack_h: StackHandles) -> None:
+    res = asyncio.run(_flavor_t26_measurement(stack_h))
+    print(f"  [T26] polls={res['polls']} prefill_bps_max={res['prefill_bps_max']:.3g} "
+          f"decode_pos_pids={res['decode_pos_pids']} "
+          f"inflight_polls={res['inflight_polls']}")
+    if not res["sglang_alive"]:
+        raise StageFail("sglang died mid-flavor-T26")
+    if res["polls"] == 0:
+        raise StageFail("no /aginfer/state polls succeeded")
+    if res["prefill_bps_max"] <= 0.0:
+        raise StageFail("T26: prefill_bps never became > 0 under prefill load "
+                        "(measurement not wired)")
+    if res["decode_pos_pids"] == 0:
+        raise StageFail("T26: decode_per_program never positive for any tagged "
+                        "program under decode load (measurement not wired)")
+    if res["inflight_polls"] == 0:
+        raise StageFail("T26: per_program_usage.hbm.inflight never populated "
+                        "under load (measurement not wired)")
+
+
 # ============================================================ F. escalate-to-fatal
 
 
@@ -939,6 +1049,7 @@ def main() -> int:
                 ("D migrate under traffic",         stage_d),
                 ("E threshold PUT atomicity",       stage_e),
                 ("G SESSION_END migrate e2e",       stage_g),
+                ("T26 throughput/inflight measurement", stage_t26),
             ]:
                 try:
                     print(f"[stage {label}] starting…")

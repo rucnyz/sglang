@@ -229,6 +229,13 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.aginfer_metrics import (
+    AGINFER_THROUGHPUT_EMA_ALPHA,
+    decode_tokens_by_program,
+    ema_update,
+    inflight_bytes_by_program,
+    running_program_view,
+)
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -319,6 +326,20 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch: Optional[ScheduleBatch] = None
+
+        # T26 (#200): aginfer throughput / in-flight measurement.  Per-
+        # program decode tokens/sec EMA + prefill bytes/sec EMA, sampled
+        # once per forward in ``process_batch_result``; pushed onto the
+        # radix cache before each ``/aginfer/state`` dump so the daemon's
+        # §8 admission math (marginal_pause_cost, pause_relief snapshot,
+        # and — once T11 lands E[remaining] — the forecast trajectory)
+        # reads real numbers instead of the 0.0 / {} placeholders.  Gated
+        # on the cache exposing the aginfer schema, so non-aginfer
+        # deployments pay nothing.
+        self._aginfer_decode_ema: Dict[str, float] = {}
+        self._aginfer_prefill_bps_ema: Optional[float] = None
+        self._aginfer_last_decode_t: Optional[float] = None
+        self._aginfer_last_prefill_t: Optional[float] = None
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -2900,6 +2921,12 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
+        # T26 (#200): sample aginfer decode/prefill throughput EMAs from the
+        # FRESH batch (pre-forward) — extend_num_tokens / input_ids are
+        # consumed by the forward and gone by process_batch_result time
+        # under overlap scheduling.  Cheap; no-op on non-aginfer caches.
+        self._aginfer_record_throughput(batch)
+
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
@@ -3391,6 +3418,101 @@ class Scheduler(
 
         return GetInternalStateReqOutput(internal_state=ret)
 
+    def _aginfer_record_throughput(self, batch: ScheduleBatch) -> None:
+        """T26 (#200): update the per-program decode tokens/sec EMA and the
+        prefill bytes/sec EMA from one forward.  Called per
+        ``process_batch_result``; a no-op when the cache isn't aginfer-
+        capable (no ``_aginfer_bytes_per_token``).
+
+        Timing uses ``perf_counter`` deltas between consecutive forwards of
+        the SAME mode — so interleaved prefills slightly inflate the decode
+        gap and the decode rate reads marginally LOW, the safe direction
+        (a lower decode_throughput → smaller forecast → less over-pause).
+        """
+        cache = getattr(self, "tree_cache", None)
+        if cache is None or not hasattr(cache, "_aginfer_bytes_per_token"):
+            return
+        fm = getattr(batch, "forward_mode", None)
+        if fm is None:
+            return
+        now = time.perf_counter()
+        if fm.is_decode():
+            last = self._aginfer_last_decode_t
+            self._aginfer_last_decode_t = now
+            if last is None:
+                return
+            dt = now - last
+            if dt <= 0.0:
+                return
+            for pid, n in decode_tokens_by_program(batch.reqs).items():
+                self._aginfer_decode_ema[pid] = ema_update(
+                    self._aginfer_decode_ema.get(pid), n / dt,
+                    AGINFER_THROUGHPUT_EMA_ALPHA)
+        elif fm.is_extend():
+            last = self._aginfer_last_prefill_t
+            self._aginfer_last_prefill_t = now
+            if last is None:
+                return
+            dt = now - last
+            if dt <= 0.0:
+                return
+            # Prefill-token count this forward.  ``extend_num_tokens`` is
+            # reset by result-processing time (overlap scheduling), so fall
+            # back to the per-req extend lengths, then the input-id tensor.
+            ntok = int(getattr(batch, "extend_num_tokens", 0) or 0)
+            if ntok <= 0:
+                el = getattr(batch, "extend_lens", None)
+                if el:
+                    ntok = int(sum(el))
+            if ntok <= 0:
+                ii = getattr(batch, "input_ids", None)
+                if ii is not None:
+                    try:
+                        ntok = int(len(ii))
+                    except TypeError:
+                        ntok = 0
+            if ntok <= 0:
+                return
+            bpt = int(cache._aginfer_bytes_per_token())
+            if bpt <= 0:
+                return
+            self._aginfer_prefill_bps_ema = ema_update(
+                self._aginfer_prefill_bps_ema, (ntok * bpt) / dt,
+                AGINFER_THROUGHPUT_EMA_ALPHA)
+
+    def _aginfer_push_runtime_metrics(self) -> None:
+        """T26 (#200): assemble the measured decode/prefill EMAs +
+        per-program in-flight bytes and push them onto the radix cache so
+        the next ``dump_aginfer_state`` reflects real numbers.  Cold path
+        (per dump cadence); a no-op when the cache can't store them."""
+        cache = getattr(self, "tree_cache", None)
+        setter = getattr(cache, "set_aginfer_runtime_metrics", None)
+        if setter is None:
+            return
+        from sglang.srt.mem_cache.unified_cache_components import (
+            BASE_COMPONENT_TYPE,
+        )
+
+        rb = getattr(self, "running_batch", None)
+        reqs = list(rb.reqs) if rb is not None else []
+        running_pids = {
+            str(r.program_id) for r in reqs if getattr(r, "program_id", None) is not None
+        }
+        # Prune decode EMAs for programs that are no longer running so the
+        # dict stays bounded by the live set (not every program ever seen).
+        self._aginfer_decode_ema = {
+            p: v for p, v in self._aginfer_decode_ema.items() if p in running_pids
+        }
+        decode_pp = running_program_view(self._aginfer_decode_ema, running_pids)
+        bpt = int(cache._aginfer_bytes_per_token())
+        subpool = cache._aginfer_subpool_name(BASE_COMPONENT_TYPE)
+        inflight = inflight_bytes_by_program(reqs, bpt, subpool)
+        setter(
+            decode_per_program=decode_pp,
+            prefill_bps=float(self._aginfer_prefill_bps_ema or 0.0),
+            inflight=inflight,
+        )
+
     def get_aginfer_state(self, recv_req: GetAginferStateReq) -> GetAginferStateReqOutput:
         """Snapshot the radix cache for the aginfer daemon (paper §3 s_t).
 
@@ -3403,6 +3525,9 @@ class Scheduler(
         10k-element list-of-dicts) and the HTTP layer can stream the bytes
         without re-encoding.
         """
+        # T26 (#200): refresh the cache's measured throughput / in-flight
+        # snapshot before EITHER dump path serialises it.
+        self._aginfer_push_runtime_metrics()
         dump_bytes = getattr(self.tree_cache, "dump_aginfer_state_bytes", None)
         if dump_bytes is not None:
             return GetAginferStateReqOutput(state_bytes=dump_bytes())

@@ -1894,8 +1894,15 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
   * `bytes_per_token_in_subpool` is now exposed —
     `pool_usage[*].subpools[sp].decode_bytes_per_token` (attention =
     bytes/token, Mamba = 0; sglang `_aginfer_decode_bytes_per_token`).
-  * `decode_throughput` = `throughput_ema.decode_per_program[p]` is the
-    T26 measurement (ships `{}`); 0 ⇒ the program contributes nothing.
+  * `decode_throughput` = `throughput_ema.decode_per_program[p]` is now
+    MEASURED (T26 / #200): the scheduler keeps a per-program decode
+    tokens/sec EMA (sampled in `run_batch`) and pushes it onto the cache
+    before each dump.  0 (program not currently decoding) ⇒ no
+    contribution.  `prefill_bps` (for `marginal_pause_cost`) and
+    `per_program_usage[p].hbm.inflight` (the §8 `snapshot_relief`) are
+    measured the same way — so `marginal_pause_cost` and the in-flight
+    half of `pause_relief` are LIVE; only the forecast *trajectory* term
+    below still waits on `E[remaining_tokens]` (T11).
   * `E[remaining_tokens]` reads an optional per-program
     `expected_remaining_tokens` field (T11 / a future dump will fill);
     **absent ⇒ `None`, and the program is skipped — NOT bootstrapped to

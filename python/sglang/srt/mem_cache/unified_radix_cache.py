@@ -572,6 +572,18 @@ class UnifiedRadixCache(BasePrefixCache):
         # state="REASONING", pre_pause_state=None for every pid that
         # has live units cited in session_ids.
         self._aginfer_program_states: dict[str, dict] = {}
+        # T26 (#200): scheduler-pushed throughput / in-flight measurement
+        # (the scheduler owns the running batch + forward timing; the
+        # cache only stores + serialises).  ``decode_per_program`` =
+        # {pid: tokens/sec EMA}; ``prefill_bps`` = bytes/sec EMA;
+        # ``inflight`` = {pid: {subpool: HBM bytes}}.  Empty cold-start →
+        # the dump emits the same placeholders as before until the
+        # scheduler pushes real numbers (set_aginfer_runtime_metrics).
+        self._aginfer_runtime_metrics: dict = {
+            "decode_per_program": {},
+            "prefill_bps": 0.0,
+            "inflight": {},
+        }
         # T40 (#184, DESIGN §6 PUT /aginfer/hints + §10 overwrite-by-
         # stamp): daemon-pushed V_u inputs for the inline scorer,
         # keyed by unit hash → {"p_hat", "lambda", "stamp"}.  The
@@ -3033,6 +3045,22 @@ class UnifiedRadixCache(BasePrefixCache):
             e["pre_pause_state"] = stored["pre_pause_state"]
         for pid in ended_no_units:
             del self._aginfer_program_states[pid]
+        # T26 (#200): overlay scheduler-pushed per-program in-flight HBM
+        # bytes.  A program can have running (in-flight) bytes with NO
+        # radix-committed units yet (first request still prefilling /
+        # decoding), so create an entry if absent — its in-flight bytes
+        # are the §8 snapshot_relief the daemon would free by pausing it.
+        for pid, sp_bytes in self._aginfer_runtime_metrics.get(
+            "inflight", {}
+        ).items():
+            e = per_program.setdefault(pid, {
+                "hbm":  {"committed": {}, "inflight": {}},
+                "dram": {"committed": {}},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": [],
+            })
+            e["hbm"]["inflight"] = {sp: int(b) for sp, b in sp_bytes.items()}
         return per_program
 
     def _aginfer_node_summary(self, node) -> dict:
@@ -3351,17 +3379,33 @@ class UnifiedRadixCache(BasePrefixCache):
             }
         return out
 
-    def _aginfer_throughput_ema(self) -> dict:
-        """Cold-start throughput_ema.  T26/T29 wire actual measurement.
+    def set_aginfer_runtime_metrics(
+        self, *, decode_per_program: dict, prefill_bps: float, inflight: dict
+    ) -> None:
+        """T26 (#200): scheduler pushes its measured throughput EMAs +
+        per-program in-flight bytes here before each dump (the scheduler
+        owns the running batch + forward timing; the cache only stores).
+        ``decode_per_program`` = {pid: tokens/sec}; ``prefill_bps`` =
+        bytes/sec; ``inflight`` = {pid: {subpool: HBM bytes}}."""
+        self._aginfer_runtime_metrics = {
+            "decode_per_program": dict(decode_per_program or {}),
+            "prefill_bps": float(prefill_bps or 0.0),
+            "inflight": {pid: dict(sp) for pid, sp in (inflight or {}).items()},
+        }
 
-        Daemon's §7 marginal_pause_cost (prefill) and §8
-        forecast_inflight_demand (decode) read these; zero
-        cold-start means the formulas degenerate to their
-        no-throughput-signal branches until measurement starts.
+    def _aginfer_throughput_ema(self) -> dict:
+        """``throughput_ema`` for the dump — the scheduler-pushed EMAs
+        (T26 #200; was a hardcoded 0.0/{} placeholder).
+
+        Daemon's §8 ``marginal_pause_cost`` (prefill_bps) and
+        ``forecast_inflight_demand`` (decode_per_program) read these.
+        Empty until the scheduler pushes a measurement, so the formulas
+        still degenerate to their no-signal branches at cold-start.
         """
+        m = self._aginfer_runtime_metrics
         return {
-            "prefill_bps": 0.0,
-            "decode_per_program": {},
+            "prefill_bps": float(m.get("prefill_bps", 0.0)),
+            "decode_per_program": dict(m.get("decode_per_program", {})),
         }
 
     def dump_aginfer_state(self) -> dict:
