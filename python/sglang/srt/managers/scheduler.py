@@ -3420,15 +3420,39 @@ class Scheduler(
 
     def _aginfer_record_throughput(self, batch: ScheduleBatch) -> None:
         """T26 (#200): update the per-program decode tokens/sec EMA and the
-        prefill bytes/sec EMA from one forward.  Called per
-        ``process_batch_result``; a no-op when the cache isn't aginfer-
-        capable (no ``_aginfer_bytes_per_token``).
+        prefill bytes/sec EMA from one forward.  Called per ``run_batch``;
+        a no-op when the cache isn't aginfer-capable (no
+        ``_aginfer_bytes_per_token``).
 
         Timing uses ``perf_counter`` deltas between consecutive forwards of
         the SAME mode — so interleaved prefills slightly inflate the decode
         gap and the decode rate reads marginally LOW, the safe direction
         (a lower decode_throughput → smaller forecast → less over-pause).
+
+        Mode classification (#200 audit): ONLY pure ``DECODE`` counts as
+        decode and ONLY pure ``EXTEND`` counts as prefill.  ``is_extend()``
+        is also True for ``MIXED`` / ``TARGET_VERIFY`` / ``DRAFT_EXTEND``,
+        so the broad check would count spec-decode verify/draft tokens —
+        and a MIXED batch's running-decode tokens — as PREFILL, polluting
+        ``prefill_bps``.  Restricting to the pure modes makes the estimate
+        CONSERVATIVE under spec-decode / chunked-prefill (under-measured,
+        never wrong); full spec/MIXED token accounting is #206.
+
+        Wrapped in a blanket ``except`` (#200 audit): this is brand-new
+        per-forward instrumentation; an unhandled error here would kill the
+        scheduler event loop.  Losing a throughput sample is harmless —
+        the daemon degrades to its no-signal branch.
         """
+        try:
+            self._aginfer_record_throughput_inner(batch)
+        except Exception:  # noqa: BLE001
+            if not getattr(self, "_aginfer_throughput_warned", False):
+                self._aginfer_throughput_warned = True
+                logger.warning(
+                    "aginfer throughput measurement raised (suppressed; "
+                    "metric degrades to no-signal)", exc_info=True)
+
+    def _aginfer_record_throughput_inner(self, batch: ScheduleBatch) -> None:
         cache = getattr(self, "tree_cache", None)
         if cache is None or not hasattr(cache, "_aginfer_bytes_per_token"):
             return
@@ -3436,7 +3460,7 @@ class Scheduler(
         if fm is None:
             return
         now = time.perf_counter()
-        if fm.is_decode():
+        if fm == ForwardMode.DECODE:
             last = self._aginfer_last_decode_t
             self._aginfer_last_decode_t = now
             if last is None:
@@ -3448,7 +3472,7 @@ class Scheduler(
                 self._aginfer_decode_ema[pid] = ema_update(
                     self._aginfer_decode_ema.get(pid), n / dt,
                     AGINFER_THROUGHPUT_EMA_ALPHA)
-        elif fm.is_extend():
+        elif fm == ForwardMode.EXTEND:
             last = self._aginfer_last_prefill_t
             self._aginfer_last_prefill_t = now
             if last is None:
@@ -3493,20 +3517,31 @@ class Scheduler(
             BASE_COMPONENT_TYPE,
         )
 
-        rb = getattr(self, "running_batch", None)
-        reqs = list(rb.reqs) if rb is not None else []
-        running_pids = {
-            str(r.program_id) for r in reqs if getattr(r, "program_id", None) is not None
-        }
-        # Prune decode EMAs for programs that are no longer running so the
-        # dict stays bounded by the live set (not every program ever seen).
-        self._aginfer_decode_ema = {
-            p: v for p, v in self._aginfer_decode_ema.items() if p in running_pids
-        }
-        decode_pp = running_program_view(self._aginfer_decode_ema, running_pids)
-        bpt = int(cache._aginfer_bytes_per_token())
-        subpool = cache._aginfer_subpool_name(BASE_COMPONENT_TYPE)
-        inflight = inflight_bytes_by_program(reqs, bpt, subpool)
+        try:
+            rb = getattr(self, "running_batch", None)
+            reqs = list(rb.reqs) if rb is not None else []
+            running_pids = {
+                str(r.program_id) for r in reqs
+                if getattr(r, "program_id", None) is not None
+            }
+            # Prune decode EMAs for programs that are no longer running so
+            # the dict stays bounded by the live set (not every program
+            # ever seen) — the ONLY prune point, so a never-dumped daemon
+            # can't make the dict grow unbounded on the hot path.
+            self._aginfer_decode_ema = {
+                p: v for p, v in self._aginfer_decode_ema.items()
+                if p in running_pids
+            }
+            decode_pp = running_program_view(
+                self._aginfer_decode_ema, running_pids)
+            bpt = int(cache._aginfer_bytes_per_token())
+            subpool = cache._aginfer_subpool_name(BASE_COMPONENT_TYPE)
+            inflight = inflight_bytes_by_program(reqs, bpt, subpool)
+        except Exception:  # noqa: BLE001 — never break the state dump
+            logger.warning(
+                "aginfer runtime-metric push raised; emitting empty",
+                exc_info=True)
+            decode_pp, inflight = {}, {}
         setter(
             decode_per_program=decode_pp,
             prefill_bps=float(self._aginfer_prefill_bps_ema or 0.0),

@@ -760,10 +760,12 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
     prog_ids = [f"t26-{i}-{uuid.uuid4().hex[:6]}" for i in range(N_PROGS)]
     deadline = time.time() + DURATION
 
+    tagged = set(prog_ids)
     seen = {
         "prefill_bps_max": 0.0,
-        "decode_pos_pids": set(),     # pids ever seen with decode rate > 0
-        "inflight_polls": 0,          # polls with ≥1 program inflight populated
+        "decode_pos_tagged": set(),   # TAGGED pids seen with decode rate > 0
+        "inflight_tagged": set(),     # TAGGED pids seen with inflight > 0
+        "inflight_polls": 0,
         "polls": 0,
     }
 
@@ -808,13 +810,16 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
                             seen["prefill_bps_max"],
                             float(te.get("prefill_bps", 0.0)))
                         for pid, rate in (te.get("decode_per_program", {}) or {}).items():
-                            if float(rate) > 0.0:
-                                seen["decode_pos_pids"].add(pid)
+                            if pid in tagged and float(rate) > 0.0:
+                                seen["decode_pos_tagged"].add(pid)
                         ppu = body.get("per_program_usage", {}) or {}
-                        if any(
-                            (e.get("hbm", {}).get("inflight") or {})
-                            for e in ppu.values()
-                        ):
+                        any_inflight = False
+                        for pid, e in ppu.items():
+                            infl = e.get("hbm", {}).get("inflight") or {}
+                            if pid in tagged and any(v > 0 for v in infl.values()):
+                                seen["inflight_tagged"].add(pid)
+                                any_inflight = True
+                        if any_inflight:
                             seen["inflight_polls"] += 1
                 except Exception:
                     pass
@@ -823,8 +828,10 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
     await asyncio.gather(*(worker(p) for p in prog_ids), poller())
     return {
         "prefill_bps_max": seen["prefill_bps_max"],
-        "decode_pos_pids": len(seen["decode_pos_pids"]),
+        "decode_pos_tagged": len(seen["decode_pos_tagged"]),
+        "inflight_tagged": len(seen["inflight_tagged"]),
         "inflight_polls": seen["inflight_polls"],
+        "n_tagged": len(tagged),
         "polls": seen["polls"],
         "sglang_alive": stack_h.sglang_proc.poll() is None,
         "daemon_alive": stack_h.daemon_proc.poll() is None,
@@ -833,8 +840,10 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
 
 def stage_t26(stack_h: StackHandles) -> None:
     res = asyncio.run(_flavor_t26_measurement(stack_h))
+    n = res["n_tagged"]
     print(f"  [T26] polls={res['polls']} prefill_bps_max={res['prefill_bps_max']:.3g} "
-          f"decode_pos_pids={res['decode_pos_pids']} "
+          f"decode_pos_tagged={res['decode_pos_tagged']}/{n} "
+          f"inflight_tagged={res['inflight_tagged']}/{n} "
           f"inflight_polls={res['inflight_polls']}")
     if not res["sglang_alive"]:
         raise StageFail("sglang died mid-flavor-T26")
@@ -843,12 +852,15 @@ def stage_t26(stack_h: StackHandles) -> None:
     if res["prefill_bps_max"] <= 0.0:
         raise StageFail("T26: prefill_bps never became > 0 under prefill load "
                         "(measurement not wired)")
-    if res["decode_pos_pids"] == 0:
-        raise StageFail("T26: decode_per_program never positive for any tagged "
-                        "program under decode load (measurement not wired)")
-    if res["inflight_polls"] == 0:
-        raise StageFail("T26: per_program_usage.hbm.inflight never populated "
-                        "under load (measurement not wired)")
+    # EVERY tagged program must be measured (not just one) — a single stuck
+    # program or a misattributed pid would otherwise pass (#200 audit).
+    if res["decode_pos_tagged"] < n:
+        raise StageFail(f"T26: only {res['decode_pos_tagged']}/{n} tagged "
+                        f"programs got a positive decode rate (per-program "
+                        f"decode measurement incomplete)")
+    if res["inflight_tagged"] < n:
+        raise StageFail(f"T26: only {res['inflight_tagged']}/{n} tagged "
+                        f"programs had inflight populated")
 
 
 # ============================================================ F. escalate-to-fatal

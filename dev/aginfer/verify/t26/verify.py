@@ -67,9 +67,13 @@ def stage_ema() -> None:
     # poisoned prev recovers to the sample.
     if ema_update(float("nan"), 7.0, a) != 7.0:
         raise StageFail("ema: non-finite prev must recover to sample")
+    # prev=0.0 is a VALID prior (a real zero EMA), NOT "unset" → blend,
+    # don't re-seed (#200 audit).
+    if ema_update(0.0, 10.0, 0.5) != 5.0:
+        raise StageFail("ema: prev=0.0 must blend (0.5*10+0.5*0), not re-seed")
     if not (0.0 < AGINFER_THROUGHPUT_EMA_ALPHA < 1.0):
         raise StageFail("ema: default alpha must be in (0,1)")
-    print(_green("  [ema] seed / blend / alpha / malformed-guard OK"))
+    print(_green("  [ema] seed / blend / alpha / prev=0 / malformed-guard OK"))
 
 
 def stage_inflight() -> None:
@@ -128,11 +132,89 @@ def stage_running_view() -> None:
     print(_green("  [running-view] projects EMA onto live programs OK"))
 
 
+def stage_scheduler_routing() -> None:
+    """#200 audit: pin the scheduler hook's forward-mode routing — ONLY
+    pure DECODE counts as decode, ONLY pure EXTEND as prefill.  MIXED /
+    TARGET_VERIFY / DRAFT_EXTEND (spec-decode) must update NEITHER (else
+    verify/draft/mixed tokens pollute prefill_bps).  Also: the per-forward
+    wrapper must never raise (a scheduler-loop crash is catastrophic)."""
+    import time
+    import types
+
+    # Heavy imports — only this stage needs the scheduler + the enum.
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    class _Cache:
+        def _aginfer_bytes_per_token(self):
+            return 2048
+
+    def _self():
+        return types.SimpleNamespace(
+            tree_cache=_Cache(),
+            _aginfer_last_decode_t=None, _aginfer_last_prefill_t=None,
+            _aginfer_decode_ema={}, _aginfer_prefill_bps_ema=None,
+            _aginfer_throughput_warned=False)
+
+    def _batch(mode, reqs=None, ent=None):
+        return types.SimpleNamespace(
+            forward_mode=mode, reqs=reqs or [], extend_num_tokens=ent,
+            extend_lens=None, input_ids=None)
+
+    # pure DECODE → decode EMA populated for the batch's programs.
+    s = _self(); s._aginfer_last_decode_t = time.perf_counter() - 0.1
+    Scheduler._aginfer_record_throughput_inner(
+        s, _batch(ForwardMode.DECODE, reqs=[_Req("A", 1, 1), _Req("B", 1, 1)]))
+    if set(s._aginfer_decode_ema) != {"A", "B"} or not all(
+            v > 0 for v in s._aginfer_decode_ema.values()):
+        raise StageFail(f"routing: pure DECODE must populate decode EMA; "
+                        f"got {s._aginfer_decode_ema}")
+    if s._aginfer_prefill_bps_ema is not None:
+        raise StageFail("routing: DECODE must not touch prefill_bps")
+
+    # pure EXTEND → prefill_bps populated, decode untouched.
+    s = _self(); s._aginfer_last_prefill_t = time.perf_counter() - 0.1
+    Scheduler._aginfer_record_throughput_inner(
+        s, _batch(ForwardMode.EXTEND, ent=100))
+    if not (s._aginfer_prefill_bps_ema and s._aginfer_prefill_bps_ema > 0):
+        raise StageFail("routing: pure EXTEND must populate prefill_bps")
+    if s._aginfer_decode_ema:
+        raise StageFail("routing: EXTEND must not touch decode EMA")
+
+    # MIXED / TARGET_VERIFY / DRAFT_EXTEND → NEITHER (the pollution fix).
+    for mode in (ForwardMode.MIXED, ForwardMode.TARGET_VERIFY,
+                 ForwardMode.DRAFT_EXTEND):
+        s = _self()
+        s._aginfer_last_decode_t = time.perf_counter() - 0.1
+        s._aginfer_last_prefill_t = time.perf_counter() - 0.1
+        Scheduler._aginfer_record_throughput_inner(
+            s, _batch(mode, reqs=[_Req("A", 1, 1)], ent=100))
+        if s._aginfer_decode_ema or s._aginfer_prefill_bps_ema is not None:
+            raise StageFail(
+                f"routing: {mode} must update NEITHER decode nor prefill "
+                f"(spec/mixed pollution); got decode={s._aginfer_decode_ema} "
+                f"prefill={s._aginfer_prefill_bps_ema}")
+
+    # raise-safety: the WRAPPER must swallow an inner error (reqs not
+    # iterable → TypeError inside) — never propagate into the forward loop.
+    s = _self(); s._aginfer_last_decode_t = time.perf_counter() - 0.1
+    bad = _batch(ForwardMode.DECODE); bad.reqs = 5  # not iterable
+    try:
+        Scheduler._aginfer_record_throughput(s, bad)
+    except Exception as e:  # noqa: BLE001
+        raise StageFail(f"routing: per-forward hook must NOT raise; got {e!r}")
+    if not s._aginfer_throughput_warned:
+        raise StageFail("routing: a suppressed error must set the warned flag")
+    print(_green("  [routing] DECODE→decode, EXTEND→prefill, MIXED/spec→none, "
+                 "raise-safe OK"))
+
+
 _STAGES = [
     ("ema", stage_ema),
     ("inflight", stage_inflight),
     ("decode-counts", stage_decode_counts),
     ("running-view", stage_running_view),
+    ("routing", stage_scheduler_routing),
 ]
 
 
@@ -156,7 +238,7 @@ def main() -> int:
     if failed:
         print(_red(f"FAILED: {', '.join(failed)}"))
         return 1
-    print(_green("T26 pure-helpers PASS — all 4 stages green"))
+    print(_green("T26 pure-helpers PASS — all 5 stages green"))
     return 0
 
 

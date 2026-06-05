@@ -35,7 +35,7 @@ daemon's `_aginfer_program_states` push.
   throughput_ema` returns it; `_aginfer_overlay_program_states` fills
   `hbm.inflight`.
 
-## Two corrections found by real-stack debugging
+## Three corrections (real-stack debugging + audit)
 
 1. **inflight = `kv_allocated_len × bpt`, not `allocated − committed`.**
    sglang commits each decoded token immediately (`kv_committed_len`
@@ -46,14 +46,26 @@ daemon's `_aginfer_program_states` push.
 2. **Prefill measured at `run_batch`, not `process_batch_result`.**  At
    result time (overlap scheduling) the extend batch's token fields are
    all `None`; the fresh pre-forward batch has them.
+3. **Pure-mode classification only (#200 audit).**  `is_extend()` is True
+   for `MIXED` / `TARGET_VERIFY` / `DRAFT_EXTEND` too, so the broad check
+   counted spec-decode verify/draft tokens — and a MIXED batch's decode
+   tokens — as PREFILL, polluting `prefill_bps`.  Now ONLY pure `DECODE`
+   counts as decode and ONLY pure `EXTEND` as prefill — conservative
+   (under-measured) under spec/chunked, never wrong.  Full spec/MIXED
+   token accounting is #206.  The per-forward hook is also wrapped in a
+   blanket `except` (a scheduler-loop crash is catastrophic; losing a
+   sample is harmless).
 
 ## Stages (pure)
 
 ```
-ema            seed / blend / alpha / malformed-input guard
+ema            seed / blend / alpha / prev=0-blends / malformed guard
 inflight       current-KV per program; skip untagged/empty; sum; bpt guard
 decode-counts  1 token/req + accumulation (spec-decode)
 running-view   project decode EMA onto live programs
+routing        scheduler hook: DECODE→decode, EXTEND→prefill,
+               MIXED/TARGET_VERIFY/DRAFT_EXTEND→neither; per-forward
+               wrapper is raise-safe
 ```
 
 The live wiring is verified end-to-end by `verify/integration_stress`
@@ -80,8 +92,10 @@ python dev/aginfer/verify/integration_stress/verify.py        # stage T26 (real 
 
 ## RESULTS
 
-**PASSED** — 4 pure stages + integration_stress stage T26 on the real
-B300 stack (`prefill_bps≈9.2e8`, `decode≈700 tok/s × 4`, inflight
-populated in 81/93 polls).
+**PASSED** — 5 pure stages (incl. the scheduler-routing/raise-safety
+stage) + integration_stress stage T26 on the real B300 stack
+(`prefill_bps≈9.2e8`, `decode≈700 tok/s × 4`, inflight populated).  The
+integration stage now requires ALL tagged programs to be measured (not
+just one) for both decode and inflight (#200 audit).
 
 * date: 2026-06-05

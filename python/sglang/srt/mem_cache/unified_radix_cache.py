@@ -3043,6 +3043,7 @@ class UnifiedRadixCache(BasePrefixCache):
             })
             e["state"] = stored["state"]
             e["pre_pause_state"] = stored["pre_pause_state"]
+        ended_gcd = set(ended_no_units)
         for pid in ended_no_units:
             del self._aginfer_program_states[pid]
         # T26 (#200): overlay scheduler-pushed per-program in-flight HBM
@@ -3050,9 +3051,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # radix-committed units yet (first request still prefilling /
         # decoding), so create an entry if absent — its in-flight bytes
         # are the §8 snapshot_relief the daemon would free by pausing it.
+        # Skip pids the ENDED-GC just dropped (#200 audit): an ENDED
+        # program with a still-draining running req must NOT be resurrected
+        # here as REASONING (the GC is authoritative about termination).
         for pid, sp_bytes in self._aginfer_runtime_metrics.get(
             "inflight", {}
         ).items():
+            if pid in ended_gcd:
+                continue
             e = per_program.setdefault(pid, {
                 "hbm":  {"committed": {}, "inflight": {}},
                 "dram": {"committed": {}},
