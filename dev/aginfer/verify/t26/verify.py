@@ -315,6 +315,48 @@ def stage_mixed() -> None:
                  "extend_num_tokens not used; spec-v2 MIXED still counts decode OK"))
 
 
+def stage_bpt_cache() -> None:
+    """#209 regression guard: UnifiedRadixCache._aginfer_bytes_per_token must
+    NOT cache a transient 0 (kvcache not yet wired when an early #200/#206
+    hot-path caller asks).  Caching 0 poisoned every pool_usage cap_bytes
+    → occ_hbm≡0 → the daemon never saw HBM pressure.  Only a positive bpt
+    may be cached; a 0 must recompute next call."""
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    class _KV:
+        def __init__(self, bpt):
+            self._bpt = bpt
+        def get_bytes_per_token(self):
+            return self._bpt
+
+    class _Alloc:
+        def __init__(self, kv):
+            self._kvcache = kv
+
+    kv = _KV(0)
+    s = _types.SimpleNamespace(token_to_kv_pool_allocator=_Alloc(kv))
+    fn = UnifiedRadixCache._aginfer_bytes_per_token
+
+    # 1st call: kvcache reports 0 (early/transient) → returns 0, NOT cached.
+    if fn(s) != 0:
+        raise StageFail("bpt-cache: transient 0 must return 0")
+    if getattr(s, "_aginfer_bpt_cache", 0):
+        raise StageFail("bpt-cache: a 0 must NOT be cached (the #209 poison)")
+    # 2nd call: kvcache now reports the real value → returns it AND caches it.
+    kv._bpt = 2048
+    if fn(s) != 2048:
+        raise StageFail("bpt-cache: must recompute the real bpt after a 0")
+    if getattr(s, "_aginfer_bpt_cache", 0) != 2048:
+        raise StageFail("bpt-cache: a positive bpt must be cached")
+    # 3rd call: even if the pool transiently reports 0 again, the cached
+    # positive value stands (layout never changes once known).
+    kv._bpt = 0
+    if fn(s) != 2048:
+        raise StageFail("bpt-cache: cached positive bpt must survive a later 0")
+    print(_green("  [bpt-cache] transient 0 not cached; positive bpt cached + "
+                 "sticky (#209) OK"))
+
+
 def stage_spec_decode() -> None:
     """#206: the post-forward spec hook attributes accept_lens (= accepted
     tokens/req, ≥1) to per-program decode EMA — NOT 1/req.  Reads
@@ -367,6 +409,7 @@ _STAGES = [
     ("routing", stage_scheduler_routing),
     ("mixed", stage_mixed),
     ("spec-decode", stage_spec_decode),
+    ("bpt-cache", stage_bpt_cache),
 ]
 
 

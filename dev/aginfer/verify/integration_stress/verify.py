@@ -766,6 +766,7 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
         "decode_pos_tagged": set(),   # TAGGED pids seen with decode rate > 0
         "inflight_tagged": set(),     # TAGGED pids seen with inflight > 0
         "inflight_polls": 0,
+        "hbm_cap_max": 0,             # #209: pool_usage HBM cap_bytes (must be >0)
         "polls": 0,
     }
 
@@ -821,6 +822,14 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
                                 any_inflight = True
                         if any_inflight:
                             seen["inflight_polls"] += 1
+                        # #209 guard: pool_usage cap_bytes must be > 0.  A
+                        # poisoned _aginfer_bytes_per_token cache zeroed every
+                        # cap → occ_hbm≡0 → the daemon never saw HBM pressure.
+                        hbm_sp = (body.get("pool_usage", {}).get("HBM", {})
+                                  .get("subpools", {}) or {})
+                        for e in hbm_sp.values():
+                            seen["hbm_cap_max"] = max(
+                                seen["hbm_cap_max"], int(e.get("cap_bytes", 0) or 0))
                 except Exception:
                     pass
                 await asyncio.sleep(0.25)
@@ -831,6 +840,7 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
         "decode_pos_tagged": len(seen["decode_pos_tagged"]),
         "inflight_tagged": len(seen["inflight_tagged"]),
         "inflight_polls": seen["inflight_polls"],
+        "hbm_cap_max": seen["hbm_cap_max"],
         "n_tagged": len(tagged),
         "polls": seen["polls"],
         "sglang_alive": stack_h.sglang_proc.poll() is None,
@@ -844,11 +854,18 @@ def stage_t26(stack_h: StackHandles) -> None:
     print(f"  [T26] polls={res['polls']} prefill_bps_max={res['prefill_bps_max']:.3g} "
           f"decode_pos_tagged={res['decode_pos_tagged']}/{n} "
           f"inflight_tagged={res['inflight_tagged']}/{n} "
-          f"inflight_polls={res['inflight_polls']}")
+          f"inflight_polls={res['inflight_polls']} hbm_cap_max={res['hbm_cap_max']}")
     if not res["sglang_alive"]:
         raise StageFail("sglang died mid-flavor-T26")
     if res["polls"] == 0:
         raise StageFail("no /aginfer/state polls succeeded")
+    # #209 regression guard: pool_usage HBM cap_bytes must be > 0, else the
+    # daemon's occ_hbm ≡ 0 and it can never see pressure (a poisoned
+    # _aginfer_bytes_per_token cache zeroed every cap_bytes).
+    if res["hbm_cap_max"] <= 0:
+        raise StageFail("T26/#209: pool_usage HBM cap_bytes stayed 0 — daemon "
+                        "would never see HBM pressure (bytes_per_token cache "
+                        "poisoned by an early transient 0)")
     if res["prefill_bps_max"] <= 0.0:
         raise StageFail("T26: prefill_bps never became > 0 under prefill load "
                         "(measurement not wired)")

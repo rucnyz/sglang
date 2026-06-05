@@ -3122,11 +3122,16 @@ class UnifiedRadixCache(BasePrefixCache):
           * MHA / MLA       : derive from ``get_kv_size_bytes() / size``
           * unknown         : return 0 — the daemon falls back to tokens
 
-        Result is cached on the instance after the first computation; the
-        KV layout never changes for the lifetime of the scheduler.
+        Only a POSITIVE result is cached — the KV layout never changes once
+        known, but an early/transient 0 (kvcache not yet wired when a hot-
+        path caller asks) must NOT poison the cache.  Before #200/#206 the
+        first caller was always the cold dump (kvcache ready → bpt>0); the
+        T26 hot-path hooks now call this much earlier, and caching their
+        transient 0 zeroed every pool_usage cap_bytes → occ_hbm≡0 → the
+        daemon never saw HBM pressure (#209).
         """
-        cached = getattr(self, "_aginfer_bpt_cache", None)
-        if cached is not None:
+        cached = getattr(self, "_aginfer_bpt_cache", 0)
+        if cached:
             return cached
         pool_alloc = self.token_to_kv_pool_allocator
         kv = None
@@ -3153,7 +3158,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         bpt = total_bytes // size
                 except Exception:
                     bpt = 0
-        self._aginfer_bpt_cache = bpt
+        if bpt > 0:  # never cache a transient 0 (#209) — recompute next call
+            self._aginfer_bpt_cache = bpt
         return bpt
 
     @staticmethod
