@@ -1933,7 +1933,10 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
     MEASURED (T26 / #200): the scheduler keeps a per-program decode
     tokens/sec EMA (sampled in `run_batch`) and pushes it onto the cache
     before each dump.  0 (program not currently decoding) ⇒ no
-    contribution.  `prefill_bps` and the undivided
+    contribution.  Pure DECODE counts 1 token/req; MIXED batches split
+    out their decode reqs; spec decode counts the post-forward
+    `accept_lens` (≥ 1/req, not 1) — all forward modes accounted (#206).
+    `prefill_bps` and the undivided
     `per_program_usage[p].hbm.inflight` (both feeding
     `marginal_pause_cost`) are measured the same way — so
     `marginal_pause_cost` is LIVE, and `snapshot_relief` reads the

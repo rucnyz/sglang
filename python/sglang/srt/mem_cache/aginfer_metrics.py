@@ -6,18 +6,21 @@ without a GPU.  The scheduler hot-path hooks gather the inputs (a step
 duration, the running ``Req`` list) and call these; the cold-path dump
 reads the results the scheduler pushes onto the radix cache.
 
-Three quantities feed the daemon's DESIGN §8 admission math (currently
-sglang placeholders):
+Three quantities feed the daemon's DESIGN §8 admission math:
 
   * ``decode_per_program[pid]`` — per-program decode throughput
-    (tokens/sec), an EMA over decode steps.  Daemon §8
-    ``forecast_inflight_demand`` / ``future_inflight_savings`` (gated
-    additionally on T11's ``E[remaining_tokens]``).
-  * ``prefill_bps`` — prefill throughput (bytes/sec), an EMA.  Daemon §8
+    (tokens/sec), an EMA over decode steps.  Under spec decode the real
+    per-step count is ``accept_lens[i]`` (≥ 1), not 1 — measured
+    post-forward (#206).  Daemon §8 ``forecast_inflight_demand`` /
+    ``future_inflight_savings`` (gated additionally on T11's
+    ``E[remaining_tokens]``).
+  * ``prefill_bps`` — prefill throughput (bytes/sec), an EMA over EXTEND
+    and the prefill portion of MIXED batches (#206).  Daemon §8
     ``marginal_pause_cost`` (the in-flight bytes re-prefilled on resume).
   * ``per_program_usage[pid].hbm.inflight[sp]`` — per-program in-flight
-    (allocated-but-not-radix-committed) HBM bytes.  Daemon §8
-    ``snapshot_relief`` (the inflight half of ``pause_relief``).
+    (undivided current-KV) HBM bytes.  Feeds Daemon §8
+    ``marginal_pause_cost`` only; ``pause_relief`` uses the shared-aware
+    ``committed`` instead (#205).
 
 Single-stack subpool scope: in-flight bytes attribute to the base
 attention subpool (``subpool_name``).  Hybrid SWA/Mamba per-component
@@ -72,12 +75,14 @@ def inflight_bytes_by_program(
     the dump's ``session_ids`` handling).  ``bytes_per_token ≤ 0`` (cache
     couldn't report it) yields an empty result rather than bogus zeros.
 
-    NOTE: this current-KV measure can overlap the dump's tree-walk
-    ``committed`` term on a running req's cached prefix; the daemon's
-    ``pause_relief`` adds the two, so a shared prefix is counted once in
-    each — a bounded over-count for the snapshot, the same disjoint-lever
-    refinement class as #2.  marginal_pause_cost (the primary consumer)
-    wants exactly this full-KV figure."""
+    NOTE: this current-KV measure overlaps the dump's tree-walk
+    ``committed`` term on a running req's cached prefix, but the two are on
+    DIFFERENT bases — ``inflight`` is the UNDIVIDED full KV, ``committed``
+    is the shared-aware ``bytes//n_holders`` per holder.  Since #205 the
+    daemon's ``pause_relief`` uses ``committed`` ALONE; this undivided
+    ``inflight`` feeds only ``marginal_pause_cost`` (the resume re-prefill
+    cost), which wants exactly this full-KV figure.  The uncached slice of
+    inflight (not yet in the tree) is a separate relief refinement (#207)."""
     out: Dict[str, Dict[str, int]] = {}
     bpt = int(bytes_per_token)
     if bpt <= 0:
@@ -98,21 +103,31 @@ def inflight_bytes_by_program(
 def decode_tokens_by_program(
     reqs: Iterable[Any],
     counts: Optional[Dict[str, int]] = None,
+    per_req_tokens: Optional[Iterable[int]] = None,
 ) -> Dict[str, int]:
     """Count generated tokens THIS decode step per program.
 
-    ``counts`` accumulates across calls when provided (so spec-decode /
-    multi-token steps can add the real per-req generated count); the
-    default attributes 1 token per running req (one normal decode step).
-    Untagged (``program_id is None``) requests are skipped.  Used by the
-    decode hot-path hook to derive the instantaneous tokens/sec before
-    the EMA update."""
+    Default: 1 token per running req (one normal decode step).
+    ``per_req_tokens`` (index-aligned with ``reqs``) overrides that with
+    the real generated count for each req — used for speculative decode,
+    where a verify step commits ``accept_lens[i]`` (≥ 1) tokens per req,
+    not 1 (#206).  A per-req count ≤ 0 contributes nothing.  ``counts``
+    accumulates into a running dict across calls when provided.
+
+    Untagged (``program_id is None``) requests are skipped — but they
+    still consume an index, so ``per_req_tokens`` stays aligned with the
+    full ``reqs`` list.  Used by the decode hot-path / spec post-forward
+    hook to derive the instantaneous tokens/sec before the EMA update."""
     out: Dict[str, int] = dict(counts) if counts else {}
-    for req in reqs:
+    prt = list(per_req_tokens) if per_req_tokens is not None else None
+    for i, req in enumerate(reqs):
         pid = getattr(req, "program_id", None)
         if pid is None:
             continue
-        out[str(pid)] = out.get(str(pid), 0) + 1
+        n = int(prt[i]) if (prt is not None and i < len(prt)) else 1
+        if n <= 0:
+            continue
+        out[str(pid)] = out.get(str(pid), 0) + n
     return out
 
 

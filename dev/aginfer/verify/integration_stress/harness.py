@@ -51,7 +51,10 @@ class StackHandles:
     daemon_log: Path
 
 
-def _launch_sglang(log_path: Path, *, tp: int = 1) -> subprocess.Popen:
+def _launch_sglang(
+    log_path: Path, *, tp: int = 1,
+    extra_args: Optional[list] = None,
+) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = GPUS
     env["SGLANG_ENABLE_UNIFIED_RADIX_TREE"] = "1"
@@ -74,6 +77,10 @@ def _launch_sglang(log_path: Path, *, tp: int = 1) -> subprocess.Popen:
         # event endpoint so the integration is real on this leg too.
         "--aginfer-notify-url", f"http://{DAEMON_HOST}:{DAEMON_PORT}/aginfer/event",
     ]
+    # #206: callers may add forward-mode-specific flags (--enable-mixed-chunk,
+    # --speculative-algorithm NGRAM, ...) to exercise MIXED / spec-decode.
+    if extra_args:
+        cmd.extend(extra_args)
     f = open(log_path, "w")
     return subprocess.Popen(
         cmd, env=env, stdout=f, stderr=subprocess.STDOUT,
@@ -142,6 +149,7 @@ def stack(
     *,
     tp: int = 1,
     daemon_extra_args: Optional[list] = None,
+    sglang_extra_args: Optional[list] = None,
     skip_daemon: bool = False,
 ) -> Iterator[StackHandles]:
     """Bring up sglang + daemon as subprocesses, yield handles, tear
@@ -165,7 +173,8 @@ def stack(
             except Exception:
                 print(f"[harness] daemon startup failed; log={daemon_log}")
                 raise
-        sglang_proc = _launch_sglang(sglang_log, tp=tp)
+        sglang_proc = _launch_sglang(
+            sglang_log, tp=tp, extra_args=sglang_extra_args)
         try:
             asyncio.run(wait_sglang())
         except Exception:

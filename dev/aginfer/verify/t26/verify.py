@@ -36,10 +36,11 @@ class StageFail(AssertionError):
 
 class _Req:
     """Minimal stand-in for a sglang Req (the helpers only read these)."""
-    def __init__(self, program_id, allocated, committed):
+    def __init__(self, program_id, allocated=1, committed=1, extend_input_len=0):
         self.program_id = program_id
         self.kv_allocated_len = allocated
         self.kv_committed_len = committed
+        self.extend_input_len = extend_input_len
 
 
 # ============================================================ stages
@@ -118,7 +119,24 @@ def stage_decode_counts() -> None:
     c2 = decode_tokens_by_program([_Req("A", 1, 0)], counts={"A": 5, "B": 1})
     if c2 != {"A": 6, "B": 1}:
         raise StageFail(f"decode-counts: must accumulate into counts; got {c2}")
-    print(_green("  [decode-counts] 1 tok/req + accumulation OK"))
+    # per_req_tokens (#206 spec-decode accept_lens): index-aligned with reqs,
+    # untagged reqs still consume an index so alignment holds.
+    reqs2 = [_Req("A"), _Req(None), _Req("B"), _Req("A")]
+    c3 = decode_tokens_by_program(reqs2, per_req_tokens=[3, 9, 1, 2])
+    if c3 != {"A": 5, "B": 1}:  # A: 3+2, B: 1, untagged 9 dropped
+        raise StageFail(f"decode-counts: per_req_tokens must align past "
+                        f"untagged reqs; got {c3}")
+    # a per-req count ≤ 0 contributes nothing (all-rejected guard).
+    c4 = decode_tokens_by_program([_Req("A"), _Req("B")], per_req_tokens=[0, 4])
+    if c4 != {"B": 4}:
+        raise StageFail(f"decode-counts: per_req ≤0 contributes nothing; got {c4}")
+    # short per_req_tokens → reqs past the end default to 1.
+    c5 = decode_tokens_by_program([_Req("A"), _Req("B")], per_req_tokens=[7])
+    if c5 != {"A": 7, "B": 1}:
+        raise StageFail(f"decode-counts: missing per_req entry defaults to 1; "
+                        f"got {c5}")
+    print(_green("  [decode-counts] 1 tok/req + accumulation + per_req_tokens "
+                 "(spec accept_lens) OK"))
 
 
 def stage_running_view() -> None:
@@ -132,39 +150,58 @@ def stage_running_view() -> None:
     print(_green("  [running-view] projects EMA onto live programs OK"))
 
 
-def stage_scheduler_routing() -> None:
-    """#200 audit: pin the scheduler hook's forward-mode routing — ONLY
-    pure DECODE counts as decode, ONLY pure EXTEND as prefill.  MIXED /
-    TARGET_VERIFY / DRAFT_EXTEND (spec-decode) must update NEITHER (else
-    verify/draft/mixed tokens pollute prefill_bps).  Also: the per-forward
-    wrapper must never raise (a scheduler-loop crash is catastrophic)."""
-    import time
-    import types
+import time as _time
+import types as _types
 
-    # Heavy imports — only this stage needs the scheduler + the enum.
+
+def _Cache():
+    class _C:
+        def _aginfer_bytes_per_token(self):
+            return 2048
+    return _C()
+
+
+def _spec(on):
+    return _types.SimpleNamespace(is_none=lambda: not on)
+
+
+def _sched_self(spec_on=False):
+    """A SimpleNamespace standing in for a Scheduler, with the real
+    instrumentation methods bound onto it so the unbound-method calls
+    inside ``_aginfer_record_throughput_inner`` resolve."""
+    from sglang.srt.managers.scheduler import Scheduler
+    s = _types.SimpleNamespace(
+        tree_cache=_Cache(),
+        spec_algorithm=_spec(spec_on),
+        _aginfer_last_decode_t=None, _aginfer_last_prefill_t=None,
+        _aginfer_decode_ema={}, _aginfer_prefill_bps_ema=None,
+        _aginfer_throughput_warned=False)
+    for name in ("_aginfer_record_throughput_inner", "_aginfer_update_decode",
+                 "_aginfer_update_prefill", "_aginfer_record_spec_decode"):
+        setattr(s, name, _types.MethodType(getattr(Scheduler, name), s))
+    # staticmethod: attach the plain function (no self injection).
+    s._aginfer_extend_token_count = Scheduler._aginfer_extend_token_count
+    return s
+
+
+def _batch(mode, reqs=None, ent=None, decoding_reqs=None, is_spec_v2=False):
+    return _types.SimpleNamespace(
+        forward_mode=mode, reqs=reqs or [], extend_num_tokens=ent,
+        extend_lens=None, input_ids=None, decoding_reqs=decoding_reqs,
+        is_spec_v2=is_spec_v2)
+
+
+def stage_scheduler_routing() -> None:
+    """#200/#206: pin the scheduler pre-forward hook's mode routing — pure
+    DECODE→decode (unless spec, then post-forward), pure EXTEND→prefill,
+    MIXED→split (prefill+decode), and the per-forward wrapper never raises."""
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-    class _Cache:
-        def _aginfer_bytes_per_token(self):
-            return 2048
-
-    def _self():
-        return types.SimpleNamespace(
-            tree_cache=_Cache(),
-            _aginfer_last_decode_t=None, _aginfer_last_prefill_t=None,
-            _aginfer_decode_ema={}, _aginfer_prefill_bps_ema=None,
-            _aginfer_throughput_warned=False)
-
-    def _batch(mode, reqs=None, ent=None):
-        return types.SimpleNamespace(
-            forward_mode=mode, reqs=reqs or [], extend_num_tokens=ent,
-            extend_lens=None, input_ids=None)
-
-    # pure DECODE → decode EMA populated for the batch's programs.
-    s = _self(); s._aginfer_last_decode_t = time.perf_counter() - 0.1
+    # pure DECODE (no spec) → decode EMA populated for the batch's programs.
+    s = _sched_self(); s._aginfer_last_decode_t = _time.perf_counter() - 0.1
     Scheduler._aginfer_record_throughput_inner(
-        s, _batch(ForwardMode.DECODE, reqs=[_Req("A", 1, 1), _Req("B", 1, 1)]))
+        s, _batch(ForwardMode.DECODE, reqs=[_Req("A"), _Req("B")]))
     if set(s._aginfer_decode_ema) != {"A", "B"} or not all(
             v > 0 for v in s._aginfer_decode_ema.values()):
         raise StageFail(f"routing: pure DECODE must populate decode EMA; "
@@ -172,8 +209,30 @@ def stage_scheduler_routing() -> None:
     if s._aginfer_prefill_bps_ema is not None:
         raise StageFail("routing: DECODE must not touch prefill_bps")
 
+    # spec-v2 DECODE (overlap-on) → pre-forward skips (decode counted
+    # post-forward via accept_lens, not 1/req here) — #206.
+    s = _sched_self(spec_on=True)
+    s._aginfer_last_decode_t = _time.perf_counter() - 0.1
+    Scheduler._aginfer_record_throughput_inner(
+        s, _batch(ForwardMode.DECODE, reqs=[_Req("A"), _Req("B")],
+                  is_spec_v2=True))
+    if s._aginfer_decode_ema:
+        raise StageFail(f"routing: spec-v2 DECODE must skip pre-forward decode "
+                        f"(counted post-forward); got {s._aginfer_decode_ema}")
+
+    # spec-v1 DECODE (overlap OFF, e.g. ngram) → no accept_lens post-forward,
+    # so it KEEPS the conservative 1/req here (never empty, no regression).
+    s = _sched_self(spec_on=True)
+    s._aginfer_last_decode_t = _time.perf_counter() - 0.1
+    Scheduler._aginfer_record_throughput_inner(
+        s, _batch(ForwardMode.DECODE, reqs=[_Req("A"), _Req("B")],
+                  is_spec_v2=False))
+    if set(s._aginfer_decode_ema) != {"A", "B"}:
+        raise StageFail(f"routing: spec-v1 DECODE must keep 1/req pre-forward "
+                        f"(no regression); got {s._aginfer_decode_ema}")
+
     # pure EXTEND → prefill_bps populated, decode untouched.
-    s = _self(); s._aginfer_last_prefill_t = time.perf_counter() - 0.1
+    s = _sched_self(); s._aginfer_last_prefill_t = _time.perf_counter() - 0.1
     Scheduler._aginfer_record_throughput_inner(
         s, _batch(ForwardMode.EXTEND, ent=100))
     if not (s._aginfer_prefill_bps_ema and s._aginfer_prefill_bps_ema > 0):
@@ -181,23 +240,9 @@ def stage_scheduler_routing() -> None:
     if s._aginfer_decode_ema:
         raise StageFail("routing: EXTEND must not touch decode EMA")
 
-    # MIXED / TARGET_VERIFY / DRAFT_EXTEND → NEITHER (the pollution fix).
-    for mode in (ForwardMode.MIXED, ForwardMode.TARGET_VERIFY,
-                 ForwardMode.DRAFT_EXTEND):
-        s = _self()
-        s._aginfer_last_decode_t = time.perf_counter() - 0.1
-        s._aginfer_last_prefill_t = time.perf_counter() - 0.1
-        Scheduler._aginfer_record_throughput_inner(
-            s, _batch(mode, reqs=[_Req("A", 1, 1)], ent=100))
-        if s._aginfer_decode_ema or s._aginfer_prefill_bps_ema is not None:
-            raise StageFail(
-                f"routing: {mode} must update NEITHER decode nor prefill "
-                f"(spec/mixed pollution); got decode={s._aginfer_decode_ema} "
-                f"prefill={s._aginfer_prefill_bps_ema}")
-
     # raise-safety: the WRAPPER must swallow an inner error (reqs not
     # iterable → TypeError inside) — never propagate into the forward loop.
-    s = _self(); s._aginfer_last_decode_t = time.perf_counter() - 0.1
+    s = _sched_self(); s._aginfer_last_decode_t = _time.perf_counter() - 0.1
     bad = _batch(ForwardMode.DECODE); bad.reqs = 5  # not iterable
     try:
         Scheduler._aginfer_record_throughput(s, bad)
@@ -205,8 +250,113 @@ def stage_scheduler_routing() -> None:
         raise StageFail(f"routing: per-forward hook must NOT raise; got {e!r}")
     if not s._aginfer_throughput_warned:
         raise StageFail("routing: a suppressed error must set the warned flag")
-    print(_green("  [routing] DECODE→decode, EXTEND→prefill, MIXED/spec→none, "
-                 "raise-safe OK"))
+    print(_green("  [routing] DECODE→decode, spec-v2→skip, spec-v1→1/req, "
+                 "EXTEND→prefill, raise-safe OK"))
+
+
+def stage_mixed() -> None:
+    """#206: a MIXED batch (chunked prefill + running decode) must split via
+    batch.decoding_reqs — prefill reqs' extend_input_len → prefill_bps, decode
+    reqs → decode EMA.  extend_num_tokens (whole-batch) must NOT pollute."""
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    # prefill req X (256-token chunk) + two decode reqs A, B.
+    pre = _Req("X", extend_input_len=256)
+    da, db = _Req("A"), _Req("B")
+    s = _sched_self()
+    s._aginfer_last_prefill_t = _time.perf_counter() - 0.1
+    s._aginfer_last_decode_t = _time.perf_counter() - 0.1
+    # extend_num_tokens=258 (256 prefill + 1×2 decode) — the trap value the
+    # split must IGNORE in favour of the prefill reqs' extend_input_len.
+    Scheduler._aginfer_record_throughput_inner(
+        s, _batch(ForwardMode.MIXED, reqs=[pre, da, db], ent=258,
+                  decoding_reqs=[da, db]))
+    if not (s._aginfer_prefill_bps_ema and s._aginfer_prefill_bps_ema > 0):
+        raise StageFail("mixed: prefill portion must feed prefill_bps")
+    # decode reqs A,B present in EMA; prefill req X absent from decode EMA.
+    if set(s._aginfer_decode_ema) != {"A", "B"}:
+        raise StageFail(f"mixed: decode reqs (not prefill X) must feed decode "
+                        f"EMA; got {set(s._aginfer_decode_ema)}")
+
+    # Deterministic proof that extend_num_tokens is NOT used: an all-decode
+    # MIXED batch has zero prefill reqs → ntok=0 → prefill_bps stays unset,
+    # even though extend_num_tokens=258 is nonzero (the old trap).
+    s0 = _sched_self()
+    s0._aginfer_last_prefill_t = _time.perf_counter() - 0.1
+    s0._aginfer_last_decode_t = _time.perf_counter() - 0.1
+    Scheduler._aginfer_record_throughput_inner(
+        s0, _batch(ForwardMode.MIXED, reqs=[da, db], ent=258,
+                   decoding_reqs=[da, db]))
+    if s0._aginfer_prefill_bps_ema is not None:
+        raise StageFail(f"mixed: all-decode batch (no prefill reqs) must NOT "
+                        f"set prefill_bps from extend_num_tokens; "
+                        f"got {s0._aginfer_prefill_bps_ema}")
+    if set(s0._aginfer_decode_ema) != {"A", "B"}:
+        raise StageFail("mixed: all-decode MIXED must still feed decode EMA")
+
+    # spec-v2 MIXED → decode portion is STILL counted here (1/req), NOT
+    # deferred: the post-forward accept_lens hook only fires for pure
+    # is_decode() batches, so deferring a MIXED batch would drop its decode
+    # tokens entirely (#206 audit F2).  prefill still counts too.
+    s2 = _sched_self(spec_on=True)
+    s2._aginfer_last_prefill_t = _time.perf_counter() - 0.1
+    s2._aginfer_last_decode_t = _time.perf_counter() - 0.1
+    Scheduler._aginfer_record_throughput_inner(
+        s2, _batch(ForwardMode.MIXED, reqs=[pre, da, db], ent=258,
+                   decoding_reqs=[da, db], is_spec_v2=True))
+    if not (s2._aginfer_prefill_bps_ema and s2._aginfer_prefill_bps_ema > 0):
+        raise StageFail("mixed(spec-v2): prefill portion must still feed prefill_bps")
+    if set(s2._aginfer_decode_ema) != {"A", "B"}:
+        raise StageFail(f"mixed(spec-v2): decode portion must be counted 1/req "
+                        f"here (post-forward hook can't reach MIXED), not "
+                        f"dropped; got {s2._aginfer_decode_ema}")
+    print(_green("  [mixed] split prefill→bps / decode→EMA via decoding_reqs; "
+                 "extend_num_tokens not used; spec-v2 MIXED still counts decode OK"))
+
+
+def stage_spec_decode() -> None:
+    """#206: the post-forward spec hook attributes accept_lens (= accepted
+    tokens/req, ≥1) to per-program decode EMA — NOT 1/req.  Reads
+    result.num_correct_drafts_per_req_cpu (= accept_lens − 1), accepted=+1."""
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    reqs = [_Req("A"), _Req("B")]
+    result = _types.SimpleNamespace(num_correct_drafts_per_req_cpu=[2, 0])
+    s = _sched_self(spec_on=True)
+    s._aginfer_last_decode_t = _time.perf_counter() - 0.1
+    Scheduler._aginfer_record_spec_decode(
+        s, _batch(ForwardMode.DECODE, reqs=reqs), result)
+    # accepted A=3 (2+1), B=1 (0+1).  EMA seeds on first sample → ratio 3:1.
+    a, b = s._aginfer_decode_ema.get("A"), s._aginfer_decode_ema.get("B")
+    if a is None or b is None or abs(a / b - 3.0) > 1e-6:
+        raise StageFail(f"spec: accept_lens must drive decode EMA at 3:1 "
+                        f"(A=3 accepted, B=1); got A={a} B={b}")
+
+    # result without spec accept counts → no-op (non-spec result shape).
+    s2 = _sched_self(spec_on=True)
+    s2._aginfer_last_decode_t = _time.perf_counter() - 0.1
+    Scheduler._aginfer_record_spec_decode(
+        s2, _batch(ForwardMode.DECODE, reqs=reqs),
+        _types.SimpleNamespace())
+    if s2._aginfer_decode_ema:
+        raise StageFail(f"spec: missing accept counts must be a no-op; "
+                        f"got {s2._aginfer_decode_ema}")
+
+    # wrapper raise-safety: malformed result must not propagate.
+    s3 = _sched_self(spec_on=True)
+    s3._aginfer_last_decode_t = _time.perf_counter() - 0.1
+    bad = _types.SimpleNamespace(num_correct_drafts_per_req_cpu="notalist")
+    try:
+        Scheduler._aginfer_record_spec_throughput(
+            s3, _batch(ForwardMode.DECODE, reqs=reqs), bad)
+    except Exception as e:  # noqa: BLE001
+        raise StageFail(f"spec: post-forward wrapper must NOT raise; got {e!r}")
+    if not s3._aginfer_throughput_warned:
+        raise StageFail("spec: a suppressed error must set the warned flag")
+    print(_green("  [spec] accept_lens → per-program decode EMA (≠1/req); "
+                 "no-op on missing counts; raise-safe OK"))
 
 
 _STAGES = [
@@ -215,6 +365,8 @@ _STAGES = [
     ("decode-counts", stage_decode_counts),
     ("running-view", stage_running_view),
     ("routing", stage_scheduler_routing),
+    ("mixed", stage_mixed),
+    ("spec-decode", stage_spec_decode),
 ]
 
 
@@ -238,7 +390,7 @@ def main() -> int:
     if failed:
         print(_red(f"FAILED: {', '.join(failed)}"))
         return 1
-    print(_green("T26 pure-helpers PASS — all 5 stages green"))
+    print(_green(f"T26 pure-helpers PASS — all {len(_STAGES)} stages green"))
     return 0
 
 
