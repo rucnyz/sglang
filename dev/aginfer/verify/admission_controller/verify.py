@@ -200,12 +200,12 @@ def stage_pause_cost_relief() -> None:
     if abs(mc - (7 * MB) / (7.0 * MB)) > 1e-9:
         raise StageFail(f"marginal_pause_cost = Σinflight/prefill_bps; got {mc}")
     relief = adm.pause_relief(pu)
-    # #205: snapshot = max(0,committed) + max(0,inflight−committed).
-    #   kv:    3MB (committed) + (5MB−3MB)=2MB uncached inflight = 5MB
-    #   mamba: 0  (committed)  + (2MB−0)=2MB uncached inflight    = 2MB
-    if relief != {"kv": 5 * MB, "mamba": 2 * MB}:
-        raise StageFail(f"pause_relief overlap-corrected (no inflight∩"
-                        f"committed double-count); got {relief}")
+    # #205: relief = committed (shared-aware radix) only; raw inflight is
+    # a marginal_pause_cost input, not relief.  kv: committed 3MB; mamba:
+    # no committed → absent (its 2MB inflight is not relief).
+    if relief != {"kv": 3 * MB}:
+        raise StageFail(f"pause_relief = committed (no raw inflight); "
+                        f"got {relief}")
     print(_green("  [pause-cost] marginal_pause_cost + pause_relief (#205) OK"))
 
 
@@ -219,7 +219,7 @@ def stage_pause_candidates() -> None:
     tracker.pause("C")               # PAUSED
     tracker.end("D")                 # ENDED
     programs = {
-        "A": _program("REASONING", inflight={"kv": 4 * MB}, unit_hashes=["uA"]),
+        "A": _program("REASONING", committed={"kv": 4 * MB}, unit_hashes=["uA"]),
         "B": _program("ACTING", committed={"kv": 2 * MB}, unit_hashes=["uB"]),
         "C": _program("PAUSED", inflight={"kv": 1 * MB}, unit_hashes=["uC"]),
         "D": _program("ENDED", unit_hashes=["uD"]),
@@ -237,8 +237,12 @@ def stage_pause_candidates() -> None:
     pa = next(p for p in pcs if p.pid == "A")
     if abs(pa.cost - vprog["A"]) > 1e-12:
         raise StageFail("pause cost must equal V_u_program (marginal=0)")
-    if pa.relief != {"kv": 4 * MB}:
-        raise StageFail(f"A relief = inflight 4MB; got {pa.relief}")
+    # A's committed 4MB minus uA's D_t-excluded share (uA ∈ MEMORY_PRESSURE
+    # D_t) — exact relief math is pinned by stage_disjoint/stage_overlap;
+    # here just confirm a positive committed-based relief.
+    if not pa.relief or pa.relief.get("kv", 0) <= 0:
+        raise StageFail(f"A relief must be a positive committed-based value; "
+                        f"got {pa.relief}")
     print(_green("  [pause-cands] REASONING/ACTING only; cost+relief OK"))
 
 
@@ -296,6 +300,7 @@ def stage_trajectory() -> None:
             programs={"A": _program("REASONING",
                                     inflight=inflight if inflight is not None
                                     else {"full": 5 * MB},
+                                    committed={"full": 2 * MB},
                                     unit_hashes=["uA"],
                                     expected_remaining_tokens=e_rem)},
             hbm={"full": _sp(1 * GB, 10 * GB, decode_bpt=dbpt)},
@@ -313,12 +318,14 @@ def stage_trajectory() -> None:
     fc = adm.forecast(st, heartbeat_s=5.0)
     if fc["full"] != float(1 * GB) + 500.0 * DBPT:
         raise StageFail(f"trajectory: forecast must add the demand; got {fc}")
-    # pause_relief future_inflight_savings: inflight 5MB + growth.
+    # pause_relief = committed snapshot (2MB) + future-savings growth
+    # (the raw 5MB inflight is NOT relief — #205 — it's a marginal_pause_
+    # cost input only; uA's "kv" committed isn't in D_t for the "full" sp).
     pcs = adm.pause_candidates(st, heartbeat_s=5.0)
     pa = next(p for p in pcs if p.pid == "A")
-    if pa.relief.get("full") != 5 * MB + int(500.0 * DBPT):
-        raise StageFail(f"trajectory: pause_relief must add future_inflight_"
-                        f"savings; got {pa.relief}")
+    if pa.relief.get("full") != 2 * MB + int(500.0 * DBPT):
+        raise StageFail(f"trajectory: pause_relief = committed 2MB + growth; "
+                        f"got {pa.relief}")
 
     # --- E[remaining] is the binding side of the min when small ---
     st2 = _st(decode={"A": 100.0}, e_rem=10)   # min(10, 500) = 10
@@ -383,20 +390,19 @@ def stage_trajectory() -> None:
     if dem_m != {"full": 1000.0 * DBPT}:
         raise StageFail(f"trajectory: Σ over A+B on full, Mamba excluded; "
                         f"got {dem_m}")
-    # pause_relief for A: snapshot (inflight 1MB+9MB + committed 2MB) +
-    # future-savings (full 500×DBPT; mamba 0).
     pcs_m = adm.pause_candidates(st_m, heartbeat_s=5.0)
     pa_m = next(p for p in pcs_m if p.pid == "A")
-    # #205 overlap-corrected: full = max(0,committed 2MB) +
-    # max(0,inflight 1MB − committed 2MB)=0 + growth = 2MB + growth.
+    # #205: relief = committed (radix) + growth; raw inflight is NOT relief.
+    # full = committed 2MB + growth (500×DBPT).
     if pa_m.relief.get("full") != 2 * MB + int(500.0 * DBPT):
-        raise StageFail(f"trajectory: A full relief = committed + growth "
-                        f"(inflight 1MB ⊆ committed 2MB → absorbed); "
+        raise StageFail(f"trajectory: A full relief = committed 2MB + growth; "
                         f"got {pa_m.relief}")
-    # mamba: committed 0 + uncached inflight (9MB−0) = 9MB; no growth.
-    if pa_m.relief.get("mamba") != 9 * MB:
-        raise StageFail(f"trajectory: A mamba relief = uncached inflight 9MB; "
-                        f"got {pa_m.relief}")
+    # mamba: A has 9MB mamba INFLIGHT but NO mamba committed → no relief
+    # (the raw inflight is a marginal_pause_cost input, not relief; a
+    # genuinely-uncached non-radix in-flight pool is the #206 gap).
+    if "mamba" in pa_m.relief:
+        raise StageFail(f"trajectory: A mamba relief must be absent "
+                        f"(inflight-only, no committed); got {pa_m.relief}")
     print(_green("  [trajectory] §8 demand/future_inflight_savings + full "
                  "T26/T11/Mamba gating + Σ-over-programs + malformed-input OK"))
 
@@ -418,57 +424,78 @@ def stage_disjoint_levers() -> None:
                                 committed={"kv": u1_bytes},
                                 unit_hashes=["u1"])})
     # MEMORY_PRESSURE → top-k D_t includes u1 → its committed (1MB) is
-    # migrate's domain → excluded.  relief = max(0,committed−excl=0) +
-    # max(0,inflight−committed) = 0 + (3MB−1MB) = 2MB (#2 + #205).
+    # migrate's domain → fully excluded → relief = committed − excl = 0
+    # (#2).  The raw 3MB inflight is NOT relief (#205).
     st_p = _build(sj, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session=None))
     if "u1" not in st_p.decision_set:
         raise StageFail("disjoint: precondition — u1 must be in MEMORY_PRESSURE D_t")
     pc_p = adm.pause_candidates(st_p, heartbeat_s=5.0)
     pp = next(c for c in pc_p if c.pid == "P")
-    if pp.relief != {"kv": 3 * MB - u1_bytes}:
-        raise StageFail(f"disjoint: u1∈D_t → committed excluded; relief = "
-                        f"inflight−committed = 3MB−1MB; got {pp.relief}")
-    # LLM_PREFILL → D_t empty → committed (1MB) kept as radix; the
-    # remaining inflight (3MB−1MB) is the uncached part.  relief =
-    # 1MB + 2MB = 3MB (committed ⊆ inflight → no double-count, #205).
+    if pp.relief != {}:
+        raise StageFail(f"disjoint: u1∈D_t → committed fully excluded → relief "
+                        f"empty (inflight is not relief, #205); got {pp.relief}")
+    # LLM_PREFILL → D_t empty → committed (1MB) kept as the radix relief.
     st_q = _build(sj, tracker, Event(kind=EventKind.LLM_PREFILL, session="P"))
     if st_q.decision_set:
         raise StageFail("disjoint: precondition — LLM_PREFILL D_t must be empty")
     pc_q = adm.pause_candidates(st_q, heartbeat_s=5.0)
     pq = next(c for c in pc_q if c.pid == "P")
-    if pq.relief != {"kv": 3 * MB}:
-        raise StageFail(f"disjoint: u1∉D_t → committed kept; relief = "
-                        f"committed + uncached-inflight = 3MB (not 4MB); "
+    if pq.relief != {"kv": u1_bytes}:
+        raise StageFail(f"disjoint: u1∉D_t → committed (1MB) is the relief; "
                         f"got {pq.relief}")
     print(_green("  [disjoint] D_t-committed excluded from pause "
                  "(no Migrate∩Pause double-count) OK"))
 
 
 def stage_overlap() -> None:
-    """#205: a running request's KV is in sglang's unified radix tree, so
-    it's counted in BOTH committed (tree-walk) and inflight (T26).
-    pause_relief must count each physical byte ONCE:
-    ``max(0, committed−excl) + max(0, inflight−committed) + future``."""
-    # decoding req fully cached: inflight ⊆ committed → inflight adds 0.
+    """#205: a running request's KV is in sglang's unified radix tree, so it's
+    counted in BOTH committed (tree-walk, shared-aware ``bytes//n_holders``)
+    AND inflight (T26, full undivided KV).  pause_relief uses COMMITTED ONLY
+    — the shared-aware per-holder share is exactly the bytes a pause frees;
+    the undivided inflight is reserved for ``marginal_pause_cost`` (resume
+    re-prefill).  relief = ``max(0, committed−excl) + future``."""
+    # decoding req fully cached: relief = committed; inflight ignored.
     r = adm.pause_relief(_program("REASONING", inflight={"kv": 4 * MB},
                                   committed={"kv": 5 * MB}))
     if r != {"kv": 5 * MB}:
-        raise StageFail(f"overlap: inflight(4MB) ⊆ committed(5MB) → relief = "
-                        f"committed 5MB (no double-count); got {r}")
-    # prefilling req: inflight > committed → the uncached excess is added.
+        raise StageFail(f"overlap: relief = committed 5MB (inflight not relief); "
+                        f"got {r}")
+    # prefilling req with inflight > committed: relief is still the committed
+    # (cached/radix) bytes only — the uncached excess is NOT relief (#205).
     r2 = adm.pause_relief(_program("REASONING", inflight={"kv": 5 * MB},
                                    committed={"kv": 2 * MB}))
-    if r2 != {"kv": 5 * MB}:  # 2MB committed + (5−2)MB uncached = 5MB
-        raise StageFail(f"overlap: inflight(5MB) > committed(2MB) → relief = "
-                        f"committed + uncached = 5MB; got {r2}")
+    if r2 != {"kv": 2 * MB}:
+        raise StageFail(f"overlap: relief = committed 2MB only (uncached inflight "
+                        f"is not relief); got {r2}")
     # future_inflight_savings (not-yet-allocated growth) stays additive.
     r3 = adm.pause_relief(_program("REASONING", inflight={"kv": 4 * MB},
                                    committed={"kv": 5 * MB}),
                           future_inflight_savings={"kv": 1 * MB})
-    if r3 != {"kv": 6 * MB}:  # committed 5MB + 0 uncached + 1MB future
+    if r3 != {"kv": 6 * MB}:  # committed 5MB + 1MB future
         raise StageFail(f"overlap: future growth additive on top; got {r3}")
-    # NOT the old buggy inflight+committed (would be 9MB / 7MB / 10MB).
-    print(_green("  [overlap] inflight∩committed counted once (#205) OK"))
+
+    # B5 (audit gap): SHARED PREFIX.  A 12MB unit held by 3 running reqs is
+    # reported as committed=12//3=4MB per holder but inflight=12MB undivided.
+    # The old `inflight−committed` formula would have credited the pause with
+    # 4MB+(12−4)=12MB — the WHOLE shared prefix — even though pausing ONE
+    # holder frees only its 4MB share.  committed-only correctly yields 4MB.
+    rb5 = adm.pause_relief(_program("REASONING", inflight={"kv": 12 * MB},
+                                    committed={"kv": 4 * MB}))
+    if rb5 != {"kv": 4 * MB}:
+        raise StageFail(f"overlap/B5: shared-prefix relief = per-holder share "
+                        f"4MB, not the whole 12MB prefix; got {rb5}")
+
+    # A3 (audit gap): DISJOINT bytes in the SAME subpool.  committed already
+    # aggregates both reqs' radix bytes (3MB); inflight (8MB) is the live
+    # footprint.  The old formula's `inflight−committed` mixed undivided with
+    # aggregated and could cancel/under-count; committed-only is just 3MB.
+    ra3 = adm.pause_relief(_program("REASONING", inflight={"kv": 8 * MB},
+                                    committed={"kv": 3 * MB}))
+    if ra3 != {"kv": 3 * MB}:
+        raise StageFail(f"overlap/A3: disjoint same-subpool relief = committed "
+                        f"3MB; got {ra3}")
+    print(_green("  [overlap] committed-only relief; B5 shared-prefix + A3 "
+                 "disjoint pinned (#205) OK"))
 
 
 _STAGES = [

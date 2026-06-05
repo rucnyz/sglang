@@ -72,9 +72,9 @@ A migrate_candidates  — cost = V(cur)−V(next)+M_eff; relief/acquired
                         per (tier,sp); relief>0 filter; (uid,add,remove) id
 B forecast            — per-HBM-subpool used_bytes (+ inflight term, 0
                         under the T26/T11 placeholders); horizon=heartbeat_s
-C pause/resume_cands  — Pause(cost=V_u_program+marginal, relief=inflight+
-                        committed) for REASONING/ACTING; Resume(gain, re_use)
-                        for PAUSED passing capacity_fits
+C pause/resume_cands  — Pause(cost=V_u_program+marginal, relief=shared-
+                        aware committed; #205) for REASONING/ACTING;
+                        Resume(gain, re_use) for PAUSED passing capacity_fits
 D joint_decide select — pressure / headroom / dead-zone; pressure
                         suppresses headroom; LLM_PREFILL (empty D_t) still
                         runs the admission generators
@@ -121,7 +121,7 @@ term need three inputs that are **not yet wired**: `decode_throughput`
 (T26 — `decode_per_program` ships empty), `E[remaining_tokens]` (T11 /
 #126), and `bytes_per_token_in_subpool` (a model-architecture constant
 not in `/aginfer/state`).  Until those land, `forecast[sp] == used_bytes`
-and `pause_relief = inflight + committed` (snapshot only) — so §9's
+and `pause_relief = shared-aware committed` (snapshot only; #205) — so §9's
 pressure/headroom triggers reduce **exactly** to the allocator-truth HBM
 occupancy the admission loop used pre-rewrite (behaviour-preserving),
 and become trajectory-aware once the inputs are measured.  `marginal_

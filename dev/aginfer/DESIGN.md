@@ -1726,25 +1726,36 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
   `snapshot_relief = inflight + committed` assumes a SEPARATE in-flight
   pool and radix-cache.  sglang's radix cache is UNIFIED: a running
   request's KV lives IN the tree, so the SAME physical bytes are
-  reported by both the tree-walk `committed` (p's radix share) and T26's
-  `inflight` (p's running-request KV) — measured ≈ equal on a decoding
-  program.  Adding them double-counts the running KV (~2×) and biases
-  toward over-pausing.  Count each physical byte once:
+  reported by both the tree-walk `committed` and T26's `inflight`.  But
+  the two are measured on DIFFERENT bases: `committed` is **shared-aware**
+  — a node held by `n` running reqs reports `bytes // n_holders` to each
+  holder's program — whereas `inflight` is the **undivided** full
+  running-request KV (T26 cannot attribute a shared prefix per holder).
+  Any arithmetic that combines them (`inflight + committed`, or even
+  `committed + max(0, inflight − committed)`) mixes the two bases and
+  mis-credits shared prefixes: for a 12 MB prefix held by 3 reqs the
+  per-holder committed is 4 MB but inflight is 12 MB, so `inflight −
+  committed` would credit a single pause with the whole 12 MB even though
+  pausing ONE holder frees only its 4 MB share (#205 B5).  Use the
+  shared-aware `committed` ALONE — it is exactly the bytes a pause frees:
 
   ```
   snapshot_relief(p, state)[sp] =
-      max(0, committed[sp] − migrate_domain[sp])   # radix bytes pause
-                                                   # frees that migrate
-                                                   # isn't handling (#2)
-    + max(0, inflight[sp] − committed[sp])         # in-flight bytes NOT
-                                                   # yet in the tree
-                                                   # (a prefilling prompt);
-                                                   # 0 once cached
+      max(0, committed[sp] − migrate_domain[sp])   # shared-aware radix
+                                                   # bytes pause frees that
+                                                   # migrate isn't handling
+                                                   # (#2); inflight is NOT
+                                                   # relief (#205)
   ```
 
-  `marginal_pause_cost` still reads the FULL `inflight` (the decoded-
-  so-far bytes re-prefilled on resume — a COST, not a relief, so the
-  overlap is irrelevant there).
+  `marginal_pause_cost` reads the FULL undivided `inflight` (the decoded-
+  so-far bytes re-prefilled on resume — a COST, not a relief, where the
+  undivided footprint is the right basis and the shared-aware split would
+  understate the re-prefill work).  The one known gap: bytes that are
+  in-flight but NOT yet in the radix tree (an uncached prefilling prompt,
+  non-radix Mamba state) are uncredited to the pause — a conservative
+  under-free, recovered next event; the shared-aware uncached-inflight
+  term needs per-unit holder attribution and is tracked as #206.
 
   The `future_inflight_savings` term is what makes Pauses
   trajectory-strong (Migrates only deliver snapshot relief).
@@ -1754,14 +1765,14 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
   relief/cost naturally.
 
   * `snapshot_relief(p, state)[sp]` — read from
-    `state.per_program_usage[p].hbm`:
-    * **inflight[sp]** — bytes p is currently using in subpool sp
-      for in-flight decode; released when p's current request
-      completes / is preempted.  Pause prevents the program's NEXT
-      request from re-allocating these.
-    * **committed[sp]** — p's exclusive share of subpool-sp radix
-      bytes; if pausing p drops `len(session_ids)` of a node to 0
-      on that subpool, the node becomes evictable on that subpool.
+    `state.per_program_usage[p].hbm.committed`.  (The sibling
+    **inflight[sp]** — p's undivided in-flight decode footprint — is
+    NOT part of snapshot_relief under the unified cache (#205); it
+    feeds `marginal_pause_cost` only.)
+    * **committed[sp]** — p's shared-aware share of subpool-sp radix
+      bytes (`node_bytes // n_holders`); if pausing p drops
+      `len(session_ids)` of a node to 0 on that subpool, the node
+      becomes evictable on that subpool.
       **Disjoint-lever exclusion (holistic-review #2):** committed
       bytes of p's units that are in THIS event's `D_t` are the
       *migrate* lever's domain, so they are SUBTRACTED here — otherwise
@@ -1922,11 +1933,12 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
     MEASURED (T26 / #200): the scheduler keeps a per-program decode
     tokens/sec EMA (sampled in `run_batch`) and pushes it onto the cache
     before each dump.  0 (program not currently decoding) ⇒ no
-    contribution.  `prefill_bps` (for `marginal_pause_cost`) and
-    `per_program_usage[p].hbm.inflight` (the §8 `snapshot_relief`) are
-    measured the same way — so `marginal_pause_cost` and the in-flight
-    half of `pause_relief` are LIVE; only the forecast *trajectory* term
-    below still waits on `E[remaining_tokens]` (T11).
+    contribution.  `prefill_bps` and the undivided
+    `per_program_usage[p].hbm.inflight` (both feeding
+    `marginal_pause_cost`) are measured the same way — so
+    `marginal_pause_cost` is LIVE, and `snapshot_relief` reads the
+    shared-aware `committed` (also live).  Only the forecast
+    *trajectory* term below still waits on `E[remaining_tokens]` (T11).
   * `E[remaining_tokens]` reads an optional per-program
     `expected_remaining_tokens` field (T11 / a future dump will fill);
     **absent ⇒ `None`, and the program is skipped — NOT bootstrapped to

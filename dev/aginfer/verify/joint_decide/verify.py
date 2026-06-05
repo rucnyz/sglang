@@ -294,22 +294,24 @@ def stage_c_program_candidates() -> None:
     tracker.observe_arrival("B")
     tracker.observe_completion("B")         # ACTING
     tracker.pause("P")                       # PAUSED
-    # NOTE: relief here uses inflight only (no committed) so this stage
-    # stays focused on candidate STRUCTURE (pid filtering, gain/re_use);
-    # the committed term + its D_t-exclusion (disjoint levers, #2) are
-    # pinned by verify/admission_controller stage_disjoint.
+    # NOTE: relief is the shared-aware ``committed`` snapshot (#205 — raw
+    # inflight is a re-prefill COST, not relief).  Units placed off-HBM so
+    # MEMORY_PRESSURE's D_t is empty and this stage stays focused on
+    # candidate STRUCTURE (pid filtering, gain/re_use); the committed
+    # D_t-exclusion (disjoint levers, #2) is pinned by
+    # verify/admission_controller stage_disjoint.
     programs = {
-        "A": _program("REASONING", inflight={"kv": 7 * MB},
+        "A": _program("REASONING", committed={"kv": 7 * MB},
                       unit_hashes=["uA"]),
-        "B": _program("ACTING", inflight={"kv": 3 * MB},
+        "B": _program("ACTING", committed={"kv": 3 * MB},
                       unit_hashes=["uB"]),
-        "P": _program("PAUSED", inflight={"kv": 1 * MB},
+        "P": _program("PAUSED", committed={"kv": 1 * MB},
                       unit_hashes=["uP"], pre_pause_state="REASONING"),
     }
     sj = _state_json(
         units=[
-            _unit(uhash="uA", residence=["HBM"], holders=["A"]),
-            _unit(uhash="uB", residence=["HBM"], holders=["B"]),
+            _unit(uhash="uA", residence=["DRAM"], holders=["A"]),
+            _unit(uhash="uB", residence=["DRAM"], holders=["B"]),
             _unit(uhash="uP", residence=["DRAM"], holders=["P"]),
         ],
         programs=programs,
@@ -324,13 +326,13 @@ def stage_c_program_candidates() -> None:
         raise StageFail(f"C: pause_candidates must cover REASONING+ACTING "
                         f"only (not PAUSED/ENDED), got {pids}")
     pa = next(p for p in pcs if p.pid == "A")
-    # relief = inflight (snapshot); future term 0, no committed here.
+    # relief = committed (snapshot); future term 0, D_t empty here.
     if pa.relief != {"kv": 7 * MB}:
-        raise StageFail(f"C: A pause_relief should be inflight=7MB, "
+        raise StageFail(f"C: A pause_relief should be committed=7MB, "
                         f"got {pa.relief}")
     pb = next(p for p in pcs if p.pid == "B")
     if pb.relief != {"kv": 3 * MB}:
-        raise StageFail(f"C: B pause_relief (inflight 3MB) should be 3MB, "
+        raise StageFail(f"C: B pause_relief (committed 3MB) should be 3MB, "
                         f"got {pb.relief}")
     # prefill_bps=0 placeholder → marginal_pause_cost 0 → cost = V_u_program.
     vprog = adm.shared_aware_prog_scores(st)
@@ -458,7 +460,7 @@ def stage_d_joint_decide_select() -> None:
     sj_pf = _state_json(
         units=[_unit(uhash="uA", residence=["HBM"], holders=["A"],
                      n_bytes_per_tier={"HBM": 1 * GB})],
-        programs={"A": _program("REASONING", inflight={"kv": 1 * GB},
+        programs={"A": _program("REASONING", committed={"kv": 1 * GB},
                                 unit_hashes=["uA"])},
         hbm={"kv": _sp(9 * GB, 10 * GB)},
     )
@@ -692,6 +694,12 @@ def stage_f_live_dispatch() -> None:
     GB = 1024 ** 3
 
     # --- pressure → a Pause is dispatched ---
+    #   Under LLM_PREFILL D_t is empty (no migrates), so the committed
+    #   radix (#205 relief source) is NOT D_t-excluded and Pause is the
+    #   sole pressure lever — the honest scenario that forces a Pause.
+    #   (Under MEMORY_PRESSURE the HBM unit would be in D_t → migrate's
+    #   domain → committed excluded → relief 0; that disjoint behavior is
+    #   pinned by verify/admission_controller stage_disjoint.)
     def _pause_case():
         tracker = ProgramTracker()
         tracker.observe_arrival("P")            # REASONING (prior state)
@@ -703,11 +711,11 @@ def stage_f_live_dispatch() -> None:
         sj = _state_json(
             units=[_unit(uhash="uP", residence=["HBM"], holders=["P"],
                          n_bytes_per_tier={"HBM": 1 * GB})],
-            programs={"P": _program("REASONING", inflight={"kv": 1 * GB},
+            programs={"P": _program("REASONING", committed={"kv": 1 * GB},
                                     unit_hashes=["uP"])},
             hbm={"kv": _sp(9 * GB, 10 * GB)})
         router = _StubRouter(sj)
-        asyncio.run(sched.handle(Event(EventKind.MEMORY_PRESSURE, session="P"),
+        asyncio.run(sched.handle(Event(EventKind.LLM_PREFILL, session="P"),
                                  router))
         return tracker, sched, _drain(ob)
 

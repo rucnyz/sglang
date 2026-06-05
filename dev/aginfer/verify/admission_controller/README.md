@@ -33,7 +33,7 @@ scoring       shared_aware_prog_scores — V_u split across holders
 forecast      per-HBM-subpool used_bytes (+ inflight term, 0 under the
               T26/T11 placeholders); forecast_horizon → heartbeat_s
 pause-cost    marginal_pause_cost (0 while prefill_bps=0) + pause_relief
-              (inflight + committed snapshot)
+              (shared-aware committed only; #205)
 pause-cands   one Pause per REASONING/ACTING program (PAUSED+ENDED skipped)
 resume-cands  one Resume per PAUSED program; capacity_fits gates overflow
 trajectory    #199: the §8 forecast trajectory term — assembled from
@@ -45,6 +45,11 @@ disjoint      holistic-review #2: a unit's committed (radix) bytes that
               so Migrate(u) and Pause(p∋u) free disjoint HBM and the §9
               DP can't double-count (under MEMORY_PRESSURE u∈D_t →
               excluded; under LLM_PREFILL D_t=∅ → committed kept)
+overlap       #205: sglang's UNIFIED cache reports a running req's KV in
+              BOTH committed (shared-aware bytes//n_holders) AND inflight
+              (undivided) — pause_relief uses committed ONLY.  Pins the
+              two audit-gap regimes: B5 shared-prefix (12MB/3 holders →
+              4MB relief, not 12MB) and A3 disjoint same-subpool
 ```
 
 The §9 phase selection + live mixed-plan dispatch are pinned by
@@ -57,9 +62,9 @@ The §9 phase selection + live mixed-plan dispatch are pinned by
 term are 0 until `decode_throughput` (T26), `E[remaining_tokens]`
 (T11/#126), and `bytes_per_token_in_subpool` (architecture constant)
 are wired.  So `forecast[sp] == used_bytes[sp]` and `pause_relief =
-inflight + committed` (snapshot only) today — the §9 triggers reduce
-exactly to allocator-truth HBM occupancy (behaviour-preserving), and
-become trajectory-aware once those inputs are measured.
+shared-aware committed` (snapshot only; #205) today — the §9 triggers
+reduce exactly to allocator-truth HBM occupancy (behaviour-preserving),
+and become trajectory-aware once those inputs are measured.
 
 ## Historical note (G1 / G9)
 
@@ -80,6 +85,14 @@ python dev/aginfer/verify/admission_controller/verify.py
 
 ## RESULTS
 
-**PASSED** — all 5 §8-generator stages.
+**PASSED** — all 8 §8-generator stages (scoring, forecast, pause-cost,
+pause-cands, resume-cands, trajectory, disjoint, overlap).
 
 * date: 2026-06-04 (#194 rewrite — was stale pre-T33)
+* date: 2026-06-05 (#205 audit closure) — `pause_relief` is now
+  shared-aware `committed` ONLY (was `committed + max(0, inflight −
+  committed)`).  The audit found that mixing the undivided `inflight`
+  with the per-holder `committed` over-counts shared prefixes (B5: a
+  12MB/3-holder prefix credited the whole 12MB to a single pause) and
+  under-counts disjoint same-subpool bytes (A3).  `stage_overlap` now
+  pins both regimes; `inflight` is read only by `marginal_pause_cost`.

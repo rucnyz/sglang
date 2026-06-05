@@ -75,9 +75,12 @@ for all tagged programs, and `hbm.inflight` populated.
 
 ## What this activates (daemon side)
 
-`marginal_pause_cost` (prefill_bps) and `pause_relief`'s in-flight
-snapshot (inflight) become real NOW.  The §8 forecast **trajectory**
-term stays 0 until T11 (#126) populates `expected_remaining_tokens` —
+`marginal_pause_cost` (prefill_bps **and** the undivided `inflight` —
+the resume re-prefill cost) becomes real NOW.  `pause_relief` itself
+uses the shared-aware `committed` snapshot, NOT inflight (#205 — the
+unified cache reports a running req's KV in both, on different bases).
+The §8 forecast **trajectory** term stays 0 until T11 (#126) populates
+`expected_remaining_tokens` —
 `_program_inflight_growth` gates on a real `E[remaining]`, not the
 bootstrap (the §8 over-pause anti-pattern).
 

@@ -333,35 +333,38 @@ def pause_relief(
     """DESIGN §8 ``pause_relief`` — per-HBM-subpool bytes pausing p frees:
     ``snapshot_relief[sp] + future_inflight_savings[sp]``.
 
-    **Overlap correction (#205).** DESIGN's ``snapshot_relief = inflight +
-    committed`` assumes a SEPARATE in-flight pool and radix-cache.  sglang
-    has a UNIFIED radix cache: a running request's KV lives IN the tree, so
-    the same physical bytes are counted by BOTH the tree-walk ``committed``
-    (p's radix share) AND T26's ``inflight`` (p's running-request KV) —
-    measured ≈ equal on a decoding program (committed ≈ inflight ≈ the
-    program's unit bytes).  Adding them double-counts the entire running
-    KV (~2×), biasing toward over-pausing.  Count each physical byte once:
+    ``snapshot_relief[sp] = max(0, committed[sp] − exclude[sp])``.
 
-      snapshot_relief[sp] = max(0, committed[sp] − exclude[sp])      # radix
-                          + max(0, inflight[sp] − committed[sp])     # uncached
-                                                                     # in-flight
-                                                                     # (prefilling)
+    **Why committed, NOT inflight + committed (#205 + audit).** DESIGN's
+    ``inflight + committed`` assumed a SEPARATE in-flight pool and radix-
+    cache.  sglang's radix cache is UNIFIED — a running request's KV lives
+    IN the tree — so a running req's bytes are ALREADY in the tree-walk
+    ``committed`` (measured ≈ equal to ``inflight`` on a decoding program).
+    ``committed`` is moreover the *shared-aware* share (``bytes //
+    n_holders`` per node): for a prefix p shares with k others, pausing p
+    frees p's 1/k share, which ``committed`` reports.  Raw ``inflight`` is
+    the UNDIVIDED full running KV, so adding it both double-counts the
+    cached part AND mis-credits shared prefixes (``inflight − committed =
+    full·(k−1)/k`` = the OTHER holders' bytes) — the #205-audit B5/A3
+    bugs.  ``committed`` alone is the correct relief; ``inflight`` is read
+    only by :func:`marginal_pause_cost` (a re-prefill COST, overlap
+    irrelevant).  ``exclude`` = the D_t-committed migrate domain
+    (holistic-review #2).  ``future_inflight_savings`` (future decode
+    GROWTH, not yet allocated) stays additive.
 
-    The first term is p's radix bytes the MIGRATE lever isn't handling
-    (``exclude`` = the D_t-committed migrate domain, holistic-review #2).
-    The second is the in-flight bytes NOT yet in the tree (a prefilling
-    request's prompt) — 0 for a fully-cached decoding request (``inflight
-    ⊆ committed``).  ``future_inflight_savings`` (future decode GROWTH, not
-    yet allocated → in neither) stays additive."""
-    inflight = _program_inflight(pu)
+    KNOWN GAP (conservative): a genuinely UNCACHED running slice — a
+    mid-prefill prompt not yet a tree node, or a non-radix in-flight pool
+    (hybrid Mamba) — is in ``inflight`` but not ``committed`` and is NOT
+    credited here.  Under-claiming relief (won't over-pause a mid-prefill
+    program); a proper shared-aware uncached-inflight term needs per-unit
+    holder attribution on the inflight side (#206)."""
     committed = _program_committed(pu)
     fut = future_inflight_savings or {}
     excl = exclude_committed or {}
     relief: Dict[str, int] = {}
-    for sp in set(inflight) | set(committed) | set(fut):
-        radix = max(0, committed.get(sp, 0) - int(excl.get(sp, 0)))
-        uncached_inflight = max(0, inflight.get(sp, 0) - committed.get(sp, 0))
-        v = radix + uncached_inflight + int(fut.get(sp, 0.0))
+    for sp in set(committed) | set(fut):
+        v = (max(0, committed.get(sp, 0) - int(excl.get(sp, 0)))
+             + int(fut.get(sp, 0.0)))
         if v > 0:
             relief[sp] = v
     return relief
@@ -381,8 +384,8 @@ def pause_candidates(
     ``relief`` is the flat ``{sp: bytes}`` shape; ``joint_decide``
     normalises it to ``{"HBM": {...}}`` before the DP (DESIGN §9).
     ``future_inflight_savings`` (the near-term decode growth pausing p
-    averts) is 0 under the current placeholders, so ``relief`` is the
-    snapshot ``inflight + committed`` until T26/T11 land (#199).
+    averts) is 0 until T11 lands (#126), so ``relief`` is the shared-aware
+    ``committed`` snapshot (#205).
     ``V_u_program`` uses the shared-aware aggregate (each unit's V_u
     split across holders) — the interim attribution under §7's binary
     p_hat; DESIGN's no-weight form is correct once T11's holder-product
