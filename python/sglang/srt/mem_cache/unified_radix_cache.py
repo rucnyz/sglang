@@ -3158,6 +3158,23 @@ class UnifiedRadixCache(BasePrefixCache):
                         bpt = total_bytes // size
                 except Exception:
                     bpt = 0
+            if bpt == 0:
+                # SWA / multi-component pools (e.g. DeepSeekV4TokenToKVPool, a
+                # BaseSWAKVPool wrapper) do NOT expose get_bytes_per_token on
+                # the wrapper — it lives on the per-component single pools it
+                # holds (swa_kv_pool / c128_kv_pool, each a
+                # DeepSeekV4SingleKVPool).  Probe them so DSV4's byte
+                # accounting isn't 0 → occ_hbm≡0 → daemon-blind (#209).
+                for _attr in ("full_kv_pool", "swa_kv_pool", "c128_kv_pool",
+                              "kv_pool", "_pool"):
+                    _sub = getattr(kv, _attr, None)
+                    if _sub is not None and hasattr(_sub, "get_bytes_per_token"):
+                        try:
+                            bpt = int(_sub.get_bytes_per_token())
+                        except Exception:
+                            bpt = 0
+                        if bpt > 0:
+                            break
         if bpt > 0:  # never cache a transient 0 (#209) — recompute next call
             self._aginfer_bpt_cache = bpt
         return bpt
