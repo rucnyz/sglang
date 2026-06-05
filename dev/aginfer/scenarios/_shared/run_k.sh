@@ -176,6 +176,39 @@ if [[ -n "$HICACHE_FLAG" ]]; then
     echo "[run_k:$VARIANT] mooncake_master up (pid=$MOONCAKE_PID)"
 fi
 
+# ---- 1b. aginfer-daemon (BEFORE sglang) ----
+# #208 ordering fix: sglang's launch-time bootstrap_thresholds_into_server_
+# args (T22 #165) GETs the daemon's /aginfer/thresholds and HALTS if the
+# daemon is unreachable ("daemon must be up before sglang").  So the daemon
+# MUST start first.  It tolerates a not-yet-up sglang at boot
+# (cold_start_probe logs + continues).  The historical A3 data predates
+# #165; the old sglang-then-daemon order now deadlocks.
+echo "[run_k:$VARIANT] starting aginfer-daemon (kv=$DAEMON_KV admission=$DAEMON_ADMISSION)..."
+PYTHONPATH="$AGINFER_DIR:${PYTHONPATH:-}" \
+    python -m daemon.main \
+        --sglang-base-url=http://127.0.0.1:30000 \
+        --port=9100 \
+        --kv-scheduler="$DAEMON_KV" \
+        --admission-controller="$DAEMON_ADMISSION" \
+        >"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+for i in $(seq 1 30); do
+    if grep -q "Uvicorn running on http://0.0.0.0:9100" "$DAEMON_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+if ! grep -q "Uvicorn running on http://0.0.0.0:9100" "$DAEMON_LOG" 2>/dev/null; then
+    echo "[run_k:$VARIANT] daemon never started; see $DAEMON_LOG" >&2
+    exit 8
+fi
+if ! grep -E "kv_scheduler=$DAEMON_KV admission_controller=$DAEMON_ADMISSION" "$DAEMON_LOG" >/dev/null; then
+    echo "[run_k:$VARIANT] HALT — daemon startup invariant did not match" >&2
+    grep "kv_scheduler=" "$DAEMON_LOG" | head -1 >&2
+    exit 9
+fi
+echo "[run_k:$VARIANT]   ✓ daemon: kv_scheduler=$DAEMON_KV admission_controller=$DAEMON_ADMISSION"
+
 # ---- 2. sglang ----
 echo "[run_k:$VARIANT] starting sglang (TP=${SGLANG_TP:-2}, GPUs=$AGINFER_GPUS, HiCache=${HICACHE_FLAG:-OFF})..."
 # T9 README §"For ALL variants": ours_greedy_score scorer is the
@@ -258,36 +291,8 @@ else
     echo "[run_k:$VARIANT]   ✓ HiCache OFF (variant J)"
 fi
 
-# ---- 4. daemon ----
-echo "[run_k:$VARIANT] starting aginfer-daemon (kv=$DAEMON_KV admission=$DAEMON_ADMISSION)..."
-PYTHONPATH="$AGINFER_DIR:${PYTHONPATH:-}" \
-    python -m daemon.main \
-        --sglang-base-url=http://127.0.0.1:30000 \
-        --port=9100 \
-        --kv-scheduler="$DAEMON_KV" \
-        --admission-controller="$DAEMON_ADMISSION" \
-        >"$DAEMON_LOG" 2>&1 &
-DAEMON_PID=$!
-
-# Wait for daemon ready.
-for i in $(seq 1 30); do
-    if grep -q "Uvicorn running on http://0.0.0.0:9100" "$DAEMON_LOG" 2>/dev/null; then
-        break
-    fi
-    sleep 1
-done
-if ! grep -q "Uvicorn running on http://0.0.0.0:9100" "$DAEMON_LOG" 2>/dev/null; then
-    echo "[run_k:$VARIANT] daemon never started; see $DAEMON_LOG" >&2
-    exit 8
-fi
-
-# 4a. Daemon startup invariant.
-if ! grep -E "kv_scheduler=$DAEMON_KV admission_controller=$DAEMON_ADMISSION" "$DAEMON_LOG" >/dev/null; then
-    echo "[run_k:$VARIANT] HALT — daemon startup invariant did not match" >&2
-    grep "kv_scheduler=" "$DAEMON_LOG" | head -1 >&2
-    exit 9
-fi
-echo "[run_k:$VARIANT]   ✓ daemon: kv_scheduler=$DAEMON_KV admission_controller=$DAEMON_ADMISSION"
+# ---- 4. daemon: started in §1b (BEFORE sglang) for the T22 bootstrap
+#         ordering (#208).  DAEMON_PID is live here for cleanup. ----
 
 # ---- 5. harbor run ----
 HARBOR_RESULTS="$RESULTS_DIR/harbor_jobs"

@@ -96,6 +96,15 @@ def _env_int(key: str, default: str) -> int:
 
 _DEFAULT_LAMBDA_ACTING = _env_float("AGINFER_LAMBDA_ACTING", "0.2")
 
+# #208 const-V_u isolation arm: neutralise the reuse-prediction signal
+# (p_hat / lambda → constant) in build_paper_state so the daemon's migrate /
+# admission ranking is reuse-blind.  Matches sglang_adapter._CONST_VU.
+_CONST_VU = bool(os.environ.get("AGINFER_CONST_VU"))
+if _CONST_VU:
+    logging.getLogger(__name__).warning(
+        "AGINFER_CONST_VU active — daemon V_u reuse signal neutralised "
+        "(p_hat=lambda=1.0) (#208)")
+
 # Top-k cap on the memory_pressure decision_set.  Paper §7.1.  256 is
 # enough to materially affect HBM occ on a B300 (~half a percent per
 # unit at 2 KB/token × 4 k tokens/unit).
@@ -639,6 +648,12 @@ def build_paper_state(
             p_hat = 1.0
         else:
             p_hat = min(1.0, hits / age)
+        if _CONST_VU:
+            # #208 const-V_u isolation arm: neutralise the reuse-prediction
+            # signal on the daemon side too (matches the inline scorer's
+            # AGINFER_CONST_VU hook) so the migrate/admission ranking is
+            # reuse-blind while the machinery still runs.
+            p_hat, lam = 1.0, 1.0
         units[uhash] = ReuseUnit(
             id=uhash,
             type=UnitType.SESSION,  # platform / tool_def tags arrive later

@@ -48,6 +48,17 @@ from .ours_greedy import (
 _BYTES_PER_TOKEN = int(os.environ.get("AGINFER_BYTES_PER_TOKEN", "2048"))
 _PI_U = float(os.environ.get("AGINFER_PI_U", "5e-5"))  # prefill cost (s/tok)
 
+# #208 const-V_u isolation arm: when set, the inline scorer neutralises the
+# reuse-prediction signal (p_hat / lambda → constant) so V_u depends only on
+# size/tier.  The daemon's build_paper_state honours the same env var.
+_CONST_VU = bool(os.environ.get("AGINFER_CONST_VU"))
+if _CONST_VU:
+    # Observable activation marker (#208) — so the const_vu arm's neutralised
+    # ranking is unambiguous in the sglang log, no proc-env archaeology needed.
+    import sys as _sys
+    print("[aginfer] AGINFER_CONST_VU active — inline V_u reuse signal "
+          "neutralised (p_hat=lambda=1.0) (#208)", file=_sys.stderr, flush=True)
+
 _COSTS = default_costs()
 
 # The FULL subpool name on a single-stack-attention cache matches
@@ -81,10 +92,18 @@ def _node_to_unit(node: Any, layer_name: str, current_counter: int) -> ReuseUnit
     n_tokens = _node_n_tokens(node, layer_name)
     age = max(1, current_counter - int(node.last_access_time))
     hits = int(node.hit_count)
-    # Reuse-frequency proxy for p_hat: bounded into [0, 1].
-    p_hat = min(1.0, hits / age) if age > 0 else 0.0
-    # Poisson rate proxy: hits per access-tick (>=1e-3 floor).
-    lam = max(1e-3, hits / age) if age > 0 else 1e-3
+    if _CONST_VU:
+        # #208 const-V_u isolation arm: neutralise the reuse-prediction
+        # signal (p_hat / lambda → constant) so V_u depends only on
+        # size/tier.  Eviction ranking becomes reuse-blind while the
+        # multi-tier machinery still runs — isolates "does the value
+        # RANKING help" from "does the machinery help".
+        p_hat, lam = 1.0, 1.0
+    else:
+        # Reuse-frequency proxy for p_hat: bounded into [0, 1].
+        p_hat = min(1.0, hits / age) if age > 0 else 0.0
+        # Poisson rate proxy: hits per access-tick (>=1e-3 floor).
+        lam = max(1e-3, hits / age) if age > 0 else 1e-3
     tier = Tier.HBM if layer_name == "DEVICE" else Tier.DRAM
     n_bytes_total = n_tokens * _BYTES_PER_TOKEN
     return ReuseUnit(

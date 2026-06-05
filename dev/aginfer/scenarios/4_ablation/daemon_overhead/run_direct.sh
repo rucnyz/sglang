@@ -18,8 +18,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AGINFER_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# This runner lives THREE levels under dev/aginfer
+# (scenarios/4_ablation/daemon_overhead/), not two like the _shared/
+# runners — so AGINFER_DIR is ../../.. (was ../.., broken since the move
+# into the ablation subdir: scenarios/scripts/env.sh doesn't exist).  #208.
+AGINFER_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 source "$AGINFER_DIR/scripts/env.sh"
+
+# A3 (HBM-pressure) completion cap — mirror run_k.sh's a3 branch so this
+# OURS_inline arm runs the SAME 4k-capped workload as ours_full A3 (#208).
+declare -a EXTRA_AK_OPTS=()
+if [[ -n "${A3_AK_CAP:-}" ]]; then
+    EXTRA_AK_OPTS=("--ak" 'llm_call_kwargs={"max_tokens":4096}')
+fi
 
 RESULTS_DIR="$AGINFER_RESULTS/run_H_prime_now${RUN_K_RESULTS_TAG:+_${RUN_K_RESULTS_TAG}}"
 mkdir -p "$RESULTS_DIR"
@@ -134,6 +145,7 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
         --ak max_turns="${HARBOR_MAX_TURNS}" \
         --ak temperature=0.0 \
         --ak seed=42 \
+        "${EXTRA_AK_OPTS[@]}" \
         -l "${HARBOR_N_TASKS}" \
         -n "${HARBOR_N_CONCURRENT}" \
         -k 1 \
