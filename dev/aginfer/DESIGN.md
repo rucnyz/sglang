@@ -1722,6 +1722,30 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
     + future_inflight_savings(p, state)[sp]
   ```
 
+  **Overlap correction (#205 — sglang unified cache).** The naive
+  `snapshot_relief = inflight + committed` assumes a SEPARATE in-flight
+  pool and radix-cache.  sglang's radix cache is UNIFIED: a running
+  request's KV lives IN the tree, so the SAME physical bytes are
+  reported by both the tree-walk `committed` (p's radix share) and T26's
+  `inflight` (p's running-request KV) — measured ≈ equal on a decoding
+  program.  Adding them double-counts the running KV (~2×) and biases
+  toward over-pausing.  Count each physical byte once:
+
+  ```
+  snapshot_relief(p, state)[sp] =
+      max(0, committed[sp] − migrate_domain[sp])   # radix bytes pause
+                                                   # frees that migrate
+                                                   # isn't handling (#2)
+    + max(0, inflight[sp] − committed[sp])         # in-flight bytes NOT
+                                                   # yet in the tree
+                                                   # (a prefilling prompt);
+                                                   # 0 once cached
+  ```
+
+  `marginal_pause_cost` still reads the FULL `inflight` (the decoded-
+  so-far bytes re-prefilled on resume — a COST, not a relief, so the
+  overlap is irrelevant there).
+
   The `future_inflight_savings` term is what makes Pauses
   trajectory-strong (Migrates only deliver snapshot relief).
   This is *why* PRESSURE_CRITICAL doesn't need a special cost

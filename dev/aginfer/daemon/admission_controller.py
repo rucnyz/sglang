@@ -331,28 +331,37 @@ def pause_relief(
     exclude_committed: Optional[Dict[str, int]] = None,
 ) -> Dict[str, int]:
     """DESIGN §8 ``pause_relief`` — per-HBM-subpool bytes pausing p frees:
-    ``snapshot_relief[sp] + future_inflight_savings[sp]`` where
-    ``snapshot_relief = inflight[sp] + committed[sp]`` (p's in-flight
-    decode bytes + its exclusive radix share).
+    ``snapshot_relief[sp] + future_inflight_savings[sp]``.
 
-    ``future_inflight_savings`` is the near-term decode growth pausing p
-    averts — the same per-program term :func:`forecast_inflight_demand`
-    sums (computed by :func:`_program_inflight_growth`; 0 under the
-    current placeholders).  ``pause_candidates`` computes it and passes
-    it in; absent ⇒ snapshot relief only.
+    **Overlap correction (#205).** DESIGN's ``snapshot_relief = inflight +
+    committed`` assumes a SEPARATE in-flight pool and radix-cache.  sglang
+    has a UNIFIED radix cache: a running request's KV lives IN the tree, so
+    the same physical bytes are counted by BOTH the tree-walk ``committed``
+    (p's radix share) AND T26's ``inflight`` (p's running-request KV) —
+    measured ≈ equal on a decoding program (committed ≈ inflight ≈ the
+    program's unit bytes).  Adding them double-counts the entire running
+    KV (~2×), biasing toward over-pausing.  Count each physical byte once:
 
-    ``exclude_committed`` (holistic-review #2) is the committed (radix)
-    bytes of p's units that are in this event's D_t — subtracted so the
-    pause and the migrate lever free disjoint HBM (no double-count).
-    See :func:`_committed_in_dt`."""
+      snapshot_relief[sp] = max(0, committed[sp] − exclude[sp])      # radix
+                          + max(0, inflight[sp] − committed[sp])     # uncached
+                                                                     # in-flight
+                                                                     # (prefilling)
+
+    The first term is p's radix bytes the MIGRATE lever isn't handling
+    (``exclude`` = the D_t-committed migrate domain, holistic-review #2).
+    The second is the in-flight bytes NOT yet in the tree (a prefilling
+    request's prompt) — 0 for a fully-cached decoding request (``inflight
+    ⊆ committed``).  ``future_inflight_savings`` (future decode GROWTH, not
+    yet allocated → in neither) stays additive."""
     inflight = _program_inflight(pu)
     committed = _program_committed(pu)
     fut = future_inflight_savings or {}
     excl = exclude_committed or {}
     relief: Dict[str, int] = {}
     for sp in set(inflight) | set(committed) | set(fut):
-        c = max(0, committed.get(sp, 0) - int(excl.get(sp, 0)))
-        v = inflight.get(sp, 0) + c + int(fut.get(sp, 0.0))
+        radix = max(0, committed.get(sp, 0) - int(excl.get(sp, 0)))
+        uncached_inflight = max(0, inflight.get(sp, 0) - committed.get(sp, 0))
+        v = radix + uncached_inflight + int(fut.get(sp, 0.0))
         if v > 0:
             relief[sp] = v
     return relief
