@@ -571,6 +571,85 @@ def stage_d_joint_decide_select() -> None:
                  "suppression, LLM_PREFILL OK"))
 
 
+def stage_d_resume_starvation() -> None:
+    """#211: a PAUSED program whose units were DROPPED while it was gated
+    must STILL be resumed when headroom exists — else it starves to an
+    AgentTimeout (a paused program emits no events and never gets its
+    bytes back on its own).  ``resume_candidates`` sizes ``re_use`` from
+    the program's units; once they are gone, ``re_use`` is empty, and the
+    headroom phase's ``_has_reuse`` filter silently drops the Resume, so the
+    program can never leave the gate.  A zero-HBM resume is the CHEAPEST
+    possible action (just release the proxy gate; the program re-prefills
+    and admission re-pauses it only if pressure actually returns) — it must
+    never be filtered out.  Both shapes the live overlay produces are pinned:
+      (a) ``unit_hashes`` still listed but the units are gone from
+          ``state.units`` (DROPped post-pause), and
+      (b) ``unit_hashes == []`` (the overlay's empty-residue PAUSED entry,
+          unified_radix_cache._aginfer_overlay_program_states)."""
+    from daemon import joint_decide as jd
+    GB = 1024 ** 3
+    kw = dict(costs=default_costs(), pi_u=1.0e-4,
+              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+    er = Event(kind=EventKind.PRESSURE_RESOLVED, session="P")
+
+    def _resume_pids(unit_hashes):
+        tracker = ProgramTracker()
+        tracker.observe_arrival("P")
+        tracker.pause("P")
+        sj = _state_json(
+            units=[],   # P's units have been DROPped while it was gated
+            programs={"P": _program("PAUSED", unit_hashes=unit_hashes,
+                                    pre_pause_state="REASONING")},
+            hbm={"kv": _sp(int(0.5 * GB), 10 * GB)},   # 5% occ → headroom
+        )
+        st = _build_state(sj, tracker, er)
+        plan = jd.joint_decide(st, er, **kw)
+        return [c.pid for c in plan if isinstance(c, Resume)]
+
+    a = _resume_pids(unit_hashes=["uP"])   # dropped, hash still referenced
+    if "P" not in a:
+        raise StageFail(
+            "#211: PAUSED program with DROPped units (hash still listed) "
+            f"must still be resumed in headroom; got resumes {a}")
+    b = _resume_pids(unit_hashes=[])       # overlay empty-residue entry
+    if "P" not in b:
+        raise StageFail(
+            "#211: PAUSED program with empty unit_hashes (overlay empty-"
+            f"residue) must still be resumed in headroom; got resumes {b}")
+
+    # --- multi-subpool gate + ordering (audit finding 5): with TWO HBM
+    #     subpools both below theta_lo (so `all(r>0)` headroom gate fires),
+    #     a VALUABLE resume (real re_use+gain) and a floored zero-re_use
+    #     resume must BOTH be granted, and the weight-0 floored one must
+    #     never steal a subpool's room from the valuable one. ---
+    tracker = ProgramTracker()
+    for p in ("V", "Z"):
+        tracker.observe_arrival(p)
+        tracker.pause(p)
+    sj_multi = _state_json(
+        units=[_unit(uhash="uV", residence=["DRAM"], holders=["V"],
+                     n_bytes_per_tier={"DRAM": {"sp_a": 1 * GB}})],
+        programs={
+            "V": _program("PAUSED", unit_hashes=["uV"],
+                          pre_pause_state="REASONING"),
+            "Z": _program("PAUSED", unit_hashes=[],   # dropped → floored
+                          pre_pause_state="REASONING"),
+        },
+        hbm={"sp_a": _sp(int(0.5 * GB), 10 * GB),
+             "sp_b": _sp(int(0.5 * GB), 10 * GB)},   # both 5% → headroom
+    )
+    st_multi = _build_state(sj_multi, tracker, er)
+    plan_multi = jd.joint_decide(st_multi, er, **kw)
+    pids_multi = {c.pid for c in plan_multi if isinstance(c, Resume)}
+    if pids_multi != {"V", "Z"}:
+        raise StageFail(
+            "#211: multi-subpool headroom must resume BOTH the valuable (V) "
+            f"and the floored zero-re_use (Z) program; got {pids_multi}")
+
+    print(_green("  [D-starve] dropped-unit PAUSED programs still resume "
+                 "in headroom; valuable+floored co-grant (#211) OK"))
+
+
 # ============================================================ Stage E
 
 
@@ -942,6 +1021,7 @@ _STAGES = [
     ("B", stage_b_forecast),
     ("C", stage_c_program_candidates),
     ("D", stage_d_joint_decide_select),
+    ("D-starve", stage_d_resume_starvation),
     ("E", stage_e_dp_correctness),
     ("F", stage_f_live_dispatch),
     ("G", stage_g_robustness),

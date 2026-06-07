@@ -430,6 +430,19 @@ def capacity_fits(
     return True
 
 
+# #211 liveness floor.  A PAUSED program emits no events of its own and can
+# never un-starve itself — only a Resume in the headroom phase releases its
+# proxy gate.  Its V_u-derived gain can legitimately be 0 (its units were
+# DROPped while it was gated), and the headroom knapsack would then never
+# pick it (a zero-gain zero-weight item ties the take-none cell and loses),
+# so it starves to an AgentTimeout.  DESIGN §8: once headroom is detected
+# (occ < theta_lo) resuming a gated program is always weakly preferable to
+# idling the room.  A tiny positive floor encodes exactly that — it makes
+# the knapsack grant an otherwise-zero-gain Resume without ever reordering
+# a real V_u-bearing one (any cached value dwarfs it).
+_RESUME_LIVENESS_FLOOR = 1.0e-9
+
+
 def resume_candidates(
     state: SchedulerState,
     heartbeat_s: float,
@@ -465,6 +478,10 @@ def resume_candidates(
             pu.get("unit_hashes", []), state.units)
         if not capacity_fits(fc, re_use, cap_view, theta_hi):
             continue
-        out.append(Resume(gain=vprog.get(pid, 0.0), re_use=re_use, pid=pid))
+        # #211: floor the gain so a paused program whose cached value is 0
+        # (units DROPped while gated) is still resumed when it fits — else
+        # it can never leave the gate (see _RESUME_LIVENESS_FLOOR).
+        gain = max(vprog.get(pid, 0.0), _RESUME_LIVENESS_FLOOR)
+        out.append(Resume(gain=gain, re_use=re_use, pid=pid))
     return out
 

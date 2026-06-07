@@ -63,10 +63,6 @@ def _has_relief(c: Any) -> bool:
     return any(b > 0 for sub in c.relief.values() for b in sub.values())
 
 
-def _has_reuse(c: Any) -> bool:
-    return any(b > 0 for sub in c.re_use.values() for b in sub.values())
-
-
 def _page_bytes(state: SchedulerState, tier_label: str, sp: str) -> int:
     """``page_bytes`` for axis (tier_label, sp).  A missing key is a
     schema-contract violation (DESIGN §10 subpool-key consistency) — let
@@ -177,7 +173,13 @@ def joint_decide(
     if admission_enabled and hbm_cap and all(r > 0 for r in free_room.values()):
         cands = adm.resume_candidates(state, heartbeat_s, theta_hi)
         cands = [replace(c, re_use={"HBM": c.re_use}) for c in cands]
-        cands = [c for c in cands if _has_reuse(c)]
+        # #211: do NOT drop zero-re_use Resumes.  A paused program whose
+        # units were DROPped while gated has empty re_use, but resuming it
+        # is a FREE un-starve (zero HBM, just release the proxy gate) — the
+        # cheapest possible headroom action, not a no-op.  resume_candidates
+        # already gated each candidate on capacity_fits, and the knapsack
+        # enforces free_room, so every candidate here is legitimately
+        # grantable; filtering by re_use bytes would strand the program.
         bucket_size = {axis: _page_bytes(state, axis[0], axis[1])
                        for axis in free_room}
         ctx = {
