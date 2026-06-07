@@ -243,8 +243,8 @@ event; everything else is NORMAL.
 * NORMAL events are FIFO.
 * The router is the only place priority appears; `joint_decide`
   itself is priority-agnostic (it reads `state` and produces a
-  plan; the urgency is encoded as a larger `bytes_needed` via
-  `forecast`).
+  plan; higher occupancy simply makes more units net-positive to
+  migrate out via `forecast`).
 
 This keeps the decision rule pure: priority is a routing concern,
 not a decision-rule concern.
@@ -876,9 +876,9 @@ event-by-event:
   the affected unit) but do not by themselves advance time.
   The MDP "tick" is the next workload event.
 * **Reward** — negative seconds-cost.  Per-event reward is the
-  total `cost` of the chosen subset under §9's knapsack
-  objective (lower is better in the pressure phase, negated for
-  the headroom phase's max-gain).  Long-run reward is total
+  total net value of the chosen subset under §9's value-maximising
+  knapsack (value = −cost; the empty set scores 0, so a no-op is
+  never worse than acting).  Long-run reward is total
   inference seconds-saved vs the always-DROP baseline, per the
   paper's reward decomposition.
 * **Policy `π`** — `joint_decide(state, event)` from §9.
@@ -923,7 +923,7 @@ because the constraint is a one-sided byte threshold.
 | `transfer_time(σ, τ)` | seconds | `transfer_bytes / bw_free` |
 | `page_bytes(τ, sp)` | bytes | per-(tier, subpool) DP quantisation granularity, read from `state.pool_usage[τ].subpools[sp].page_bytes`.  §9's multi-axis DP uses each axis's own bucket size — no global LCM/min collapse |
 | `cost`, `gain`, `V_u`, `V_u_program` | seconds | net value at the same time-axis |
-| `relief`, `re_use`, `acquired`, `bytes_needed` | per-(tier, subpool) bytes-dict | HBM-resource axes (and destination-tier consumption for `acquired`); see §9 |
+| `relief`, `re_use`, `acquired` | per-(tier, subpool) bytes-dict | HBM-resource axes (and destination-tier consumption for `acquired`); `relief` carries the pressured-subpool targeting filter, `acquired`/`re_use` the value knapsack's budget consumption; see §9 |
 | `forecast(state)` | dict[subpool, bytes] | per-HBM-subpool predicted bytes at the next event arrival if no scheduling action is taken: `pool_usage.HBM.subpools[sp].used_bytes + forecast_inflight_demand(state)[sp]`.  Compare each entry against `theta_hi × subpools[sp].cap_bytes`.  Horizon = `forecast_horizon(state)`, see §8 |
 | `forecast_horizon(state)` | seconds | expected time to next event: `min(heartbeat_s, 1 / recent_event_rate)`.  Bounded above by webhook heartbeat under HIGH/CRITICAL pressure (≈ 5 s) and below by typical event interval under normal load (≈ 10 ms) |
 | `decode_throughput(p)` | tokens/sec | sglang-observed decode rate for p, used to cap `E[remaining_tokens]` by `horizon × throughput` |
@@ -1638,11 +1638,12 @@ The Resume `gain` is a **counterfactual**: "if we resume p, how
 much V_u does p produce?".  Computing `V_u_program(p)` on the
 current state would return 0 because PAUSED holders' contribution
 to every unit's `p_hat` is 0 by §7's conditional formulation —
-all paused programs would tie at 0 and the headroom phase's
-`gain / re_use` ordering would be undefined.
+all paused programs would tie at 0 and the value knapsack's
+`gain / re_use` ranking would be undefined.
 
-§9 consumes these candidates: pressure phase uses Pauses + §7's
-Migrates; headroom phase uses Resumes.
+§9 consumes these candidates: relief takes net-positive Migrates from
+§7 (the Pause lever is dormant, §9); the resume phase takes net-positive
+Resumes.
 
 ### Component definitions
 
@@ -2002,61 +2003,103 @@ These aren't pathological corner cases — they happen whenever a
 single program contributes both migrate candidates and pause
 relief, which is the common case in agent workloads.
 
+**Status: the pause lever is currently DORMANT.**  The argument above
+is why the *architecture* is a single decision over the union action
+space rather than two sequential passes — it keeps pause and migrate
+commensurable for when pause is enabled.  But `joint_decide` does not
+generate pauses today (their cost misses the paused agent's forgone
+progress and their OOM-benefit is unmodelled — §8), so the *live* joint
+decision is over {migrate-relief} ∪ {resume}, both value-gated and
+coexisting in one event.  The union framing and the one-decision-function
+structure are unchanged; only the pause item is withheld until it can be
+correctly valued.
+
 ### Joint decide
 
-Two phases, each is a **0/1 knapsack solved by exact DP**.  The
-pressure phase is multi-axis because items consume bytes from
-*different* (tier, subpool) budgets — every HBM subpool's relief
-plus every DRAM/DISK subpool's destination capacity.  The headroom
-phase is single-tier (HBM only) but still multi-axis: one resource
-axis per HBM subpool.
+The §9 decision is a single **value-maximising** choice over the union
+action space, and **no-op is always available**.  An action enters the
+plan only when its **net value is positive** — the benefit it produces
+exceeds its cost.  When nothing pays, the plan is empty and the daemon
+does nothing.  This is what makes the daemon **do-no-harm by
+construction**: it acts only where acting helps, and otherwise leaves
+the state to sglang's own backstop (which is exactly the no-daemon
+baseline).
 
-The decision rule is **event-priority-agnostic**: `PRESSURE_CRITICAL`
-takes the same code path as `MEMORY_PRESSURE`.  Urgency enters
-through `forecast(state)` (larger at higher occupancy), which
-makes `bytes_needed` bigger, which makes Pauses dominate Migrates
-in the DP via `pause_relief`'s `future_inflight_savings` term (§8).
-The CRITICAL-specific behaviour lives in the event router (§4) —
-CRITICAL events preempt the queue, they don't change the decision
-function.
+There is **no "cover" target and no must-relieve wall**.  `theta_hi` is
+a **signal** that gates whether relief candidates are generated — *not*
+a hard limit the daemon must push occupancy back under.  A subpool at
+high occupancy is worth relieving only if some relief action is
+net-positive; if every relief action costs more than it saves — the
+case for an over-subscribed, non-migratable subpool such as attention
+`swa`, whose resident units are all in active use (high V_u, not leaves)
+— the relief no-ops and the bottleneck stays a bottleneck, exactly as
+with no daemon.  Earlier revisions used a min-cost-**cover** pressure
+phase that *forced* relief whenever `forecast > theta_hi`; against a
+permanently-pegged, unrelievable subpool that forced the daemon to pause
+active programs it could never usefully resume → agent-stall timeouts
+worse than baseline.  The value-gated rule removes the forcing: the same
+DP that picks beneficial actions also picks the empty set when none is
+beneficial.
 
-* **Pressure phase** runs when **any** HBM subpool's `forecast[sp]`
-  crosses `theta_hi × subpools[sp].cap_bytes`.  Items: Pause
-  programs + Migrate-HBM-out units.  Resources: per-HBM-subpool
-  relief budget + per-(DRAM|DISK, subpool) destination capacity.
-  Goal: free at least `bytes_needed[sp]` from each pressured HBM
-  subpool **while not overflowing destination subpools**,
-  minimising total V_u cost.
-* **Headroom phase** runs when **every** HBM subpool's
-  `forecast[sp]` falls below `theta_lo × subpools[sp].cap_bytes`.
-  Items: Resume paused programs.  Resources: per-HBM-subpool
-  free room.  Goal: maximise total V_u gain subject to per-subpool
-  bytes-reclaimed ≤ `free_room[sp]`.
+`PRESSURE_CRITICAL` still takes the same code path as `MEMORY_PRESSURE`;
+urgency enters through `forecast(state)` (larger at higher occupancy,
+which makes more units net-positive to migrate out), and the
+CRITICAL-specific behaviour lives in the event router (§4) — CRITICAL
+events preempt the queue, they don't change the decision function.
 
-**Pressure suppresses headroom across all subpools.**  When any
-HBM subpool is pressured, the headroom phase does not run for any
-subpool — even subpools sitting in slack.  This is intentional:
-resuming a paused program tends to grow inflight bytes across
-*every* subpool that program decodes into (attention `full`
-always, plus `swa`/`mamba` if the architecture uses them), so
-resuming during partial pressure would make the pressured subpool
-worse before headroom can help.  The pressure→headroom transition
-waits for full slack on all subpools.
+The decision has two budget-shaped pieces; **both are value-maximising
+0/1 knapsacks with the empty set allowed** (multi-axis, exact sparse DP
+— machinery below).  They run in the SAME event and their plans
+combine — independent levers on different state, **not mutually
+exclusive**:
 
-**`LLM_PREFILL` runs `joint_decide` like every other event.**
-Even though `LLM_PREFILL`'s `D_t` is `∅` (§7) so
-`migrate_candidates` returns `[]`, the admission generators
-(`pause_candidates` / `resume_candidates`) still produce
-candidates from the live state.  joint_decide runs the same DP;
-typically there is nothing to do (no pressure, no slack-to-fill)
-and an empty plan is returned, but the entry-point is uniform.
-A reader skimming for "what events trigger decisions" should
-read: all 13 events trigger `joint_decide`; what differs is
-which candidates are eligible.
+* **Relief** (candidates generated when **any** HBM subpool's
+  `forecast[sp]` crosses `theta_hi × cap`): items are Migrate-HBM-out
+  units, wrapped as value-items with **value = −cost**.  A Migrate whose
+  `V_u(next) − V_u(current) − M_eff > 0` is net-positive — worth moving.
+  An item is kept only if (a) it is net-positive (`cost < 0`) AND (b) it
+  **relieves a subpool that is actually pressured**.  (a) protects hot
+  units: because V_u already nets each unit's per-subpool holding cost
+  and reuse value, a COLD unit (low V_u → cheap to move) has `cost < 0`
+  while a hot/active unit (high V_u) has `cost > 0` and is dropped.  (b)
+  keeps relief on the bottleneck and never churns a subpool that has
+  room.  Together: a subpool full of active windows (`swa`) has **no
+  Migrate that both improves V_u and relieves it** → relief no-ops
+  (do-no-harm); a subpool full of cold cached prefix yields many → the
+  daemon relieves it.  **No per-subpool threshold tuning** — the value
+  rule carries the per-unit decision, the pressured-subpool filter
+  carries the targeting.  The **Pause lever is DORMANT — not
+  generated.**  A Pause's *cost* (`V_u_program + marginal_pause_cost`)
+  omits the paused agent's forgone PROGRESS, and its *benefit* (the OOM
+  it averts) is unmodelled, so a Pause cannot yet be correctly valued.
+  We do **not** rely on "its value comes out negative so the gate drops
+  it": `V_u_program` itself goes negative under the holding tax, which
+  would make an under-costed Pause look net-positive and wrongly stall an
+  active agent (the A3 regression).  Until BOTH the progress-cost and the
+  OOM-benefit are modelled (§8), the daemon never pauses; Migrate is the
+  working relief lever.  Constraint: do not overflow any destination
+  `(DRAM|DISK, subpool)` cap.  Goal: **maximise total net value**, take
+  only net-positive items, **empty set allowed**.
 
-The two phases are mutually exclusive per event (forecast is
-either too high or too low; in between is the hysteresis band
-where neither phase has anything to do).
+* **Resume** (candidates evaluated **every event**): items are
+  Resume-paused-program candidates whose re_use **fits** —
+  `forecast[sp] + re_use[sp] ≤ theta_hi × cap` on every subpool the
+  resume *grows*; a resume that adds **0 bytes** to a subpool can never
+  make it worse, so it fits even when that subpool is pegged (the free
+  un-starve of a program whose units were dropped while gated).
+  Constraint: per-HBM-subpool free room at `theta_lo` (hysteresis
+  margin, clamped ≥ 0).  Goal: **maximise total V_u gain**, **empty set
+  allowed**.
+
+Relief and Resume run together in one event: the daemon may migrate cold
+KV out of a pressured subpool AND resume a fitting paused program at
+once.  Both are gated on net value; both can do nothing.
+
+**`LLM_PREFILL` runs `joint_decide` like every other event.**  Its
+`D_t` is `∅` (§7) so `migrate_candidates` returns `[]`, but the Resume
+candidates are still evaluated; typically nothing is net-positive and an
+empty plan is returned.  All 13 events trigger `joint_decide`; what
+differs is which candidates are eligible.
 
 ```python
 def capacity_left_bytes(state, τ, sp):
@@ -2068,76 +2111,59 @@ def joint_decide(state, event):
     hbm_subpools  = state.pool_usage["HBM"]["subpools"]
     dram_subpools = state.pool_usage["DRAM"]["subpools"]
     disk_subpools = state.pool_usage["DISK"]["subpools"]
+    plan = []
 
-    # Pressure: per (HBM, subpool) target = max(0, forecast - theta_hi × cap).
-    bytes_needed = {
-        ("HBM", sp): max(0, forecast(state)[sp]
-                            - theta_hi * hbm_subpools[sp]["cap_bytes"])
-        for sp in hbm_subpools
-    }
-    if any(b > 0 for b in bytes_needed.values()):
+    # ---- Relief: VALUE-GATED.  Candidates are generated only when some
+    #      HBM subpool is pressured, but the DP takes ONLY net-positive
+    #      actions and MAY RETURN NOTHING.  There is no cover / no forced
+    #      relief: theta_hi gates candidate generation, it is not a wall.
+    pressured_sps = {sp for sp in hbm_subpools
+                     if forecast(state)[sp] > theta_hi * hbm_subpools[sp]["cap_bytes"]}
+    if pressured_sps:
+        cands = kv_scheduler.migrate_candidates(state, decision_set(event, state))
+        # value = −cost.  Keep a Migrate iff (a) net-positive (cost < 0 ⇒
+        # moving a COLD unit out improves total V_u; a HOT unit's cost > 0
+        # → dropped) AND (b) it relieves an ACTUALLY-pressured subpool
+        # (never churn a healthy subpool that has room).  re_use = the
+        # destination bytes it consumes.  NO Pause items (dormant lever, §8).
+        items = [ValueItem(gain=-c.cost, re_use=c.acquired, group=c.group, src=c)
+                 for c in cands
+                 if c.cost < 0
+                 and any(sp in pressured_sps for sp in c.relief.get("HBM", {}))]
+        # Constraint: do not overflow any destination (DRAM|DISK) cap.
         cap_left = {("DRAM", sp): capacity_left_bytes(state, "DRAM", sp)
                     for sp in dram_subpools} | \
                    {("DISK", sp): capacity_left_bytes(state, "DISK", sp)
                     for sp in disk_subpools}
-        cands  = kv_scheduler.migrate_candidates(state, decision_set(event, state))
-        cands += admission.pause_candidates(state, event)
-        # Normalise Pause.relief to the per-(tier, subpool) nested shape
-        # Migrate already uses.  After this rewrite both candidate types
-        # carry `relief: dict[Tier, dict[subpool, int]]` and the DP's
-        # `_relief_at` collapses to a single branch.
-        cands = [
-            replace(c, relief={"HBM": c.relief}) if isinstance(c, Pause) else c
-            for c in cands
-        ]
-        cands = [c for c in cands
-                 if any(b > 0
-                        for sub in c.relief.values()
-                        for b in sub.values())]
-        bucket_size = {(tier, sp): state.pool_usage[tier]["subpools"][sp]["page_bytes"]
-                       for (tier, sp) in (list(bytes_needed) + list(cap_left))}
-        return knapsack_min_cost_multi(
-            items        = cands,
-            bytes_needed = bytes_needed,             # keyed by (HBM, sp)
-            cap_left     = cap_left,                 # keyed by (DRAM|DISK, sp)
-            bucket_size  = bucket_size,              # per-axis page granularity
-        )
+        bucket_size = {(t, sp): state.pool_usage[t]["subpools"][sp]["page_bytes"]
+                       for (t, sp) in cap_left}
+        chosen = knapsack_max_value_multi(items, budget=cap_left,
+                                          bucket_size=bucket_size)
+        plan += [it.src for it in chosen]            # [] if nothing net-positive
 
-    # Headroom: per HBM-subpool slack budget.  Resumes consume HBM
-    # bytes in each subpool the resumed program's units live in.
-    free_room = {
-        ("HBM", sp): max(0, theta_lo * hbm_subpools[sp]["cap_bytes"]
-                            - forecast(state)[sp])
-        for sp in hbm_subpools
-    }
-    if all(r > 0 for r in free_room.values()):
-        cands = admission.resume_candidates(state)
-        # Normalise Resume.re_use to the per-(tier, subpool) nested
-        # shape — symmetric with the pressure-phase Pause.relief
-        # rewrite above.  Both DPs now consume candidates of one
-        # uniform shape.
-        cands = [replace(c, re_use={"HBM": c.re_use}) for c in cands]
-        cands = [c for c in cands
-                 if any(b > 0
-                        for sub in c.re_use.values()
-                        for b in sub.values())]
-        bucket_size = {(tier, sp): state.pool_usage[tier]["subpools"][sp]["page_bytes"]
-                       for (tier, sp) in free_room}
-        return knapsack_max_value_multi(
-            items       = cands,
-            budget      = free_room,                 # keyed by (HBM, sp)
-            bucket_size = bucket_size,               # per-axis page granularity
-        )
+    # ---- Resume: VALUE-GATED, runs EVERY event, independent of relief
+    #      (no longer mutually exclusive — a resume that fits never makes
+    #      a pressured subpool worse, so it can coexist with relief).
+    free_room = {("HBM", sp): max(0, theta_lo * hbm_subpools[sp]["cap_bytes"]
+                                     - forecast(state)[sp])
+                 for sp in hbm_subpools}
+    rcands = admission.resume_candidates(state)       # already capacity_fits-gated
+    rcands = [replace(c, re_use={"HBM": c.re_use}) for c in rcands]
+    bucket_size = {(t, sp): state.pool_usage[t]["subpools"][sp]["page_bytes"]
+                   for (t, sp) in free_room}
+    plan += knapsack_max_value_multi(rcands, budget=free_room,
+                                     bucket_size=bucket_size)
 
-    return []                                        # hysteresis dead-zone
+    return plan                                       # MAY BE EMPTY — no-op
 ```
 
 A workload with a Mamba snapshot subpool at 95 % occupancy and an
-attention `full` subpool at 60 % will see `bytes_needed[mamba] > 0
-and bytes_needed[full] == 0` — the DP picks candidates that relieve
-specifically `mamba` (Pauses of programs holding large mamba state,
-Migrates of Mamba-leaf units to DRAM/DISK), without disturbing
-attention-resident units that are cheap and healthy.
+attention `full` subpool at 60 % has `pressured_sps == {mamba}` — the
+relief filter keeps only Migrates of cold Mamba-leaf units (to
+DRAM/DISK) that relieve `mamba`, and drops any migrate that would only
+touch the healthy `full` subpool.  If every Mamba-resident unit is hot
+(high V_u → `cost > 0`), no item survives and relief no-ops; attention-
+resident units stay put either way.
 
 Both phases are **exact 0/1 knapsack** at K ≈ tens of items
 (K_MAX = 256 per §7 top-k cap).  Resource-axis count is
@@ -2175,140 +2201,17 @@ def _bk(n, bucket_size):                            # round-down quantisation
 def _bk_up(n, bucket_size):                         # round-up quantisation
     return (n + bucket_size - 1) // bucket_size
 
-# Axis enumeration helpers — pressure phase has one >= axis per HBM
-# subpool and one <= axis per (DRAM|DISK, subpool); headroom phase
-# has one <= axis per HBM subpool only.
-def _hbm_relief_axes(bytes_needed):                 # >= axes (frees HBM)
-    return [("HBM", sp) for sp in bytes_needed]
-def _dest_cap_axes(cap_left):                       # <= axes (destinations)
-    return list(cap_left.keys())                    # [(DRAM, sp), (DISK, sp), ...]
-
-def _relief_at(c, tier, sp):
-    """Bytes the candidate frees on (tier, sp).
-
-    Both Migrate and Pause carry `relief: dict[Tier, dict[subpool, int]]`
-    by the time they reach the DP (joint_decide normalises Pause's
-    flat subpool dict into {HBM: relief} before calling).  The dict
-    is **sparse by design**: only tiers / subpools the candidate
-    actually frees are listed.  Absent key = "this candidate
-    contributes 0 to this axis" — a meaningful encoding, not a
-    defensive guard.  Per-axis bucket arithmetic in the DP uses
-    these 0s legitimately."""
-    return c.relief.get(tier, {}).get(sp, 0)
-
-def _acquire_at(c, tier, sp):
-    """Bytes the candidate adds to destination (tier, sp).
-
-    Migrate.acquired is sparse-by-design (only destination
-    subpools touched).  Pauses have no `acquired` field by
-    construction — pausing a program never consumes destination
-    capacity — so we return 0 directly without indexing."""
-    if isinstance(c, Migrate):
-        return c.acquired.get(tier, {}).get(sp, 0)
-    return 0
-
-def knapsack_min_cost_multi(items, bytes_needed, cap_left, bucket_size):
-    """0/1 knapsack: subset S minimising Σ cost(s∈S) subject to
-    (a) for each (HBM, sp) axis:
-        Σ_{s∈S} relief[HBM][sp](s)   >= bytes_needed[(HBM, sp)]
-    (b) for each (DRAM|DISK, sp) axis a:
-        Σ_{s∈S} acquired[a](s)       <= cap_left[a]
-
-    `bucket_size` is a dict keyed by axis (tier, sp); each axis uses
-    its own page granularity per §5 pool_usage[tier].subpools[sp].page_bytes.
-
-    Pure-remove Migrates contribute 0 to (b) by construction.
-    Pauses contribute relief on the HBM tier only.  Quantises
-    relief round-DOWN (safe for >=); quantises destination
-    consumption round-UP (safe for <=)."""
-    relief_axes = list(bytes_needed.keys())          # list of (HBM, sp)
-    cap_axes    = list(cap_left.keys())              # list of (DRAM|DISK, sp)
-    W    = {a: _bk_up(bytes_needed[a], bucket_size[a]) for a in relief_axes}
-    Wcap = {a: _bk(cap_left[a], bucket_size[a])        for a in cap_axes}
-    K    = len(items)
-    INF  = float("inf")
-
-    # dp state encodes (relief_buckets, cap_buckets) as a flat tuple.
-    # Sparse — only reachable cells materialise.
-    def zero_state():
-        return (*(0 for _ in relief_axes), *(0 for _ in cap_axes))
-
-    dp   = {zero_state(): 0.0}
-    take = {}
-    for k, c in enumerate(items, start=1):
-        d_relief = tuple(_bk(_relief_at(c, tier, sp), bucket_size[(tier, sp)])
-                         for (tier, sp) in relief_axes)
-        d_cap    = tuple(_bk_up(_acquire_at(c, tier, sp), bucket_size[(tier, sp)])
-                         for (tier, sp) in cap_axes)
-        new_dp = dict(dp)
-        for s, cost in dp.items():
-            n = len(relief_axes)
-            r_buckets, cap_buckets = s[:n], s[n:]
-            r_new = tuple(min(W[relief_axes[i]], r_buckets[i] + d_relief[i])
-                          for i in range(n))
-            cap_new = tuple(cap_buckets[i] + d_cap[i]
-                            for i in range(len(cap_axes)))
-            if any(cap_new[i] > Wcap[cap_axes[i]] for i in range(len(cap_axes))):
-                continue
-            s_new = r_new + cap_new
-            new_cost = cost + c.cost
-            if new_cost < new_dp.get(s_new, INF):
-                new_dp[s_new] = new_cost
-                take[(k, s_new)] = True
-        dp = new_dp
-
-    # Feasible cells: every (HBM, sp) relief axis hit its bucket bound.
-    full_r = tuple(W[a] for a in relief_axes)
-    feasible = [(c, s) for s, c in dp.items() if s[:len(relief_axes)] == full_r]
-    if not feasible:
-        # Reaching here is an algorithm bug, not a workload reality:
-        # the candidate set always includes DROP (acquired={}) and Pause
-        # (acquired={}) options that don't consume destination capacity,
-        # so a feasible plan must exist unless top_k_pressure undersized
-        # the candidate set or migrate_candidates filtered something it
-        # shouldn't have.  Halt loudly with a forensic dump so the bug
-        # can be diagnosed; do NOT silently emit a partial plan that
-        # masks the bug.
-        fatal("joint_decide_infeasible",
-              event=event, state=state,
-              decision_set=decision_set(event, state),
-              candidates=items,
-              bytes_needed=bytes_needed, cap_left=cap_left,
-              bucket_size=bucket_size,
-              dp_size=len(dp))
-        # fatal() never returns; see §10 "Fatal halts emit forensic
-        # state dump" for the dump contract.
-    _, s_pick = min(feasible)                        # min over cost
-    chosen, k = [], K
-    while k > 0:
-        if take.get((k, s_pick)):
-            c = items[k - 1]
-            chosen.append(c)
-            n = len(relief_axes)
-            r_buckets   = list(s_pick[:n])
-            cap_buckets = list(s_pick[n:])
-            for i, (tier, sp) in enumerate(relief_axes):
-                r_buckets[i] = max(0, r_buckets[i]
-                                  - _bk(_relief_at(c, tier, sp),
-                                        bucket_size[(tier, sp)]))
-            for i, (tier, sp) in enumerate(cap_axes):
-                cap_buckets[i] -= _bk_up(_acquire_at(c, tier, sp),
-                                         bucket_size[(tier, sp)])
-            s_pick = tuple(r_buckets) + tuple(cap_buckets)
-        k -= 1
-    return chosen
-
-
 def knapsack_max_value_multi(items, budget, bucket_size):
     """0/1 knapsack: subset S maximising Σ gain(s∈S) subject to
-    for each (HBM, sp) axis a:
-        Σ_{s∈S} re_use[HBM][sp](s)   <= budget[a]
+    for each (tier, sp) axis a:
+        Σ_{s∈S} re_use[tier][sp](s)   <= budget[a]
     `bucket_size` keyed by axis (tier, sp); each axis quantises at
     its own page granularity.  Quantises re_use round-UP (safe for
-    <=).  Same sparse multi-axis DP shape as knapsack_min_cost_multi.
-    Assumes items' `re_use` has the nested {tier: {sp: bytes}} shape
-    (joint_decide normalises Resume.re_use to {HBM: re_use} before
-    calling)."""
+    <=).  This is the ONE primitive the value-gated joint_decide uses:
+    relief feeds it Migrate value-items (gain = −cost, re_use =
+    destination `acquired`, budget = DRAM/DISK free room); resume feeds
+    it Resume candidates (gain = V_u, re_use = {HBM: re_use}, budget =
+    per-HBM-subpool free room).  Both may select the empty set."""
     axes = list(budget.keys())                       # list of (HBM, sp)
     W    = {a: _bk(budget[a], bucket_size[a]) for a in axes}
     K    = len(items)
@@ -2350,24 +2253,21 @@ apply path reads `acquired.keys()` directly to decide which
 destination subpools absorb which bytes of the unit, without
 needing a separate `target_subpool` field.
 
-**Reconstruction (#156 / T34 correction).** The traceback above
-subtracts each taken item's quantised delta to recover the
-predecessor state.  That is WRONG for the pressure phase: the relief
-axis is capped via `min(W, …)` on the forward step, so the state is
-non-invertible once a transition saturates the cap, and the subtract
-reconstruction returns a wrong (often infeasible, too-cheap) subset —
-while the DP `dp[s_pick]` COST stays correct.  The implementation
-(`baselines/knapsack.py`) instead records the **predecessor state per
-improving transition** (`parent[(k, s_new)] = s`) and follows those
-pointers, which is exact regardless of capping.  Verified against an
-exhaustive brute-force oracle in `verify/t34/` (stage A2 caught the
-subtract bug).  Infeasibility is raised as `KnapsackInfeasibleError`
-(forensic context) and mapped to `fatal("joint_decide_infeasible")`
-by `joint_decide`, keeping the primitive pure + testable.
+**Reconstruction (#156 / T34 correction).** The pseudocode above
+subtracts each taken item's quantised delta to recover the predecessor
+state.  The implementation (`baselines/knapsack.py`) instead records the
+**predecessor state per improving transition** (`parent[(gi, s_new)] =
+(s, member)`) and follows those pointers.  This is required once the DP
+runs over **multiple-choice groups** (correction 1 below): the subtract-
+by-item-index readout cannot tell which member of a group was taken, and
+nothing guarantees the per-axis subtraction lands back on the exact
+predecessor cell.  Parent pointers make the chosen-subset readout exact;
+verified against an exhaustive brute-force oracle in `verify/t34/`
+(stage A2 caught the subtract version returning a wrong subset).
 
 **Three further corrections (#194 — live integration).** Wiring the DP
-into the live path surfaced three more deviations from the pseudocode
-above, all verified in `verify/joint_decide/` + `verify/integration_stress/`:
+into the live path surfaced three deviations from the pseudocode above,
+all verified in `verify/joint_decide/` + `verify/integration_stress/`:
 
 1. **Multiple-choice, not plain 0/1, over a unit's transitions.**
    `migrate_candidates` emits several transitions per unit (evict /
@@ -2376,35 +2276,40 @@ above, all verified in `verify/joint_decide/` + `verify/integration_stress/`:
    and the costs aren't additive (each is scored as a marginal change
    from the unit's ORIGINAL residence).  The DP treats candidates
    sharing a `group` key (= unit hash) as **at-most-one**
-   (multiple-choice); Pause/Resume are ungrouped (one per program).
-2. **`cap_left` clamps to `max(0, cap − used)`.**  A destination tier
-   can be over-subscribed (`cap − used < 0`).  A negative budget makes
-   the DP reject even zero-acquire DROP candidates (the cap accumulator
-   starts at 0, already `>` a negative bound), spuriously infeasible.
-   No room is 0 room, never less than zero.
-3. **Pressure infeasibility → best-effort, not `fatal`.**  The claim
-   above that infeasibility "is an algorithm bug, not a workload
-   reality" is FALSE for **in-flight-dominated pressure**: when most of
-   HBM is decode bytes (tiny radix footprint) that migration can't
-   touch, and no Pause candidate is available (e.g. `per_program_usage`
-   not yet measurement-populated), no subset reaches `bytes_needed` —
-   a workload reality.  Crashing the daemon on transient over-pressure
-   contradicts §6's fire-and-forget "re-evaluate on the next event"
-   recovery and §10's reactive backstop (sglang's own eviction).  The
-   pressure phase frees the **max-relief subset** (`best_effort`) and
-   logs the shortfall; `fatal` is reserved for the genuine
-   misconfiguration (the `max_dp_cells` DP blow-up).  The
-   `fatal("joint_decide_infeasible")` call above is therefore not on
-   the live path.
+   (multiple-choice); Resume is ungrouped (one per program).
+2. **`budget` (destination room) clamps to `max(0, cap − used)`.**  A
+   destination tier can be over-subscribed (`cap − used < 0`).  A
+   negative budget makes the DP reject even zero-consume candidates (the
+   accumulator starts at 0, already `>` a negative bound).  No room is 0
+   room, never less than zero.  The value-gated DP needs no
+   infeasibility / best-effort handling at all: every phase is value-
+   maximising with the empty set reachable, so "no subset relieves the
+   pressure" is simply the empty plan (no-op), never a crash — the
+   in-flight-dominated pressure case (a non-migratable pegged subpool)
+   is handled by construction, not by a `best_effort` fallback.
+3. **The budget covers EVERY axis a candidate consumes, not just the
+   configured destination subpools.**  The DP reads consumption only on
+   axes present in the `budget` dict; an axis a candidate consumes but
+   that is absent would be silently treated as 0 bytes (free), letting
+   the DP over-subscribe a destination subpool that isn't mirrored across
+   tiers (§10 subpool-key consistency assumes it is — this is the
+   fail-safe for when it isn't).  So `joint_decide` extends `cap_left` /
+   `free_room` with every `(tier, subpool)` appearing in any candidate's
+   `acquired` / `re_use`, defaulting an UNCONFIGURED subpool to **0 room**
+   (a unit cannot be written to a subpool that does not exist → any
+   consumption there rounds up to ≥1 bucket > 0 → the candidate is
+   rejected).  Consistent with `page_bytes`'s fail-loud stance: a missing
+   destination axis is never silently free.
 
 **SESSION_END migration is now pressure-gated (consequence of #194).**
 Pre-joint, the greedy `OursGreedyPolicy.decide` ran on every event with
 no pressure gate, so a SESSION_END always demoted/dropped the ended
 program's exclusive units (their `V(keep HBM) < V(DROP)` once `p_hat`
 drops).  Under `joint_decide`, migrate candidates are emitted only in
-the pressure phase, so SESSION_END demotes the ended units **only when
-HBM is pressured** — otherwise they stay resident.  This is correct
-under §9's pressure-driven model and benign under the §3 superset
+the relief phase, so SESSION_END demotes the ended units **only when
+HBM is pressured AND the demotion is net-positive** — otherwise they
+stay resident.  This is correct under §9's value-gated model and benign
+under the §3 superset
 framing: the ended units carry the lowest V_u (hint-table broadcast),
 so they are the FIRST evicted under any pressure, and sglang's own
 inline eviction reclaims them when it needs the space regardless of the
@@ -2414,18 +2319,17 @@ pressured dead KV is dropped.
 
 #### Why exact DP, not greedy
 
-LP-relaxation greedy (sort by `cost/relief`, take cheapest-per-byte
-until budget met) is the standard 0/1 knapsack approximation.
-Worst-case it's 2× off — e.g. budget 100, items A=(cost 10, relief
-99) and B=(cost 11, relief 100): greedy picks A then B for total
-cost 21, optimal is B alone at 11.
+LP-relaxation greedy (sort by `value/byte`, take densest-first until
+the budget fills) is the standard 0/1 knapsack approximation.
+Worst-case it's 2× off — e.g. budget 10, items A=(value 6, weight 6),
+B=(value 5, weight 5), C=(value 5, weight 5): greedy takes A first
+(density 1.0) then can fit neither B nor C (4 left), total value 6;
+optimal is B+C at value 10.
 
-That worst case happens whenever a single sufficient item is
-slightly less efficient per byte than a sequence of insufficient
-items that together waste cost.  In admission this is the
-"one-pause-could-have-solved-it but we did three migrates first"
-scenario.  Not adversarially constructed — common when one runaway
-program could cover the budget alone.
+That worst case happens whenever the densest item crowds out a pair of
+slightly-less-dense items that together pay more.  Not adversarially
+constructed — common when a few cold units share a destination subpool's
+limited room and one bulky migrate would block two cheaper ones.
 
 At K ≈ 30 and bucketised W ≈ 100, exact DP is microseconds — the
 same order as greedy.  There is **no efficiency reason** to use
@@ -2433,17 +2337,21 @@ the approximation.  The exact form is the design.
 
 #### Properties this satisfies
 
-1. **Optimal cost / gain** under the knapsack formulation.  No
-   1/2-approximation gap.
-2. **Per-tier sub-budgets.**  `cap_left[τ]` tracks how many bytes
-   remain in each destination tier; migrate candidates are
-   filtered up-front if they'd overflow τ.  Without this guard
-   the plan could schedule 50 HBM→DRAM moves into a DRAM
-   that's already 95 % full.
-3. **Pause/Migrate vs Resume disjoint.**  Pressure phase only
-   handles `freeing` actions (Pause, HBM-out Migrate).  Headroom
-   phase only handles `claiming` actions (Resume).  They never
-   compete in the same knapsack.
+1. **Optimal net value** under the knapsack formulation.  No
+   1/2-approximation gap; the empty set is always a candidate, so a
+   negative-value plan is never chosen.
+2. **Per-tier sub-budgets.**  The destination `budget[(τ, sp)]` tracks
+   how many bytes remain in each subpool; the DP rejects any subset that
+   would overflow τ.  Without this the plan could schedule 50 HBM→DRAM
+   moves into a DRAM that's already 95 % full.
+3. **Relief and Resume coexist, both value-gated.**  They are NOT
+   disjoint phases — relief (cold-unit migrate out of a pegged subpool)
+   and Resume (un-starve a fitting paused program) run in the same event
+   and their plans combine.  Each is its own value-maximising knapsack
+   that may pick the empty set, so neither forces the other and neither
+   forces action: a resume that adds 0 bytes to a pegged subpool fits
+   even under pressure, and a pegged subpool with no net-positive migrate
+   simply yields no relief.
 
 #### Always-fresh state at the inter-event boundary
 
@@ -2456,32 +2364,18 @@ always-fresh invariant (§10) is satisfied at the event boundary:
 the next event's joint_decide will refetch state and re-solve
 its knapsack from scratch.
 
-> **Planned (code lag).**  The daemon's current `joint_decide`
-> implementation uses the greedy `cost/relief` ordering instead
-> of exact DP, and treats the destination-tier sub-budgets as a
-> per-item filter rather than as a multi-dimensional knapsack
-> resource.  This is a pure code lag — both replacements run in
-> the same microsecond order on K ≈ 30 candidates.  Replace with
-> `knapsack_min_cost_multi` / `knapsack_max_value_multi` per the
-> pseudo-code above.
-
 ### What collapses out
 
-* **Trade gate**: the min-cost DP only includes an item in the
-  optimal subset if it reduces total cost relative to the next-
-  best subset achieving the same relief.  Any subset dominated
-  by a cheaper one is rejected by construction — there's no
-  need for the explicit `if pause.cost > pause.relief × (best alt
-  cost/byte): break` guard a sequential greedy would require
-  (which itself only type-checks once both sides are expressed in
-  seconds/byte; cost is seconds, relief is bytes, so the gate
-  collapses out at the DP's level rather than as a scalar
-  comparison).
-* **Composition order**: the DP enumerates subsets implicitly
-  across the union; there's no "run kv_scheduler first then
-  admission".  A Pause and a Migrate can both appear in the
-  optimal subset, or only one, or neither — whichever combination
-  minimises total cost.
+* **Trade gate**: the value-maximising DP includes an item only if some
+  net-positive subset contains it; any item that doesn't pay for itself
+  (or is dominated by a cheaper alternative achieving the same) is
+  rejected by construction — no explicit "is this move worth it?" guard
+  is needed, the `value = −cost > 0` gate and the empty-set option carry
+  it at the DP level.
+* **Composition order**: the DP enumerates subsets implicitly across the
+  union; there's no "run kv_scheduler first then admission".  A relief
+  Migrate and a Resume can both appear in the combined plan, or only one,
+  or neither — whichever maximises total net value.
 * **Per-trigger D_t for admission**: admission considers every
   active / paused program every event; D_t only constrains the
   unit-migrate candidate generator.
@@ -2501,8 +2395,8 @@ for pause/resume).
 | invariant | enforced by |
 |---|---|
 | **Daemon is a single asyncio process**: one OS process hosts the event_router consumer task, the proxy's request-forwarding tasks, and the outbound action worker task.  They share memory directly (no IPC).  On crash all tasks die together; "the daemon" and "the proxy" never desynchronise.  This makes the volatile-queue and proxy-gate invariants below well-defined as a single failure domain | daemon launch script + asyncio runtime |
-| **Two fault classes + sustained-escalation tier**: per-event, faults split into **deployment-bug** (schema mismatch, missing required state fields, joint_decide infeasibility, `peak_bw_bps ≤ 0`, mode-switch attempt, hash collision — `fatal(...)`) and **load** (apply_failed race, sglang briefly slow, transient outbound queue depth — log + absorb).  The two never blur per-event.  In aggregate, sustained load failure escalates: when consecutive outbound POST failures + the just-popped batch's queue-wait age (= the oldest pending batch's age at pop time, by FIFO) BOTH cross operator-tunable thresholds on the same worker iteration, the daemon `fatal('sglang_sustained_unreachable', ...)` exits and the supervisor (systemd/k8s) restarts — crash-only software pattern.  `fatal()` uses `os._exit(1)` (NOT `sys.exit(1)`) so the crash path does not depend on asyncio Task exception propagation routing the `SystemExit` past uvicorn / `gather` / `shield` wrappers (#166).  Running degraded forever (queue growing while sglang stays dead) is NOT a valid state.  Operator alerts off the `outbound_queue_depth` / `outbound_oldest_age_ms` quantiles on `daemon_obs_summary` (T42); for live snapshots, `/health` exposes `outbound_consecutive_failures` and `outbound_oldest_age_ms` — the age field is computed LIVE from the current in-queue head (decays to 0 when the queue drains), not cached from the last pop, so k8s readiness probes do not get stuck after sglang heals (#166).  fatal-escalate is the hard backstop | daemon code review + outbound queue observability + #164/#166 |
-| **Fatal halts emit forensic state dump**: every `fatal(reason, **context)` call writes a structured JSON file to `<daemon-data>/forensic/<reason>_<ts>.json` containing the event that triggered the handler, the full `/aginfer/state` snapshot fetched at handler entry, the candidate sets produced upstream, all DP inputs (`bytes_needed`, `cap_left`, `bucket_size`, etc.), the failure reason string, and the Python traceback — then logs a fatal-level line pointing at the file path and `sys.exit(1)`.  Supervisor restart policy is deployment-controlled; the forensic file survives the restart for post-hoc analysis | daemon `fatal()` helper |
+| **Two fault classes + sustained-escalation tier**: per-event, faults split into **deployment-bug** (schema mismatch, missing required state fields, joint_decide DP blow-up, `peak_bw_bps ≤ 0`, mode-switch attempt, hash collision — `fatal(...)`) and **load** (apply_failed race, sglang briefly slow, transient outbound queue depth — log + absorb).  The two never blur per-event.  In aggregate, sustained load failure escalates: when consecutive outbound POST failures + the just-popped batch's queue-wait age (= the oldest pending batch's age at pop time, by FIFO) BOTH cross operator-tunable thresholds on the same worker iteration, the daemon `fatal('sglang_sustained_unreachable', ...)` exits and the supervisor (systemd/k8s) restarts — crash-only software pattern.  `fatal()` uses `os._exit(1)` (NOT `sys.exit(1)`) so the crash path does not depend on asyncio Task exception propagation routing the `SystemExit` past uvicorn / `gather` / `shield` wrappers (#166).  Running degraded forever (queue growing while sglang stays dead) is NOT a valid state.  Operator alerts off the `outbound_queue_depth` / `outbound_oldest_age_ms` quantiles on `daemon_obs_summary` (T42); for live snapshots, `/health` exposes `outbound_consecutive_failures` and `outbound_oldest_age_ms` — the age field is computed LIVE from the current in-queue head (decays to 0 when the queue drains), not cached from the last pop, so k8s readiness probes do not get stuck after sglang heals (#166).  fatal-escalate is the hard backstop | daemon code review + outbound queue observability + #164/#166 |
+| **Fatal halts emit forensic state dump**: every `fatal(reason, **context)` call writes a structured JSON file to `<daemon-data>/forensic/<reason>_<ts>.json` containing the event that triggered the handler, the full `/aginfer/state` snapshot fetched at handler entry, the candidate sets produced upstream, all DP inputs (`budget`, `bucket_size`, axes, etc.), the failure reason string, and the Python traceback — then logs a fatal-level line pointing at the file path and `os._exit(1)` (NOT `sys.exit(1)`, per the fault-class row above — the crash path must not depend on asyncio `SystemExit` propagation).  Supervisor restart policy is deployment-controlled; the forensic file survives the restart for post-hoc analysis | daemon `fatal()` helper |
 | **Policy mode is launch-time, never runtime-switched**: sglang launches in exactly one mode — either with the aginfer daemon attached (full policy via hint table), or with the default policy module (LRU-equivalent V_u, baseline ablation).  A daemon configured for "aginfer full" that loses its daemon mid-run halts loudly; it does not degrade to the default module.  Mode is a deployment choice, not a runtime fallback | sglang launch flags + daemon liveness check |
 | **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer anywhere — kv_scheduler, admission, forecast refresh, program_tracker, and the proxy all recompute only on event arrival.  SESSION_END is signalled by the client explicitly (§4); there is no time-based fallback | asyncio queue + single consumer |
 | **Unit hashes are content-derived and collision-detected on migrate build**: `u.hash` is sglang's existing SHA-256 page-chained content hash (`compute_node_hash_values` over the unit's token prefix; computed lazily on KV-event emission and on migrate-action processing).  Collision probability is negligible at any tree size aginfer encounters (≤ 10⁷ live units, birthday-paradox bound < 10⁻²²) but is verified, not assumed: every `apply_aginfer_migrations` call builds a `{hash → node}` lookup via a single DFS over the radix tree.  At that point sglang checks whether the same hash key already maps to a different node; if so, it fires the `HASH_COLLISION` webhook (§4) with both nodes' summaries and the daemon `fatal()`s with a forensic dump.  Cost is amortised free — the DFS already runs O(N) per migrate batch; adding the collision check is one extra comparison per node | sglang `apply_aginfer_migrations` |
@@ -2514,7 +2408,7 @@ for pause/resume).
 | **Observability for state-dump cost**: every `GET /aginfer/state` records its wall-clock latency on the sglang side, and the daemon logs (a) latency-per-fetch and (b) event-queue depth at handler entry.  No backpressure mechanism is wired (drop-on-full / coalescing) — these are kept off the spec until measured evidence shows the queue grows unboundedly.  The logs are the first-class signal for when to revisit | sglang dump path + daemon event_router metrics |
 | **Atomic unit visibility**: units appear in `/aginfer/state.units` **only after sglang commits the chunk to the radix tree** (page-aligned commit boundary).  Partial-prefill chunks under chunked prefill do not appear as units; the daemon does not observe in-progress prefill state, only the post-commit snapshot.  This eliminates a class of "what's the p_hat of a half-written unit" questions by construction — half-written units don't exist in the spec's data model | sglang radix-tree commit path |
 | **Subpool key consistency**: for every unit `u` and every tier `τ ∈ u.residence`, `u.n_bytes[τ].keys() ⊆ state.pool_usage[τ].subpools.keys()`.  Sglang's UnifiedRadixCache component registry guarantees this on commit; §7's `_value` holding-cost loop iterates `u.n_bytes[τ]` and looks up `pool_usage[τ].subpools[sp]` directly without any defensive `.get(...)` — a missing key is a deployment bug | sglang component registry |
-| **Preemption transparency**: sglang's continuous-batching preempt-and-resume of in-flight requests changes `per_program_usage[p].hbm.inflight` between events without any daemon action.  The daemon does not track inflight state across events (cf. always-fresh invariant); each handler re-fetches state, so a preempted-then-resumed program is indistinguishable from one that never preempted.  Forecast / `bytes_needed` / pause_relief are computed on the live snapshot, so they always reflect post-preemption truth | always-fresh state + §5 per_program_usage |
+| **Preemption transparency**: sglang's continuous-batching preempt-and-resume of in-flight requests changes `per_program_usage[p].hbm.inflight` between events without any daemon action.  The daemon does not track inflight state across events (cf. always-fresh invariant); each handler re-fetches state, so a preempted-then-resumed program is indistinguishable from one that never preempted.  Forecast / relief budget / pause_relief are computed on the live snapshot, so they always reflect post-preemption truth | always-fresh state + §5 per_program_usage |
 | **State-dump internal consistency**: a single `/aginfer/state` response is a snapshot taken under a single read-side lock on sglang's tree cache + allocator + per-program tables.  `units[*]`, `per_program_usage[*].unit_hashes`, and `pool_usage` always refer to the same logical timestamp; `state.units[h]` is safe to dereference for every `h ∈ per_program_usage[p].unit_hashes` | sglang `dump_aginfer_state` |
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
@@ -2757,7 +2651,7 @@ One attention component, no SWA, no Mamba.
 | `tier_holding_cost.HBM` | `{"attn": h_max}` |
 | §9 DP axis count | 3 (HBM-attn relief + DRAM-attn cap + DISK-attn cap) |
 
-forecast / bytes_needed / capacity_fits each have a single
+forecast / capacity_fits / the relief budget each have a single
 `attn` key.  The multi-axis sparse DP reduces to the 3-axis case
 matching the round-6 multi-resource baseline.
 
@@ -2908,6 +2802,6 @@ involved live in different subpools (see S3).
 Across S1 – S5 the daemon code path is identical: read
 `pool_usage.HBM.subpools.keys()` at state-dump entry, iterate
 over those keys for every per-subpool quantity (`forecast`,
-`bytes_needed`, `cap_left`, `pause_relief`, `re_use`,
+`cap_left`, `pause_relief`, `re_use`, `relief`,
 `tier_holding_cost`).  No scenario-specific branch lives in the
 daemon — the keys come from the state-dump, the rest follows.

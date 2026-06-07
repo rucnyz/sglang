@@ -1,36 +1,27 @@
 """T34 (#156, DESIGN §9) — multi-axis sparse 0/1 knapsack DP.
 
-Verifies the two `joint_decide` primitives against an EXHAUSTIVE
-brute-force oracle (enumerate all 2^K subsets, take the optimum) — the
-gold standard for an exact DP.  At bucket_size=1 the DP works in raw
-bytes, so the DP optimum must equal the brute-force optimum exactly.
-Separate stages pin the per-axis bucket quantisation (relief/budget
-round DOWN, destination consumption rounds UP) and the infeasibility
-contract.
+DESIGN §9 is **value-gated**: every phase runs the SAME value-maximising
+primitive ``knapsack_max_value_multi`` and may pick the empty set.  Relief
+feeds it Migrate value-items (gain = −cost, re_use = destination
+``acquired``); resume feeds it Resume candidates (gain = V_u, re_use =
+HBM re-entry).  This suite verifies that ONE primitive against an
+EXHAUSTIVE brute-force oracle (enumerate all subset choices, take the
+optimum) — the gold standard for an exact DP.  At bucket_size=1 the DP
+works in raw bytes, so DP optimum == brute optimum exactly; separate
+stages pin per-axis bucket quantisation (round UP, safe for ``<=``),
+multiple-choice grouping (#194), and the DP-cell ceiling.
 
 Stages:
-  A. knapsack_min_cost_multi (pressure phase)
-    A0 single relief axis: min-cost subset hits bytes_needed
-    A1 multi-axis: 2 HBM relief axes + 1 DRAM cap axis, both targets hit
-       without overflowing the destination cap
-    A2 EXACTNESS vs brute force (random fixtures, bucket_size=1): the
-       DP's chosen-subset cost == the brute-force min feasible cost
-    A3 destination cap is a hard constraint: a cheap Migrate that would
-       overflow DRAM is rejected in favour of a Pause (no acquired)
-    A4 the returned subset is itself feasible + its cost == the DP min
-  B. quantisation
-    B0 relief rounds DOWN (sub-bucket relief doesn't count toward the
-       target); destination consumption rounds UP (sub-bucket acquire
-       costs a whole bucket)
-  C. infeasibility
-    C0 no subset can hit bytes_needed → KnapsackInfeasibleError w/ ctx
-    C1 DROP / Pause are always feasible: even with destinations FULL, a
-       Pause (relief, no acquired) satisfies the target
-  D. knapsack_max_value_multi (headroom phase)
-    D0 max-gain subset within a single budget axis
-    D1 EXACTNESS vs brute force (random, bucket_size=1)
-    D2 budget is a hard constraint; re_use rounds UP
-    D3 the returned subset is feasible + its gain == the DP max
+  D0 single budget axis: max-gain subset within one budget
+  D1 EXACTNESS vs brute force (random, bucket_size=1, 2 axes)
+  D2 budget is a hard constraint; re_use rounds UP
+  D3 the returned subset is feasible + its gain == the DP max
+  G0 multiple-choice groups (#194): at most one member per group; EXACT
+     vs a grouped brute oracle (this is what makes a unit's mutually-
+     exclusive transitions safe to feed as relief value-items)
+  E0 EXACT vs a quantising brute oracle at bucket_size>1, multi-axis
+  E1 DP cell ceiling fails loud (KnapsackBudgetExceededError + ctx)
+  E2 empty items / zero budget → empty plan (value-gated no-op)
 """
 from __future__ import annotations
 
@@ -48,16 +39,10 @@ if str(_AGINFER_ROOT) not in sys.path:
 
 from baselines.knapsack import (  # noqa: E402
     KnapsackBudgetExceededError,
-    KnapsackInfeasibleError,
-    Migrate,
-    Pause,
     Resume,
-    _acquire_at,
     _bk,
     _bk_up,
-    _relief_at,
     knapsack_max_value_multi,
-    knapsack_min_cost_multi,
 )
 
 
@@ -72,253 +57,56 @@ class StageFail(AssertionError):
 # ----------------------------------------------------------- brute-force oracle
 
 
-def _brute_min_cost(items, bytes_needed, cap_left):
-    """Exhaustive optimum (raw bytes — match the DP at bucket_size=1).
-    Returns (best_cost, n_feasible) or (None, 0) if infeasible."""
-    best = None
-    n_feasible = 0
-    for r in range(len(items) + 1):
-        for subset in itertools.combinations(items, r):
-            if all(sum(_relief_at(c, *a) for c in subset) >= bytes_needed[a]
-                   for a in bytes_needed) and \
-               all(sum(_acquire_at(c, *a) for c in subset) <= cap_left[a]
-                   for a in cap_left):
-                n_feasible += 1
-                cost = sum(c.cost for c in subset)
-                if best is None or cost < best:
-                    best = cost
-    return best, n_feasible
-
-
-def _brute_min_cost_q(items, bytes_needed, cap_left, bucket_size):
-    """Brute optimum at bucket_size>1 — quantises IDENTICALLY to the DP
-    (round each item's relief DOWN, acquire UP, then sum; compare to the
-    round-UP need / round-DOWN cap).  Returns (best_cost, n_feasible)."""
-    W = {a: _bk_up(bytes_needed[a], bucket_size[a]) for a in bytes_needed}
-    Wcap = {a: _bk(cap_left[a], bucket_size[a]) for a in cap_left}
-    best, n_feas = None, 0
-    for r in range(len(items) + 1):
-        for subset in itertools.combinations(items, r):
-            rb = {a: sum(_bk(_relief_at(c, *a), bucket_size[a]) for c in subset)
-                  for a in bytes_needed}
-            cb = {a: sum(_bk_up(_acquire_at(c, *a), bucket_size[a]) for c in subset)
-                  for a in cap_left}
-            if all(rb[a] >= W[a] for a in bytes_needed) and \
-               all(cb[a] <= Wcap[a] for a in cap_left):
-                n_feas += 1
-                cost = sum(c.cost for c in subset)
-                if best is None or cost < best:
-                    best = cost
-    return best, n_feas
+def _use_at(c, a):
+    return c.re_use.get(a[0], {}).get(a[1], 0)
 
 
 def _brute_max_value(items, budget):
-    best = 0.0  # empty subset is always feasible, gain 0
+    """Exhaustive optimum at bucket_size=1 (raw bytes).  Empty subset is
+    always feasible with gain 0, so a negative-only fixture → 0."""
+    best = 0.0
     for r in range(len(items) + 1):
         for subset in itertools.combinations(items, r):
-            if all(sum(c.re_use.get(a[0], {}).get(a[1], 0) for c in subset)
-                   <= budget[a] for a in budget):
+            if all(sum(_use_at(c, a) for c in subset) <= budget[a]
+                   for a in budget):
                 gain = sum(c.gain for c in subset)
                 if gain > best:
                     best = gain
     return best
 
 
-def _feasible_min(subset, bytes_needed, cap_left) -> bool:
-    return (all(sum(_relief_at(c, *a) for c in subset) >= bytes_needed[a]
-                for a in bytes_needed)
-            and all(sum(_acquire_at(c, *a) for c in subset) <= cap_left[a]
-                    for a in cap_left))
+def _brute_max_value_q(items, budget, bucket_size):
+    """Brute optimum at bucket_size>1 — quantises IDENTICALLY to the DP
+    (round each item's re_use UP, sum, compare to the round-DOWN budget)."""
+    Wb = {a: _bk(budget[a], bucket_size[a]) for a in budget}
+    best = 0.0
+    for r in range(len(items) + 1):
+        for subset in itertools.combinations(items, r):
+            use = {a: sum(_bk_up(_use_at(c, a), bucket_size[a]) for c in subset)
+                   for a in budget}
+            if all(use[a] <= Wb[a] for a in budget):
+                gain = sum(c.gain for c in subset)
+                if gain > best:
+                    best = gain
+    return best
+
+
+def _brute_max_value_grouped(groups, budget):
+    """Exhaustive optimum with at-most-one-per-group (multiple-choice)."""
+    best = 0.0
+    opts = [[None] + list(g) for g in groups]
+    for combo in itertools.product(*opts):
+        subset = [m for m in combo if m is not None]
+        if all(sum(_use_at(c, a) for c in subset) <= budget[a]
+               for a in budget):
+            gain = sum(c.gain for c in subset)
+            if gain > best:
+                best = gain
+    return best
 
 
 def _unit_buckets(*axes) -> Dict[Any, int]:
     return {a: 1 for a in axes}
-
-
-# ============================================================ A. min-cost
-
-
-def stage_a0_single_axis() -> None:
-    need = {("HBM", "kv"): 100}
-    cap = {}
-    items = [
-        Migrate(cost=5.0, relief={"HBM": {"kv": 60}}, id="m60"),
-        Migrate(cost=3.0, relief={"HBM": {"kv": 40}}, id="m40"),
-        Migrate(cost=9.0, relief={"HBM": {"kv": 100}}, id="m100"),
-    ]
-    bs = _unit_buckets(("HBM", "kv"))
-    chosen = knapsack_min_cost_multi(items, need, cap, bs)
-    # cheapest way to free >=100 is m60+m40 (cost 8) vs m100 (cost 9).
-    if abs(sum(c.cost for c in chosen) - 8.0) > 1e-9:
-        raise StageFail(f"expected min cost 8.0 (m60+m40); got {sum(c.cost for c in chosen)} ({[c.id for c in chosen]})")
-
-
-def stage_a1_multi_axis() -> None:
-    """2 HBM relief axes (full, mamba) + 1 DRAM destination cap."""
-    need = {("HBM", "full"): 50, ("HBM", "mamba"): 30}
-    cap = {("DRAM", "full"): 1000, ("DRAM", "mamba"): 1000}
-    items = [
-        Migrate(cost=2.0, relief={"HBM": {"full": 50}}, acquired={"DRAM": {"full": 50}}, id="full"),
-        Migrate(cost=2.0, relief={"HBM": {"mamba": 30}}, acquired={"DRAM": {"mamba": 30}}, id="mamba"),
-        Migrate(cost=10.0, relief={"HBM": {"full": 50, "mamba": 30}}, acquired={"DRAM": {"full": 50, "mamba": 30}}, id="both"),
-    ]
-    bs = _unit_buckets(("HBM", "full"), ("HBM", "mamba"), ("DRAM", "full"), ("DRAM", "mamba"))
-    chosen = knapsack_min_cost_multi(items, need, cap, bs)
-    # full+mamba (cost 4) beats the single "both" (cost 10).
-    if {c.id for c in chosen} != {"full", "mamba"}:
-        raise StageFail(f"expected {{full, mamba}}; got {[c.id for c in chosen]}")
-
-
-def stage_a2_exactness_vs_brute() -> None:
-    rng = random.Random(34_156)
-    bs = _unit_buckets(("HBM", "kv"), ("DRAM", "kv"))
-    for trial in range(60):
-        K = rng.randint(3, 9)
-        items: List[Any] = []
-        for i in range(K):
-            relief = rng.randint(10, 80)
-            # mix Migrate (with destination acquire) and Pause (no acquire)
-            if rng.random() < 0.5:
-                items.append(Migrate(cost=round(rng.uniform(1, 10), 2),
-                                     relief={"HBM": {"kv": relief}},
-                                     acquired={"DRAM": {"kv": rng.randint(0, 80)}},
-                                     id=f"m{i}"))
-            else:
-                items.append(Pause(cost=round(rng.uniform(1, 10), 2),
-                                   relief={"HBM": {"kv": relief}}, pid=f"p{i}"))
-        total_relief = sum(_relief_at(c, "HBM", "kv") for c in items)
-        need = {("HBM", "kv"): rng.randint(0, total_relief)}
-        cap = {("DRAM", "kv"): rng.randint(0, 400)}
-        brute, n_feas = _brute_min_cost(items, need, cap)
-        if brute is None:
-            continue  # infeasible fixtures handled in C0
-        chosen = knapsack_min_cost_multi(items, need, cap, bs)
-        dp_cost = sum(c.cost for c in chosen)
-        if abs(dp_cost - brute) > 1e-9:
-            raise StageFail(
-                f"trial {trial}: DP cost {dp_cost} != brute-force min {brute} "
-                f"(K={K}, need={need}, cap={cap}, feasible={n_feas})"
-            )
-        if not _feasible_min(chosen, need, cap):
-            raise StageFail(f"trial {trial}: DP returned an INFEASIBLE subset")
-
-
-def stage_a3_dest_cap_hard_constraint() -> None:
-    """A cheap Migrate would overflow DRAM; the DP must pick the (more
-    expensive) Pause instead, which consumes no destination capacity."""
-    need = {("HBM", "kv"): 100}
-    cap = {("DRAM", "kv"): 50}   # only 50 bytes of DRAM room
-    items = [
-        Migrate(cost=1.0, relief={"HBM": {"kv": 100}}, acquired={"DRAM": {"kv": 100}}, id="cheap-but-overflows"),
-        Pause(cost=5.0, relief={"HBM": {"kv": 100}}, pid="pause"),
-    ]
-    bs = _unit_buckets(("HBM", "kv"), ("DRAM", "kv"))
-    chosen = knapsack_min_cost_multi(items, need, cap, bs)
-    ids = {getattr(c, "id", None) or getattr(c, "pid", None) for c in chosen}
-    if ids != {"pause"}:
-        raise StageFail(
-            f"cheap Migrate overflows DRAM cap (100 > 50) and must be "
-            f"rejected for the Pause; got {ids}"
-        )
-
-
-def stage_a4_returned_subset_optimal_and_feasible() -> None:
-    need = {("HBM", "kv"): 70}
-    cap = {("DRAM", "kv"): 90}
-    items = [
-        Migrate(cost=4.0, relief={"HBM": {"kv": 40}}, acquired={"DRAM": {"kv": 40}}, id="a"),
-        Migrate(cost=4.0, relief={"HBM": {"kv": 40}}, acquired={"DRAM": {"kv": 40}}, id="b"),
-        Migrate(cost=7.5, relief={"HBM": {"kv": 70}}, acquired={"DRAM": {"kv": 70}}, id="c"),
-    ]
-    bs = _unit_buckets(("HBM", "kv"), ("DRAM", "kv"))
-    chosen = knapsack_min_cost_multi(items, need, cap, bs)
-    brute, _ = _brute_min_cost(items, need, cap)
-    if not _feasible_min(chosen, need, cap):
-        raise StageFail("returned subset not feasible")
-    if abs(sum(c.cost for c in chosen) - brute) > 1e-9:
-        raise StageFail(f"returned cost {sum(c.cost for c in chosen)} != optimum {brute}")
-
-
-# ============================================================ B. quantisation
-
-
-def stage_b0_bucket_rounding() -> None:
-    # bucket = 64.  relief rounds DOWN, destination acquire rounds UP.
-    bs = {("HBM", "kv"): 64, ("DRAM", "kv"): 64}
-    # relief 63 → 0 buckets (rounds down): a single such Migrate cannot
-    # satisfy a 64-byte (1-bucket) need.
-    need = {("HBM", "kv"): 64}
-    cap = {("DRAM", "kv"): 64}
-    one_small = [Migrate(cost=1.0, relief={"HBM": {"kv": 63}}, acquired={"DRAM": {"kv": 1}}, id="x")]
-    try:
-        knapsack_min_cost_multi(one_small, need, cap, bs)
-    except KnapsackInfeasibleError:
-        pass
-    else:
-        raise StageFail("relief 63 must round DOWN to 0 buckets → infeasible for a 64-byte need")
-    # two of them: relief 63+63=126 bytes → but each rounds down to 0
-    # buckets BEFORE summing? No — the DP sums bucketised deltas, so
-    # 0+0 = 0 buckets → still infeasible.  Confirms per-item round-down.
-    two_small = one_small + [Migrate(cost=1.0, relief={"HBM": {"kv": 63}}, acquired={"DRAM": {"kv": 1}}, id="y")]
-    try:
-        knapsack_min_cost_multi(two_small, need, cap, bs)
-    except KnapsackInfeasibleError:
-        pass
-    else:
-        raise StageFail("per-item round-down: 63+63 each → 0 buckets → still infeasible")
-    # destination acquire 1 byte → rounds UP to 1 bucket (64); a Migrate
-    # freeing 64 (1 bucket) but acquiring 1 byte needs 1 DRAM bucket.
-    need2 = {("HBM", "kv"): 64}
-    items = [Migrate(cost=1.0, relief={"HBM": {"kv": 64}}, acquired={"DRAM": {"kv": 1}}, id="z")]
-    chosen = knapsack_min_cost_multi(items, need2, {("DRAM", "kv"): 64}, bs)   # 1 bucket room → fits
-    if {c.id for c in chosen} != {"z"}:
-        raise StageFail("acquire 1B → 1 bucket should fit a 1-bucket (64B) DRAM cap")
-    try:
-        knapsack_min_cost_multi(items, need2, {("DRAM", "kv"): 0}, bs)   # 0 buckets room
-    except KnapsackInfeasibleError:
-        pass
-    else:
-        raise StageFail("acquire 1B rounds UP to 1 bucket → must NOT fit 0-byte DRAM cap")
-
-
-# ============================================================ C. infeasibility
-
-
-def stage_c0_infeasible_raises() -> None:
-    need = {("HBM", "kv"): 1000}
-    cap = {("DRAM", "kv"): 1000}
-    items = [Migrate(cost=1.0, relief={"HBM": {"kv": 10}}, acquired={"DRAM": {"kv": 10}}, id="tiny")]
-    bs = _unit_buckets(("HBM", "kv"), ("DRAM", "kv"))
-    try:
-        knapsack_min_cost_multi(items, need, cap, bs, context={"event": "TEST"})
-    except KnapsackInfeasibleError as e:
-        # forensic context present
-        for key in ("bytes_needed", "cap_left", "n_items", "dp_size", "items"):
-            if key not in e.context:
-                raise StageFail(f"infeasible context missing {key!r}: {e.context}")
-        if e.context.get("event") != "TEST":
-            raise StageFail("caller context not threaded into the forensic dump")
-        # #156 audit #8: the candidates themselves must be in the dump.
-        if list(e.context["items"]) != items:
-            raise StageFail("infeasible context must carry the candidate items")
-        return
-    raise StageFail("total relief (10) < need (1000) must raise KnapsackInfeasibleError")
-
-
-def stage_c1_pause_always_feasible() -> None:
-    """Destinations are FULL (0 cap) — but a Pause frees HBM without
-    consuming any destination, so a plan always exists."""
-    need = {("HBM", "kv"): 100}
-    cap = {("DRAM", "kv"): 0, ("DISK", "kv"): 0}
-    items = [
-        Migrate(cost=1.0, relief={"HBM": {"kv": 100}}, acquired={"DRAM": {"kv": 100}}, id="m"),  # would overflow
-        Pause(cost=50.0, relief={"HBM": {"kv": 100}}, pid="p"),                                   # no acquire
-    ]
-    bs = _unit_buckets(("HBM", "kv"), ("DRAM", "kv"), ("DISK", "kv"))
-    chosen = knapsack_min_cost_multi(items, need, cap, bs)
-    ids = {getattr(c, "pid", None) or getattr(c, "id", None) for c in chosen}
-    if ids != {"p"}:
-        raise StageFail(f"with destinations full, only the Pause is feasible; got {ids}")
 
 
 # ============================================================ D. max-value
@@ -335,7 +123,8 @@ def stage_d0_single_axis() -> None:
     chosen = knapsack_max_value_multi(items, budget, bs)
     # within 100 bytes: a(60)+b(40)=gain 8 (uses 100); a+c=110 over; b+c=90 gain 7.
     if abs(sum(c.gain for c in chosen) - 8.0) > 1e-9:
-        raise StageFail(f"expected max gain 8.0 (a+b); got {sum(c.gain for c in chosen)} ({[c.pid for c in chosen]})")
+        raise StageFail(f"expected max gain 8.0 (a+b); got "
+                        f"{sum(c.gain for c in chosen)} ({[c.pid for c in chosen]})")
 
 
 def stage_d1_exactness_vs_brute() -> None:
@@ -350,21 +139,24 @@ def stage_d1_exactness_vs_brute() -> None:
                 re_use["HBM"]["full"] = rng.randint(0, 60)
             if rng.random() < 0.5:
                 re_use["HBM"]["mamba"] = rng.randint(0, 40)
-            items.append(Resume(gain=round(rng.uniform(1, 10), 2), re_use=re_use, pid=f"r{i}"))
-        budget = {("HBM", "full"): rng.randint(0, 200), ("HBM", "mamba"): rng.randint(0, 150)}
+            # gains may be negative — the empty set must dominate a
+            # net-negative pick (value-gated no-op).
+            items.append(Resume(gain=round(rng.uniform(-3, 10), 2),
+                                 re_use=re_use, pid=f"r{i}"))
+        budget = {("HBM", "full"): rng.randint(0, 200),
+                  ("HBM", "mamba"): rng.randint(0, 150)}
         brute = _brute_max_value(items, budget)
         chosen = knapsack_max_value_multi(items, budget, bs)
         dp_gain = sum(c.gain for c in chosen)
         if abs(dp_gain - brute) > 1e-9:
             raise StageFail(
                 f"trial {trial}: DP gain {dp_gain} != brute max {brute} "
-                f"(K={K}, budget={budget})"
-            )
-        # feasible?
+                f"(K={K}, budget={budget})")
         for a in budget:
-            used = sum(c.re_use.get(a[0], {}).get(a[1], 0) for c in chosen)
+            used = sum(_use_at(c, a) for c in chosen)
             if used > budget[a]:
-                raise StageFail(f"trial {trial}: chosen subset overspends {a}: {used} > {budget[a]}")
+                raise StageFail(f"trial {trial}: chosen overspends {a}: "
+                                f"{used} > {budget[a]}")
 
 
 def stage_d2_budget_hard_and_roundup() -> None:
@@ -376,9 +168,9 @@ def stage_d2_budget_hard_and_roundup() -> None:
         Resume(gain=5.0, re_use={"HBM": {"kv": 1}}, pid="b"),
     ]
     chosen = knapsack_max_value_multi(items, budget, bs)
-    # each costs 1 bucket; budget is 1 bucket → only ONE fits.
     if len(chosen) != 1:
-        raise StageFail(f"re_use rounds UP (1B→1 bucket); only one fits a 1-bucket budget; got {len(chosen)}")
+        raise StageFail(f"re_use rounds UP (1B→1 bucket); only one fits a "
+                        f"1-bucket budget; got {len(chosen)}")
 
 
 def stage_d3_returned_subset_optimal() -> None:
@@ -392,145 +184,161 @@ def stage_d3_returned_subset_optimal() -> None:
     chosen = knapsack_max_value_multi(items, budget, bs)
     brute = _brute_max_value(items, budget)
     if abs(sum(c.gain for c in chosen) - brute) > 1e-9:
-        raise StageFail(f"returned gain {sum(c.gain for c in chosen)} != optimum {brute}")
+        raise StageFail(f"returned gain {sum(c.gain for c in chosen)} "
+                        f"!= optimum {brute}")
+
+
+# ============================================================ G. grouping
+
+
+def stage_g0_multiple_choice_groups() -> None:
+    """#194 multiple-choice: candidates sharing a non-None ``group`` are
+    at-most-one (a unit's evict/spill/DROP transitions are alternatives —
+    taking two double-counts the unit's bytes).  EXACT vs a grouped brute
+    oracle, including the same-budget case where a plain 0/1 knapsack would
+    wrongly stack two members of one group."""
+    # direct: two members of group "u" each fit; the DP takes the higher-
+    # value ONE, never both (even though both would fit the budget).
+    a = Resume(gain=10.0, re_use={"HBM": {"kv": 30}}, pid="u-a", group="u")
+    b = Resume(gain=4.0, re_use={"HBM": {"kv": 30}}, pid="u-b", group="u")
+    bs = _unit_buckets(("HBM", "kv"))
+    chosen = knapsack_max_value_multi([a, b], {("HBM", "kv"): 1000}, bs)
+    if [c.pid for c in chosen] != ["u-a"]:
+        raise StageFail(f"group 'u': at most one member, the higher-value; "
+                        f"got {[c.pid for c in chosen]}")
+
+    # exact vs grouped brute over random grouped fixtures, 2 axes.
+    rng = random.Random(34_222)
+    bs2 = _unit_buckets(("HBM", "full"), ("DRAM", "kv"))
+    for trial in range(60):
+        n_groups = rng.randint(2, 5)
+        groups = []
+        for gi in range(n_groups):
+            members = []
+            for mi in range(rng.randint(1, 3)):
+                re_use = {"HBM": {"full": rng.randint(0, 40)},
+                          "DRAM": {"kv": rng.randint(0, 40)}}
+                members.append(Resume(gain=round(rng.uniform(-2, 9), 2),
+                                       re_use=re_use, pid=(gi, mi),
+                                       group=f"g{gi}"))
+            groups.append(members)
+        items = [m for g in groups for m in g]
+        budget = {("HBM", "full"): rng.randint(0, 120),
+                  ("DRAM", "kv"): rng.randint(0, 120)}
+        brute = _brute_max_value_grouped(groups, budget)
+        chosen = knapsack_max_value_multi(items, budget, bs2)
+        # at most one per group
+        seen = [c.group for c in chosen]
+        if len(seen) != len(set(seen)):
+            raise StageFail(f"trial {trial}: 2+ members of one group chosen: "
+                            f"{[c.pid for c in chosen]}")
+        if abs(sum(c.gain for c in chosen) - brute) > 1e-9:
+            raise StageFail(f"trial {trial}: grouped DP gain "
+                            f"{sum(c.gain for c in chosen)} != brute {brute}")
 
 
 # ============================================================ E. audit closure
 
 
 def stage_e0_bs_gt1_multi_axis_exactness() -> None:
-    """#156 audit #10 + #11: EXACT vs a quantising brute oracle at
-    bucket_size>1, with MULTIPLE relief axes AND multiple cap axes
-    simultaneously (the genuinely multi-axis pressure case the original
-    A2 — 1 relief + 1 cap, bucket=1 — did not cover)."""
+    """EXACT vs a quantising brute oracle at bucket_size>1, with MULTIPLE
+    budget axes simultaneously (the genuinely multi-axis case bucket=1 did
+    not cover).  re_use rounds UP per item, budget rounds DOWN."""
     rng = random.Random(34_999)
     BS = 64
-    bs = {("HBM", "full"): BS, ("HBM", "mamba"): BS,
-          ("DRAM", "full"): BS, ("DRAM", "mamba"): BS}
+    bs = {("DRAM", "full"): BS, ("DRAM", "mamba"): BS}
     for trial in range(60):
         K = rng.randint(3, 8)
         items = []
         for i in range(K):
-            relief = {"HBM": {}}
-            acquired = {"DRAM": {}}
+            re_use = {"DRAM": {}}
             if rng.random() < 0.7:
-                r = rng.randint(0, 200)
-                relief["HBM"]["full"] = r
-                acquired["DRAM"]["full"] = r if rng.random() < 0.8 else 0
+                re_use["DRAM"]["full"] = rng.randint(0, 200)
             if rng.random() < 0.6:
-                r = rng.randint(0, 200)
-                relief["HBM"]["mamba"] = r
-                acquired["DRAM"]["mamba"] = r if rng.random() < 0.8 else 0
-            if rng.random() < 0.3:  # Pause (no acquire)
-                items.append(Pause(cost=round(rng.uniform(1, 9), 2), relief=relief, pid=f"p{i}"))
-            else:
-                items.append(Migrate(cost=round(rng.uniform(1, 9), 2),
-                                     relief=relief, acquired=acquired, id=f"m{i}"))
-        tot_full = sum(_relief_at(c, "HBM", "full") for c in items)
-        tot_mamba = sum(_relief_at(c, "HBM", "mamba") for c in items)
-        need = {("HBM", "full"): rng.randint(0, tot_full),
-                ("HBM", "mamba"): rng.randint(0, tot_mamba)}
-        cap = {("DRAM", "full"): rng.randint(0, 600),
-               ("DRAM", "mamba"): rng.randint(0, 600)}
-        brute, n_feas = _brute_min_cost_q(items, need, cap, bs)
-        try:
-            chosen = knapsack_min_cost_multi(items, need, cap, bs)
-        except KnapsackInfeasibleError:
-            if brute is not None:
-                raise StageFail(f"trial {trial}: DP infeasible but brute found cost {brute}")
-            continue
-        if brute is None:
-            raise StageFail(f"trial {trial}: DP feasible but brute infeasible")
-        if abs(sum(c.cost for c in chosen) - brute) > 1e-9:
+                re_use["DRAM"]["mamba"] = rng.randint(0, 200)
+            items.append(Resume(gain=round(rng.uniform(-2, 9), 2),
+                                 re_use=re_use, pid=f"r{i}"))
+        budget = {("DRAM", "full"): rng.randint(0, 600),
+                  ("DRAM", "mamba"): rng.randint(0, 600)}
+        brute = _brute_max_value_q(items, budget, bs)
+        chosen = knapsack_max_value_multi(items, budget, bs)
+        if abs(sum(c.gain for c in chosen) - brute) > 1e-9:
             raise StageFail(
-                f"trial {trial} (bs={BS}, multi-axis): DP cost "
-                f"{sum(c.cost for c in chosen)} != brute {brute} "
-                f"(need={need}, cap={cap}, feasible={n_feas})"
-            )
+                f"trial {trial} (bs={BS}, multi-axis): DP gain "
+                f"{sum(c.gain for c in chosen)} != brute {brute} "
+                f"(budget={budget})")
 
 
 def stage_e1_dp_cell_ceiling() -> None:
     """#156 audit #9: a candidate set with large, distinct bucket-deltas
     blows up the sparse DP (state cross-product).  Past ``max_dp_cells``
-    the primitive FAILS LOUD (KnapsackBudgetExceededError + forensic
-    ctx) instead of stalling the event loop.  A normal small fixture
-    stays well under the ceiling."""
-    bs = _unit_buckets(("HBM", "kv"), ("DRAM", "kv"))
-    # powers-of-two relief → 2^K distinct partial sums; large need/cap so
-    # nothing clamps or rejects → |dp| grows to ~2^K.
-    blow = [Migrate(cost=1.0, relief={"HBM": {"kv": 2 ** i}},
-                    acquired={"DRAM": {"kv": 2 ** i}}, id=i) for i in range(12)]
-    big = {("HBM", "kv"): 10 ** 9}
-    cap = {("DRAM", "kv"): 10 ** 9}
+    the primitive FAILS LOUD (KnapsackBudgetExceededError + forensic ctx)
+    instead of stalling the event loop.  A normal small fixture stays well
+    under the ceiling."""
+    bs = _unit_buckets(("HBM", "kv"))
+    # powers-of-two re_use → 2^K distinct partial sums; large budget so
+    # nothing rejects → |dp| grows to ~2^K.
+    blow = [Resume(gain=1.0, re_use={"HBM": {"kv": 2 ** i}}, pid=i)
+            for i in range(12)]
     try:
-        knapsack_min_cost_multi(blow, big, cap, bs, max_dp_cells=50, context={"event": "BLOW"})
+        knapsack_max_value_multi(blow, {("HBM", "kv"): 10 ** 9}, bs,
+                                 max_dp_cells=50, context={"event": "BLOW"})
     except KnapsackBudgetExceededError as e:
-        for key in ("dp_size", "max_dp_cells", "item_index", "n_items", "items", "axes"):
+        for key in ("dp_size", "max_dp_cells", "item_index", "n_items",
+                    "items", "axes"):
             if key not in e.context:
                 raise StageFail(f"blowup ctx missing {key!r}: {list(e.context)}")
         if e.context["dp_size"] <= 50:
-            raise StageFail(f"ceiling should trip ABOVE max_dp_cells; dp_size={e.context['dp_size']}")
+            raise StageFail(f"ceiling should trip ABOVE max_dp_cells; "
+                            f"dp_size={e.context['dp_size']}")
     else:
         raise StageFail("a 2^12-state fixture must trip max_dp_cells=50")
-    # headroom side too
-    blow_r = [Resume(gain=1.0, re_use={"HBM": {"kv": 2 ** i}}, pid=i) for i in range(12)]
-    try:
-        knapsack_max_value_multi(blow_r, {("HBM", "kv"): 10 ** 9}, _unit_buckets(("HBM", "kv")),
-                                 max_dp_cells=50)
-    except KnapsackBudgetExceededError:
-        pass
-    else:
-        raise StageFail("max-value DP must also honour max_dp_cells")
     # a normal small fixture stays well under the (default) ceiling
-    ok = knapsack_min_cost_multi(
-        [Migrate(cost=1.0, relief={"HBM": {"kv": 100}}, acquired={"DRAM": {"kv": 100}}, id="x")],
-        {("HBM", "kv"): 100}, {("DRAM", "kv"): 1000}, bs)
-    if {c.id for c in ok} != {"x"}:
+    ok = knapsack_max_value_multi(
+        [Resume(gain=1.0, re_use={"HBM": {"kv": 100}}, pid="x")],
+        {("HBM", "kv"): 1000}, bs)
+    if [c.pid for c in ok] != ["x"]:
         raise StageFail("a normal fixture must NOT trip the ceiling")
 
 
 def stage_e2_empty_and_zero() -> None:
-    """#156 audit #12: empty items / all-zero need / zero budget."""
+    """#156 audit #12: empty items / zero budget / all-negative gains →
+    the empty plan (value-gated no-op)."""
     bs = _unit_buckets(("HBM", "kv"))
-    # min-cost: no items + zero need → empty plan (the zero state IS full_r)
-    if knapsack_min_cost_multi([], {("HBM", "kv"): 0}, {}, bs) != []:
-        raise StageFail("empty items + zero need → [] (already satisfied)")
-    # no items + positive need → infeasible
-    try:
-        knapsack_min_cost_multi([], {("HBM", "kv"): 10}, {}, bs)
-    except KnapsackInfeasibleError:
-        pass
-    else:
-        raise StageFail("empty items + positive need must be infeasible")
-    # max-value: no items → []; zero budget excludes positive-re_use items
     if knapsack_max_value_multi([], {("HBM", "kv"): 100}, bs) != []:
-        raise StageFail("max-value empty items → []")
-    chosen = knapsack_max_value_multi(
-        [Resume(gain=5.0, re_use={"HBM": {"kv": 5}}, pid="a")],
-        {("HBM", "kv"): 0}, bs)
-    if chosen != []:
-        raise StageFail("zero budget must exclude a positive-re_use Resume")
+        raise StageFail("empty items → []")
+    # zero budget excludes a positive-re_use item
+    if knapsack_max_value_multi(
+            [Resume(gain=5.0, re_use={"HBM": {"kv": 5}}, pid="a")],
+            {("HBM", "kv"): 0}, bs) != []:
+        raise StageFail("zero budget must exclude a positive-re_use item")
+    # all-negative gains → empty (no item pays for itself)
+    neg = knapsack_max_value_multi(
+        [Resume(gain=-1.0, re_use={"HBM": {"kv": 1}}, pid="a"),
+         Resume(gain=-3.0, re_use={"HBM": {"kv": 1}}, pid="b")],
+        {("HBM", "kv"): 100}, bs)
+    if neg != []:
+        raise StageFail(f"all-negative gains must yield [] (no-op), got "
+                        f"{[c.pid for c in neg]}")
 
 
 # ============================================================ run
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 min-cost single relief axis",              stage_a0_single_axis),
-    ("A1 min-cost multi-axis (2 HBM relief + DRAM cap)", stage_a1_multi_axis),
-    ("A2 min-cost EXACT vs brute force (60 random)", stage_a2_exactness_vs_brute),
-    ("A3 destination cap is a hard constraint",     stage_a3_dest_cap_hard_constraint),
-    ("A4 returned subset feasible + optimal",       stage_a4_returned_subset_optimal_and_feasible),
-    ("B0 relief rounds down, acquire rounds up",    stage_b0_bucket_rounding),
-    ("C0 infeasible → KnapsackInfeasibleError + ctx", stage_c0_infeasible_raises),
-    ("C1 Pause always feasible (destinations full)", stage_c1_pause_always_feasible),
     ("D0 max-value single budget axis",             stage_d0_single_axis),
-    ("D1 max-value EXACT vs brute force (60 random)", stage_d1_exactness_vs_brute),
+    ("D1 max-value EXACT vs brute force (60 random, +/- gains)",
+     stage_d1_exactness_vs_brute),
     ("D2 budget hard constraint; re_use rounds up", stage_d2_budget_hard_and_roundup),
     ("D3 returned subset optimal",                  stage_d3_returned_subset_optimal),
-    ("E0 EXACT vs brute at bucket>1, multi-relief+multi-cap (#10/#11)", stage_e0_bs_gt1_multi_axis_exactness),
-    ("E1 DP cell ceiling fails loud (#9 blow-up guard)", stage_e1_dp_cell_ceiling),
-    ("E2 empty items / zero need / zero budget (#12)", stage_e2_empty_and_zero),
+    ("G0 multiple-choice groups EXACT vs grouped brute (#194)",
+     stage_g0_multiple_choice_groups),
+    ("E0 EXACT vs brute at bucket>1, multi-axis (#10/#11)",
+     stage_e0_bs_gt1_multi_axis_exactness),
+    ("E1 DP cell ceiling fails loud (#9 blow-up guard)",
+     stage_e1_dp_cell_ceiling),
+    ("E2 empty items / zero budget / negative gains (#12)",
+     stage_e2_empty_and_zero),
 ]
 
 

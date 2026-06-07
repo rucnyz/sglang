@@ -4,7 +4,7 @@ halts (DESIGN §10 "Fatal halts emit forensic state dump", PLAN §4 T43).
 Two fault classes (DESIGN §10):
 
   * **deployment-bug** — schema mismatch, missing required state
-    fields, joint_decide infeasibility, ``peak_bw_bps ≤ 0``, mode-
+    fields, joint_decide DP blow-up, ``peak_bw_bps ≤ 0``, mode-
     switch attempt, hash collision.  "This should never happen in a
     correct deployment."  → ``fatal(...)``: dump forensic state, exit.
     Supervisor decides restart policy.
@@ -14,7 +14,9 @@ Two fault classes (DESIGN §10):
 
 Call sites (DESIGN §10 + this module's docstring):
 
-  * ``joint_decide`` infeasibility (T34, DESIGN §9 line 2131)
+  * ``joint_decide`` DP blow-up (``joint_decide_dp_blowup`` — the value
+    knapsack's reachable-cell count exceeds ``max_dp_cells``; there is no
+    infeasibility path, the value-gated DP can always pick the empty set)
   * ``bytes_at`` τ-not-in-residence assertion (T34)
   * Missing ``link_stats`` / ``tier_holding_cost`` / ``throughput_ema``
     fields in ``/aginfer/state``
@@ -121,8 +123,8 @@ def fatal(reason: str, **context: Any) -> None:
       * ``event``       — the event that triggered the handler
       * ``state``       — the ``/aginfer/state`` snapshot
       * ``candidates``  — candidate sets produced upstream
-      * ``dp_inputs``   — DP inputs (``bytes_needed``, ``cap_left``,
-                          ``bucket_size``, etc.)
+      * ``dp_inputs``   — DP inputs (``budget``, ``bucket_size``,
+                          axes, etc.)
 
     Effects:
       1. Writes ``<data_dir>/forensic/<reason>_<unix_ts_ns>.json``.
@@ -153,8 +155,8 @@ def fatal(reason: str, **context: Any) -> None:
         forensic_dir = None
 
     # Capture the call-site stack as well as any active exception.  The
-    # PLAN explicitly lists assertions and infeasibility halts that do
-    # NOT come from an exception context, so format_stack() is required.
+    # PLAN explicitly lists assertion / positivity halts that do NOT come
+    # from an exception context, so format_stack() is required.
     exc_info = sys.exc_info()
     if exc_info[0] is not None:
         tb_lines = traceback.format_exception(*exc_info)

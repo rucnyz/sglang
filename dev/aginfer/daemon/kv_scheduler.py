@@ -129,7 +129,7 @@ def _filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
     TOCTOU evict cooldown.  Pure-add migrates (write-through) for a cooled
     hash still pass — only the failing remove is backed off.  Expired entries
     are ignored (and pruned by the caller)."""
-    from .joint_decide import Migrate
+    from baselines.knapsack import Migrate
     out: List[Any] = []
     for c in plan:
         if isinstance(c, Migrate):
@@ -1255,10 +1255,13 @@ class KvScheduler:
           * ``Pause``   → ``tracker.pause(pid)`` (gates the proxy) AND
             ``PUT /aginfer/program_paused`` so sglang stores p's
             ``pre_pause_state`` (the §8 resume counterfactual reads it).
+            **The Pause lever is DORMANT (DESIGN §9): ``joint_decide`` never
+            emits a Pause today, so this branch is retained for when the
+            lever is enabled but is not exercised by any current plan.**
           * ``Resume``  → ``tracker.resume(pid)`` (releases the gate) AND
             a ``PUT`` clearing the paused mark back to ``pre_pause_state``.
         """
-        from .joint_decide import Migrate, Pause, Resume
+        from baselines.knapsack import Migrate, Pause, Resume
         from ._metrics import m as _m
         migrates = [c for c in plan if isinstance(c, Migrate)]
         pauses = [c for c in plan if isinstance(c, Pause)]

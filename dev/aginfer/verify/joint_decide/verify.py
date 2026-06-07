@@ -8,13 +8,19 @@ the admission ``_on_pressure`` / ``_on_resolved`` loops (the
 ``joint_decide(state, event)`` that:
 
   * generates unit-level Migrate candidates (§7 ``migrate_candidates``),
-  * generates program-level Pause / Resume candidates (§8
-    ``pause_candidates`` / ``resume_candidates``),
-  * computes the per-HBM-subpool ``forecast`` and the
-    ``bytes_needed`` / ``free_room`` thresholds (§8 / §9),
-  * runs the pressure-phase ``knapsack_min_cost_multi`` OR the
-    headroom-phase ``knapsack_max_value_multi`` (mutually exclusive),
+  * generates program-level Resume candidates (§8 ``resume_candidates``;
+    the Pause lever is DORMANT — not generated, §9),
+  * computes the per-HBM-subpool ``forecast`` and the destination /
+    ``free_room`` budgets (§8 / §9),
+  * runs ONE value-maximising knapsack (``knapsack_max_value_multi``) for
+    relief (net-positive Migrates that relieve a PRESSURED subpool) and
+    again for resume — both may pick the empty set (no-op),
   * returns the chosen mixed plan for the live handler to dispatch.
+
+§9 is **value-gated, not cover**: every phase takes ONLY net-positive
+actions and MAY no-op; relief and resume COEXIST (not mutually
+exclusive); there is no forced relief and no infeasibility (the empty
+plan is always reachable).
 
 Stages (TDD — each builds a fixture, asserts the contract):
 
@@ -23,10 +29,11 @@ Stages (TDD — each builds a fixture, asserts the contract):
   B. forecast            — §8 per-HBM-subpool forecast (degrades to
                            used_bytes under the T26/T11 placeholders)
   C. pause/resume_cands  — §8 program generators (cost/relief, gain/re_use)
-  D. joint_decide select — §9 pressure vs headroom vs dead-zone;
-                           pressure-suppresses-headroom; LLM_PREFILL runs
-  E. joint_decide DP      — exact vs brute-force oracle; no same-unit
-                           double-count; Infeasible/BudgetExceeded→fatal
+  D. joint_decide select — §9 value-gated: net-positive relief acts;
+                           do-no-harm no-op on an unrelievable subpool;
+                           pauses never appear; relief+resume coexist
+  E. joint_decide DP      — value-max exact vs brute-force oracle; no
+                           same-group double-count; blow-up→fatal
   F. live wiring         — handler dispatches the mixed plan
 
 Usage:
@@ -478,8 +485,9 @@ def _hbm_relief(chosen) -> Dict[str, int]:
 
 
 def stage_d_joint_decide_select() -> None:
-    """§9 phase selection: pressure / headroom / dead-zone, pressure
-    suppresses headroom, LLM_PREFILL runs joint_decide."""
+    """§9 VALUE-GATED selection: net-positive relief acts; the hysteresis
+    dead-zone no-ops; an UNRELIEVABLE pegged subpool no-ops (do-no-harm);
+    headroom resume runs; the Pause lever is dormant (never appears)."""
     from daemon import joint_decide as jd
     GB = 1024 ** 3
     kw = dict(costs=default_costs(), pi_u=1.0e-4,
@@ -488,7 +496,9 @@ def stage_d_joint_decide_select() -> None:
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
 
-    # --- pressure: HBM 90% (forecast=9GB > 8.5GB) → free ≥ 0.5GB ---
+    # --- pressure + a COLD migratable unit (on {HBM,DRAM} → evict-HBM is
+    #     net-positive: DRAM retains the data) → relief migrates it out.
+    #     No forced cover target; the action is taken because value>0. ---
     sj = _state_json(
         units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
                      n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
@@ -497,16 +507,30 @@ def stage_d_joint_decide_select() -> None:
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
     st = _build_state(sj, tracker, ev)
     plan = jd.joint_decide(st, ev, **kw)
-    if not plan:
-        raise StageFail("D: pressure phase must return a non-empty plan")
+    migs = [c for c in plan if isinstance(c, Migrate)]
+    if not migs:
+        raise StageFail("D: pressure + net-positive relief must migrate the "
+                        f"cold unit out; got {[type(c).__name__ for c in plan]}")
+    # u1 emits THREE net-positive transitions (evict-HBM, drop-DRAM, DROP)
+    # all sharing group=u1's hash; the multiple-choice exclusion via
+    # `_ValueItem.group` must pick AT MOST ONE (else the unit's bytes
+    # double-count).  Asserting exactly one pins the grouping WIRING in
+    # joint_decide, not just the primitive (t34 G0 covers the primitive).
+    if len(migs) != 1:
+        raise StageFail(f"D: same-unit transitions must collapse to ONE "
+                        f"migrate (group exclusion); got {len(migs)}: "
+                        f"{[c.id for c in migs]}")
+    if any(isinstance(c, Pause) for c in plan):
+        raise StageFail("D: the Pause lever is DORMANT — no Pause may appear")
     if any(isinstance(c, Resume) for c in plan):
-        raise StageFail("D: pressure plan must contain no Resume")
-    relief = _hbm_relief(plan)
-    if relief.get("kv", 0) < int(0.5 * GB):
-        raise StageFail(f"D: pressure plan must free ≥ bytes_needed (0.5GB), "
-                        f"freed {relief}")
+        raise StageFail("D: no PAUSED program here → no Resume expected")
+    # the chosen migrate must actually relieve the pegged subpool.
+    if _hbm_relief(plan).get("kv", 0) <= 0:
+        raise StageFail(f"D: relief must free the pegged subpool, got "
+                        f"{_hbm_relief(plan)}")
 
-    # --- dead-zone: HBM 78% (between theta_lo=70% and theta_hi=85%) ---
+    # --- dead-zone: HBM 78% (between theta_lo=70% and theta_hi=85%) → no
+    #     relief candidates generated, no paused program → empty no-op. ---
     sj_dz = _state_json(
         units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"])],
         hbm={"kv": _sp(int(7.8 * GB), 10 * GB)})
@@ -514,7 +538,30 @@ def stage_d_joint_decide_select() -> None:
     if jd.joint_decide(st_dz, ev, **kw) != []:
         raise StageFail("D: hysteresis dead-zone (70–85%) must return []")
 
-    # --- headroom: HBM 5% (< theta_lo) + PAUSED program fits ---
+    # --- DO-NO-HARM no-op: a subpool ('swa') pegged at 90% whose pressure
+    #     is NOT relievable by migration (no migratable unit lives on it —
+    #     the resident bytes are in-flight, modelled here as a pegged
+    #     subpool with no units), while a HEALTHY 'full' subpool holds the
+    #     only cold migratable unit.  Relief must NOT churn 'full' (it has
+    #     room) and cannot touch 'swa' → empty plan, exactly like no daemon.
+    #     This is the A3 swa regime that the value-gate must leave alone. ---
+    sj_noop = _state_json(
+        units=[_unit(uhash="uf", residence=["HBM", "DRAM"], holders=["S"],
+                     n_bytes_per_tier={"HBM": {"full": 1 * GB},
+                                       "DRAM": {"full": 1 * GB}},
+                     subpool="full")],
+        hbm={"swa": _sp(9 * GB, 10 * GB),      # pegged, no migratable units
+             "full": _sp(1 * GB, 10 * GB)},    # healthy, holds the cold unit
+    )
+    st_noop = _build_state(sj_noop, tracker, ev)
+    plan_noop = jd.joint_decide(st_noop, ev, **kw)
+    if plan_noop != []:
+        raise StageFail("D: pegged-but-unrelievable subpool (swa) + a healthy "
+                        "subpool holding the only cold unit must NO-OP "
+                        f"(do-no-harm); got {[type(c).__name__ for c in plan_noop]}")
+
+    # --- headroom: HBM 5% (< theta_lo) + PAUSED program fits → resume P,
+    #     no Pause, no Migrate. ---
     tracker.pause("P")
     sj_hr = _state_json(
         units=[_unit(uhash="uP", residence=["DRAM"], holders=["P"],
@@ -528,47 +575,10 @@ def stage_d_joint_decide_select() -> None:
     plan_hr = jd.joint_decide(st_hr, er, **kw)
     if not (len(plan_hr) == 1 and isinstance(plan_hr[0], Resume)
             and plan_hr[0].pid == "P"):
-        raise StageFail(f"D: headroom phase must resume P, got {plan_hr}")
+        raise StageFail(f"D: headroom must resume P (only), got {plan_hr}")
 
-    # --- pressure suppresses headroom: pressured subpool + a PAUSED
-    #     program present → result has NO Resume (headroom doesn't run) ---
-    sj_sup = _state_json(
-        units=[
-            _unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
-                  n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB}),
-            _unit(uhash="uP", residence=["DRAM"], holders=["P"],
-                  n_bytes_per_tier={"DRAM": 1 * GB}),
-        ],
-        programs={"P": _program("PAUSED", unit_hashes=["uP"],
-                                pre_pause_state="REASONING")},
-        hbm={"kv": _sp(9 * GB, 10 * GB)},
-    )
-    st_sup = _build_state(sj_sup, tracker, ev)
-    plan_sup = jd.joint_decide(st_sup, ev, **kw)
-    if any(isinstance(c, Resume) for c in plan_sup):
-        raise StageFail("D: pressure must suppress headroom (no Resume "
-                        f"while any subpool pressured), got {plan_sup}")
-
-    # --- LLM_PREFILL: empty D_t (no migrates) but pause candidates still
-    #     run; under pressure with an active program → a Pause appears ---
-    sj_pf = _state_json(
-        units=[_unit(uhash="uA", residence=["HBM"], holders=["A"],
-                     n_bytes_per_tier={"HBM": 1 * GB})],
-        programs={"A": _program("REASONING", committed={"kv": 1 * GB},
-                                unit_hashes=["uA"])},
-        hbm={"kv": _sp(9 * GB, 10 * GB)},
-    )
-    tracker.observe_arrival("A")
-    epf = Event(kind=EventKind.LLM_PREFILL, session="A")
-    st_pf = _build_state(sj_pf, tracker, epf)
-    if st_pf.decision_set:
-        raise StageFail("D: LLM_PREFILL D_t must be empty (precondition)")
-    plan_pf = jd.joint_decide(st_pf, epf, **kw)
-    if not any(isinstance(c, Pause) for c in plan_pf):
-        raise StageFail(f"D: LLM_PREFILL must still run admission generators "
-                        f"(expected a Pause under pressure), got {plan_pf}")
-    print(_green("  [D] joint_decide selection: pressure/headroom/dead-zone, "
-                 "suppression, LLM_PREFILL OK"))
+    print(_green("  [D] value-gated select: net-positive relief acts; "
+                 "dead-zone + unrelievable-swa no-op; resume; pauses dormant OK"))
 
 
 def stage_d_resume_starvation() -> None:
@@ -690,192 +700,134 @@ def stage_d_resume_under_pressure() -> None:
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
     st = _build_state(sj, tracker, ev)
     plan = jd.joint_decide(st, ev, **kw)
-    # Pressure must still be acted on (a Pause and/or Migrate present)...
-    if not any(isinstance(c, (Pause, Migrate)) for c in plan):
+    # The net-positive relief migrate (cold {HBM,DRAM} unit) must be taken...
+    if not any(isinstance(c, Migrate) for c in plan):
         raise StageFail(
-            "D-press-resume: pressure must still be acted on (Pause/Migrate); "
-            f"got {[type(c).__name__ for c in plan]}")
-    # ...AND the un-starve resume of P must NOT be suppressed by the pressure.
+            "D-press-resume: the net-positive relief migrate must be taken "
+            f"under pressure; got {[type(c).__name__ for c in plan]}")
+    if any(isinstance(c, Pause) for c in plan):
+        raise StageFail("D-press-resume: Pause lever is dormant — none allowed")
+    # ...AND the un-starve resume of P COEXISTS with the relief in one plan
+    #    (relief and resume are NOT mutually exclusive — the #213 fix).
     resumed = {c.pid for c in plan if isinstance(c, Resume)}
     if "P" not in resumed:
         raise StageFail(
             "#213: a dropped-units PAUSED program must resume even under "
-            "pressure (pressure no longer suppresses fitting resumes); got "
+            "pressure (relief + resume coexist); got "
             f"resumes={resumed}, plan={[type(c).__name__ for c in plan]}")
-    print(_green("  [D-press-resume] resume runs alongside pressure; "
-                 "fitting paused program un-starved under pressure (#213) OK"))
+    print(_green("  [D-press-resume] relief migrate + un-starve resume coexist "
+                 "in one plan under pressure; no pause (#213) OK"))
 
 
 # ============================================================ Stage E
 
 
 def stage_e_dp_correctness() -> None:
-    """§9 DP: no same-unit double-pick (multiple-choice constraint),
-    exact vs brute-force oracle, infeasible → fatal."""
-    from daemon import joint_decide as jd
-    from baselines.knapsack import (knapsack_min_cost_multi,
-                                     KnapsackInfeasibleError)
+    """§9 value-max DP (`knapsack_max_value_multi`): no same-group double-
+    pick (multiple-choice), exact vs brute-force value oracle, empty set
+    when nothing pays, multi-axis budget respected, blow-up → raise."""
+    from baselines.knapsack import (knapsack_max_value_multi,
+                                     KnapsackBudgetExceededError, Resume)
     import itertools
 
-    # --- no same-unit double-pick: two transitions of unit "u" both
-    #     relieve HBM; the DP must pick AT MOST ONE (else relief double-
-    #     counts the same physical bytes). ---
-    m_evict = Migrate(cost=1.0, relief={"HBM": {"kv": 100}},
-                      acquired={"DRAM": {"kv": 100}}, id=("u", "evict"),
-                      group="u")
-    m_drop = Migrate(cost=5.0, relief={"HBM": {"kv": 100}}, acquired={},
-                     id=("u", "drop"), group="u")
-    chosen = knapsack_min_cost_multi(
-        [m_evict, m_drop],
-        bytes_needed={("HBM", "kv"): 100},
-        cap_left={("DRAM", "kv"): 10_000},
-        bucket_size={("HBM", "kv"): 1, ("DRAM", "kv"): 1},
-    )
-    if len(chosen) != 1:
-        raise StageFail(f"E: must pick exactly one of unit u's transitions, "
-                        f"got {[c.id for c in chosen]}")
-    if chosen[0].id != ("u", "evict"):
-        raise StageFail(f"E: should pick the cheaper transition (evict), "
-                        f"got {chosen[0].id}")
+    # --- no same-group double-pick: two transitions of unit "u" both
+    #     consume DRAM budget; the DP must pick AT MOST ONE (the higher
+    #     value), never both (that would double-count u's physical bytes). ---
+    a = Resume(gain=10.0, re_use={"DRAM": {"kv": 100}}, pid=("u", "a"), group="u")
+    b = Resume(gain=4.0, re_use={"DRAM": {"kv": 100}}, pid=("u", "b"), group="u")
+    chosen = knapsack_max_value_multi(
+        [a, b], budget={("DRAM", "kv"): 10_000},
+        bucket_size={("DRAM", "kv"): 1})
+    if [c.pid for c in chosen] != [("u", "a")]:
+        raise StageFail(f"E: must pick the single higher-value group member, "
+                        f"got {[c.pid for c in chosen]}")
 
-    # If bytes_needed exceeds ONE transition's relief, a 0/1 knapsack
-    # would (wrongly) pick both same-unit transitions to reach 200; the
-    # MCKP must instead reach into OTHER groups.  With only unit u
-    # available and need=150 > 100, it is genuinely infeasible (not a
-    # 2× double-count) → exception.
-    raised = False
-    try:
-        knapsack_min_cost_multi(
-            [m_evict, m_drop],
-            bytes_needed={("HBM", "kv"): 150},
-            cap_left={("DRAM", "kv"): 10_000},
-            bucket_size={("HBM", "kv"): 1, ("DRAM", "kv"): 1})
-    except KnapsackInfeasibleError:
-        raised = True
-    if not raised:
-        raise StageFail("E: need>single-transition with one unit must be "
-                        "infeasible (MCKP forbids double-counting u's bytes)")
+    # --- empty set when no item pays: all-negative-value items → []. ---
+    neg = knapsack_max_value_multi(
+        [Resume(gain=-1.0, re_use={"DRAM": {"kv": 10}}, pid="n1", group="g1"),
+         Resume(gain=-5.0, re_use={"DRAM": {"kv": 10}}, pid="n2", group="g2")],
+        budget={("DRAM", "kv"): 10_000}, bucket_size={("DRAM", "kv"): 1})
+    if neg != []:
+        raise StageFail(f"E: all-negative-value items must yield the empty "
+                        f"set (value-gated no-op), got {[c.pid for c in neg]}")
 
-    # --- exact vs brute-force oracle over grouped candidates ---
-    def brute_min_cost(items, need, groups):
-        # enumerate choices: per group pick none or one member.
-        best = None
-        opts = []
-        for g in groups:
-            opts.append([None] + list(g))
+    # --- exact vs brute-force value oracle over grouped, MULTI-AXIS items.
+    #     Deterministic fixtures (no RNG per harness rules — vary by index). ---
+    def brute_max_value(groups, budget):
+        best_val, best_pick = 0.0, []          # empty set is always allowed
+        opts = [[None] + list(g) for g in groups]
         for combo in itertools.product(*opts):
             picked = [m for m in combo if m is not None]
-            tot_relief = sum(m.relief.get("HBM", {}).get("kv", 0) for m in picked)
-            if tot_relief < need:
+            use = {}
+            for m in picked:
+                for (t, sp), bd in (((t, sp), v)
+                                    for t, d in m.re_use.items()
+                                    for sp, v in d.items()):
+                    use[(t, sp)] = use.get((t, sp), 0) + bd
+            if any(use.get(ax, 0) > cap for ax, cap in budget.items()):
                 continue
-            cost = sum(m.cost for m in picked)
-            if best is None or cost < best[0]:
-                best = (cost, picked)
-        return best
+            val = sum(m.gain for m in picked)
+            if val > best_val:
+                best_val, best_pick = val, picked
+        return best_val
 
-    # deterministic small fixtures (no RNG per harness rules — vary by index)
-    import math
     fails = 0
     for seed in range(40):
-        # build 3 units, each with 2 grouped transitions, bytes vary by seed
-        items = []
         groups = []
         for ui in range(3):
-            base = 30 + ((seed * 7 + ui * 13) % 50)
-            g = []
-            a = Migrate(cost=1.0 + ((seed + ui) % 4),
-                        relief={"HBM": {"kv": base}}, acquired={},
-                        id=(ui, "a"), group=f"u{ui}")
-            b = Migrate(cost=4.0 + ((seed * 3 + ui) % 5),
-                        relief={"HBM": {"kv": base + 20}}, acquired={},
-                        id=(ui, "b"), group=f"u{ui}")
-            g = [a, b]
-            items += g
+            wa = 30 + ((seed * 7 + ui * 13) % 50)
+            wb = 20 + ((seed * 5 + ui * 11) % 40)
+            # gains can be +/-; two axes (DRAM kv, DISK kv) so the budget
+            # bind is multi-dimensional.
+            ga = ((seed + ui) % 7) - 2.0
+            gb = ((seed * 3 + ui) % 6) - 1.0
+            g = [Resume(gain=ga, re_use={"DRAM": {"kv": wa}}, pid=(ui, "a"),
+                        group=f"u{ui}"),
+                 Resume(gain=gb, re_use={"DISK": {"kv": wb}}, pid=(ui, "b"),
+                        group=f"u{ui}")]
             groups.append(g)
-        need = 60 + (seed % 40)
-        oracle = brute_min_cost(items, need, groups)
-        try:
-            dp = knapsack_min_cost_multi(
-                items, {("HBM", "kv"): need}, {},
-                {("HBM", "kv"): 1})
-        except KnapsackInfeasibleError:
-            if oracle is not None:
-                fails += 1
-            continue
-        if oracle is None:
-            fails += 1
-            continue
-        dp_cost = sum(c.cost for c in dp)
-        # at most one per group in the DP result
+        items = [m for g in groups for m in g]
+        budget = {("DRAM", "kv"): 60 + (seed % 40),
+                  ("DISK", "kv"): 50 + (seed % 30)}
+        oracle = brute_max_value(groups, budget)
+        dp = knapsack_max_value_multi(
+            items, budget,
+            bucket_size={("DRAM", "kv"): 1, ("DISK", "kv"): 1})
+        # at most one per group
         gseen = [c.group for c in dp]
         if len(gseen) != len(set(gseen)):
             raise StageFail(f"E: seed {seed} DP picked 2+ from one group: "
-                            f"{[c.id for c in dp]}")
-        if abs(dp_cost - oracle[0]) > 1e-9:
+                            f"{[c.pid for c in dp]}")
+        # budget respected
+        use = {}
+        for m in dp:
+            for t, d in m.re_use.items():
+                for sp, v in d.items():
+                    use[(t, sp)] = use.get((t, sp), 0) + v
+        if any(use.get(ax, 0) > cap for ax, cap in budget.items()):
+            raise StageFail(f"E: seed {seed} DP exceeded budget: {use} vs {budget}")
+        dp_val = sum(c.gain for c in dp)
+        if abs(dp_val - oracle) > 1e-9:
             fails += 1
     if fails:
-        raise StageFail(f"E: DP vs brute-force mismatch on {fails}/40 fixtures")
+        raise StageFail(f"E: value DP vs brute-force mismatch on {fails}/40")
 
-    # --- under-relievable pressure → BEST-EFFORT, not fatal (#194).
-    #     In-flight-dominated pressure (tiny radix footprint, no Pause
-    #     candidate) cannot be fully relieved by migration; the daemon
-    #     must free what it can and re-evaluate next event, NOT crash. ---
-    GB = 1024 ** 3
-    fatal_called = {"n": 0}
-
-    def _fake_fatal(reason, **ctx):
-        fatal_called["n"] += 1
-        raise RuntimeError("fatal-sentinel")
-    orig = jd.fatal
-    jd.fatal = _fake_fatal
-    try:
-        tracker = ProgramTracker()
-        tracker.observe_arrival("S")
-        # HBM 90% (need ≈ 0.5GB) but the only D_t unit is 2 MB on {HBM}
-        # with no lower tier, and no active program → no Pause.  Migration
-        # can free at most 2 MB ≪ 0.5GB.
-        sj = _state_json(
-            units=[_unit(uhash="u1", residence=["HBM"], holders=["S"],
-                         n_bytes_per_tier={"HBM": 2 * 1024 * 1024})],
-            hbm={"kv": _sp(9 * GB, 10 * GB)})
-        ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
-        st = _build_state(sj, tracker, ev)
-        plan = jd.joint_decide(st, ev, costs=default_costs(), pi_u=1e-4,
-                               theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
-        if fatal_called["n"] != 0:
-            raise StageFail("E: under-relievable pressure must NOT fatal "
-                            "(best-effort); fatal was called")
-        # best-effort frees what it can: the one available unit (DROP or
-        # evict→DRAM), i.e. a non-empty plan that under-relieves.
-        if not plan:
-            raise StageFail("E: best-effort must free what it can (non-empty "
-                            "plan), got []")
-        freed = sum(b for c in plan for b in c.relief.get("HBM", {}).values())
-        if freed > int(0.5 * GB):
-            raise StageFail(f"E: this fixture can only under-relieve; freed "
-                            f"{freed} unexpectedly ≥ need")
-    finally:
-        jd.fatal = orig
-
-    # --- DP blow-up STILL fatals (genuine misconfiguration) ---
-    from baselines.knapsack import KnapsackBudgetExceededError
+    # --- DP blow-up STILL raises (genuine misconfiguration: many distinct
+    #     bucket-deltas across an axis exceed the reachable-cell ceiling). ---
     blew = False
     try:
-        knapsack_min_cost_multi(
-            [Migrate(cost=1.0, relief={"HBM": {"kv": 64 * 1024}},
-                     acquired={"DRAM": {"kv": i * 64 * 1024}}, id=i, group=i)
-             for i in range(1, 60)],
-            bytes_needed={("HBM", "kv"): 64 * 1024 * 40},
-            cap_left={("DRAM", "kv"): 64 * 1024 * 100000},
-            bucket_size={("HBM", "kv"): 64 * 1024, ("DRAM", "kv"): 1},
-            max_dp_cells=50, best_effort=True)
+        knapsack_max_value_multi(
+            [Resume(gain=1.0, re_use={"DRAM": {"kv": i * 64 * 1024}},
+                    pid=i, group=i) for i in range(1, 60)],
+            budget={("DRAM", "kv"): 64 * 1024 * 100000},
+            bucket_size={("DRAM", "kv"): 64 * 1024},
+            max_dp_cells=50)
     except KnapsackBudgetExceededError:
         blew = True
     if not blew:
-        raise StageFail("E: DP cell ceiling must still raise "
-                        "KnapsackBudgetExceededError even in best_effort")
-    print(_green("  [E] DP: no same-unit double-pick, exact vs brute (40), "
-                 "under-relief→best-effort (no fatal), blow-up→raise OK"))
+        raise StageFail("E: DP cell ceiling must raise KnapsackBudgetExceededError")
+    print(_green("  [E] value DP: no same-group double-pick, empty-on-no-pay, "
+                 "exact vs brute (40, multi-axis), budget held, blow-up→raise OK"))
 
 
 # ============================================================ Stage F
@@ -917,50 +869,46 @@ def _drain(ob):
 
 def stage_f_live_dispatch() -> None:
     """The handler runs joint_decide and _dispatch_plan routes the mixed
-    plan: Pause → tracker.pause + PUT{PAUSED, pre_pause_state}; Resume →
-    tracker.resume + PUT{pre_pause_state}.  Brand-new dispatch code —
-    pinned end-to-end through KvScheduler.handle (admission ON)."""
+    plan: Migrate → POST /aginfer/migrate; Resume → tracker.resume +
+    PUT{pre_pause_state}.  The Pause lever is dormant, so no pause is ever
+    dispatched.  Pinned end-to-end through KvScheduler.handle (admission ON)."""
     GB = 1024 ** 3
 
-    # --- pressure → a Pause is dispatched ---
-    #   Under LLM_PREFILL D_t is empty (no migrates), so the committed
-    #   radix (#205 relief source) is NOT D_t-excluded and Pause is the
-    #   sole pressure lever — the honest scenario that forces a Pause.
-    #   (Under MEMORY_PRESSURE the HBM unit would be in D_t → migrate's
-    #   domain → committed excluded → relief 0; that disjoint behavior is
-    #   pinned by verify/admission_controller stage_disjoint.)
-    def _pause_case():
+    # --- pressure → a net-positive relief Migrate is dispatched (POST
+    #     /aginfer/migrate), and NO pause is dispatched (dormant lever). ---
+    def _migrate_case():
         tracker = ProgramTracker()
-        tracker.observe_arrival("P")            # REASONING (prior state)
+        tracker.observe_arrival("P")            # REASONING
         ob = OutboundQueue(sglang_base_url="http://unused",
                            http_client=_DummyHttp())
         sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
                                 outbound=ob)
         sched.admission_enabled = True
         sj = _state_json(
-            units=[_unit(uhash="uP", residence=["HBM"], holders=["P"],
-                         n_bytes_per_tier={"HBM": 1 * GB})],
+            units=[_unit(uhash="uP", residence=["HBM", "DRAM"], holders=["P"],
+                         n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
             programs={"P": _program("REASONING", committed={"kv": 1 * GB},
                                     unit_hashes=["uP"])},
             hbm={"kv": _sp(9 * GB, 10 * GB)})
         router = _StubRouter(sj)
-        asyncio.run(sched.handle(Event(EventKind.LLM_PREFILL, session="P"),
+        asyncio.run(sched.handle(Event(EventKind.MEMORY_PRESSURE, session="P"),
                                  router))
         return tracker, sched, _drain(ob)
 
-    tracker, sched, batches = _pause_case()
-    if tracker.state("P") is not State.PAUSED:
-        raise StageFail("F: pressure → handler must tracker.pause(P)")
-    if sched.pause_calls != 1:
-        raise StageFail(f"F: pause_calls must be 1, got {sched.pause_calls}")
-    puts = [b for b in batches if b.endpoint == "program_paused"]
-    if not puts:
-        raise StageFail(f"F: pause must enqueue a program_paused PUT; "
+    tracker, sched, batches = _migrate_case()
+    if sched.migrate_calls != 1:
+        raise StageFail(f"F: pressure → relief migrate must dispatch once, "
+                        f"got migrate_calls={sched.migrate_calls}")
+    if sched.pause_calls != 0:
+        raise StageFail("F: Pause lever is dormant — pause_calls must be 0")
+    if tracker.state("P") is State.PAUSED:
+        raise StageFail("F: no program may be paused (dormant pause lever)")
+    migs = [b for b in batches if b.endpoint == "migrate"]
+    if not migs:
+        raise StageFail(f"F: relief must enqueue a /aginfer/migrate POST; "
                         f"got {[b.endpoint for b in batches]}")
-    body = puts[0].body
-    if body.get("state") != "PAUSED" or body.get("pre_pause_state") != "REASONING":
-        raise StageFail(f"F: pause PUT body must be {{PAUSED, pre=REASONING}}; "
-                        f"got {body}")
+    if any(b.endpoint == "program_paused" for b in batches):
+        raise StageFail("F: no program_paused PUT may be enqueued (no pause)")
 
     # --- headroom → a Resume is dispatched, restoring pre_pause_state ---
     def _resume_case():
@@ -1013,146 +961,195 @@ def stage_f_live_dispatch() -> None:
     tracker, sched = _kvonly_case()
     if sched.pause_calls != 0:
         raise StageFail("F: admission OFF must dispatch no Pause (kv-only arm)")
+    if sched.resume_calls != 0:
+        raise StageFail("F: admission OFF must dispatch no Resume (kv-only arm)")
     if tracker.state("P") is State.PAUSED:
         raise StageFail("F: admission OFF must not pause P")
-    print(_green("  [F] live dispatch: pause+PUT / resume+PUT / kv-only no-pause OK"))
+    print(_green("  [F] live dispatch: migrate+POST / resume+PUT / "
+                 "kv-only relief-only OK"))
 
 
 # ============================================================ Stage G
 
 
 def stage_g_robustness() -> None:
-    """#194 audit: the cap_left≥0 clamp (over-subscribed destination must
-    not reject zero-acquire DROP) + best_effort relieves ALL axes when
-    caps allow."""
+    """#194 audit + value-gate: the destination-budget ≥0 clamp (an over-
+    subscribed destination must not reject a zero-acquire evict) + the
+    value-gate excludes a HOT (cost ≥ 0) relief candidate end-to-end."""
     from daemon import joint_decide as jd
-    from baselines.knapsack import knapsack_min_cost_multi
     GB = 1024 ** 3
 
-    # --- cap_left clamp: DRAM over-subscribed (used > cap → cap_left<0).
+    # --- budget clamp: DRAM over-subscribed (used > cap → free room < 0).
     #     A unit on {HBM,DRAM} can still evict-HBM (acquired={}) — the
-    #     clamp keeps that DROP/evict feasible instead of spuriously
-    #     infeasible. ---
+    #     clamp keeps that evict in play instead of rejecting it on a
+    #     spurious negative budget. ---
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
     sj = _state_json(
         units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
                      n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
         hbm={"kv": _sp(9 * GB, 10 * GB)},
-        dram={"kv": _sp(50 * GB, 40 * GB)})   # used > cap → cap_left = -10GB
+        dram={"kv": _sp(50 * GB, 40 * GB)})   # used > cap → free room = -10GB
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
     st = _build_state(sj, tracker, ev)
     plan = jd.joint_decide(st, ev, costs=default_costs(), pi_u=1e-4,
                            theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
     if not plan:
-        raise StageFail("G: over-subscribed DRAM must NOT make pressure "
-                        "infeasible — evict-HBM (acquired={}) is still valid")
-    relief = _hbm_relief(plan)
-    if relief.get("kv", 0) < int(0.5 * GB):
+        raise StageFail("G: over-subscribed DRAM must NOT block relief — "
+                        "evict-HBM (acquired={}) is still net-positive & valid")
+    if _hbm_relief(plan).get("kv", 0) <= 0:
         raise StageFail(f"G: clamp must let the HBM-freeing plan through; "
-                        f"freed {relief}")
+                        f"freed {_hbm_relief(plan)}")
 
-    # --- best_effort relieves BOTH pressured axes when caps allow (no
-    #     forced tradeoff): two DROPs, one per subpool, both chosen. ---
-    a = Migrate(cost=1.0, relief={"HBM": {"full": 100}}, acquired={},
-                id="a", group="ua")
-    b = Migrate(cost=1.0, relief={"HBM": {"mamba": 100}}, acquired={},
-                id="b", group="ub")
-    chosen = knapsack_min_cost_multi(
-        [a, b],
-        bytes_needed={("HBM", "full"): 100, ("HBM", "mamba"): 100},
-        cap_left={}, bucket_size={("HBM", "full"): 1, ("HBM", "mamba"): 1},
-        best_effort=True)
-    if {c.id for c in chosen} != {"a", "b"}:
-        raise StageFail(f"G: best_effort must relieve BOTH axes when caps "
-                        f"allow; got {[c.id for c in chosen]}")
-    print(_green("  [G] cap_left≥0 clamp; best_effort relieves all axes OK"))
+    # --- value-gate excludes a HOT candidate, end-to-end.  Inject (via
+    #     migrate_candidates) a HOT HBM-relieving migrate (cost > 0 → moving
+    #     it LOSES value) alongside a COLD one (cost < 0).  The value-gate
+    #     keeps only cost < 0, so the plan must carry the cold migrate and
+    #     NOT the hot one — pins the `cost < 0` filter wiring, not the
+    #     real-cost coincidence. ---
+    inject = [
+        Migrate(cost=-5.0, relief={"HBM": {"kv": 1 * GB}}, acquired={},
+                id=("cold", [], ["HBM"]), group="cold"),
+        Migrate(cost=+5.0, relief={"HBM": {"kv": 1 * GB}}, acquired={},
+                id=("hot", [], ["HBM"]), group="hot"),
+    ]
+    orig_mc = jd.migrate_candidates
+    jd.migrate_candidates = lambda *a, **k: list(inject)
+    try:
+        plan2 = jd.joint_decide(st, ev, costs=default_costs(), pi_u=1e-4,
+                                theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+    finally:
+        jd.migrate_candidates = orig_mc
+    tags = [c.id[0] for c in plan2 if isinstance(c, Migrate)]
+    if "cold" not in tags:
+        raise StageFail(f"G: the COLD (cost<0) migrate must be taken; got {tags}")
+    if "hot" in tags:
+        raise StageFail(f"G: the HOT (cost≥0) migrate must be value-gated OUT; "
+                        f"got {tags}")
+    print(_green("  [G] destination-budget ≥0 clamp; value-gate excludes the "
+                 "hot (cost≥0) relief candidate end-to-end OK"))
 
 
 # ============================================================ Stage H
 
 
-def stage_h_no_hbm_acquire_in_pressure() -> None:
-    """AUDIT (decision-math round): a pressure-phase candidate that ACQUIRES
-    bytes into a pressured (HBM / relief-axis) subpool must never be applied
-    — it grows the very tier the phase is trying to relieve.
+def stage_h_relief_targets_pressured_subpool() -> None:
+    """SF-3 (value-gated rewrite): relief must target the PRESSURED subpool
+    and never a candidate that grows it.
 
-    The DP only models DRAM/DISK as destination-cap axes (``cap_left``);
-    HBM is a relief axis, so a candidate's HBM ``acquired`` is invisible to
-    the cap constraint and treated as FREE.  The one relief-bearing migrate
-    that acquires HBM is ``promote+drop_disk`` ({DRAM,DISK} → {HBM,DRAM}):
-    it relieves DISK (irrelevant to HBM pressure) while pulling the unit's
-    bytes BACK into HBM.  With a negative cost (a cold unit, where promoting
-    is scored "beneficial") the min-cost DP greedily takes it as free cost
-    reduction — silently worsening HBM pressure.  ``joint_decide`` must drop
-    any pressure candidate that acquires into a relief (HBM) axis before the
-    knapsack runs."""
+    Two ways a non-targeted candidate must be excluded by the pressured-
+    subpool filter (`any(sp in pressured_sps for sp in c.relief['HBM'])`):
+
+      1. A candidate that relieves a HEALTHY HBM subpool (not the pegged
+         one) is dropped — relief never churns a subpool with room.
+      2. A ``promote+drop_disk`` candidate ({DRAM,DISK} → {HBM,DRAM}) that
+         relieves DISK while ACQUIRING bytes back into the pegged HBM
+         subpool has empty ``relief['HBM']`` → it cannot pass the filter,
+         so it can never grow the very subpool under pressure — even with a
+         strongly negative cost that a pure value-max DP would want.
+
+    Pinned end-to-end through joint_decide by injecting candidates (so it
+    tests the WIRING of the filter, not a real-cost coincidence)."""
     from daemon import joint_decide as jd
-    from baselines.knapsack import knapsack_min_cost_multi
-
-    # Direct primitive-level pin: an HBM-acquiring, DISK-relieving,
-    # negative-cost candidate must NOT be selected when the only real need
-    # is on HBM.  (cap axes are DRAM/DISK; HBM acquire is unconstrained.)
-    E = Migrate(cost=1.0, relief={"HBM": {"kv": 100}}, acquired={},
-                id="E", group="uE")
-    P = Migrate(cost=-10.0, relief={"DISK": {"kv": 100}},
-                acquired={"HBM": {"kv": 50}}, id="P", group="uP")
-    # The caller (joint_decide) is responsible for not handing the DP a
-    # relief-axis-acquiring candidate; emulate its filtered candidate set.
-    cands = jd._drop_relief_axis_acquirers(
-        [E, P], relief_axes=[("HBM", "kv")])
-    chosen = knapsack_min_cost_multi(
-        cands, bytes_needed={("HBM", "kv"): 100},
-        cap_left={("DRAM", "kv"): 10**9, ("DISK", "kv"): 10**9},
-        bucket_size={("HBM", "kv"): 1, ("DRAM", "kv"): 1, ("DISK", "kv"): 1},
-        best_effort=True)
-    if any(c.id == "P" for c in chosen):
-        raise StageFail(
-            "H: a candidate that ACQUIRES HBM (the pressured tier) must not "
-            f"be selected in the pressure plan; got {[c.id for c in chosen]}")
-
-    # End-to-end through joint_decide, NON-VACUOUSLY.  Under the default
-    # calibration promote+drop_disk's cost is ≥ 0, so the min-cost DP would
-    # not pick it whether or not the filter is wired — a real-cost end-to-end
-    # check would pass either way (vacuous, and would NOT catch dropping the
-    # filter call).  So monkeypatch migrate_candidates to inject a
-    # NEGATIVE-cost HBM-acquirer P alongside a real evict E: now the DP WANTS
-    # P (free cost reduction), so the plan contains an HBM-acquirer IFF
-    # joint_decide forgot to call _drop_relief_axis_acquirers — pinning the
-    # WIRING, not just the helper.
     GB = 1024 ** 3
+    kw = dict(costs=default_costs(), pi_u=1e-4,
+              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
+    # 'swa' pegged at 90%, 'full' healthy at 10%.  Inject three candidates:
+    #   • cold migrate that relieves the PEGGED 'swa'  → MUST be taken
+    #   • cold migrate that relieves the HEALTHY 'full' → MUST be dropped
+    #   • negative-cost DISK-relieving HBM(swa)-ACQUIRER → MUST be dropped
     sj = _state_json(
         units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
-                     n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
-        hbm={"kv": _sp(9 * GB, 10 * GB)},
+                     n_bytes_per_tier={"HBM": {"swa": 1 * GB},
+                                       "DRAM": {"swa": 1 * GB}}, subpool="swa")],
+        hbm={"swa": _sp(9 * GB, 10 * GB), "full": _sp(1 * GB, 10 * GB)},
     )
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
     st = _build_state(sj, tracker, ev)
     inject = [
-        Migrate(cost=1.0, relief={"HBM": {"kv": 1 * GB}}, acquired={},
-                id=("u1", [], ["HBM"]), group="u1"),
+        Migrate(cost=-5.0, relief={"HBM": {"swa": 1 * GB}}, acquired={},
+                id=("relieve_swa", [], ["HBM"]), group="g_swa"),
+        Migrate(cost=-5.0, relief={"HBM": {"full": 1 * GB}}, acquired={},
+                id=("relieve_full", [], ["HBM"]), group="g_full"),
         Migrate(cost=-10.0, relief={"DISK": {"kv": 1 * GB}},
-                acquired={"HBM": {"kv": 1 * GB}},
-                id=("u2", ["HBM"], ["DISK"]), group="u2"),
+                acquired={"HBM": {"swa": 1 * GB}},
+                id=("acquire_swa", ["HBM"], ["DISK"]), group="g_acq"),
     ]
     orig_mc = jd.migrate_candidates
     jd.migrate_candidates = lambda *a, **k: list(inject)
     try:
-        plan = jd.joint_decide(st, ev, costs=default_costs(), pi_u=1e-4,
-                               theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+        plan = jd.joint_decide(st, ev, **kw)
     finally:
         jd.migrate_candidates = orig_mc
+    tags = [c.id[0] for c in plan if isinstance(c, Migrate)]
+    if "relieve_swa" not in tags:
+        raise StageFail(f"H: the migrate that relieves the PEGGED swa subpool "
+                        f"must be taken; got {tags}")
+    if "relieve_full" in tags:
+        raise StageFail(f"H: a migrate relieving the HEALTHY 'full' subpool "
+                        f"must be dropped (relief targets the bottleneck); {tags}")
     for c in plan:
-        acq = getattr(c, "acquired", {}) or {}
-        if acq.get("HBM"):
+        if (getattr(c, "acquired", {}) or {}).get("HBM"):
             raise StageFail(
-                "H: joint_decide pressure plan must not include a candidate "
-                f"that acquires HBM (is _drop_relief_axis_acquirers wired?); "
-                f"got {c.id} acquired={acq}")
-    print(_green("  [H] pressure phase excludes HBM-acquiring candidates "
-                 "(no growing the pressured tier) OK"))
+                "H: no relief candidate may ACQUIRE into the pegged HBM "
+                f"subpool (it grows the bottleneck); got {c.id} "
+                f"acquired={c.acquired}")
+    print(_green("  [H] relief targets the pressured subpool only; never "
+                 "churns a healthy subpool nor grows the pegged one (SF-3) OK"))
+
+
+def stage_i_off_budget_consumption_rejected() -> None:
+    """ROUND-2 audit: the value knapsack must NOT treat consumption on an
+    axis ABSENT from its budget as free.  A migrate that relieves the pegged
+    subpool but ACQUIRES into a destination subpool that is not configured
+    (or has no room) must be rejected (0 room), never silently over-
+    subscribed.  Inject two relief candidates for the pegged 'swa':
+      • an over-subscriber: relieves swa, acquires DRAM['xx'] 2GB where DRAM
+        only has subpool 'kv' configured → off-budget → MUST be rejected
+      • a clean DROP: relieves swa, acquires nothing → MUST be taken
+    Without the union-budget fix the over-subscriber's 2GB lands on an axis
+    the DP never budgeted → free → wrongly taken."""
+    from daemon import joint_decide as jd
+    GB = 1024 ** 3
+    kw = dict(costs=default_costs(), pi_u=1e-4,
+              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+    tracker = ProgramTracker()
+    tracker.observe_arrival("S")
+    sj = _state_json(
+        units=[_unit(uhash="u1", residence=["HBM"], holders=["S"],
+                     n_bytes_per_tier={"HBM": {"swa": 1 * GB}}, subpool="swa")],
+        hbm={"swa": _sp(9 * GB, 10 * GB)},
+        dram={"kv": _sp(0, 40 * GB)},          # NO 'xx' subpool configured
+    )
+    ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
+    st = _build_state(sj, tracker, ev)
+    inject = [
+        Migrate(cost=-10.0, relief={"HBM": {"swa": 1 * GB}},
+                acquired={"DRAM": {"xx": 2 * GB}},   # off-budget destination
+                id=("oversub", ["DRAM"], ["HBM"]), group="g_over"),
+        Migrate(cost=-5.0, relief={"HBM": {"swa": 1 * GB}}, acquired={},
+                id=("clean_drop", [], ["HBM"]), group="g_drop"),
+    ]
+    orig_mc = jd.migrate_candidates
+    jd.migrate_candidates = lambda *a, **k: list(inject)
+    try:
+        plan = jd.joint_decide(st, ev, **kw)
+    finally:
+        jd.migrate_candidates = orig_mc
+    tags = [c.id[0] for c in plan if isinstance(c, Migrate)]
+    if "oversub" in tags:
+        raise StageFail(
+            "I: a migrate acquiring into an UNCONFIGURED destination subpool "
+            "(DRAM['xx'], 0 room) must be rejected, not taken for free; "
+            f"got {tags}")
+    if "clean_drop" not in tags:
+        raise StageFail(f"I: the clean no-acquire DROP relieving swa must be "
+                        f"taken; got {tags}")
+    print(_green("  [I] off-budget consumption is 0-room (rejected), never "
+                 "silently free (round-2 audit) OK"))
 
 
 # ============================================================ runner
@@ -1168,7 +1165,8 @@ _STAGES = [
     ("E", stage_e_dp_correctness),
     ("F", stage_f_live_dispatch),
     ("G", stage_g_robustness),
-    ("H", stage_h_no_hbm_acquire_in_pressure),
+    ("H", stage_h_relief_targets_pressured_subpool),
+    ("I", stage_i_off_budget_consumption_rejected),
 ]
 
 

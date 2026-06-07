@@ -443,9 +443,9 @@ def capacity_fits(
 
 
 # #211 liveness floor.  A PAUSED program emits no events of its own and can
-# never un-starve itself — only a Resume in the headroom phase releases its
+# never un-starve itself — only a Resume (the §9 resume step) releases its
 # proxy gate.  Its V_u-derived gain can legitimately be 0 (its units were
-# DROPped while it was gated), and the headroom knapsack would then never
+# DROPped while it was gated), and the resume knapsack would then never
 # pick it (a zero-gain zero-weight item ties the take-none cell and loses),
 # so it starves to an AgentTimeout.  DESIGN §8: once headroom is detected
 # (occ < theta_lo) resuming a gated program is always weakly preferable to
