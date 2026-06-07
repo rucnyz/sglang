@@ -1013,6 +1013,92 @@ def stage_g_robustness() -> None:
     print(_green("  [G] cap_left≥0 clamp; best_effort relieves all axes OK"))
 
 
+# ============================================================ Stage H
+
+
+def stage_h_no_hbm_acquire_in_pressure() -> None:
+    """AUDIT (decision-math round): a pressure-phase candidate that ACQUIRES
+    bytes into a pressured (HBM / relief-axis) subpool must never be applied
+    — it grows the very tier the phase is trying to relieve.
+
+    The DP only models DRAM/DISK as destination-cap axes (``cap_left``);
+    HBM is a relief axis, so a candidate's HBM ``acquired`` is invisible to
+    the cap constraint and treated as FREE.  The one relief-bearing migrate
+    that acquires HBM is ``promote+drop_disk`` ({DRAM,DISK} → {HBM,DRAM}):
+    it relieves DISK (irrelevant to HBM pressure) while pulling the unit's
+    bytes BACK into HBM.  With a negative cost (a cold unit, where promoting
+    is scored "beneficial") the min-cost DP greedily takes it as free cost
+    reduction — silently worsening HBM pressure.  ``joint_decide`` must drop
+    any pressure candidate that acquires into a relief (HBM) axis before the
+    knapsack runs."""
+    from daemon import joint_decide as jd
+    from baselines.knapsack import knapsack_min_cost_multi
+
+    # Direct primitive-level pin: an HBM-acquiring, DISK-relieving,
+    # negative-cost candidate must NOT be selected when the only real need
+    # is on HBM.  (cap axes are DRAM/DISK; HBM acquire is unconstrained.)
+    E = Migrate(cost=1.0, relief={"HBM": {"kv": 100}}, acquired={},
+                id="E", group="uE")
+    P = Migrate(cost=-10.0, relief={"DISK": {"kv": 100}},
+                acquired={"HBM": {"kv": 50}}, id="P", group="uP")
+    # The caller (joint_decide) is responsible for not handing the DP a
+    # relief-axis-acquiring candidate; emulate its filtered candidate set.
+    cands = jd._drop_relief_axis_acquirers(
+        [E, P], relief_axes=[("HBM", "kv")])
+    chosen = knapsack_min_cost_multi(
+        cands, bytes_needed={("HBM", "kv"): 100},
+        cap_left={("DRAM", "kv"): 10**9, ("DISK", "kv"): 10**9},
+        bucket_size={("HBM", "kv"): 1, ("DRAM", "kv"): 1, ("DISK", "kv"): 1},
+        best_effort=True)
+    if any(c.id == "P" for c in chosen):
+        raise StageFail(
+            "H: a candidate that ACQUIRES HBM (the pressured tier) must not "
+            f"be selected in the pressure plan; got {[c.id for c in chosen]}")
+
+    # End-to-end through joint_decide, NON-VACUOUSLY.  Under the default
+    # calibration promote+drop_disk's cost is ≥ 0, so the min-cost DP would
+    # not pick it whether or not the filter is wired — a real-cost end-to-end
+    # check would pass either way (vacuous, and would NOT catch dropping the
+    # filter call).  So monkeypatch migrate_candidates to inject a
+    # NEGATIVE-cost HBM-acquirer P alongside a real evict E: now the DP WANTS
+    # P (free cost reduction), so the plan contains an HBM-acquirer IFF
+    # joint_decide forgot to call _drop_relief_axis_acquirers — pinning the
+    # WIRING, not just the helper.
+    GB = 1024 ** 3
+    tracker = ProgramTracker()
+    tracker.observe_arrival("S")
+    sj = _state_json(
+        units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
+                     n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
+        hbm={"kv": _sp(9 * GB, 10 * GB)},
+    )
+    ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
+    st = _build_state(sj, tracker, ev)
+    inject = [
+        Migrate(cost=1.0, relief={"HBM": {"kv": 1 * GB}}, acquired={},
+                id=("u1", [], ["HBM"]), group="u1"),
+        Migrate(cost=-10.0, relief={"DISK": {"kv": 1 * GB}},
+                acquired={"HBM": {"kv": 1 * GB}},
+                id=("u2", ["HBM"], ["DISK"]), group="u2"),
+    ]
+    orig_mc = jd.migrate_candidates
+    jd.migrate_candidates = lambda *a, **k: list(inject)
+    try:
+        plan = jd.joint_decide(st, ev, costs=default_costs(), pi_u=1e-4,
+                               theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+    finally:
+        jd.migrate_candidates = orig_mc
+    for c in plan:
+        acq = getattr(c, "acquired", {}) or {}
+        if acq.get("HBM"):
+            raise StageFail(
+                "H: joint_decide pressure plan must not include a candidate "
+                f"that acquires HBM (is _drop_relief_axis_acquirers wired?); "
+                f"got {c.id} acquired={acq}")
+    print(_green("  [H] pressure phase excludes HBM-acquiring candidates "
+                 "(no growing the pressured tier) OK"))
+
+
 # ============================================================ runner
 
 _STAGES = [
@@ -1025,6 +1111,7 @@ _STAGES = [
     ("E", stage_e_dp_correctness),
     ("F", stage_f_live_dispatch),
     ("G", stage_g_robustness),
+    ("H", stage_h_no_hbm_acquire_in_pressure),
 ]
 
 

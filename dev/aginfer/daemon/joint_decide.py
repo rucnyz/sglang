@@ -63,6 +63,37 @@ def _has_relief(c: Any) -> bool:
     return any(b > 0 for sub in c.relief.values() for b in sub.values())
 
 
+def _drop_relief_axis_acquirers(cands: List[Any], relief_axes: List[Any]) -> List[Any]:
+    """Drop pressure candidates that ACQUIRE bytes into a relief (HBM)
+    subpool.
+
+    The pressure DP models only DRAM/DISK as destination-cap axes
+    (``cap_left``); HBM is a relief axis, so a candidate's HBM ``acquired``
+    is invisible to the cap constraint and treated as FREE.  The one
+    relief-bearing migrate that acquires HBM is ``promote+drop_disk``
+    ({DRAM,DISK} → {HBM,DRAM}): it relieves DISK (irrelevant to HBM
+    pressure) while pulling the unit's bytes BACK into HBM.  With a negative
+    cost the min-cost DP would greedily take it as free cost reduction —
+    silently GROWING the very tier the pressure phase is relieving.
+    Applying such a transition during HBM pressure is incoherent; exclude
+    it before the knapsack runs.  (``promote+drop_disk``'s cost is provably
+    ≥ 0 under the default h_HBM ≥ h_DRAM calibration, so this is normally
+    inert — but the DP must not depend on a calibration invariant to stay
+    correct.)"""
+    pressured_subpools: Dict[str, set] = {}
+    for (tier, sp) in relief_axes:
+        pressured_subpools.setdefault(tier, set()).add(sp)
+    out: List[Any] = []
+    for c in cands:
+        acq = getattr(c, "acquired", None) or {}
+        if any(sp in pressured_subpools.get(tier, ())
+               for tier, sub in acq.items()
+               for sp, b in sub.items() if b > 0):
+            continue
+        out.append(c)
+    return out
+
+
 def _page_bytes(state: SchedulerState, tier_label: str, sp: str) -> int:
     """``page_bytes`` for axis (tier_label, sp).  A missing key is a
     schema-contract violation (DESIGN §10 subpool-key consistency) — let
@@ -122,6 +153,11 @@ def joint_decide(
         cands = [replace(c, relief={"HBM": c.relief}) if isinstance(c, Pause)
                  else c for c in cands]
         cands = [c for c in cands if _has_relief(c)]
+        # A candidate that ACQUIRES into a relief (HBM) subpool would GROW
+        # the pressured tier — and the DP's cap model (DRAM/DISK only) can't
+        # see it.  Exclude such candidates (e.g. promote+drop_disk) before
+        # the knapsack so they can never be selected as "free" relief.
+        cands = _drop_relief_axis_acquirers(cands, list(bytes_needed.keys()))
 
         bucket_size = {
             axis: _page_bytes(state, axis[0], axis[1])
