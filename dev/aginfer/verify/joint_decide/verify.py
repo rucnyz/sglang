@@ -1219,6 +1219,57 @@ def stage_j_resume_dedup() -> None:
                  "(#215) OK"))
 
 
+def stage_k_no_evict_reuse_imminent_tail() -> None:
+    """#223: at TOOL_CALL_END the decision set is the caller's session TAIL,
+    which is reuse-imminent (the session resumes and extends it next turn —
+    DESIGN §7 marks it a *promote* candidate).  Evicting it is a futile
+    dump→apply TOCTOU (the frontier leaf gains a device child by apply time →
+    sglang rejects remove_hbm_not_device_leaf).  Under value-gating the evict
+    is even net-POSITIVE (HBM holding at 0.9 occ is dear, DRAM preserves the
+    data), so the value-gate alone does NOT protect it — joint_decide must
+    suppress remove-HBM relief specifically at TOOL_CALL_END.  The same hot
+    unit under MEMORY_PRESSURE (the cold-unit top-k path) is still evictable,
+    so relief is not crippled."""
+    from daemon import joint_decide as jd
+    GB = 1024 ** 3
+    kw = dict(costs=default_costs(), pi_u=1.0e-4,
+              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
+    def _plan(kind):
+        tracker = ProgramTracker()
+        tracker.observe_arrival("S")
+        tracker.observe_completion("S")          # ACTING (alive holder)
+        sj = _state_json(
+            units=[_unit(uhash="tail", residence=["HBM"], holders=["S"],
+                         n_bytes_per_tier={"HBM": 1 * GB}, last_access_time=999)],
+            programs={"S": _program("ACTING", committed={"kv": 1 * GB},
+                                    unit_hashes=["tail"])},
+            hbm={"kv": _sp(9 * GB, 10 * GB)},     # 90% → pressured
+            time_counter=1000)
+        ev = Event(kind=kind, session="S")
+        st = _build_state(sj, tracker, ev)
+        plan = jd.joint_decide(st, ev, **kw)
+        # remove-HBM migrates in the plan (the #223 futile evict)
+        return [c for c in plan if isinstance(c, Migrate)
+                and Tier.HBM in c.id[2]]
+
+    # net-positive sanity: the evict IS net-positive, so suppression is real
+    # work, not vacuous (the value-gate would otherwise take it — proven by
+    # the MEMORY_PRESSURE branch below taking it).
+    end_evicts = _plan(EventKind.TOOL_CALL_END)
+    if end_evicts:
+        raise StageFail(
+            "#223: TOOL_CALL_END must NOT evict the reuse-imminent session "
+            f"tail (futile TOCTOU); got remove-HBM {[c.id[0] for c in end_evicts]}")
+    mp_evicts = _plan(EventKind.MEMORY_PRESSURE)
+    if not mp_evicts:
+        raise StageFail(
+            "#223: MEMORY_PRESSURE relief must still evict (the cold-unit "
+            "top-k path is not crippled by the TOOL_CALL_END guard); got none")
+    print(_green("  [K] reuse-imminent TOOL_CALL_END tail not evicted (futile "
+                 "TOCTOU), MEMORY_PRESSURE relief intact (#223) OK"))
+
+
 # ============================================================ runner
 
 _STAGES = [
@@ -1235,6 +1286,7 @@ _STAGES = [
     ("H", stage_h_relief_targets_pressured_subpool),
     ("I", stage_i_off_budget_consumption_rejected),
     ("J", stage_j_resume_dedup),
+    ("K", stage_k_no_evict_reuse_imminent_tail),
 ]
 
 

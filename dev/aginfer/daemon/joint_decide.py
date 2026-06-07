@@ -54,6 +54,7 @@ from baselines.knapsack import (
 from baselines.ours_greedy import migrate_candidates
 
 from . import admission_controller as adm
+from .events import EventKind
 from ._fatal import fatal
 
 logger = logging.getLogger(__name__)
@@ -195,17 +196,30 @@ def joint_decide(
                      if fc.get(sp, 0.0) > theta_hi * float(cap)}
     if pressured_sps:
         cands = migrate_candidates(state, state.decision_set, costs, pi_u)
+        # #223: at TOOL_CALL_END the decision set is the caller's session
+        # TAIL, which is REUSE-IMMINENT — the session resumes and extends it
+        # next turn (DESIGN §7 decision_set table marks it a *promote*
+        # candidate, "about to reuse").  Evicting it is futile: the frontier
+        # leaf gains a device-KV child by apply time → sglang rejects
+        # remove_hbm_not_device_leaf (a dump→apply TOCTOU), and it is against
+        # the event's promote intent.  So suppress remove-HBM relief for a
+        # reuse-imminent tail; genuine HBM pressure is relieved by the
+        # MEMORY_PRESSURE events' cold-unit top-k, not by evicting the hot
+        # frontier.  (The per-hash cooldown #223 stays as the backstop for
+        # the residual same-tick race on the MEMORY_PRESSURE path.)
+        reuse_imminent = getattr(event, "kind", None) == EventKind.TOOL_CALL_END
         # Keep a Migrate iff (a) net-positive (cost < 0 ⇒ moving improves
         # total V_u — a COLD unit) AND (b) it relieves a subpool that is
-        # ACTUALLY pressured.  (a) protects hot units, (b) keeps relief on
-        # the bottleneck (never churns a healthy subpool).  Together: an
-        # all-in-flight pegged subpool (swa) has no relieving migrate → the
-        # relief no-ops.  Each item carries its destination ``acquired``
-        # bytes as the budget it consumes.  No Pause items (dormant lever).
-        # group = the unit hash (migrate_candidates always sets it) — the
-        # multiple-choice exclusion of a unit's mutually-exclusive
-        # transitions RELIES on this; a per-transition id would split them
-        # into singletons and let the DP double-count the unit's bytes.
+        # ACTUALLY pressured AND (c) it is not a remove-HBM on a reuse-imminent
+        # tail.  (a) protects hot units, (b) keeps relief on the bottleneck
+        # (never churns a healthy subpool).  Together: an all-in-flight pegged
+        # subpool (swa) has no relieving migrate → the relief no-ops.  Each
+        # item carries its destination ``acquired`` bytes as the budget it
+        # consumes.  No Pause items (dormant lever).  group = the unit hash
+        # (migrate_candidates always sets it) — the multiple-choice exclusion
+        # of a unit's mutually-exclusive transitions RELIES on this; a
+        # per-transition id would split them into singletons and let the DP
+        # double-count the unit's bytes.
         items = [
             _ValueItem(gain=-float(c.cost),
                        re_use=(getattr(c, "acquired", None) or {}),
@@ -214,6 +228,7 @@ def joint_decide(
             for c in cands
             if float(c.cost) < 0.0
             and any(sp in pressured_sps for sp in c.relief.get("HBM", {}))
+            and not (reuse_imminent and Tier.HBM in c.id[2])
         ]
         if items:
             # Only constraint: do not overflow any destination (DRAM|DISK,

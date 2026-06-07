@@ -2095,12 +2095,26 @@ exclusive**:
   units, wrapped as value-items with **value = −cost**.  A Migrate whose
   `V_u(next) − V_u(current) − M_eff > 0` is net-positive — worth moving.
   An item is kept only if (a) it is net-positive (`cost < 0`) AND (b) it
-  **relieves a subpool that is actually pressured**.  (a) protects hot
+  **relieves a subpool that is actually pressured** AND (c) it is **not a
+  remove-HBM on a reuse-imminent tail** (#223).  (a) protects hot
   units: because V_u already nets each unit's per-subpool holding cost
   and reuse value, a COLD unit (low V_u → cheap to move) has `cost < 0`
   while a hot/active unit (high V_u) has `cost > 0` and is dropped.  (b)
   keeps relief on the bottleneck and never churns a subpool that has
-  room.  Together: a subpool full of active windows (`swa`) has **no
+  room.  (c) handles a case (a) does NOT catch: at `TOOL_CALL_END` the
+  decision set is the caller's session tail, which the §7 table marks a
+  *promote* candidate ("about to reuse").  Under HBM pressure evicting it
+  to DRAM is net-POSITIVE (HBM holding at high occupancy is dear and DRAM
+  preserves the bytes), so (a) does not stop it — yet it is FUTILE: the
+  session resumes and extends the tail, the frontier leaf gains a device
+  child by apply time, and sglang rejects `remove_hbm_not_device_leaf` (a
+  dump→apply TOCTOU, ~10²-10³ wasted removes/cycle in the A3 daemon arm).
+  So relief suppresses remove-HBM for a reuse-imminent (`TOOL_CALL_END`)
+  tail; genuine HBM pressure is relieved by the `MEMORY_PRESSURE` events'
+  cold-unit top-k, not by evicting the hot frontier.  (A per-hash
+  cooldown, §10, remains the reactive backstop for the residual same-tick
+  race on the pressure path.)  Together: a subpool full of active windows
+  (`swa`) has **no
   Migrate that both improves V_u and relieves it** → relief no-ops
   (do-no-harm); a subpool full of cold cached prefix yields many → the
   daemon relieves it.  **No per-subpool threshold tuning** — the value
