@@ -209,6 +209,26 @@ def migrate_candidates(
                 + list(add_tiers)
             if frozenset(new_residence) == current_key:
                 continue  # no-op edit
+            # #210: a remove that sglang is structurally guaranteed to reject
+            # is pure waste — it frees nothing yet costs a webhook round-trip,
+            # and under A3 saturation the unfiltered policy produced ~86k
+            # apply_failed/cycle, zero relief, daemon thrash.  Mirror sglang's
+            # three apply-site guards (unified_radix_cache.py:2673/2684/2687,
+            # in that order) so a reject-guaranteed migrate is never proposed:
+            #   • full-drop (post-residence empty) needs a tree leaf
+            #     (len(children)==0) — stricter than device-leaf, since a
+            #     node with disk-only children is a device leaf yet not a
+            #     tree leaf → remove_not_leaf.
+            #   • remove-HBM needs a device leaf → remove_hbm_not_device_leaf.
+            #   • remove-DRAM needs a host leaf  → remove_dram_not_host_leaf
+            #     (host-leaf also requires the node be device-evicted, so a
+            #     device-resident node can never drop its host backup here).
+            if not new_residence and not u.is_tree_leaf:
+                continue
+            if Tier.HBM in remove_tiers and not u.is_device_leaf:
+                continue
+            if Tier.DRAM in remove_tiers and not u.is_host_leaf:
+                continue
 
             cost = value_residence(u, current, state, costs, pi_u) \
                 - value_residence(u, new_residence, state, costs, pi_u)

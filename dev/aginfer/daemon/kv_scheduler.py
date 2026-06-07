@@ -665,6 +665,14 @@ def build_paper_state(
             p_hat=p_hat,
             lambda_rate=lam,
             holders=list(session_ids),
+            # #210: the three structural leaf flags migrate_candidates uses
+            # to mirror sglang's apply-site guards (remove_not_leaf /
+            # remove_hbm_not_device_leaf / remove_dram_not_host_leaf).
+            # Default True if the dump predates the field (co-shipped, so in
+            # practice always present); then the policy keeps old behavior.
+            is_device_leaf=bool(raw.get("is_device_leaf", True)),
+            is_host_leaf=bool(raw.get("is_host_leaf", True)),
+            is_tree_leaf=bool(raw.get("is_tree_leaf", True)),
         )
 
     decision_set = _build_decision_set(event, units, tracker)

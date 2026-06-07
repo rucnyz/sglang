@@ -3591,6 +3591,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 "last_access_time": int(node.last_access_time),
                 "hit_count": int(node.hit_count),
                 "session_ids": sorted(sids) if sids else [],
+                # #210: the three structural leaf predicates the daemon's
+                # migrate_candidates needs to mirror sglang's apply-site
+                # guards (2673/2684/2687) — else reject storms under
+                # pressure (remove_not_leaf / remove_hbm_not_device_leaf /
+                # remove_dram_not_host_leaf).  is_host_leaf ⟹ is_tree_leaf,
+                # but is_device_leaf does NOT, so all three are dumped.
+                "is_device_leaf": self._is_device_leaf(node),
+                "is_host_leaf": self._is_host_leaf(node),
+                "is_tree_leaf": len(node.children) == 0,
             })
 
         pool_usage = self._aginfer_pool_usage()
@@ -3761,6 +3770,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 units_buf.extend(_o.dumps(sids_sorted))
             else:
                 units_buf.extend(b',"session_ids":[]')
+            # #210: the three structural leaf predicates (see dict-path
+            # dump) — migrate_candidates mirrors sglang's apply-site guards
+            # 2673/2684/2687 so it never proposes a reject-guaranteed migrate.
+            units_buf.extend(
+                b',"is_device_leaf":'
+                + (b"true" if self._is_device_leaf(node) else b"false"))
+            units_buf.extend(
+                b',"is_host_leaf":'
+                + (b"true" if self._is_host_leaf(node) else b"false"))
+            units_buf.extend(
+                b',"is_tree_leaf":'
+                + (b"true" if len(node.children) == 0 else b"false"))
             units_buf.extend(b"}")
 
             # ---- per-program accumulator (single dict-of-dicts per pid) ----

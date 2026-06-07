@@ -65,6 +65,24 @@ class ReuseUnit:
     # Per-session holders (admission §8 uses this for 1/holders weighting)
     holders: List[str] = field(default_factory=list)
 
+    # DESIGN §7/§9 (#210): the three structural leaf predicates sglang
+    # checks before applying a remove (unified_radix_cache apply site
+    # 2673/2684/2687).  migrate_candidates mirrors them so it never
+    # proposes a reject-guaranteed migrate (which is pure waste — under
+    # A3 saturation the unfiltered policy produced ~86k apply_failed/cycle,
+    # zero relief, daemon thrash).
+    #   is_device_leaf — no child holds device Full-KV, unlocked, not root
+    #                    ⇒ removable from HBM.
+    #   is_host_leaf   — device-evicted, backuped, no children, unlocked
+    #                    ⇒ removable from DRAM.  (Implies is_tree_leaf.)
+    #   is_tree_leaf   — len(children) == 0 ⇒ a full-drop (post-residence
+    #                    empty) is allowed.  is_device_leaf does NOT imply
+    #                    this (disk-only children), so it is carried apart.
+    # Default True keeps pre-#210 fixtures valid; the live dump fills them.
+    is_device_leaf: bool = True
+    is_host_leaf: bool = True
+    is_tree_leaf: bool = True
+
     @property
     def n_bytes(self) -> int:
         """Total bytes across all (tier, subpool).  Convenience for

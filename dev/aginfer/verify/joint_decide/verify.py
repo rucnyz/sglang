@@ -76,6 +76,9 @@ def _unit(
     last_access_time: int = 0,
     hit_count: int = 1,
     subpool: str = "kv",
+    is_device_leaf: bool = True,
+    is_host_leaf: bool = True,
+    is_tree_leaf: bool = True,
 ) -> Dict[str, Any]:
     """Synthetic post-T17 unit JSON.  ``n_bytes_per_tier`` may be a flat
     ``{tier: bytes}`` (single subpool) or a nested ``{tier: {sp: bytes}}``."""
@@ -93,6 +96,9 @@ def _unit(
         "last_access_time": last_access_time,
         "hit_count": hit_count,
         "session_ids": list(holders),
+        "is_device_leaf": is_device_leaf,
+        "is_host_leaf": is_host_leaf,
+        "is_tree_leaf": is_tree_leaf,
     }
 
 
@@ -240,6 +246,94 @@ def stage_a_migrate_candidates() -> None:
     if migrate_candidates(st, [], default_costs()):
         raise StageFail("A: empty decision_set must yield no candidates")
     print(_green("  [A] migrate_candidates: cost/relief/acquired + filter OK"))
+
+
+def stage_a_leaf_filter() -> None:
+    """#210: migrate_candidates must mirror sglang's THREE apply-site leaf
+    guards (unified_radix_cache.py 2673/2684/2687) so it never proposes a
+    remove that sglang is structurally guaranteed to reject — pure waste
+    that under A3 saturation produced ~86k apply_failed/cycle, zero relief,
+    daemon thrash.  Pins each guard with a matched leaf/non-leaf pair:
+      • remove-HBM  ⇐ is_device_leaf  (remove_hbm_not_device_leaf)
+      • remove-DRAM ⇐ is_host_leaf    (remove_dram_not_host_leaf)
+      • full-drop   ⇐ is_tree_leaf    (remove_not_leaf) — STRICTER than
+        device-leaf: a node with disk-only children is a device leaf yet
+        not a tree leaf, so device-leaf alone does not cover full-drop.
+    Each non-leaf branch also asserts the OTHER candidates survive (no
+    over-filtering)."""
+    GB = 1024 ** 3
+    nb = 2_000_000
+
+    def _ids(unit_kwargs, residence, nbt):
+        tracker = ProgramTracker()
+        tracker.observe_arrival("S")
+        sj = _state_json(
+            units=[_unit(uhash="u1", residence=residence, holders=["S"],
+                         n_bytes_per_tier=nbt, **unit_kwargs)],
+            hbm={"kv": _sp(5 * GB, 10 * GB)})
+        st = _build_state(
+            sj, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session="S"))
+        cands = migrate_candidates(st, ["u1"], default_costs())
+        # (sorted add-tier names, sorted remove-tier names) per candidate.
+        return {(tuple(sorted(t.name for t in c.id[1])),
+                 tuple(sorted(t.name for t in c.id[2]))) for c in cands}
+
+    def _removes(ids):
+        return {rem for _add, rem in ids}
+
+    # ---- guard 1: remove-HBM ⇐ device-leaf -------------------------------
+    hd = {"HBM": nb, "DRAM": nb}
+    leaf = _removes(_ids({"is_device_leaf": True}, ["HBM", "DRAM"], hd))
+    if ("HBM",) not in leaf:
+        raise StageFail(f"device-leaf MUST allow remove-HBM; got {leaf}")
+    nonleaf = _removes(_ids({"is_device_leaf": False}, ["HBM", "DRAM"], hd))
+    if any("HBM" in rs for rs in nonleaf):
+        raise StageFail(
+            f"#210: non-device-leaf must yield NO remove-HBM migrate "
+            f"(remove_hbm_not_device_leaf); got {nonleaf}")
+
+    # ---- guard 2: remove-DRAM ⇐ host-leaf --------------------------------
+    # {DRAM,DISK} (device-evicted): the ([],[DRAM]) transition drops the
+    # host backup and keeps DISK (NOT a full-drop), so host-leaf is the only
+    # guard in play.
+    dd = {"DRAM": nb, "DISK": nb}
+    hleaf = _removes(_ids({"is_host_leaf": True}, ["DRAM", "DISK"], dd))
+    if ("DRAM",) not in hleaf:
+        raise StageFail(f"host-leaf MUST allow remove-DRAM; got {hleaf}")
+    hnon = _removes(_ids({"is_host_leaf": False}, ["DRAM", "DISK"], dd))
+    if any("DRAM" in rs for rs in hnon):
+        raise StageFail(
+            f"#210: non-host-leaf must yield NO remove-DRAM migrate "
+            f"(remove_dram_not_host_leaf); got {hnon}")
+    if ("DISK",) not in hnon:
+        raise StageFail(
+            f"over-filtered: remove-DISK must survive when only host-leaf "
+            f"is False; got {hnon}")
+
+    # ---- guard 3: full-drop ⇐ tree-leaf ----------------------------------
+    # {HBM}-only with is_device_leaf=True but is_tree_leaf=False (disk-only
+    # children).  The DROP ([],[HBM]) is a full-drop → must be suppressed by
+    # the stricter tree-leaf guard, which device-leaf alone does NOT cover.
+    # The evict-HBM ([DRAM],[HBM]) is NOT a full-drop (lands in {DRAM}) and,
+    # being a device leaf, must survive.
+    h_only = {"HBM": nb}
+    DROP = ((), ("HBM",))
+    EVICT = (("DRAM",), ("HBM",))
+    tl = _ids({"is_device_leaf": True, "is_tree_leaf": True}, ["HBM"], h_only)
+    if DROP not in tl:
+        raise StageFail(f"tree-leaf MUST allow full-drop; got {tl}")
+    ntl = _ids({"is_device_leaf": True, "is_tree_leaf": False}, ["HBM"], h_only)
+    if DROP in ntl:
+        raise StageFail(
+            f"#210: non-tree-leaf must yield NO full-drop migrate "
+            f"(remove_not_leaf, stricter than device-leaf); got {ntl}")
+    if EVICT not in ntl:
+        raise StageFail(
+            f"over-filtered: device-leaf evict-HBM must survive when only "
+            f"tree-leaf is False; got {ntl}")
+
+    print(_green("  [A-leaf] migrate_candidates mirrors sglang's 3 leaf "
+                 "guards (remove-HBM/DRAM/full-drop) (#210) OK"))
 
 
 def _program(state="REASONING", *, inflight=None, committed=None,
@@ -844,6 +938,7 @@ def stage_g_robustness() -> None:
 
 _STAGES = [
     ("A", stage_a_migrate_candidates),
+    ("A-leaf", stage_a_leaf_filter),
     ("B", stage_b_forecast),
     ("C", stage_c_program_candidates),
     ("D", stage_d_joint_decide_select),
