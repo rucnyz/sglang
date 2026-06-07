@@ -186,10 +186,11 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         the worst-case link).
       * tier_holding_cost[tier][sp].h_max_per_byte_sec: identical
         across ranks (static deployment); take rank-0.
-      * throughput_ema.prefill_bps: SUM across ranks (each rank
-        processes its prefill slice; aggregate is the system rate).
-      * throughput_ema.decode_per_program[pid]: SUM across ranks
-        (a program may have decode work on multiple ranks via TP).
+      * throughput_ema.prefill_bps / decode_per_program[pid]: SUM across
+        ranks — kept consistent with the SUMmed byte fields (the daemon
+        runs in a uniform N×-scaled space; see the inline rationale at the
+        throughput block).  DESIGN §6 L766/L767 "mean" assumes a true-scale
+        regime this impl does not use; true-scale conversion is #214.
       * per_program_usage[pid].hbm.committed[sp] (and dram.committed):
         SUM across ranks; state reconciles to the SAFE side on cross-
         rank disagreement (PAUSED > REASONING > ACTING > ENDED): PAUSED
@@ -204,7 +205,9 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
         to both ranks is the correct action.  On residence disagree-
         ment between ranks we keep the COLDER union (= the unit's
         bytes are persisted somewhere even if mid-migration on one
-        rank).
+        rank).  leaf flags AND-reconcile (#210), session_ids/holders
+        UNION (#211), last_access_time/hit_count MAX (warmest, the
+        liveness-preserving side feeding V_u), n_tokens identical→rank-0.
       * time_counter: MAX across ranks (clocks may differ).
 
     Single-rank shape (no ``per_rank``) is returned unchanged.
@@ -286,7 +289,27 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
     # ---- tier_holding_cost: identical across ranks; take rank-0 ----
     agg_holding = rank0["tier_holding_cost"]
 
-    # ---- throughput_ema: sum prefill, merge decode per program ----
+    # ---- throughput_ema: SUM prefill, SUM decode per program ----
+    # KEEP SUM (status quo).  The daemon runs in a UNIFORM N×-scaled byte
+    # space: a unit's n_bytes are IDENTICAL across ranks (the agree-or-fatal
+    # check below proves KV bytes are MIRRORED, not 1/N-sharded — MLA latent
+    # / replicated prefix), and pool_usage + per-program committed/inflight
+    # are SUMmed, so every absolute byte AND byte-rate is N×.  Because that
+    # scaling is uniform, every consumer cancels: occ is a ratio; the
+    # knapsack compares N× budget vs N× weight; marginal_pause_cost =
+    # (N× inflight) / (N× prefill_bps); forecast growth (N× decode_tokens ×
+    # bpt) is compared against the N× cap.  MEAN-ing ONLY prefill_bps /
+    # decode while committed/inflight/cap stay SUMmed would BREAK those
+    # cancellations and inject a real N× error — so we do not.
+    #
+    # DESIGN §6 L766/L767 say "mean" for these rates: that assumes a
+    # true-scale (or genuinely sharded) regime this impl does not use.
+    # Converting to true-scale means de-N×-ing ALL byte fields together
+    # (pool / committed / inflight / units), not just the two rates —
+    # deferred to #214.  Moot today on two counts: the forecast consumer is
+    # dormant until T11/T26, and this whole multi-rank merge path is dead
+    # until #174 wires per-rank dumps (sglang currently returns a single
+    # pre-aggregated dump → _flatten_per_rank returns it unchanged).
     agg_throughput: Dict[str, Any] = {
         "prefill_bps": sum(
             float(rank["throughput_ema"]["prefill_bps"]) for rank in per_rank),
@@ -438,6 +461,36 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 u_sids = u.get("session_ids") or []
                 existing["session_ids"] = sorted(
                     set(existing_sids) | set(u_sids))
+                # MAX-reconcile last_access_time + hit_count (same transient-
+                # divergence class as the #210 leaf flags / #211 holders
+                # union).  Each rank's scheduler bumps the radix node's
+                # access counters on the SAME request stream, so in a
+                # propagation window one rank can read a just-accessed value
+                # (recent last_access, higher hit_count) while a lagging rank
+                # is stale.  These feed V_u: age = max(1, now - last_access),
+                # lam = hits/age, p_hat = min(1, hits/age) for units with no
+                # live holder.  A stale rank-0 last_access → larger age →
+                # smaller p_hat → the unit looks COLDER → _top_k_by_regret
+                # (saved = p_hat·Δρ·n_tokens) ranks it a demote candidate it
+                # shouldn't be.  Take the SAFE (warmest / liveness-preserving)
+                # side — MAX, mirroring the residence-union "colder superset"
+                # and the holders union — so a stale single-rank view never
+                # spuriously demotes a still-warm unit.  Order-independent.
+                existing["last_access_time"] = max(
+                    int(existing.get("last_access_time", 0)),
+                    int(u.get("last_access_time", 0)))
+                existing["hit_count"] = max(
+                    int(existing.get("hit_count", 0)),
+                    int(u.get("hit_count", 0)))
+                # n_tokens: REPLICATED logical token count (every rank holds
+                # the same prefix tokens; only the head-dim slice of each
+                # token's KV differs), so it is identical across ranks by
+                # construction — like n_bytes but architecture-derived from
+                # the token count rather than the byte shape.  Take rank-0
+                # (kept verbatim from the first-seen unit dict above); a
+                # genuine cross-rank disagreement would be a deployment bug,
+                # but unlike n_bytes there is no per-token fatal guard because
+                # n_tokens is not a sharded byte quantity any consumer sums.
                 continue
             hash_to_idx[uhash] = len(agg_units)
             agg_units.append(dict(u))

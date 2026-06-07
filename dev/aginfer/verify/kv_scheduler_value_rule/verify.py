@@ -342,6 +342,50 @@ def stage_a1d_multi_rank_holders_union() -> None:
                 f"session_ids={sids!r}")
 
 
+def stage_a1g_multi_rank_last_access_hit_count_max() -> None:
+    """Cross-rank access-counter skew (same transient-divergence class as
+    the #210 leaf flags / #211 holders union): radix-node ``last_access_
+    time`` and ``hit_count`` are bumped by EACH rank's own scheduler on the
+    same request stream, so in a propagation window the same hash can read
+    a just-accessed (recent last_access, higher hit_count) value on one
+    rank and a stale one on a lagging rank.  ``_flatten_per_rank`` kept
+    rank-0's values VERBATIM in the dedupe branch — making them ORDER-
+    DEPENDENT, exactly the omission class fixed for holders.
+
+    These feed V_u: ``age = max(1, now - last_access)``, ``lam = hits /
+    age``, ``p_hat = min(1, hits/age)`` (for units with no live holder).
+    A stale rank-0 last_access → larger age → smaller p_hat → the unit
+    looks COLDER → ``_top_k_by_regret`` (saved = p_hat·Δρ·n_tokens) ranks
+    it as a demote candidate it shouldn't be.  Reconcile to the SAFE
+    (warmest / liveness-preserving) side, mirroring residence-union and
+    holders-union: last_access = MAX (most-recent across ranks), hit_count
+    = MAX (most-progressed rank).  Order-independent."""
+    GB = 1024 ** 3
+    rank_recent = _state_json(units=[_unit(
+        uhash="shared", residence=["HBM"], holders=["p0"],
+        n_bytes_per_tier={"HBM": GB}, last_access_time=90, hit_count=7)])
+    rank_stale = _state_json(units=[_unit(
+        uhash="shared", residence=["HBM"], holders=["p0"],
+        n_bytes_per_tier={"HBM": GB}, last_access_time=10, hit_count=2)])
+    for order in ([rank_recent, rank_stale], [rank_stale, rank_recent]):
+        flat = kvs._flatten_per_rank({"per_rank": order})
+        if len(flat["units"]) != 1:
+            raise StageFail(
+                f"shared hash must dedupe; got {len(flat['units'])}")
+        u = flat["units"][0]
+        if int(u["last_access_time"]) != 90:
+            raise StageFail(
+                "cross-rank last_access_time must reconcile to the MAX (most "
+                "recent; a stale rank-0 value inflates age → deflates p_hat → "
+                "spuriously demotes a warm unit); got "
+                f"last_access_time={u['last_access_time']} (expected 90)")
+        if int(u["hit_count"]) != 7:
+            raise StageFail(
+                "cross-rank hit_count must reconcile to the MAX (most-"
+                f"progressed rank); got hit_count={u['hit_count']} "
+                "(expected 7)")
+
+
 def stage_a2_unknown_tier_label_skipped() -> None:
     """A unit residing in an unknown tier label is SKIPPED (not
     silently coerced to HBM — that was the round-1 B1 bug).  The
@@ -1079,6 +1123,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                               stage_a1c_multi_rank_paused_state_wins),
     ("A1d multi-rank holders UNION (order-independent V_u divisor)",
                               stage_a1d_multi_rank_holders_union),
+    ("A1g multi-rank last_access/hit_count MAX (warmest; order-independent V_u)",
+                              stage_a1g_multi_rank_last_access_hit_count_max),
     ("A2 unknown tier label skipped + logged once",
                               stage_a2_unknown_tier_label_skipped),
     ("A3 missing state field → fatal()",
