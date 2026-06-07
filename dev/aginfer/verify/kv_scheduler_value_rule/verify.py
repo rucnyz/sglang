@@ -70,6 +70,9 @@ def _unit(
     last_access_time: int = 0,
     hit_count: int = 1,
     subpool: str = "kv",
+    is_device_leaf: bool = True,
+    is_host_leaf: bool = True,
+    is_tree_leaf: bool = True,
 ) -> Dict[str, Any]:
     """Synthetic post-T17 unit JSON."""
     if n_bytes_per_tier is None:
@@ -83,6 +86,9 @@ def _unit(
         "last_access_time": last_access_time,
         "hit_count": hit_count,
         "session_ids": list(holders),
+        "is_device_leaf": is_device_leaf,
+        "is_host_leaf": is_host_leaf,
+        "is_tree_leaf": is_tree_leaf,
     }
 
 
@@ -215,6 +221,47 @@ def stage_a1_multi_rank_flatten() -> None:
         raise StageFail(
             f"shared-hash units should dedupe: got {len(flat['units'])}"
         )
+
+
+def stage_a1b_multi_rank_leaf_flag_and_reconcile() -> None:
+    """#210 audit: when the SAME hash appears on multiple ranks with
+    DIVERGING leaf flags (a mid-migration window — one rank still has the
+    node device-resident, another has it evicted), ``_flatten_per_rank``
+    must AND-reconcile is_device_leaf / is_host_leaf / is_tree_leaf, NOT
+    keep rank-0's view.  A remove is structurally safe (sglang won't
+    reject it) only if EVERY rank agrees the node is the relevant leaf;
+    taking rank-0's permissive ``True`` would let migrate_candidates
+    propose a remove that the disagreeing rank rejects — re-arming the
+    #210 apply_failed leak in exactly the mid-migration window the
+    residence-union comment already calls out.  Mirror is the residence
+    UNION (colder superset): leaf flags take the AND (stricter)."""
+    GB = 1024 ** 3
+    rank_leaf = _state_json(units=[_unit(
+        uhash="shared", residence=["HBM", "DRAM"], holders=["p0"],
+        n_bytes_per_tier={"HBM": GB, "DRAM": GB},
+        is_device_leaf=True, is_host_leaf=True, is_tree_leaf=True)])
+    rank_nonleaf = _state_json(units=[_unit(
+        uhash="shared", residence=["HBM", "DRAM"], holders=["p0"],
+        n_bytes_per_tier={"HBM": GB, "DRAM": GB},
+        is_device_leaf=False, is_host_leaf=False, is_tree_leaf=False)])
+    # Order-independent: the permissive rank first, then the strict one.
+    flat = kvs._flatten_per_rank({"per_rank": [rank_leaf, rank_nonleaf]})
+    if len(flat["units"]) != 1:
+        raise StageFail(f"shared hash must dedupe; got {len(flat['units'])}")
+    u = flat["units"][0]
+    for k in ("is_device_leaf", "is_host_leaf", "is_tree_leaf"):
+        if u.get(k) is not False:
+            raise StageFail(
+                f"#210: cross-rank {k} must AND-reconcile to False when any "
+                f"rank reports non-leaf (else a remove the disagreeing rank "
+                f"rejects → apply_failed); got {k}={u.get(k)!r}")
+    # And the reverse order yields the same AND (rank-0 strict, rank-1 leaf).
+    flat2 = kvs._flatten_per_rank({"per_rank": [rank_nonleaf, rank_leaf]})
+    u2 = flat2["units"][0]
+    if any(u2.get(k) is not False for k in
+           ("is_device_leaf", "is_host_leaf", "is_tree_leaf")):
+        raise StageFail(
+            f"#210: cross-rank leaf AND must be order-independent; got {u2}")
 
 
 def stage_a2_unknown_tier_label_skipped() -> None:
@@ -948,6 +995,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                               stage_a0_schema_pool_usage_to_tier_usage),
     ("A1 multi-rank per_rank flatten (sum + dedupe)",
                               stage_a1_multi_rank_flatten),
+    ("A1b multi-rank leaf-flag AND-reconcile (#210)",
+                              stage_a1b_multi_rank_leaf_flag_and_reconcile),
     ("A2 unknown tier label skipped + logged once",
                               stage_a2_unknown_tier_label_skipped),
     ("A3 missing state field → fatal()",

@@ -377,6 +377,18 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                             merged_nb[tier][sp] = int(u_val)
                 existing["residence"] = merged_residence
                 existing["n_bytes"] = merged_nb
+                # #210: AND-reconcile the leaf flags.  A remove is structurally
+                # safe (sglang won't reject it) only if EVERY rank agrees the
+                # node is the relevant leaf — in the mid-migration window the
+                # residence-union comment above calls out, one rank can have
+                # the node device-resident (is_device_leaf=True) while another
+                # has it evicted (False).  Keeping rank-0's permissive view
+                # would let migrate_candidates propose a remove the disagreeing
+                # rank rejects, re-arming the #210 apply_failed leak.  AND is
+                # the stricter mirror of the (colder-superset) residence union.
+                for _flag in ("is_device_leaf", "is_host_leaf", "is_tree_leaf"):
+                    existing[_flag] = bool(existing.get(_flag, True)) \
+                        and bool(u.get(_flag, True))
                 continue
             hash_to_idx[uhash] = len(agg_units)
             agg_units.append(dict(u))
