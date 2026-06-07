@@ -207,6 +207,11 @@ def joint_decide(
         # MEMORY_PRESSURE events' cold-unit top-k, not by evicting the hot
         # frontier.  (The per-hash cooldown #223 stays as the backstop for
         # the residual same-tick race on the MEMORY_PRESSURE path.)
+        # TOOL_CALL_END is the only IMPLEMENTED reuse-imminent (promote)
+        # event; SUB_RETURN (§7 — parent tail becomes a promote candidate when
+        # a sub-agent returns) is in DESIGN/the paper but not yet in EventKind.
+        # When it lands, add it here — its decision set is likewise a
+        # about-to-reuse tail that must not be evicted.
         reuse_imminent = getattr(event, "kind", None) == EventKind.TOOL_CALL_END
         # Keep a Migrate iff (a) net-positive (cost < 0 ⇒ moving improves
         # total V_u — a COLD unit) AND (b) it relieves a subpool that is
