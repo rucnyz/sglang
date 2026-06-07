@@ -1152,6 +1152,62 @@ def stage_i_off_budget_consumption_rejected() -> None:
                  "silently free (round-2 audit) OK"))
 
 
+def stage_j_resume_dedup() -> None:
+    """#215: a resume re-proposed while its clearing PUT is still in flight
+    (the dump's overlay lag keeps showing PAUSED) must NOT be re-dispatched
+    every event — pure waste.  But a clear that never lands (lost PUT) MUST
+    still recover (re-fire) after the dedup window, else the program
+    re-starves.  Drives KvScheduler.handle with a FIXED dump (overlay never
+    advances) to model the lag, then flips the dump to model the clear."""
+    GB = 1024 ** 3
+    tracker = ProgramTracker()
+    tracker.pause("R")
+    ob = OutboundQueue(sglang_base_url="http://unused", http_client=_DummyHttp())
+    sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
+                            outbound=ob)
+    sched.admission_enabled = True
+    sj = _state_json(
+        units=[_unit(uhash="uR", residence=["DRAM"], holders=["R"],
+                     n_bytes_per_tier={"DRAM": 1 * GB})],
+        programs={"R": _program("PAUSED", unit_hashes=["uR"],
+                                pre_pause_state="ACTING")},
+        hbm={"kv": _sp(int(0.5 * GB), 10 * GB)})   # 5% → headroom, R fits
+    router = _StubRouter(sj)
+    ev = Event(EventKind.PRESSURE_RESOLVED, session="R")
+
+    # event 1: R is PAUSED in the dump and fits → resume fires once.
+    asyncio.run(sched.handle(ev, router))
+    if sched.resume_calls != 1:
+        raise StageFail(f"J: first event must resume R once, got "
+                        f"{sched.resume_calls}")
+    # event 2: SAME dump (overlay lag, R still shows PAUSED) → within the
+    # dedup window → must NOT re-fire.
+    asyncio.run(sched.handle(ev, router))
+    if sched.resume_calls != 1:
+        raise StageFail(f"#215: a resume re-proposed within the dedup window "
+                        f"(overlay lag) must NOT re-fire; got resume_calls="
+                        f"{sched.resume_calls}")
+    # event 3: window (=2 generations) has now elapsed and the dump STILL
+    # shows PAUSED → treat the clear as lost and recover (re-fire).
+    asyncio.run(sched.handle(ev, router))
+    if sched.resume_calls != 2:
+        raise StageFail(f"#215: a clear that never lands must recover (re-fire) "
+                        f"after the dedup window; got resume_calls="
+                        f"{sched.resume_calls}")
+    # the dump finally reflects the clear (R no longer PAUSED): no further
+    # resume, and the in-flight entry is pruned.
+    router._sj["per_program_usage"]["R"]["state"] = "ACTING"
+    asyncio.run(sched.handle(ev, router))
+    if sched.resume_calls != 2:
+        raise StageFail(f"J: once the dump clears PAUSED, no further resume; "
+                        f"got {sched.resume_calls}")
+    if "R" in sched._resume_inflight:
+        raise StageFail("J: in-flight entry must be pruned once the dump "
+                        "confirms the clear (no longer PAUSED)")
+    print(_green("  [J] resume dedup: suppresses re-fire in the overlay-lag "
+                 "window, recovers a lost clear after it, prunes on clear (#215) OK"))
+
+
 # ============================================================ runner
 
 _STAGES = [
@@ -1167,6 +1223,7 @@ _STAGES = [
     ("G", stage_g_robustness),
     ("H", stage_h_relief_targets_pressured_subpool),
     ("I", stage_i_off_budget_consumption_rejected),
+    ("J", stage_j_resume_dedup),
 ]
 
 

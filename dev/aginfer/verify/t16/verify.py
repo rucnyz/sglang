@@ -249,12 +249,15 @@ def stage_5_multi_subpool_aggregation() -> None:
         )
 
 
-def stage_6_dropped_unit_silently_zero() -> None:
-    """A hash in ``program_unit_hashes`` that is NOT in the units dict
-    (legitimate: unit was DROPped between pause and now, sglang no
-    longer reports it) contributes 0 silently.  The alternative —
-    raising KeyError — would force callers to pre-filter, which is
-    redundant with the no-op skip."""
+def stage_6_partial_drop_credits_reprefill() -> None:
+    """#216: a hash NOT in ``units`` (DROPped while the program was gated)
+    is credited a re-prefill estimate when the program has SURVIVING units
+    (partial drop) — on resume it re-prefills that prefix into HBM, a burst
+    the load-back model misses, so ``capacity_fits`` must see it.  The
+    estimate is the program's own per-unit mean (per subpool).
+
+    1 surviving DRAM unit (1024 in 'attn') + 2 dropped:
+      re_use = 1024 (load-back) + (1024/1)*2 (dropped credit) = 3072."""
     units = {
         "h_present": _unit(
             "h_present",
@@ -267,11 +270,80 @@ def stage_6_dropped_unit_silently_zero() -> None:
         program_unit_hashes=["h_present", "h_gone", "h_also_gone"],
         units=units,
     )
-    if out != {"attn": 1024}:
+    if out != {"attn": 3072}:
         raise StageFail(
-            f"missing hashes should be silent zero contribution; "
-            f"got {out!r}"
-        )
+            f"partial drop must credit dropped units the surviving per-unit "
+            f"mean (1024 load-back + 2×1024 dropped = 3072); got {out!r}")
+
+
+def stage_6b_full_drop_stays_zero() -> None:
+    """#216 carve-out preserving #211/#213: a FULLY-dropped program (NO
+    surviving unit to size from) keeps re_use = {} so it can still un-starve
+    — releasing the gate is free, re-prefill is future work sglang admission-
+    controls.  Two live shapes: (a) hashes listed but all gone, (b) empty
+    unit_hashes (the overlay's empty residue)."""
+    units = {}  # all of this program's units were DROPped
+    out_a = expected_peak_hbm_after_resume(["h_gone", "h_also_gone"], units)
+    if out_a != {}:
+        raise StageFail(f"#211: fully-dropped (hashes listed, all gone) must "
+                        f"keep re_use={{}} to un-starve; got {out_a!r}")
+    out_b = expected_peak_hbm_after_resume([], units)
+    if out_b != {}:
+        raise StageFail(f"#211: empty unit_hashes (overlay residue) must keep "
+                        f"re_use={{}}; got {out_b!r}")
+
+
+def stage_6c_hbm_resident_survivor_sizes_dropped() -> None:
+    """#216 + B1: a surviving HBM-resident unit contributes 0 to its own
+    load-back (B1), but DOES size the dropped-unit credit (we need byte SIZE,
+    not residence).  1 HBM-resident survivor (2048 in 'attn') + 1 dropped:
+      re_use = 0 (B1, no load-back) + (2048/1)*1 (dropped credit) = 2048."""
+    units = {
+        "h_hbm": _unit(
+            "h_hbm",
+            residence=[Tier.HBM],
+            n_bytes_by_tier={Tier.HBM: {"attn": 2048}},
+            holders=["paused-prog", "other"],
+        ),
+    }
+    out = expected_peak_hbm_after_resume(["h_hbm", "h_gone"], units)
+    if out != {"attn": 2048}:
+        raise StageFail(
+            f"HBM-resident survivor must size the dropped credit (0 load-back "
+            f"+ 1×2048 dropped = 2048); got {out!r}")
+
+
+def stage_6d_no_drop_unchanged() -> None:
+    """No dropped units → behaviour is exactly the load-back sum (the #216
+    credit never fires).  2 DRAM survivors (1024 + 4096) → {'attn': 5120}."""
+    units = {
+        "h1": _unit("h1", residence=[Tier.DRAM],
+                    n_bytes_by_tier={Tier.DRAM: {"attn": 1024}}, holders=["p"]),
+        "h2": _unit("h2", residence=[Tier.DRAM],
+                    n_bytes_by_tier={Tier.DRAM: {"attn": 4096}}, holders=["p"]),
+    }
+    out = expected_peak_hbm_after_resume(["h1", "h2"], units)
+    if out != {"attn": 5120}:
+        raise StageFail(f"no-drop must equal the load-back sum 5120; got {out!r}")
+
+
+def stage_6e_multi_subpool_credit() -> None:
+    """#216 credit is distributed per subpool at each subpool's surviving
+    mean.  2 survivors: one DRAM 'full' 600, one DRAM 'swa' 200; 2 dropped.
+      'full': 600 load-back + (600/2)*2 = 600+600 = 1200
+      'swa' : 200 load-back + (200/2)*2 = 200+200 = 400
+    (mean per subpool divides by the TOTAL survivor count, n=2.)"""
+    units = {
+        "h_full": _unit("h_full", residence=[Tier.DRAM],
+                        n_bytes_by_tier={Tier.DRAM: {"full": 600}}, holders=["p"]),
+        "h_swa": _unit("h_swa", residence=[Tier.DRAM],
+                       n_bytes_by_tier={Tier.DRAM: {"swa": 200}}, holders=["p"]),
+    }
+    out = expected_peak_hbm_after_resume(
+        ["h_full", "h_swa", "h_d1", "h_d2"], units)
+    if out != {"full": 1200, "swa": 400}:
+        raise StageFail(f"multi-subpool credit wrong; expected "
+                        f"{{'full':1200,'swa':400}}, got {out!r}")
 
 
 def stage_7_idempotent_pure_function() -> None:
@@ -363,7 +435,14 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("3  DISK-only unit full bytes",                   stage_3_disk_only_unit_full_bytes),
     ("4  mixed bag — only non-HBM counts",             stage_4_mixed_bag_only_non_hbm_counts),
     ("5  multi-subpool aggregation",                   stage_5_multi_subpool_aggregation),
-    ("6  dropped/missing hash silently zero",          stage_6_dropped_unit_silently_zero),
+    ("6  partial-drop credits re-prefill estimate (#216)",
+                                                       stage_6_partial_drop_credits_reprefill),
+    ("6b full-drop stays zero — un-starve preserved (#211/#213)",
+                                                       stage_6b_full_drop_stays_zero),
+    ("6c HBM-resident survivor sizes dropped credit (#216+B1)",
+                                                       stage_6c_hbm_resident_survivor_sizes_dropped),
+    ("6d no-drop unchanged (load-back sum)",           stage_6d_no_drop_unchanged),
+    ("6e multi-subpool credit distribution (#216)",    stage_6e_multi_subpool_credit),
     ("7  pure / idempotent / non-mutating",            stage_7_idempotent_pure_function),
     ("8  capacity_fits no-double-count scenario (B1 E2E)",
                                                        stage_8_capacity_fits_no_double_count_scenario),
