@@ -3054,9 +3054,13 @@ class UnifiedRadixCache(BasePrefixCache):
         # Skip pids the ENDED-GC just dropped (#200 audit): an ENDED
         # program with a still-draining running req must NOT be resurrected
         # here as REASONING (the GC is authoritative about termination).
-        for pid, sp_bytes in self._aginfer_runtime_metrics.get(
-            "inflight", {}
-        ).items():
+        # #217: default via getattr — runtime metrics (T26/#200) may not be
+        # pushed yet (cold start before the scheduler's first
+        # set_aginfer_runtime_metrics), and the overlay must still build a
+        # valid program-state map rather than AttributeError.
+        for pid, sp_bytes in getattr(
+            self, "_aginfer_runtime_metrics", {}
+        ).get("inflight", {}).items():
             if pid in ended_gcd:
                 continue
             e = per_program.setdefault(pid, {
@@ -3431,7 +3435,7 @@ class UnifiedRadixCache(BasePrefixCache):
         Empty until the scheduler pushes a measurement, so the formulas
         still degenerate to their no-signal branches at cold-start.
         """
-        m = self._aginfer_runtime_metrics
+        m = getattr(self, "_aginfer_runtime_metrics", {})   # #217: cold-start safe
         return {
             "prefill_bps": float(m.get("prefill_bps", 0.0)),
             "decode_per_program": dict(m.get("decode_per_program", {})),
