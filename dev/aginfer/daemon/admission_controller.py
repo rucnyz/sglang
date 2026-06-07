@@ -420,11 +420,23 @@ def capacity_fits(
     hbm_subpools: Dict[str, Dict[str, int]],
     theta_hi: float,
 ) -> bool:
-    """DESIGN §8 ``capacity_fits`` — true iff for EVERY HBM subpool:
-    ``forecast[sp] + re_use[sp] ≤ theta_hi × cap[sp]``."""
+    """DESIGN §8 ``capacity_fits`` — true iff resuming the program does not
+    push ANY HBM subpool past theta_hi.  For a subpool the resume ADDS bytes
+    to: ``forecast[sp] + re_use[sp] ≤ theta_hi × cap[sp]``.
+
+    #213: a resume that adds ZERO bytes to a subpool never makes that subpool
+    worse, so it must NOT be blocked just because the subpool is ALREADY over
+    theta_hi from OTHER programs' load.  Otherwise a free un-starve (a paused
+    program whose units were DROPped → empty re_use) is permanently rejected
+    whenever any subpool is pegged (A3 swa ~0.99) → monotonic-pause
+    starvation.  So skip subpools the resume doesn't touch; gate only the
+    ones it actually grows."""
     for sp, fields in hbm_subpools.items():
+        add = float(re_use.get(sp, 0))
+        if add <= 0.0:
+            continue  # zero-add: can't make this subpool worse
         cap = float(fields["cap_bytes"])
-        proj = forecast_dict.get(sp, 0.0) + float(re_use.get(sp, 0))
+        proj = forecast_dict.get(sp, 0.0) + add
         if proj > theta_hi * cap:
             return False
     return True

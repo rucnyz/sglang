@@ -124,6 +124,45 @@ def joint_decide(
     hbm_cap = tu.pool_cap.get(Tier.HBM, {})
     fc = adm.forecast(state, heartbeat_s)            # {sp: forecast bytes}
 
+    def _resume_plan() -> List[Any]:
+        """#213: a paused program resumes as soon as IT fits, per-subpool —
+        decoupled from pressure on OTHER subpools.  ``free_room`` is the
+        theta_lo headroom (hysteresis margin) clamped to >=0; a resume with
+        zero re_use on a tight/pegged subpool has zero weight THERE and so
+        fits even under pressure (the un-starve path for dropped-units
+        programs).  Run EVERY event — not just when all subpools have cooled.
+
+        Why: the pressure and resume phases used to be mutually exclusive
+        (pressure ran whenever ANY subpool crossed theta_hi, resume only in
+        the else).  Under a permanently-pegged subpool (A3 swa ~0.99) the
+        pressure phase is always active, so resume never fired → the daemon
+        paused monotonically and agents starved.  Running resume alongside
+        pressure makes admission a feedback controller: pause the heavy
+        programs, run what fits, and resume paused programs as running ones
+        finish and free capacity.  capacity_fits (theta_hi, inside
+        resume_candidates) already keeps a resume from re-pressuring a tight
+        subpool, so a resumed program never worsens the pegged axis."""
+        if not (admission_enabled and hbm_cap):
+            return []
+        free_room = {
+            ("HBM", sp): max(0.0, theta_lo * float(cap) - fc.get(sp, 0.0))
+            for sp, cap in hbm_cap.items()
+        }
+        rcands = adm.resume_candidates(state, heartbeat_s, theta_hi)
+        rcands = [replace(c, re_use={"HBM": c.re_use}) for c in rcands]
+        if not rcands:
+            return []
+        rbucket = {axis: _page_bytes(state, axis[0], axis[1])
+                   for axis in free_room}
+        rctx = {"event": getattr(event, "kind", event), "phase": "headroom",
+                "forecast": fc, "theta_lo": theta_lo}
+        try:
+            return knapsack_max_value_multi(
+                rcands, free_room, rbucket, context=rctx)
+        except KnapsackBudgetExceededError as exc:
+            fatal("joint_decide_dp_blowup", **exc.context)
+            return []
+
     # ---- Pressure phase ----
     bytes_needed = {
         ("HBM", sp): max(0.0, fc.get(sp, 0.0) - theta_hi * float(cap))
@@ -199,36 +238,13 @@ def joint_decide(
                     sp, freed.get(sp, 0), int(need), len(cands),
                     admission_enabled,
                 )
-        return plan
+        # #213: resume runs ALONGSIDE pressure now (no longer suppressed).
+        # The pressure plan pauses heavy programs / migrates KV; the resume
+        # plan admits paused programs that fit per-subpool (zero weight on the
+        # pegged subpool).  Different programs, independent levers — together
+        # they make admission a feedback controller instead of monotonic
+        # pausing.  (#211 zero-re_use Resumes are kept — a free un-starve.)
+        return plan + _resume_plan()
 
-    # ---- Headroom phase (pressure suppresses it across all subpools) ----
-    free_room = {
-        ("HBM", sp): max(0.0, theta_lo * float(cap) - fc.get(sp, 0.0))
-        for sp, cap in hbm_cap.items()
-    }
-    if admission_enabled and hbm_cap and all(r > 0 for r in free_room.values()):
-        cands = adm.resume_candidates(state, heartbeat_s, theta_hi)
-        cands = [replace(c, re_use={"HBM": c.re_use}) for c in cands]
-        # #211: do NOT drop zero-re_use Resumes.  A paused program whose
-        # units were DROPped while gated has empty re_use, but resuming it
-        # is a FREE un-starve (zero HBM, just release the proxy gate) — the
-        # cheapest possible headroom action, not a no-op.  resume_candidates
-        # already gated each candidate on capacity_fits, and the knapsack
-        # enforces free_room, so every candidate here is legitimately
-        # grantable; filtering by re_use bytes would strand the program.
-        bucket_size = {axis: _page_bytes(state, axis[0], axis[1])
-                       for axis in free_room}
-        ctx = {
-            "event": getattr(event, "kind", event),
-            "phase": "headroom",
-            "forecast": fc,
-            "theta_lo": theta_lo,
-        }
-        try:
-            return knapsack_max_value_multi(
-                cands, free_room, bucket_size, context=ctx)
-        except KnapsackBudgetExceededError as exc:
-            fatal("joint_decide_dp_blowup", **exc.context)
-        return []
-
-    return []  # hysteresis dead-zone
+    # ---- No pressure on any subpool: resume what fits (cool-down). ----
+    return _resume_plan()

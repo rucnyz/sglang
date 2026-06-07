@@ -650,6 +650,62 @@ def stage_d_resume_starvation() -> None:
                  "in headroom; valuable+floored co-grant (#211) OK"))
 
 
+def stage_d_resume_under_pressure() -> None:
+    """#213: resume must run ALONGSIDE pressure — not be suppressed by it.
+
+    The killer bug in the live A3 daemon arm: the pressure and resume phases
+    were mutually exclusive (pressure ran whenever ANY subpool crossed
+    theta_hi; resume only in the else).  Under a permanently-pegged subpool
+    (A3 swa ~0.99) the pressure phase is ALWAYS active → resume never fires →
+    the daemon pauses monotonically and agents starve to AgentTimeout.
+
+    New contract: a paused program that FITS (zero re_use on the pegged
+    subpool — e.g. its units were DROPped) resumes even while that subpool is
+    pressured.  A paused program that does NOT fit (re_use on the pegged
+    subpool) stays suppressed (capacity_fits, exercised by stage D).  So the
+    plan under pressure carries BOTH the pressure response AND the un-starve
+    resume."""
+    from daemon import joint_decide as jd
+    GB = 1024 ** 3
+    kw = dict(costs=default_costs(), pi_u=1.0e-4,
+              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+    tracker = ProgramTracker()
+    tracker.observe_arrival("S")
+    tracker.observe_arrival("P")
+    tracker.pause("P")
+    # Single HBM subpool pegged at 90% (> theta_hi) → pressure phase active.
+    # An ACTIVE program S holds the HBM-resident pressure; a PAUSED program P
+    # has DROPped units (empty re_use → zero weight on the pegged subpool).
+    sj = _state_json(
+        units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
+                     n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
+        programs={
+            "S": _program("REASONING", committed={"kv": 9 * GB},
+                          unit_hashes=["u1"]),
+            "P": _program("PAUSED", unit_hashes=[],   # dropped → empty re_use
+                          pre_pause_state="REASONING"),
+        },
+        hbm={"kv": _sp(9 * GB, 10 * GB)},
+    )
+    ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
+    st = _build_state(sj, tracker, ev)
+    plan = jd.joint_decide(st, ev, **kw)
+    # Pressure must still be acted on (a Pause and/or Migrate present)...
+    if not any(isinstance(c, (Pause, Migrate)) for c in plan):
+        raise StageFail(
+            "D-press-resume: pressure must still be acted on (Pause/Migrate); "
+            f"got {[type(c).__name__ for c in plan]}")
+    # ...AND the un-starve resume of P must NOT be suppressed by the pressure.
+    resumed = {c.pid for c in plan if isinstance(c, Resume)}
+    if "P" not in resumed:
+        raise StageFail(
+            "#213: a dropped-units PAUSED program must resume even under "
+            "pressure (pressure no longer suppresses fitting resumes); got "
+            f"resumes={resumed}, plan={[type(c).__name__ for c in plan]}")
+    print(_green("  [D-press-resume] resume runs alongside pressure; "
+                 "fitting paused program un-starved under pressure (#213) OK"))
+
+
 # ============================================================ Stage E
 
 
@@ -1108,6 +1164,7 @@ _STAGES = [
     ("C", stage_c_program_candidates),
     ("D", stage_d_joint_decide_select),
     ("D-starve", stage_d_resume_starvation),
+    ("D-press-resume", stage_d_resume_under_pressure),
     ("E", stage_e_dp_correctness),
     ("F", stage_f_live_dispatch),
     ("G", stage_g_robustness),
