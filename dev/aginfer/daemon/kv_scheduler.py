@@ -110,6 +110,35 @@ if _CONST_VU:
 # unit at 2 KB/token × 4 k tokens/unit).
 _DEFAULT_MEMORY_PRESSURE_TOPK = _env_int("AGINFER_MEMORY_PRESSURE_TOPK", "256")
 
+# #223: per-hash TOCTOU evict cooldown (seconds).  A device-leaf at dump time
+# can gain a device-KV child before the migrate applies (a concurrent request
+# extends that prefix — common for popular shared-prefix nodes), so a
+# correctly-proposed remove-HBM is rejected at apply (remove_hbm_not_device_
+# leaf).  The dump keeps reporting it as a leaf, so it is re-proposed every
+# event → a systematic reject storm (956/cycle observed, migrate_applied=0).
+# On a leaf-reject APPLY_FAILED we cool the hash down for this long; the
+# dispatch skips re-proposing a REMOVE for a cooled hash until it expires (by
+# then the node has usually gained a stable host backup or been evicted by
+# sglang itself).  Backoff, not value math — wall-clock is fine here.
+_EVICT_COOLDOWN_S = _env_float("AGINFER_EVICT_COOLDOWN_S", "5.0")
+
+
+def _filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
+                          now: float) -> List[Any]:
+    """#223: drop any migrate that REMOVES a tier for a hash currently in the
+    TOCTOU evict cooldown.  Pure-add migrates (write-through) for a cooled
+    hash still pass — only the failing remove is backed off.  Expired entries
+    are ignored (and pruned by the caller)."""
+    from .joint_decide import Migrate
+    out: List[Any] = []
+    for c in plan:
+        if isinstance(c, Migrate):
+            uid, _add, remove = c.id
+            if remove and cooldown.get(uid, 0.0) > now:
+                continue
+        out.append(c)
+    return out
+
 
 # DESIGN §7 bw_free branch: link is "cold-idle" iff
 # time_since_last_sample_s > LINK_IDLE_SECONDS.  Public so
@@ -1191,6 +1220,17 @@ class KvScheduler:
             heartbeat_s=router.heartbeat_s,
             admission_enabled=self.admission_enabled,
         )
+        # #223: back off remove migrates for hashes whose remove recently
+        # failed the dump-vs-apply leaf TOCTOU (cooldown populated by the
+        # APPLY_FAILED handler on the router).  Prunes expired entries.
+        _cd = getattr(router, "evict_cooldown", None)
+        if _cd:
+            import time as _time
+            _now = _time.monotonic()
+            for _h in [h for h, exp in _cd.items() if exp <= _now]:
+                _cd.pop(_h, None)
+            if _cd:
+                plan = _filter_cooled_evicts(plan, _cd, _now)
         self.decisions += 1
         self.last_plan = plan
         if not plan:

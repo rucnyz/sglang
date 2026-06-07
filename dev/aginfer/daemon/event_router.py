@@ -317,6 +317,20 @@ async def _apply_failed_handler(event: Event, router: "EventRouter") -> None:
     action_id = payload.get("action_id")
     if isinstance(reason, str) and reason:
         router.observability.record_failure(reason)
+        # #223: a dump-vs-apply leaf TOCTOU (remove_*_not_*_leaf /
+        # remove_not_leaf) means a correctly-proposed remove was rejected
+        # because the node gained a child before apply.  Cool the hash down
+        # so the daemon stops re-proposing the doomed remove every event
+        # (the systematic 956/cycle reject storm).  Keyed on hash; read by
+        # kv_scheduler.handle before dispatch.
+        h = payload.get("hash")
+        if h and "leaf" in reason:
+            import time as _time
+            from .kv_scheduler import _EVICT_COOLDOWN_S
+            cd = getattr(router, "evict_cooldown", None)
+            if cd is None:
+                cd = router.evict_cooldown = {}
+            cd[str(h)] = _time.monotonic() + _EVICT_COOLDOWN_S
     logger.info(
         "aginfer apply_failed received: endpoint=%s action_id=%s reason=%s "
         "hash=%s",

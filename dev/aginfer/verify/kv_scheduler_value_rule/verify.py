@@ -1109,6 +1109,38 @@ def stage_f1_latency_decide_under_budget() -> None:
         )
 
 
+def stage_g0_evict_cooldown_filter() -> None:
+    """#223: a hash whose remove failed the dump-vs-apply leaf TOCTOU is
+    cooled down so the daemon stops re-proposing the doomed remove every
+    event (the 956/cycle reject storm).  ``_filter_cooled_evicts`` drops a
+    REMOVE migrate for a cooled hash, keeps a pure-ADD migrate for the same
+    hash (only the failing op is backed off), and keeps non-cooled / expired
+    hashes."""
+    from baselines.knapsack import Migrate
+    now = 1000.0
+    cd = {"hot": now + 5.0, "stale": now - 1.0}   # stale = expired
+    plan = [
+        Migrate(cost=1, relief={"HBM": {"kv": 1}}, acquired={},
+                id=("hot", [], ["HBM"]), group="hot"),       # cooled remove
+        Migrate(cost=1, relief={}, acquired={"DRAM": {"kv": 1}},
+                id=("hot", ["DRAM"], []), group="hot"),       # cooled pure-add
+        Migrate(cost=1, relief={"HBM": {"kv": 1}}, acquired={},
+                id=("cold", [], ["HBM"]), group="cold"),      # not cooled
+        Migrate(cost=1, relief={"HBM": {"kv": 1}}, acquired={},
+                id=("stale", [], ["HBM"]), group="stale"),    # expired
+    ]
+    kept = {(c.id[0], tuple(c.id[1])) for c in
+            kvs._filter_cooled_evicts(plan, cd, now)}
+    if ("hot", ()) in kept:
+        raise StageFail("#223: cooled-hash REMOVE must be dropped")
+    if ("hot", ("DRAM",)) not in kept:
+        raise StageFail("#223: cooled-hash pure-ADD must be kept "
+                        "(only the failing remove is backed off)")
+    if ("cold", ()) not in kept or ("stale", ()) not in kept:
+        raise StageFail("#223: non-cooled and expired hashes must be kept; "
+                        f"got {kept}")
+
+
 # ============================================================ run
 
 
@@ -1161,6 +1193,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                               stage_f0_idempotence_same_state_same_action),
     ("F1 latency: decide(1k units) mean+3σ < 25 ms",
                               stage_f1_latency_decide_under_budget),
+    ("G0 #223 evict-cooldown filter (drop cooled REMOVE, keep ADD/cold)",
+                              stage_g0_evict_cooldown_filter),
 ]
 
 
