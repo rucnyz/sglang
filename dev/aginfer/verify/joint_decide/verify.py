@@ -1153,13 +1153,17 @@ def stage_i_off_budget_consumption_rejected() -> None:
 
 
 def stage_j_resume_dedup() -> None:
-    """#215: a resume re-proposed while its clearing PUT is still in flight
-    (the dump's overlay lag keeps showing PAUSED) must NOT be re-dispatched
-    every event — pure waste.  But a clear that never lands (lost PUT) MUST
-    still recover (re-fire) after the dedup window, else the program
-    re-starves.  Drives KvScheduler.handle with a FIXED dump (overlay never
-    advances) to model the lag, then flips the dump to model the clear."""
+    """#215 (tracker-authority rework): a resume the daemon has already issued
+    must NOT be re-dispatched every event while the dump's overlay lag still
+    shows PAUSED (pure waste) — the program_tracker, reconciled against the
+    fresh dump, owns this (no parallel dedup cache).  But a clear that never
+    lands (lost PUT — the outbound queue does not retry) MUST still recover
+    (re-fire) after the bounded window, else the program re-starves.  Drives
+    KvScheduler.handle with a FIXED dump (overlay never advances) to model the
+    lag/loss, then flips the dump to model the clear landing."""
     GB = 1024 ** 3
+    from daemon import kv_scheduler as _kvs
+    win = _kvs._RESUME_DEDUP_WINDOW
     tracker = ProgramTracker()
     tracker.pause("R")
     ob = OutboundQueue(sglang_base_url="http://unused", http_client=_DummyHttp())
@@ -1175,37 +1179,44 @@ def stage_j_resume_dedup() -> None:
     router = _StubRouter(sj)
     ev = Event(EventKind.PRESSURE_RESOLVED, session="R")
 
-    # event 1: R is PAUSED in the dump and fits → resume fires once.
+    # event 1: R PAUSED in the dump and fits → resume fires once; the tracker
+    # now reports the resume in flight.
     asyncio.run(sched.handle(ev, router))
     if sched.resume_calls != 1:
         raise StageFail(f"J: first event must resume R once, got "
                         f"{sched.resume_calls}")
-    # event 2: SAME dump (overlay lag, R still shows PAUSED) → within the
-    # dedup window → must NOT re-fire.
+    if not tracker.resume_in_flight("R"):
+        raise StageFail("J: tracker must report R's resume in flight after dispatch")
+    # event 2: SAME dump (overlay lag) → within the dedup window → no re-fire.
     asyncio.run(sched.handle(ev, router))
     if sched.resume_calls != 1:
-        raise StageFail(f"#215: a resume re-proposed within the dedup window "
-                        f"(overlay lag) must NOT re-fire; got resume_calls="
-                        f"{sched.resume_calls}")
-    # event 3: window (=2 generations) has now elapsed and the dump STILL
-    # shows PAUSED → treat the clear as lost and recover (re-fire).
-    asyncio.run(sched.handle(ev, router))
-    if sched.resume_calls != 2:
-        raise StageFail(f"#215: a clear that never lands must recover (re-fire) "
-                        f"after the dedup window; got resume_calls="
-                        f"{sched.resume_calls}")
+        raise StageFail(f"#215: a resume re-proposed within the window "
+                        f"(overlay lag) must NOT re-fire; got {sched.resume_calls}")
+    # keep the SAME dump (clear never lands): the tracker must re-arm after the
+    # window and the resume must recover (re-fire) — bounded by win+1 events.
+    fired_again_at = None
+    for k in range(win + 2):
+        asyncio.run(sched.handle(ev, router))
+        if sched.resume_calls == 2:
+            fired_again_at = k
+            break
+    if fired_again_at is None:
+        raise StageFail(f"#215: a lost clear must recover (re-fire) within the "
+                        f"window ({win}); resume_calls stuck at {sched.resume_calls}")
     # the dump finally reflects the clear (R no longer PAUSED): no further
-    # resume, and the in-flight entry is pruned.
+    # resume, and the tracker's in-flight record is pruned.
+    calls_before = sched.resume_calls
     router._sj["per_program_usage"]["R"]["state"] = "ACTING"
     asyncio.run(sched.handle(ev, router))
-    if sched.resume_calls != 2:
+    if sched.resume_calls != calls_before:
         raise StageFail(f"J: once the dump clears PAUSED, no further resume; "
-                        f"got {sched.resume_calls}")
-    if "R" in sched._resume_inflight:
-        raise StageFail("J: in-flight entry must be pruned once the dump "
-                        "confirms the clear (no longer PAUSED)")
-    print(_green("  [J] resume dedup: suppresses re-fire in the overlay-lag "
-                 "window, recovers a lost clear after it, prunes on clear (#215) OK"))
+                        f"{sched.resume_calls} vs {calls_before}")
+    if tracker.resume_in_flight("R"):
+        raise StageFail("J: tracker in-flight record must be pruned once the "
+                        "dump confirms the clear (no longer PAUSED)")
+    print(_green("  [J] resume dedup via program_tracker: suppresses re-fire in "
+                 "the overlay-lag window, recovers a lost clear, prunes on clear "
+                 "(#215) OK"))
 
 
 # ============================================================ runner

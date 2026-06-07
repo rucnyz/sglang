@@ -418,6 +418,50 @@ async def step_gc_ended_bounds_tracker() -> None:
     assert pt3.state("reuse") is State.REASONING, "reused pid must resurrect"
 
 
+async def step_resume_ack_reconciliation() -> None:
+    """#215: the tracker owns resume-in-flight bookkeeping (reconciled against
+    the fresh dump), so the daemon does not re-fire a resume during overlay lag
+    yet recovers a lost clear.  Unit-test the primitive directly."""
+    WIN = 2
+    pt = ProgramTracker()
+    pt.pause("p")
+    # before any resume: not in flight.
+    assert not pt.resume_in_flight("p"), "no resume issued yet"
+    # daemon issues the resume.
+    pt.resume("p")                         # resume() records issued (age 0)
+    assert pt.resume_in_flight("p"), "resume must be in flight right after resume()"
+
+    # dump STILL shows p PAUSED (overlay lag / lost clear): stays in flight up
+    # to WIN reconciles, then re-arms (recovery) so the daemon re-fires.
+    for k in range(WIN):
+        pt.reconcile_resume_acks({"p"}, WIN)
+        assert pt.resume_in_flight("p"), (
+            f"must remain suppressed within the window (k={k})")
+    pt.reconcile_resume_acks({"p"}, WIN)   # one past the window
+    assert not pt.resume_in_flight("p"), (
+        "a clear that never lands must re-arm after the window (recovery)")
+
+    # clear LANDED: dump no longer shows p PAUSED → record dropped immediately.
+    pt.resume("p")
+    assert pt.resume_in_flight("p")
+    pt.reconcile_resume_acks(set(), WIN)   # p not in the dump's PAUSED set
+    assert not pt.resume_in_flight("p"), "clear landed → record dropped at once"
+
+    # a fresh pause cycle clears a stale in-flight record so the new cycle's
+    # resume is not wrongly suppressed.
+    pt.resume("p")
+    assert pt.resume_in_flight("p")
+    pt.pause("p")
+    assert not pt.resume_in_flight("p"), "fresh pause must clear stale record"
+
+    # gc_ended also reclaims the record (no leak).
+    pt.resume("p")
+    pt.end("p")
+    pt.gc_ended(live_pids=set())           # p ended + no units → reclaimed
+    assert not pt.resume_in_flight("p"), "gc_ended must drop the record"
+    assert "p" not in pt._resume_issued_age
+
+
 async def main() -> None:
     print("=== T6 verify: program_tracker state machine ===")
     print()
@@ -461,6 +505,10 @@ async def main() -> None:
     await step_gc_ended_bounds_tracker()
     print("[9] #190: gc_ended reclaims ENDED-no-units pids (bounded "
           "tracker); keeps live + gated + ENDED-with-units; reuse resurrects ✓")
+
+    await step_resume_ack_reconciliation()
+    print("[10] #215: resume-in-flight bookkeeping — suppressed in the lag "
+          "window, re-arms on a lost clear, drops on landed/pause/gc ✓")
 
     dur_ms = (time.perf_counter() - t0) * 1000
     print()

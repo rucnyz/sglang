@@ -123,6 +123,16 @@ class ProgramTracker:
         # proxy ends the program on disconnect only when this drops to
         # zero.
         self._gated_count: Dict[str, int] = {}
+        # #215 resume-ack bookkeeping.  The tracker is the daemon's single
+        # authority for program lifecycle (DESIGN §10 "derived cache"); a
+        # resume the daemon has ISSUED but sglang has not yet reflected in the
+        # dump (overlay lag) lives here so the same pid is not re-proposed
+        # every event.  Maps pid -> consecutive dumps still showing it PAUSED
+        # since we issued the resume.  This is NOT the forbidden per-unit hint
+        # cache (§10): it is bounded by the paused-program count, pruned on
+        # ack, and reconstructed from the dump on restart like the rest of the
+        # tracker.
+        self._resume_issued_age: Dict[str, int] = {}
 
     # ---- queries ----
 
@@ -197,6 +207,9 @@ class ProgramTracker:
         # from a prior cycle so the freshly-parked request is judged
         # on THIS cycle's outcome (resume → proceed, end → 499).
         self._ended_while_gated.discard(pid)
+        # #215: a fresh pause is a new gate cycle — clear any resume-in-flight
+        # record from a prior cycle so this cycle's resume is not suppressed.
+        self._resume_issued_age.pop(pid, None)
         self._event(pid).clear()
         logger.info("program_tracker: paused %s", pid)
         from ._metrics import m as _m
@@ -226,8 +239,46 @@ class ProgramTracker:
                 pid,
             )
         self._event(pid).set()
+        # #215: from this point the daemon has issued the resume; until the
+        # dump reflects the clear (reconcile_resume_acks drops it), the same
+        # pid must not be re-proposed every event (overlay lag).
+        self._resume_issued_age[pid] = 0
         logger.info("program_tracker: resumed %s (state stays %s until next arrival)",
                     pid, self._states.get(pid))
+
+    # ---- #215 resume-ack reconciliation (the daemon's own un-acked action) --
+
+    def resume_in_flight(self, pid: str) -> bool:
+        """True iff the daemon has ISSUED a resume for ``pid`` whose clear the
+        latest dump has not yet reflected (and the recovery window has not
+        expired).  ``joint_decide`` re-proposes a resume for any pid the dump
+        still shows PAUSED; this suppresses re-dispatching one already in
+        flight (DESIGN §10 — idempotency is the backstop, this avoids the
+        redundant work).  The tracker, not a parallel structure, owns this
+        because "have I resumed p?" is program-lifecycle truth."""
+        return pid in self._resume_issued_age
+
+    def note_resume_issued(self, pid: str) -> None:
+        """Record that a resume clear was issued for ``pid`` (the dispatcher
+        calls this right after enqueuing the clear PUT)."""
+        self._resume_issued_age[pid] = 0
+
+    def reconcile_resume_acks(self, dump_paused_pids: set, window: int) -> None:
+        """Per event, reconcile in-flight resumes against the fresh dump (the
+        always-fresh ground truth).  For each pid we issued a resume for:
+          * the dump no longer shows it PAUSED ⇒ the clear LANDED → drop the
+            record (resume_in_flight goes False; nothing to re-propose anyway);
+          * the dump still shows it PAUSED ⇒ bump its age, and once it exceeds
+            ``window`` consecutive still-PAUSED dumps treat the clear as LOST
+            (the outbound queue does not retry — DESIGN §10) → drop the record
+            so the resume re-fires next decision (recovery, no re-starve)."""
+        for pid in list(self._resume_issued_age):
+            if pid not in dump_paused_pids:
+                del self._resume_issued_age[pid]            # clear landed
+            else:
+                self._resume_issued_age[pid] += 1
+                if self._resume_issued_age[pid] > window:
+                    del self._resume_issued_age[pid]        # lost → allow re-fire
 
     # ---- SESSION_END hook (T41 #185, DESIGN §11 F5) ----
 
@@ -337,6 +388,7 @@ class ProgramTracker:
             self._events.pop(pid, None)
             self._ended_while_gated.discard(pid)
             self._gated_count.pop(pid, None)
+            self._resume_issued_age.pop(pid, None)   # #215
         if stale:
             from ._metrics import m as _m
             _m("program_gc_ended", reclaimed=len(stale))

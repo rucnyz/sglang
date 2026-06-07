@@ -1101,17 +1101,10 @@ class KvScheduler:
         # Audit round-2 R2-N2: per-instance unknown-tier log set so
         # cross-test / cross-restart state doesn't leak.
         self._unknown_tier_log: set = set()
-        # #215 resume double-fire dedup.  joint_decide re-proposes a resume
-        # for any pid the dump still shows PAUSED; after we send the clearing
-        # PUT the dump keeps showing PAUSED until sglang processes it and we
-        # re-fetch (overlay lag), so the SAME pid is re-granted every event in
-        # that window — pure waste (tracker.resume is idempotent, the clear PUT
-        # returns applied=0).  We suppress a re-fire while the clear is in
-        # flight, keyed by pid + the dump-generation when sent, and expire the
-        # suppression after _RESUME_DEDUP_WINDOW generations so a genuinely
-        # LOST clear PUT still recovers (re-fire → re-starve avoided).
-        self._resume_inflight: Dict[str, int] = {}   # pid -> dump-gen sent
-        self._dump_gen: int = 0
+        # #215 resume double-fire dedup lives in the program_tracker (the
+        # single authority for program lifecycle), reconciled against the
+        # fresh dump each event — see ProgramTracker.reconcile_resume_acks /
+        # resume_in_flight.  No parallel structure here.
 
     async def handle(self, event: Event, router) -> None:  # noqa: ANN001
         """Single entry point for all paper §4 events.
@@ -1250,18 +1243,14 @@ class KvScheduler:
                 plan = _filter_cooled_evicts(plan, _cd, _now)
         self.decisions += 1
         self.last_plan = plan
-        # #215 resume dedup, generation bookkeeping — runs EVERY event (incl.
-        # the empty-plan ones below): advance the dump generation, then drop
-        # in-flight resume entries the fresh dump confirms cleared (pid no
-        # longer PAUSED → the clear landed) or whose suppression window expired
-        # (clear PUT likely lost → allow a recovery re-fire next time).
-        self._dump_gen += 1
+        # #215: reconcile in-flight resumes against the fresh dump — runs EVERY
+        # event (incl. the empty-plan ones below) so a clear that lands (or is
+        # lost) is observed promptly.  The tracker drops a pid once the dump no
+        # longer shows it PAUSED (clear landed) or after the recovery window
+        # (clear lost → re-fire).
         _paused_now = {pid for pid, pu in sched_state.per_program_usage.items()
                        if pu.get("state") == "PAUSED"}
-        self._resume_inflight = {
-            pid: g for pid, g in self._resume_inflight.items()
-            if pid in _paused_now and (self._dump_gen - g) < _RESUME_DEDUP_WINDOW
-        }
+        self.tracker.reconcile_resume_acks(_paused_now, _RESUME_DEDUP_WINDOW)
         if not plan:
             # Nothing to do this event — declined (every V_u-positive
             # alternative loses) or the hysteresis dead-zone (§9).
@@ -1308,16 +1297,17 @@ class KvScheduler:
             await self._dispatch_migrate([m.id for m in migrates])
         for c in pauses:
             await self._dispatch_pause(c.pid, sched_state)
-        # #215 resume double-fire dedup: skip a resume whose clearing PUT is
-        # still in flight (pid in _resume_inflight); stamp the rest with the
-        # current dump generation.  The generation advance + prune of cleared /
-        # expired entries runs in handle() so it happens every event, including
-        # the empty-plan ones that return before this method.
+        # #215 resume double-fire dedup: skip a resume the daemon has already
+        # issued whose clear the dump hasn't reflected yet (overlay lag).  The
+        # tracker owns this — it is reconciled against the fresh dump in
+        # handle() and re-arms on a lost clear.  _dispatch_resume → tracker.
+        # resume notes the issue; we mark it explicitly to be robust if that
+        # call path changes.
         for c in resumes:
-            if c.pid in self._resume_inflight:
-                continue  # clear PUT still in flight (overlay lag) — don't re-fire
+            if self.tracker.resume_in_flight(c.pid):
+                continue  # already issued; dump just lags — don't re-fire
             await self._dispatch_resume(c.pid, sched_state)
-            self._resume_inflight[c.pid] = self._dump_gen
+            self.tracker.note_resume_issued(c.pid)
 
     async def _dispatch_pause(self, pid: str, sched_state) -> None:
         """Pause program ``pid``: gate the proxy + notify sglang with the
