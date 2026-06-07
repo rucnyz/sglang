@@ -264,6 +264,84 @@ def stage_a1b_multi_rank_leaf_flag_and_reconcile() -> None:
             f"#210: cross-rank leaf AND must be order-independent; got {u2}")
 
 
+def stage_a1c_multi_rank_paused_state_wins() -> None:
+    """Cross-rank starvation: PUT /aginfer/program_paused fans out PER
+    RANK and is NOT cross-rank atomic, so a state dump can land mid-fan-
+    out with the SAME pid PAUSED on the rank that already applied and
+    REASONING (lagging) on another.  ``_flatten_per_rank`` must let PAUSED
+    WIN — ``resume_candidates`` only considers ``state == "PAUSED"`` pids,
+    so a lagging REASONING masking the pause drops the program out of the
+    resume set and (a PAUSED program emits no events of its own) STARVES
+    it to an AgentTimeout (#211 class via cross-rank merge).  The winning
+    PAUSED rank's ``pre_pause_state`` must survive too (the §8 resume
+    counterfactual reads it); taking the REASONING rank's ``None`` would
+    restore the program to the wrong state.  Order-independent + ENDED
+    still LOSES to active (premature ENDED would drop a lagging co-holder
+    rank's session_scoped KV)."""
+    def _prog(state, pre):
+        return {"hbm": {"committed": {}, "inflight": {}},
+                "dram": {"committed": {}}, "state": state,
+                "pre_pause_state": pre, "unit_hashes": []}
+    rank_paused = _state_json(
+        units=[], programs={"p0": _prog("PAUSED", "REASONING")})
+    rank_lagging = _state_json(
+        units=[], programs={"p0": _prog("REASONING", None)})
+    for order in ([rank_paused, rank_lagging], [rank_lagging, rank_paused]):
+        flat = kvs._flatten_per_rank({"per_rank": order})
+        merged = flat["per_program_usage"]["p0"]
+        if merged["state"] != "PAUSED":
+            raise StageFail(
+                "cross-rank: a PAUSED program masked by a lagging rank's "
+                f"REASONING starves (never a resume candidate); got "
+                f"state={merged['state']!r}")
+        if merged["pre_pause_state"] != "REASONING":
+            raise StageFail(
+                "cross-rank: pre_pause_state must come from the PAUSED rank "
+                f"(else resume restores wrong state); got "
+                f"{merged['pre_pause_state']!r}")
+    # ENDED must NOT win over an active co-holder rank (premature drop).
+    rank_ended = _state_json(
+        units=[], programs={"p1": _prog("ENDED", None)})
+    rank_active = _state_json(
+        units=[], programs={"p1": _prog("ACTING", None)})
+    flat = kvs._flatten_per_rank({"per_rank": [rank_ended, rank_active]})
+    if flat["per_program_usage"]["p1"]["state"] != "ACTING":
+        raise StageFail(
+            "cross-rank: ENDED must LOSE to an active rank (premature ENDED "
+            "drops a lagging co-holder's session_scoped KV); got "
+            f"{flat['per_program_usage']['p1']['state']!r}")
+
+
+def stage_a1d_multi_rank_holders_union() -> None:
+    """Cross-rank holder skew: node session tagging
+    (``node.session_ids.add(pid)`` / SESSION_END untag) runs in each
+    rank's OWN scheduler, so in a transient window the same hash carries
+    {p0,p1} on one rank and {p0} on a rank that already processed p1's
+    SESSION_END.  ``_flatten_per_rank`` must UNION session_ids in the
+    dedupe branch — keeping rank-0's set verbatim made ``holders``
+    ORDER-DEPENDENT, skewing shared_aware_prog_scores' V_u divisor
+    (``len(holders)``) and session_scoped_units' ``holders == {session}``
+    predicate by rank ordering."""
+    GB = 1024 ** 3
+    rank_two = _state_json(units=[_unit(
+        uhash="shared", residence=["HBM"], holders=["p0", "p1"],
+        n_bytes_per_tier={"HBM": GB})])
+    rank_one = _state_json(units=[_unit(
+        uhash="shared", residence=["HBM"], holders=["p0"],
+        n_bytes_per_tier={"HBM": GB})])
+    for order in ([rank_two, rank_one], [rank_one, rank_two]):
+        flat = kvs._flatten_per_rank({"per_rank": order})
+        if len(flat["units"]) != 1:
+            raise StageFail(
+                f"shared hash must dedupe; got {len(flat['units'])}")
+        sids = flat["units"][0]["session_ids"]
+        if sorted(sids) != ["p0", "p1"]:
+            raise StageFail(
+                "cross-rank holders must UNION (order-independent) — a stale "
+                "single-rank view must not strand a still-shared unit; got "
+                f"session_ids={sids!r}")
+
+
 def stage_a2_unknown_tier_label_skipped() -> None:
     """A unit residing in an unknown tier label is SKIPPED (not
     silently coerced to HBM — that was the round-1 B1 bug).  The
@@ -997,6 +1075,10 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                               stage_a1_multi_rank_flatten),
     ("A1b multi-rank leaf-flag AND-reconcile (#210)",
                               stage_a1b_multi_rank_leaf_flag_and_reconcile),
+    ("A1c multi-rank PAUSED-state wins (no resume starvation)",
+                              stage_a1c_multi_rank_paused_state_wins),
+    ("A1d multi-rank holders UNION (order-independent V_u divisor)",
+                              stage_a1d_multi_rank_holders_union),
     ("A2 unknown tier label skipped + logged once",
                               stage_a2_unknown_tier_label_skipped),
     ("A3 missing state field → fatal()",

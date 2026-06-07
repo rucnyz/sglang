@@ -191,9 +191,12 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
       * throughput_ema.decode_per_program[pid]: SUM across ranks
         (a program may have decode work on multiple ranks via TP).
       * per_program_usage[pid].hbm.committed[sp] (and dram.committed):
-        SUM across ranks; state takes the most-active (REASONING >
-        ACTING > PAUSED > ENDED) across ranks; unit_hashes is the
-        union.  pre_pause_state mirrors state.
+        SUM across ranks; state reconciles to the SAFE side on cross-
+        rank disagreement (PAUSED > REASONING > ACTING > ENDED): PAUSED
+        wins so a lagging rank can't mask a pause and starve the resume
+        candidate; ENDED loses so a lagging co-holder rank isn't dropped
+        prematurely.  unit_hashes is the union; pre_pause_state follows
+        the winning (PAUSED) rank.
       * units: concatenate verbatim — **no hash prefix**.  sglang's
         hashes are globally unique (hex SHA256 or ``node-<id>``); if
         two ranks emit the SAME hash it's the same logical unit
@@ -296,8 +299,35 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 + float(bps))
 
     # ---- per_program_usage: sum committed bytes; union unit_hashes ----
-    # State preference (most-active wins): REASONING > ACTING > PAUSED > ENDED.
-    _STATE_RANK = {"REASONING": 3, "ACTING": 2, "PAUSED": 1, "ENDED": 0}
+    # Cross-rank state reconciliation.  PUT /aginfer/program_paused fans
+    # out to every rank's scheduler PER-RANK and is NOT cross-rank atomic
+    # (tokenizer_control_mixin: "partial ok = race with another in-flight
+    # PUT"); a state dump can land mid-fan-out, so the SAME pid can read
+    # PAUSED on the rank that already applied and REASONING/ACTING on a
+    # lagging rank.
+    #
+    #   PAUSED must WIN over REASONING/ACTING.  ``resume_candidates`` only
+    #   considers pids whose merged ``state == "PAUSED"``; if a lagging
+    #   rank's REASONING masked the pause, the program would drop out of
+    #   the resume set and — since a PAUSED program emits no events of its
+    #   own and can only be un-gated by a headroom Resume — STARVE to an
+    #   AgentTimeout (the #211 starvation class, here via cross-rank merge
+    #   instead of dropped units).  This mirrors the residence "colder
+    #   superset" union and the #210 leaf-flag AND: when ranks disagree on
+    #   a daemon-controlled transition, take the SAFE (liveness-preserving)
+    #   side, never rank-0's permissive view.
+    #
+    #   ENDED LOSES to any active/paused state (kept from the original
+    #   "most-active wins" rule): a rank that saw SESSION_END first must
+    #   not prematurely drive the program to ENDED on a lagging co-holder
+    #   rank — premature ENDED drops session_scoped KV the lagging rank may
+    #   still reference (unsafe), whereas keeping it active over-retains
+    #   for one event and self-heals when every rank catches up (benign).
+    #
+    #   REASONING > ACTING only breaks the λ tie (REASONING uses the
+    #   hits/age proxy, ACTING the calibrated floor); neither gates
+    #   liveness, so their relative order is cosmetic.
+    _STATE_RANK = {"PAUSED": 4, "REASONING": 3, "ACTING": 2, "ENDED": 0}
     agg_programs: Dict[str, Dict[str, Any]] = {}
     for rank in per_rank:
         for pid, e in rank["per_program_usage"].items():
@@ -389,6 +419,25 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 for _flag in ("is_device_leaf", "is_host_leaf", "is_tree_leaf"):
                     existing[_flag] = bool(existing.get(_flag, True)) \
                         and bool(u.get(_flag, True))
+                # UNION session_ids (holders) across ranks.  Node session
+                # tagging (``node.session_ids.add(pid)`` / SESSION_END
+                # untagging) runs in each rank's OWN scheduler, driven by
+                # the same request stream but at slightly different wall-
+                # clock moments, so in a transient window the same hash can
+                # carry {p0,p1} on one rank and {p0} on a rank that already
+                # processed p1's SESSION_END.  Keeping rank-0's set verbatim
+                # made ``holders`` ORDER-DEPENDENT (whichever rank emitted
+                # the hash first won), so ``len(u.holders)`` —
+                # shared_aware_prog_scores' V_u divisor — and
+                # session_scoped_units' ``holders == {session}`` predicate
+                # diverged by rank ordering.  Union is the colder superset
+                # (a holder seen by ANY rank is a holder): it keeps a live
+                # co-holder's p_hat high and never lets a stale single-rank
+                # view strand a still-shared unit as session-scoped.
+                existing_sids = existing.get("session_ids") or []
+                u_sids = u.get("session_ids") or []
+                existing["session_ids"] = sorted(
+                    set(existing_sids) | set(u_sids))
                 continue
             hash_to_idx[uhash] = len(agg_units)
             agg_units.append(dict(u))
