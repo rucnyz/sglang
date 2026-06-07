@@ -1859,9 +1859,11 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
       wired.  Failing that, the EXACT (not mean) footprint would come
       from the daemon recording each unit's size before it is dropped,
       or sglang reporting the paused program's pre-drop footprint.  The
-      surviving-unit mean is the interim that needs neither and is
-      conservative-ish (credits SOMETHING rather than 0); it is replaced
-      when the trajectory term lands."""
+      surviving-unit mean is the interim that needs neither — strictly
+      better than the old 0-credit, but NOT provably conservative: a
+      dropped unit was evicted by sglang's victim policy (recency/value),
+      which need not correlate with size, so the mean can over- OR
+      under-size it.  It is replaced when the trajectory term lands."""
   ```
 
   Why "not already in HBM" is the correct filter for the load-back sum:
