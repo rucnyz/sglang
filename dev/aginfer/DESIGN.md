@@ -1801,16 +1801,15 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
 
   ```
   expected_peak_hbm_after_resume(p, state)[sp] =
-      Σ_{h ∈ p.unit_hashes : HBM ∉ state.units[h].residence}
-          unit_hbm_subpool_bytes(state.units[h], sp)
-                                                  # only count units not
-                                                  # currently HBM-resident
-                                                  # (demoted, dropped, or
-                                                  # absent).  For HBM+DRAM
-                                                  # coexisting units, the
-                                                  # HBM copy still satisfies
-                                                  # resume needs — no new
-                                                  # HBM bytes consumed.
+      Σ_{h ∈ p.unit_hashes : h ∈ state.units,
+                             HBM ∉ state.units[h].residence}
+          unit_hbm_subpool_bytes(state.units[h], sp)   # load-back of a
+                                                  # SURVIVING non-HBM unit.
+                                                  # An HBM-resident unit
+                                                  # (kept alive by another
+                                                  # holder) consumes no new
+                                                  # HBM → counted 0.
+    + dropped_reprefill_credit(p, state)[sp]      # #216: see below
     + future_inflight_savings(p, state)[sp]       # post-resume decode
                                                   # growth in subpool sp
 
@@ -1828,14 +1827,36 @@ follows the subpool keys exposed by `state.pool_usage.HBM.subpools`.
       assert u.residence, f"unit {u.hash} has empty residence"
       τ = next(iter(u.residence))                  # any resident tier
       return u.n_bytes[τ][sp]
+
+  dropped_reprefill_credit(p, state)[sp]:
+      """#216.  A hash in p.unit_hashes that is ABSENT from state.units
+      was DROPped while p was gated, so the load-back sum above credits
+      it 0 — yet on resume p re-prefills that prefix straight back into
+      HBM (its conversation context needs it), a near-instantaneous
+      burst capacity_fits would otherwise miss.  Credit each dropped
+      hash a re-prefill estimate sized from p's OWN surviving units
+      (mean HBM-equivalent bytes per unit, per subpool):
+
+          mean_sp = (Σ_{h surviving} unit_subpool_bytes(h, sp)) / n_surviving
+          credit[sp] = mean_sp × n_dropped
+
+      Applied ONLY when p has surviving units.  A FULLY-dropped program
+      (no survivor to size from — units all DROPped, or unit_hashes is
+      the overlay's empty residue) keeps credit = 0 so it can still
+      un-starve: releasing its proxy gate is free, and its re-prefill is
+      future work sglang's allocator admission-controls on the actual
+      prefill.  This is exactly the §9 zero-re_use un-starve — only
+      PARTIAL drops, which carry real resident context, pay the
+      re-prefill reserve."""
   ```
 
-  Why "not already in HBM" is the correct filter: HBM bytes for a
-  unit already resident are accounted in `pool_usage[HBM].subpools[sp].used_bytes`
-  (the first term of `forecast`).  `capacity_fits` checks each
-  subpool independently — re-adding bytes via `re_use[sp]` would
-  double-count them and over-reject Resume candidates whose units
-  are kept alive by other holders.
+  Why "not already in HBM" is the correct filter for the load-back sum:
+  HBM bytes for a unit already resident are accounted in
+  `pool_usage[HBM].subpools[sp].used_bytes` (the first term of
+  `forecast`).  `capacity_fits` checks each subpool independently —
+  re-adding bytes via `re_use[sp]` would double-count them and
+  over-reject Resume candidates whose units are kept alive by other
+  holders.
 
 * `capacity_fits(p, state)` — true iff for **every** HBM subpool sp:
   `forecast(state)[sp] + expected_peak_hbm_after_resume(p, state)[sp]
@@ -2401,7 +2422,7 @@ for pause/resume).
 | **Single-worker event loop**: handlers serialised; no concurrent migrate races; no internal timer anywhere — kv_scheduler, admission, forecast refresh, program_tracker, and the proxy all recompute only on event arrival.  SESSION_END is signalled by the client explicitly (§4); there is no time-based fallback | asyncio queue + single consumer |
 | **Unit hashes are content-derived and collision-detected on migrate build**: `u.hash` is sglang's existing SHA-256 page-chained content hash (`compute_node_hash_values` over the unit's token prefix; computed lazily on KV-event emission and on migrate-action processing).  Collision probability is negligible at any tree size aginfer encounters (≤ 10⁷ live units, birthday-paradox bound < 10⁻²²) but is verified, not assumed: every `apply_aginfer_migrations` call builds a `{hash → node}` lookup via a single DFS over the radix tree.  At that point sglang checks whether the same hash key already maps to a different node; if so, it fires the `HASH_COLLISION` webhook (§4) with both nodes' summaries and the daemon `fatal()`s with a forensic dump.  Cost is amortised free — the DFS already runs O(N) per migrate batch; adding the collision check is one extra comparison per node | sglang `apply_aginfer_migrations` |
 | **Always-fresh state**: every handler entry re-fetches `/aginfer/state`; event payload's snapshot is never trusted | daemon `KvScheduler.handle()` |
-| **Idempotent daemon→sglang actions**: every endpoint accepts re-application — migrate (a no-op `applied=0` with a `race:*` skip when the target tier already matches), pause/resume (200 with `applied:false` when the program is already in the requested state), hint PUT (overwrite-by-stamp).  Same reasoning across all of them: the daemon may emit the same action twice across consecutive event handlers because state-dump propagation lags the daemon's just-emitted action; the sglang side must absorb this without error | sglang endpoints |
+| **Idempotent daemon→sglang actions**: every endpoint accepts re-application — migrate (a no-op `applied=0` with a `race:*` skip when the target tier already matches), pause/resume (200 with `applied:false` when the program is already in the requested state), hint PUT (overwrite-by-stamp).  Same reasoning across all of them: the daemon may emit the same action twice across consecutive event handlers because state-dump propagation lags the daemon's just-emitted action; the sglang side must absorb this without error.  Idempotency is the correctness backstop; the daemon ALSO suppresses the redundant re-fire daemon-side where cheap — the resume path skips re-proposing a pid whose clearing PUT is still in flight (the dump still shows PAUSED), keyed by dump-generation and expiring after a bounded window so a genuinely LOST PUT still recovers (#215) | sglang endpoints + daemon resume dedup |
 | **Outbound queue is volatile**: the daemon's outbound action queue lives in memory only.  On daemon crash, pending actions are lost — and that's correct.  After restart, the daemon's first `GET /aginfer/state` reads the live state; if the lost action was needed, `joint_decide` re-issues it.  No disk WAL exists for outbound actions, by the same first-principles argument that rules out a webhook persistence WAL (§11): every authoritative quantity already lives in sglang's state, the daemon is just a decision function over it | daemon outbound worker |
 | **No daemon-side hint cache**: the daemon does not maintain a shadow `{hash: last_pushed_value}` map.  Per-event, the daemon re-scores the units in `D_t` (small set, ≤ K_MAX = 256) and pushes their hints unconditionally; sglang's hint table is overwrite-by-stamp (§6) and dedupes on its side.  Eliminates an unbounded daemon-side data structure; the trade is some redundant PUTs that overwrite identical values — negligible at D_t cardinality | daemon kv_scheduler hint emitter |
 | **Proxy gate releases on client disconnect**: a request held in the proxy gate awaits BOTH the gate condition AND `request.is_disconnected()`; whichever fires first wins.  TCP disconnect deterministically signals the client gave up — no timer, no fallback.  On disconnect the proxy releases the gated request locally, the daemon's `program_tracker.client_disconnected(p)` enqueues `PUT /aginfer/program_paused {transition: END, ...}` onto the outbound queue, and `p`'s residence is reaped at the next state-dump | daemon proxy gate |
@@ -2413,7 +2434,7 @@ for pause/resume).
 | **Hint clear ordering**: when sglang evicts unit u, the order is (1) inline scorer finishes its current heap-iteration read (using the hint that was live when u was picked); (2) eviction commits, allocator reclaims u's bytes; (3) hint entry for u is cleared.  This rules out a "scorer reads cleared hint" race; the scorer never sees a missing entry for a unit that's still in the heap | sglang inline scorer + allocator commit path |
 | **Webhook mandatory**: every sglang launch passes `--aginfer-notify-url`; the admission trigger path is not optional | launch script per-deployment |
 | **Pool-truth admission, per subpool**: admission's `forecast(state)` returns a dict over HBM subpools, each reading `state.pool_usage.HBM.subpools[sp].used_bytes` and `cap_bytes` (byte-denominated, since `forecast_inflight_demand` is byte-scaled and §9 budgets are bytes).  Pressure fires when **any** subpool's forecast crosses `theta_hi`; this prevents the failure mode where a Mamba snapshot subpool at 95 % is hidden by an attention subpool at 60 %.  If the snapshot lacks `pool_usage.HBM.subpools` the daemon halts loudly | daemon `admission_controller.forecast` |
-| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_(τ, sp)(occ)` reads `state.tier_holding_cost[τ][sp].h_max_per_byte_sec`, never a constant baked into the daemon; `prefill_throughput(state)` reads `state.throughput_ema.prefill_bps`; `decode_throughput(p)` reads `state.throughput_ema.decode_per_program[p]`.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; the prefill / decode loops update their per-step throughput EMA; operator config sets per-(tier, subpool) `h_max`); the daemon consumes them.  Required positivity: `peak_bw_bps > 0`, `h_max_per_byte_sec > 0`, `prefill_bps > 0` (once any prefill has run).  Missing fields or non-positive values are deployment bugs → `fatal()` | sglang instrumentation + operator config |
+| **Physical inputs sourced from sglang**: `bw_free(σ, τ)` reads `state.link_stats[σ→τ]`, never an in-daemon estimate; `h_(τ, sp)(occ)` reads `state.tier_holding_cost[τ][sp].h_max_per_byte_sec`, never a constant baked into the daemon; `prefill_throughput(state)` reads `state.throughput_ema.prefill_bps`; `decode_throughput(p)` reads `state.throughput_ema.decode_per_program[p]`.  Sglang owns the measurements (HiCache + Mooncake instrumentation hooks expose link throughput; the prefill / decode loops update their per-step throughput EMA; operator config sets per-(tier, subpool) `h_max`); the daemon consumes them.  Required positivity: `peak_bw_bps > 0`, `h_max_per_byte_sec > 0`, `prefill_bps > 0` (once any prefill has run), and `page_bytes > 0` for every configured subpool (the §9 DP quantises by it — a 0 would divide-by-zero; #218).  Missing fields or non-positive values are deployment bugs → `fatal()` | sglang instrumentation + operator config |
 | **Pool-truth V_u**: V_u's `h_(τ, sp)(occ)` term reads `pool_usage[τ].subpools[sp]` (the per-subpool allocator-truth view) so holding cost reflects real pressure, not an inferred radix-tree slice | daemon `OursGreedyPolicy._value` |
 | **All traffic through daemon proxy**: every chat-completion to sglang arrives via the daemon's `/v1/chat/completions` proxy; direct-to-sglang clients are out of scope and would render admission's program-pause unenforceable | deployment topology |
 | **Hint table covers every live unit**: sglang seeds a "fresh access just happened" entry on unit birth (`p_hat ≈ 1` for the next event horizon); the daemon refines via `PUT /aginfer/hints`; eviction never falls back to LRU on absent hints | sglang allocator hook + daemon hint pusher |
