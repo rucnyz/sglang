@@ -85,8 +85,17 @@ class _ValueItem:
 def _page_bytes(state: SchedulerState, tier_label: str, sp: str) -> int:
     """``page_bytes`` for axis (tier_label, sp).  A missing key is a
     schema-contract violation (DESIGN §10 subpool-key consistency) — let
-    the KeyError surface rather than defaulting to a wrong granularity."""
-    return int(state.tier_usage.page_bytes[_TIER[tier_label]][sp])
+    the KeyError surface rather than defaulting to a wrong granularity.
+
+    A configured subpool reporting ``page_bytes <= 0`` is a deployment bug
+    (#218): it would divide-by-zero in the DP quantisation.  Fail loud with
+    a forensic dump, in the same "required positivity" family as
+    ``peak_bw_bps`` / ``h_max`` / ``prefill_bps`` (DESIGN §10)."""
+    pb = int(state.tier_usage.page_bytes[_TIER[tier_label]][sp])
+    if pb <= 0:
+        fatal("nonpositive_page_bytes", tier=tier_label, subpool=sp,
+              page_bytes=pb)
+    return pb
 
 
 def _budget_and_buckets(state, base_budget, items):

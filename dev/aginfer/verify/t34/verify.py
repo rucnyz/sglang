@@ -322,6 +322,27 @@ def stage_e2_empty_and_zero() -> None:
                         f"{[c.pid for c in neg]}")
 
 
+def stage_e3_nonpositive_bucket_guard() -> None:
+    """#218: a non-positive ``bucket_size`` (page granularity) divides in
+    _bk/_bk_up — must raise a CLEAR, contextful ValueError up front, not a
+    bare ZeroDivisionError deep in the DP (which the daemon would surface as
+    an unhelpful crash instead of fatal('nonpositive_page_bytes'))."""
+    item = [Resume(gain=5.0, re_use={"HBM": {"kv": 100}}, pid="a")]
+    for bad_bs in (0, -64):
+        try:
+            knapsack_max_value_multi(item, {("HBM", "kv"): 1000},
+                                     {("HBM", "kv"): bad_bs})
+        except ValueError as e:
+            if "bucket_size" not in str(e):
+                raise StageFail(f"guard message must name bucket_size: {e}")
+        except ZeroDivisionError:
+            raise StageFail(f"bucket_size={bad_bs} raised a bare "
+                            "ZeroDivisionError — the #218 positivity guard "
+                            "must catch it first with a clear message")
+        else:
+            raise StageFail(f"bucket_size={bad_bs} must raise ValueError")
+
+
 # ============================================================ run
 
 
@@ -339,6 +360,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
      stage_e1_dp_cell_ceiling),
     ("E2 empty items / zero budget / negative gains (#12)",
      stage_e2_empty_and_zero),
+    ("E3 non-positive bucket_size → clear ValueError, not ZeroDiv (#218)",
+     stage_e3_nonpositive_bucket_guard),
 ]
 
 

@@ -206,6 +206,15 @@ def knapsack_max_value_multi(
     reachable-cell count exceeds ``max_dp_cells``.  Returns the chosen
     candidate list (empty when no positive-value subset fits)."""
     axes = list(budget.keys())
+    # Positivity guard (#218): bucket_size divides in _bk/_bk_up; a 0 (or
+    # negative) page granularity would raise a bare ZeroDivisionError deep
+    # in the DP.  Fail with a clear, contextful error instead — the daemon
+    # maps it to fatal (a non-positive page_bytes is a deployment bug).
+    bad = [a for a in axes if int(bucket_size.get(a, 0)) <= 0]
+    if bad:
+        raise ValueError(
+            f"knapsack_max_value_multi: bucket_size must be > 0 for every "
+            f"axis; non-positive at {bad} (bucket_size={bucket_size})")
     W = {a: _bk(budget[a], bucket_size[a]) for a in axes}
     K = len(items)
     NEG = float("-inf")
