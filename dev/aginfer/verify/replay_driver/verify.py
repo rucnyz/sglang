@@ -182,6 +182,24 @@ async def test_live() -> None:
     agg2 = aggregate(rows2, wall2)
     check(agg2["n_error"] == 3 and agg2["n_ok"] == 0, "B2 502s counted as errors")
 
+    # B3 (audit C-1): a request that HANGS past the deadline becomes a
+    # counted error, not an indefinite wedge.
+    port3 = _free_port()
+    stub3 = make_stub(per_tok_delay_s=5.0)  # 5s/token >> deadline
+    async with _Server(stub3, port3):
+        t0 = asyncio.get_event_loop().time()
+        rows3, wall3, _g3 = await replay(
+            [{"t": 0.0, "program_id": "H", "output_len": 10,
+              "body": {"model": "m", "messages": [{"role": "user", "content": "h"}]}}],
+            base_url=f"http://127.0.0.1:{port3}/v1",
+            mode="arrival", slowdown=1.0, max_concurrency=4,
+            request_deadline_s=0.5,
+        )
+        elapsed = asyncio.get_event_loop().time() - t0
+    check(rows3[0]["ok"] is False and rows3[0].get("error") == "request-deadline",
+          "B3 hung request -> counted deadline error")
+    check(elapsed < 4.0, f"B3 deadline fired fast (not the 50s hang) ({elapsed:.1f}s)")
+
 
 def test_sessions_pure() -> None:
     print("C. closed-loop session reconstruction (pure)")

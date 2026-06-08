@@ -297,6 +297,25 @@ class _InflightGauge:
         self.cur -= 1
 
 
+async def _request_with_deadline(
+    cli: httpx.AsyncClient, url: str, rec: Dict[str, Any], deadline_s: float
+) -> Dict[str, Any]:
+    """_one_request with a wall deadline (audit C-1).
+
+    The a3 arm runs admission ON, so a replayed request can PARK in the
+    proxy gate and — if a resume is ever lost (knapsack can't fit, dropped
+    event, apply-failed) — never return.  With ``read=None`` on the client
+    that would hang asyncio.gather forever and wedge the whole multi-trial
+    run.  A generous per-request deadline converts that hang into a counted
+    error that the sanity gate then catches.
+    """
+    try:
+        return await asyncio.wait_for(_one_request(cli, url, rec), timeout=deadline_s)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": "request-deadline",
+                "want_out": int(rec.get("output_len") or 0)}
+
+
 async def replay(
     records: List[Dict[str, Any]],
     *,
@@ -304,6 +323,7 @@ async def replay(
     mode: str,
     slowdown: float,
     max_concurrency: int,
+    request_deadline_s: float = 300.0,
 ) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any]]:
     url = base_url.rstrip("/") + "/chat/completions"
     rows: List[Dict[str, Any]] = [None] * len(records)  # type: ignore
@@ -320,7 +340,9 @@ async def replay(
             async with sem:
                 gauge.enter()
                 try:
-                    rows[i] = await _one_request(cli, url, rec)
+                    rows[i] = await _request_with_deadline(
+                        cli, url, rec, request_deadline_s
+                    )
                 finally:
                     gauge.exit()
 
@@ -349,6 +371,7 @@ async def replay_sessions(
     slowdown: float,
     max_concurrency: int,
     zero_tool_time: bool = False,
+    request_deadline_s: float = 300.0,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, Dict[str, Any]]:
     """Closed-loop replay: each session is a dependent request chain.
 
@@ -390,7 +413,9 @@ async def replay_sessions(
                 async with sem:
                     gauge.enter()
                     try:
-                        row = await _one_request(cli, url, step["record"])
+                        row = await _request_with_deadline(
+                            cli, url, step["record"], request_deadline_s
+                        )
                     finally:
                         gauge.exit()
                 rows.append(row)
@@ -452,6 +477,9 @@ def main() -> int:
     ap.add_argument("--out", default="")
     ap.add_argument("--zero-tool-time", action="store_true",
                     help="session mode: drop tool-think gaps (benefit upper bound)")
+    ap.add_argument("--request-deadline", type=float, default=300.0,
+                    help="per-request wall deadline (s); a parked/hung request "
+                         "becomes a counted error instead of wedging the run")
     args = ap.parse_args()
 
     records = load_trace(args.trace, args.limit or None)
@@ -474,6 +502,7 @@ def main() -> int:
                 slowdown=args.slowdown,
                 max_concurrency=args.max_concurrency,
                 zero_tool_time=args.zero_tool_time,
+                request_deadline_s=args.request_deadline,
             )
         )
         metrics = aggregate(rows, makespan)
@@ -487,6 +516,7 @@ def main() -> int:
                 mode=args.mode,
                 slowdown=args.slowdown,
                 max_concurrency=args.max_concurrency,
+                request_deadline_s=args.request_deadline,
             )
         )
         metrics = aggregate(rows, wall_s)

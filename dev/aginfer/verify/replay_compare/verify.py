@@ -70,6 +70,16 @@ def test_sanity() -> None:
     res2 = sanity_check(s_div)
     check(not res2["ok"] and any("total_out_tokens" in r for r in res2["reasons"]),
           "C2 divergent tokens -> COMPARISON INVALID")
+    # M-1: baseline arm missing -> INVALID (was: false HOLDS)
+    s_miss = summarize({"a3": [_m(100, 50, 40)] * 3})
+    r_miss = sanity_check(s_miss)
+    check(not r_miss["ok"] and any("a3_kvoff" in r and "missing" in r for r in r_miss["reasons"]),
+          "M-1 missing baseline arm -> COMPARISON INVALID")
+    # M-1: unequal trial counts -> INVALID
+    s_uneq = summarize({"a3": [_m(100, 50, 40)] * 3, "a3_kvoff": [_m(100, 50, 40)]})
+    r_uneq = sanity_check(s_uneq)
+    check(not r_uneq["ok"] and any("unequal" in r or ">=2" in r for r in r_uneq["reasons"]),
+          "M-1 unequal trial counts -> COMPARISON INVALID")
 
 
 def _m(ttft_p99: float, e2e_p50: float, thr: float) -> dict:

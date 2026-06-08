@@ -138,6 +138,17 @@ def sanity_check(summary: Dict[str, Any], *, min_len_match: float = 0.98) -> Dic
     broke and the comparison is INVALID, not 'do-no-harm holds'.
     """
     reasons: List[str] = []
+    # M-1: both expected arms must be present with equal n>=2, else there is
+    # no valid comparison — refuse rather than green-out on a half-run.
+    arms = summary.get("arms", {})
+    for need in ("a3", "a3_kvoff"):
+        if arms.get(need, 0) < 1:
+            reasons.append(f"arm '{need}' missing (no trials)")
+    if arms.get("a3", 0) and arms.get("a3_kvoff", 0):
+        if arms["a3"] < 2 or arms["a3_kvoff"] < 2:
+            reasons.append(f"need >=2 trials/arm (a3={arms['a3']}, a3_kvoff={arms['a3_kvoff']})")
+        elif arms["a3"] != arms["a3_kvoff"]:
+            reasons.append(f"unequal trial counts (a3={arms['a3']} vs a3_kvoff={arms['a3_kvoff']})")
     san = summary.get("sanity", {})
     for arm, d in san.items():
         lm = d.get("len_match_rate", {})
@@ -223,12 +234,21 @@ def main() -> int:
         print("  (forced-length / fairness invariant broke; verdict suppressed)")
         return 1
 
-    regressions = [r["metric"] for r in s["latency"] + s.get("endtoend", [])
+    all_rows = s["latency"] + s.get("endtoend", [])
+    regressions = [r["metric"] for r in all_rows
                    if "regression" in str(r.get("verdict", ""))]
+    # M-1: a verdict only counts if it was a real comparison (stable/noise),
+    # not a refusal ("insufficient"/"unequal").  Zero real verdicts => we
+    # cannot claim HOLDS.
+    real = [r for r in all_rows
+            if any(k in str(r.get("verdict", "")) for k in ("STABLY", "within-noise"))]
     if regressions:
         print(f"DO-NO-HARM: VIOLATED on {regressions}")
+    elif not real:
+        print("DO-NO-HARM: INCONCLUSIVE — no metric produced a comparable verdict")
+        return 1
     else:
-        print("DO-NO-HARM: HOLDS (no latency/end-to-end metric stably worse than baseline)")
+        print(f"DO-NO-HARM: HOLDS ({len(real)} metrics compared, none stably worse)")
     # Benefit call-out: closed-loop makespan stably lower = the workload
     # finishes sooner with the daemon on.
     for r in s.get("endtoend", []):
