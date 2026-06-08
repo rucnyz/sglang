@@ -27,15 +27,19 @@ _PROMPT = re.compile(r'"?prompt_tokens"?[:=]\s*(\d+)')
 _CACHED = re.compile(r'"?cached_tokens"?[:=]\s*(\d+)')
 
 
-def trial_dirs(arm_label):
-    # cycle dirs are results/run_K_<variant>_benefit_<label>_c<i>
+def trial_dirs(arm_label, tag):
+    # cycle dirs are results/run_K_<variant>_<tag>_<label>_c<i>, where <tag>
+    # is the results-dir basename minus the leading 'a3real_'.  The label can
+    # itself contain underscores (a3_kvoff), so anchor on _<tag>_<label>_c.
     pats = [
+        os.path.join(ROOT, "results", f"run_K_*_{tag}_{arm_label}_c*"),
+        # fallback for older 'benefit_<label>_c' naming
         os.path.join(ROOT, "results", f"run_K_*_benefit_{arm_label}_c*"),
     ]
     out = []
     for p in pats:
         out.extend(sorted(glob.glob(p)))
-    return out
+    return sorted(set(out))
 
 
 def parse_log(path):
@@ -63,9 +67,9 @@ def parse_log(path):
             "cache_hit_rate": c_sum / p_sum if p_sum else 0.0}
 
 
-def arm_summary(arm_label):
+def arm_summary(arm_label, tag):
     rows = []
-    for d in trial_dirs(arm_label):
+    for d in trial_dirs(arm_label, tag):
         r = parse_log(os.path.join(d, "sglang_v4flash.log"))
         if r:
             rows.append(r)
@@ -83,13 +87,17 @@ def _ms(xs):
 
 def main():
     results_dir = sys.argv[1] if len(sys.argv) > 1 else "."
+    # the cycle-dir tag is the results-dir basename minus the leading 'a3real_'
+    tag = os.path.basename(os.path.normpath(results_dir))
+    if tag.startswith("a3real_"):
+        tag = tag[len("a3real_"):]
     # arm labels are the metrics_<label>_c<i>.json stems
     labels = sorted({os.path.basename(f)[len("metrics_"):].rsplit("_c", 1)[0]
                      for f in glob.glob(os.path.join(results_dir, "metrics_*.json"))})
-    print(f"=== re-prefill mechanism (arms: {labels}) ===")
+    print(f"=== re-prefill mechanism (arms: {labels}, tag: {tag}) ===")
     summ = {}
     for lab in labels:
-        rows = arm_summary(lab)
+        rows = arm_summary(lab, tag)
         if not rows:
             print(f"  {lab}: no sglang logs found")
             continue
