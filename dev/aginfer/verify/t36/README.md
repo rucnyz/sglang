@@ -61,7 +61,7 @@ APPLY_FAILED.
 | Sglang transient 5xx storm | worker survives, posts all batches, no retry | A3 |
 | Sglang/network ConnectError | worker survives, no crash | A4 |
 | SIGTERM mid-burst | stop() drains in-flight then exits within ~2 s | A5 |
-| FIFO inversion | worker dequeues in enqueue order | A2 |
+| Burst coalescing (post-#228) | worker drains the wake's burst → ≤1 POST/PUT per endpoint, order program_paused→migrate→hints, latest-per-key | A2 |
 | batch_id collision after 2^32 enqueues | UUID4 collision probability < 10⁻²² | A0 |
 | Wiring bug: outbound not injected | `_dispatch_migrate(outbound=None)` raises RuntimeError | T42 B4 |
 | kv_scheduler wires outbound | `_dispatch_migrate` enqueues exactly once | A6 |
@@ -74,9 +74,11 @@ APPLY_FAILED.
 A0  batch_id is UUID4 + unique across calls
 A1  handler enqueue returns < 1 ms even when downstream POST takes
     200 ms (the headline T36 property)
-A2  worker drains FIFO (10 batches with distinct hashes; order preserved)
-A3  worker survives 5xx storm (5 × 503; no crash; all 5 hit the wire)
-A4  worker survives ConnectError (3 × raise; no crash)
+A2  worker coalesces a wake's burst (post-#228): ≤1 POST/PUT per endpoint,
+    cross-endpoint order program_paused→migrate→hints, latest-decision-per-
+    hash (migrate) / highest-stamp-per-hash (hints)
+A3  worker survives 5xx storm (no crash; keeps dispatching later wakes)
+A4  worker survives ConnectError (no crash; later wave still dispatched)
 A5  stop() drains in-flight POSTs then exits within bounded time
 A6  KvScheduler wired with outbound enqueues exactly one OutboundBatch
     per _dispatch_migrate call
@@ -154,9 +156,9 @@ pkill -TERM -f "daemon.main"; pkill -9 -f sglang.launch_server
 |---|---|
 | A0 batch_id is UUID4 + unique | PASS |
 | A1 handler enqueue < 1 ms regardless of POST latency | PASS — measured max enqueue ~30 µs across 50 calls with 200 ms stubbed POST |
-| A2 worker drains FIFO | PASS — 10 hashes preserved order |
-| A3 worker survives 5xx | PASS — 5/5 posts despite all 503 |
-| A4 worker survives ConnectError | PASS — 3/3 posts attempted |
+| A2 worker coalesces burst (≤1/endpoint, order, latest-per-key) | PASS (post-#228) |
+| A3 worker survives 5xx | PASS — no crash; later wakes still dispatched |
+| A4 worker survives ConnectError | PASS — no crash; later wave dispatched |
 | A5 stop() drains in-flight | PASS — 3 batches × 50 ms drained in < 2 s |
 | A6 KvScheduler wires to outbound, no sync POST | PASS |
 | B0 live stress (skipped without env) | PASS (skipped — manual run below) |

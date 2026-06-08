@@ -30,6 +30,20 @@ If only ONE crosses, escalation does NOT fire.  Rationale:
 The both-or-neither contract guards against false positives on
 either axis alone.
 
+**Post-#228 coalescing note.**  The worker now drains each wake's burst
+and emits at most one POST/PUT per endpoint, so `consecutive_failures`
+**accumulates across wakes** (≤ one increment per endpoint per wake, reset
+only on a 2xx) rather than one-per-enqueued-batch, and the age in (2) is
+the oldest `enqueue_ts` of the coalesced burst being dispatched.  The
+escalation BEHAVIOR is unchanged (both conditions still required; the
+streak still reaches the threshold under a sustained stall, over more
+wakes).  Accordingly the tests changed: A0–A2 now exercise the consec
+accounting at the per-dispatch unit (`_dispatch_one`) directly, and B0/C0
+pack three endpoints into one wake (program_paused + migrate + hints, all
+failing) so a single wake yields three failed POSTs that trip the
+low-threshold fatal — a fixture convenience, not a weakening of the
+production sustained-failure condition.
+
 **Failure classes counted for consec**:
 | HTTP / exception | counts as |
 |---|---|
