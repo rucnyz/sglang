@@ -69,6 +69,10 @@ from .program_tracker import ProgramTracker
 
 logger = logging.getLogger(__name__)
 
+# Sentinel so create_app can distinguish "caller passed None (force-disable
+# capture)" from "caller passed nothing (fall back to env-gated capture)".
+_UNSET = object()
+
 
 # ---------------------------------------------------------------- helpers
 
@@ -218,6 +222,7 @@ def create_app(
     theta_crit: float = 0.9,
     heartbeat_s: float = 5.0,
     observability_summary_every_n: int = 200,
+    trace_recorder: Any = _UNSET,
 ) -> FastAPI:
     """Build the daemon's FastAPI app.
 
@@ -227,8 +232,19 @@ def create_app(
     ``enable_event_router=True`` (default) mounts the T5
     ``POST /aginfer/event`` endpoint + spawns the event_worker.
     Set False for proxy-only tests.
+
+    ``trace_recorder`` (#231): a ``TraceRecorder`` to capture the request
+    stream for the deterministic replay benchmark.  Defaults (``_UNSET``)
+    to ``recorder_from_env()`` so production capture is purely env-gated
+    (``AGINFER_TRACE_CAPTURE``); tests inject one directly, or pass
+    ``None`` to force-disable.
     """
     app = FastAPI(title="aginfer-daemon", version="0.1")
+    if trace_recorder is _UNSET:
+        from .trace_capture import recorder_from_env
+
+        trace_recorder = recorder_from_env()
+    app.state.trace_recorder = trace_recorder
     app.state.sglang_base_url = sglang_base_url.rstrip("/")
     app.state.event_bus = event_bus or EventBus()
     app.state.program_tracker = program_tracker or ProgramTracker()
@@ -288,6 +304,10 @@ def create_app(
             app.state.outbound = None
         if app.state.owns_http_client and app.state.http_client is not None:
             await app.state.http_client.aclose()
+        # #231 — flush + close the request-trace recorder if active.
+        rec = getattr(app.state, "trace_recorder", None)
+        if rec is not None:
+            rec.close()
 
     @app.get("/health")
     async def health() -> Any:
@@ -329,6 +349,13 @@ def create_app(
         bus: EventBus = app.state.event_bus
         tracker: ProgramTracker = app.state.program_tracker
         client: httpx.AsyncClient = app.state.http_client
+
+        # #231 — stamp the request's arrival for the replay trace at the
+        # TRUE entry point (before the pause gate), so the captured
+        # inter-arrival timing reflects the real offered load.  output_len
+        # is filled in at completion below.  Zero-cost when capture is off.
+        recorder = getattr(app.state, "trace_recorder", None)
+        _cap_arrival = recorder.note_arrival() if recorder is not None else None
 
         # 1. Gate on pause/resume — racing client disconnect (F1).
         if pid is not None:
@@ -442,6 +469,17 @@ def create_app(
                     status_code=resp.status_code,
                     media_type=ct,
                 )
+                # #231 — capture this request for the replay trace, with
+                # the exact generated length from the usage block.
+                if recorder is not None and _cap_arrival is not None:
+                    from .trace_capture import usage_completion_tokens
+
+                    recorder.write(
+                        arrival_offset=_cap_arrival,
+                        program_id=pid,
+                        body=body,
+                        output_len=usage_completion_tokens(body_bytes) or 0,
+                    )
             except httpx.RequestError as exc:
                 pass_resp = JSONResponse(
                     {"error": {"message": f"upstream sglang error: {exc!s}"}},
@@ -500,9 +538,19 @@ def create_app(
                 status_code=502,
             )
 
+        # #231 — accumulate the generated length across SSE chunks for the
+        # replay trace.  Carry holds a partial trailing line between chunks.
+        _cap_count = 0
+        _cap_carry: Dict[str, bytes] = {}
+
         async def _stream() -> Any:
+            nonlocal _cap_count
             try:
                 async for chunk in upstream_resp.aiter_bytes():
+                    if recorder is not None and _cap_arrival is not None:
+                        from .trace_capture import count_sse_content_tokens
+
+                        _cap_count += count_sse_content_tokens(chunk, _cap_carry)
                     yield chunk
             except Exception as exc:  # noqa: BLE001
                 # Mid-stream upstream break.  Emit an SSE error frame +
@@ -522,6 +570,13 @@ def create_app(
                     # swallow would mask connection-pool leaks.
                     logger.exception("proxy: req_ctx cleanup raised")
                 await _emit_completion()
+                if recorder is not None and _cap_arrival is not None:
+                    recorder.write(
+                        arrival_offset=_cap_arrival,
+                        program_id=pid,
+                        body=body,
+                        output_len=_cap_count,
+                    )
 
         # Preserve upstream content-type if present (defaults to SSE).
         upstream_ct = upstream_resp.headers.get(
