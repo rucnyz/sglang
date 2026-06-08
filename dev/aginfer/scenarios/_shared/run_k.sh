@@ -97,6 +97,16 @@ case "$VARIANT" in
         ;;
 esac
 
+# #231 benefit: HICACHE_OFF=1 forces HiCache off regardless of variant, so the
+# LRU baseline can run HBM-only (the paper's "LRU (literature)": res(u) in
+# {{HBM}, empty}, no DRAM/DISK tier).  Evicted units are then DROPPED ->
+# re-prefilled on reuse, exposing the cost the daemon's 4-tier residence
+# avoids.  The HiCache invariant adapts to HICACHE_FLAG so the check still
+# passes.
+if [[ "${HICACHE_OFF:-0}" == "1" ]]; then
+    HICACHE_FLAG=""
+fi
+
 RESULTS_DIR="$AGINFER_RESULTS/run_K_${VARIANT}${RUN_K_RESULTS_TAG:+_${RUN_K_RESULTS_TAG}}"
 mkdir -p "$RESULTS_DIR"
 
