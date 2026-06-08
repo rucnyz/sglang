@@ -96,6 +96,26 @@ Knobs: `CAP_N_TASKS / CAP_N_CONCURRENT / CAP_MAX_TURNS` size the capture;
 - `output_len` from streamed runs is counted as content SSE deltas — exact
   under per-token streaming; a lower bound if a backend coalesces tokens. The
   replay forces the length regardless.
+- **Admission in arrival mode (audit C1):** the a3 arm runs the daemon's full
+  machinery including admission, which can PAUSE a replayed request — that
+  gate-park time lands in a3's TTFT/e2e, while a3_kvoff (admission off) never
+  pauses. This is deliberate (do-no-harm = the daemon's whole footprint), and
+  in open-loop it is **conservative** for a3: admission's cost is counted but
+  its back-pressure benefit (the next arrival backing off) is invisible with
+  frozen arrivals — that benefit shows up in `session` mode. So treat arrival
+  as a pessimistic do-no-harm bound, session as the realistic one. To isolate
+  *pure serving* latency (no admission), run an admission-off variant.
+- **The verdict is gated on a sanity check (audit C2):** `compare.py` prints
+  `COMPARISON INVALID` (and refuses a do-no-harm verdict) unless both arms hit
+  `len_match_rate ≥ 0.98`, zero errors, and statistically-equal total tokens —
+  i.e. the forced-length / identical-work invariant actually held. A clean
+  "DO-NO-HARM: HOLDS" therefore means the arms provably did the same work.
+- **Concurrency cap:** the driver defaults `--max-concurrency 4096` so the cap
+  does not throttle the captured offered load (or serialize sessions); if it is
+  ever hit, `cap_saturated` is set and a warning printed. Comparisons stay
+  valid (both arms capped identically) but absolute numbers would be throttled.
+- **Verdict statistics:** mean±std uses the SAMPLE std (÷ n−1) and a stable
+  better/worse verdict is only issued when both arms have equal n ≥ 2.
 
 ## Tests
 

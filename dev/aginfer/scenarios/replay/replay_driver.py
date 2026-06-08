@@ -45,6 +45,18 @@ def build_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     program_id is injected top-level where the proxy reads it.  output_len
     is clamped to >=1 (max_tokens=0 is rejected; a 0-length capture replays
     as a single token, negligible and flagged in the row).
+
+    FAIRNESS NOTE (audit C1): keeping program_id means the daemon's FULL
+    machinery runs on the a3 arm — including admission, which may PAUSE a
+    replayed request (its TTFT then includes gate-park time that a3_kvoff,
+    admission-off, never sees).  This is deliberate: the do-no-harm question
+    is the daemon's *whole* latency footprint.  In open-loop `arrival` mode
+    it is CONSERVATIVE for a3 — admission's cost is counted but its
+    open-loop-invisible benefit (back-pressure → the next arrival backing
+    off) is not; that benefit shows up in closed-loop `session` mode.  So
+    arrival-mode is a pessimistic do-no-harm bound for a3, session-mode the
+    realistic one.  (To isolate pure serving latency, run an admission-off
+    variant; see README.)
     """
     body = record.get("body") or {}
     out_len = int(record.get("output_len") or 0)
@@ -229,6 +241,22 @@ async def _one_request(
                                 ttft_ms = (now - t0) * 1000.0
                             n_out += 1
                             last_tok_t = now
+            # m3: flush a final un-terminated data line (stream ended without
+            # a trailing newline) so the last token isn't silently dropped.
+            tail = carry.strip()
+            if tail.startswith(b"data:"):
+                p = tail[5:].strip()
+                if p and p != b"[DONE]":
+                    try:
+                        obj = json.loads(p)
+                        for ch in obj.get("choices") or ():
+                            if (ch.get("delta") or {}).get("content"):
+                                if ttft_ms is None:
+                                    ttft_ms = (time.perf_counter() - t0) * 1000.0
+                                n_out += 1
+                                last_tok_t = time.perf_counter()
+                    except Exception:
+                        pass
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc), "want_out": want_out}
 
@@ -247,6 +275,28 @@ async def _one_request(
     }
 
 
+class _InflightGauge:
+    """Tracks concurrent in-flight requests + whether the concurrency cap
+    was ever hit (M1: a saturated cap silently reshapes the offered-load /
+    KV-pressure profile the replay is meant to reproduce)."""
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        self.cur = 0
+        self.peak = 0
+        self.saturated = False
+
+    def enter(self) -> None:
+        self.cur += 1
+        if self.cur > self.peak:
+            self.peak = self.cur
+        if self.cur >= self.cap:
+            self.saturated = True
+
+    def exit(self) -> None:
+        self.cur -= 1
+
+
 async def replay(
     records: List[Dict[str, Any]],
     *,
@@ -254,10 +304,11 @@ async def replay(
     mode: str,
     slowdown: float,
     max_concurrency: int,
-) -> Tuple[List[Dict[str, Any]], float]:
+) -> Tuple[List[Dict[str, Any]], float, Dict[str, Any]]:
     url = base_url.rstrip("/") + "/chat/completions"
     rows: List[Dict[str, Any]] = [None] * len(records)  # type: ignore
     sem = asyncio.Semaphore(max_concurrency)
+    gauge = _InflightGauge(max_concurrency)
     limits = httpx.Limits(max_connections=max_concurrency + 8)
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=30.0),
@@ -267,7 +318,11 @@ async def replay(
 
         async def run(i: int, rec: Dict[str, Any]) -> None:
             async with sem:
-                rows[i] = await _one_request(cli, url, rec)
+                gauge.enter()
+                try:
+                    rows[i] = await _one_request(cli, url, rec)
+                finally:
+                    gauge.exit()
 
         tasks: List[Any] = []
         if mode == "arrival":
@@ -284,7 +339,7 @@ async def replay(
                 tasks.append(asyncio.ensure_future(run(i, rec)))
             await asyncio.gather(*tasks)
         wall_s = time.perf_counter() - wall0
-    return rows, wall_s
+    return rows, wall_s, {"peak_inflight": gauge.peak, "cap_saturated": gauge.saturated}
 
 
 async def replay_sessions(
@@ -294,19 +349,28 @@ async def replay_sessions(
     slowdown: float,
     max_concurrency: int,
     zero_tool_time: bool = False,
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, Dict[str, Any]]:
     """Closed-loop replay: each session is a dependent request chain.
 
     Sessions start at their recorded first-arrival offset (preserving
     inter-session concurrency); within a session, request N+1 is dispatched
     only after N completes + its tool-think gap.  ``zero_tool_time`` drops
     the gaps (benefit upper bound).  Returns (per-request rows, per-session
-    rows, makespan_s).
+    rows, makespan_s, gauge).
+
+    M3: ``max_concurrency`` MUST be >= len(sessions), else sessions queue at
+    the semaphore and the makespan is throttled (equally for both arms, so
+    the comparison still holds, but the absolute number is an artifact).
+    The caller is warned via gauge.cap_saturated.
     """
     url = base_url.rstrip("/") + "/chat/completions"
+    # M2: rows is append-as-completed (NOT trace-ordered like open-loop's
+    # indexed list).  aggregate() is order-independent so this is fine;
+    # do NOT join these rows back to the trace by index.
     rows: List[Dict[str, Any]] = []
     sess_rows: List[Dict[str, Any]] = []
     sem = asyncio.Semaphore(max_concurrency)
+    gauge = _InflightGauge(max_concurrency)
     limits = httpx.Limits(max_connections=max_concurrency + 8)
     base_t = min((s["start_t"] for s in sessions), default=0.0)
     async with httpx.AsyncClient(
@@ -324,7 +388,11 @@ async def replay_sessions(
             last_done = sess_start
             for step in s["steps"]:
                 async with sem:
-                    row = await _one_request(cli, url, step["record"])
+                    gauge.enter()
+                    try:
+                        row = await _one_request(cli, url, step["record"])
+                    finally:
+                        gauge.exit()
                 rows.append(row)
                 last_done = time.perf_counter()
                 gap = 0.0 if zero_tool_time else step["gap_after"]
@@ -340,7 +408,12 @@ async def replay_sessions(
 
         await asyncio.gather(*[run_session(s) for s in sessions])
         makespan_s = time.perf_counter() - wall0
-    return rows, sess_rows, makespan_s
+    ginfo = {
+        "peak_inflight": gauge.peak,
+        "cap_saturated": gauge.saturated,
+        "n_sessions": len(sessions),
+    }
+    return rows, sess_rows, makespan_s, ginfo
 
 
 def load_trace(path: str, limit: Optional[int]) -> List[Dict[str, Any]]:
@@ -370,7 +443,10 @@ def main() -> int:
              "session = closed-loop dependent chains (end-to-end makespan)",
     )
     ap.add_argument("--slowdown", type=float, default=1.0)
-    ap.add_argument("--max-concurrency", type=int, default=64)
+    # M1/M3: default high so the cap does not throttle the captured offered
+    # load (32-way + runaway) / serialize sessions.  Surfaced via
+    # cap_saturated if it is ever hit.
+    ap.add_argument("--max-concurrency", type=int, default=4096)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--label", default="run")
     ap.add_argument("--out", default="")
@@ -383,9 +459,15 @@ def main() -> int:
         print("no records in trace")
         return 1
 
+    # M4: a trace missing ref_e2e_ms makes closed-loop gaps wrong (over-long).
+    n_missing_e2e = sum(1 for r in records if "ref_e2e_ms" not in r)
+    if args.mode == "session" and n_missing_e2e:
+        print(f"WARNING: {n_missing_e2e}/{len(records)} records lack ref_e2e_ms "
+              f"— closed-loop tool-think gaps will be OVER-estimated", flush=True)
+
     if args.mode == "session":
         sessions = build_sessions(records)
-        rows, sess_rows, makespan = asyncio.run(
+        rows, sess_rows, makespan, ginfo = asyncio.run(
             replay_sessions(
                 sessions,
                 base_url=args.base_url,
@@ -398,7 +480,7 @@ def main() -> int:
         metrics["sessions"] = aggregate_sessions(sess_rows, makespan)
         extra_rows: Dict[str, Any] = {"session_rows": sess_rows}
     else:
-        rows, wall_s = asyncio.run(
+        rows, wall_s, ginfo = asyncio.run(
             replay(
                 records,
                 base_url=args.base_url,
@@ -410,6 +492,13 @@ def main() -> int:
         metrics = aggregate(rows, wall_s)
         extra_rows = {}
 
+    metrics["peak_inflight"] = ginfo.get("peak_inflight")
+    metrics["cap_saturated"] = ginfo.get("cap_saturated")
+    if ginfo.get("cap_saturated"):
+        print(f"WARNING: concurrency cap {args.max_concurrency} SATURATED "
+              f"(peak_inflight={ginfo.get('peak_inflight')}) — offered-load / "
+              f"pressure profile may be throttled; raise --max-concurrency",
+              flush=True)
     metrics["label"] = args.label
     metrics["mode"] = args.mode
     print(json.dumps(metrics, indent=2))

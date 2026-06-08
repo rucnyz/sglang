@@ -38,8 +38,16 @@ def _mean_std(xs: List[float]) -> Dict[str, float]:
     if not xs:
         return {"mean": float("nan"), "std": float("nan"), "n": 0}
     m = sum(xs) / len(xs)
-    var = sum((x - m) ** 2 for x in xs) / len(xs)
-    return {"mean": m, "std": math.sqrt(var), "n": len(xs)}
+    # M6: SAMPLE std (÷ n-1), not population (÷ n).  Population std on N=3
+    # trials under-states spread and makes the do-no-harm "stably worse"
+    # bands trigger-happy — the opposite of what a do-no-harm gate wants.
+    # n=1 → std is undefined; report NaN so _band_verdict refuses a verdict.
+    if len(xs) >= 2:
+        var = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
+        std = math.sqrt(var)
+    else:
+        std = float("nan")
+    return {"mean": m, "std": std, "n": len(xs)}
 
 
 def _get(metrics: Dict[str, Any], grp: str, stat: str) -> Optional[float]:
@@ -100,7 +108,18 @@ def summarize(metrics_by_arm: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]
 
 
 def _band_verdict(ours: Dict[str, float], base: Dict[str, float], *, lower_is_better: bool) -> str:
-    """Disjoint mean±std bands -> stable better/worse; else within-noise."""
+    """Disjoint mean±std bands -> stable better/worse; else within-noise.
+
+    Refuses a verdict (M5) when either arm has <2 trials (std undefined,
+    NaN) or the two arms have unequal trial counts — comparing a 3-sample
+    band against a 1-sample (std=0) band manufactures false stable verdicts.
+    """
+    if ours.get("n", 0) < 2 or base.get("n", 0) < 2:
+        return "insufficient samples (need n>=2/arm)"
+    if ours["n"] != base["n"]:
+        return f"unequal samples (a3 n={ours['n']} vs base n={base['n']})"
+    if ours["std"] != ours["std"] or base["std"] != base["std"]:  # NaN
+        return "insufficient samples"
     o_lo, o_hi = ours["mean"] - ours["std"], ours["mean"] + ours["std"]
     b_lo, b_hi = base["mean"] - base["std"], base["mean"] + base["std"]
     if o_hi < b_lo:
@@ -108,6 +127,35 @@ def _band_verdict(ours: Dict[str, float], base: Dict[str, float], *, lower_is_be
     if o_lo > b_hi:
         return "ours STABLY HIGHER (regression)" if lower_is_better else "ours STABLY BETTER"
     return "within-noise"
+
+
+def sanity_check(summary: Dict[str, Any], *, min_len_match: float = 0.98) -> Dict[str, Any]:
+    """C2 — verify the arms actually did identical work before any verdict
+    is trustworthy.  Returns {ok, reasons}.  Fails if (a) either arm's
+    len_match_rate < min_len_match, (b) either arm saw errors, or (c) the
+    two arms' total generated tokens are stably different (disjoint
+    mean±std bands) — any of which means the forced-length invariant
+    broke and the comparison is INVALID, not 'do-no-harm holds'.
+    """
+    reasons: List[str] = []
+    san = summary.get("sanity", {})
+    for arm, d in san.items():
+        lm = d.get("len_match_rate", {})
+        if lm.get("n") and lm["mean"] < min_len_match:
+            reasons.append(f"{arm} len_match_rate {lm['mean']:.3f} < {min_len_match}")
+        ne = d.get("n_error", {})
+        if ne.get("n") and ne["mean"] > 0.5:
+            reasons.append(f"{arm} mean n_error {ne['mean']:.1f} > 0")
+    a = san.get("a3", {}).get("total_out_tokens")
+    b = san.get("a3_kvoff", {}).get("total_out_tokens")
+    if a and b and a.get("n", 0) >= 2 and b.get("n", 0) >= 2:
+        v = _band_verdict(a, b, lower_is_better=True)
+        if "STABLY" in v:
+            reasons.append(
+                f"total_out_tokens diverged across arms (a3={a['mean']:.0f} "
+                f"vs base={b['mean']:.0f}) — forced-length invariant broke"
+            )
+    return {"ok": not reasons, "reasons": reasons}
 
 
 def load_dir(results_dir: str) -> Dict[str, List[Dict[str, Any]]]:
@@ -165,9 +213,18 @@ def main() -> int:
         b = _fmt(row.get("a3_kvoff", {"n": 0}))
         print(f"  {row['metric']:12s} {a:16s} {b:16s}  {row.get('verdict','')}")
 
+    # C2 — the verdict is only trustworthy if the arms did identical work.
+    sanity = sanity_check(s)
+    print()
+    if not sanity["ok"]:
+        print("COMPARISON INVALID — arms did not do identical work:")
+        for r in sanity["reasons"]:
+            print("  - " + r)
+        print("  (forced-length / fairness invariant broke; verdict suppressed)")
+        return 1
+
     regressions = [r["metric"] for r in s["latency"] + s.get("endtoend", [])
                    if "regression" in str(r.get("verdict", ""))]
-    print()
     if regressions:
         print(f"DO-NO-HARM: VIOLATED on {regressions}")
     else:

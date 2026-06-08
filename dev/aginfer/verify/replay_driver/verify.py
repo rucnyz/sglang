@@ -156,10 +156,12 @@ async def test_live() -> None:
     port = _free_port()
     stub = make_stub()
     async with _Server(stub, port):
-        rows, wall = await replay(
+        rows, wall, ginfo = await replay(
             records, base_url=f"http://127.0.0.1:{port}/v1",
             mode="arrival", slowdown=1.0, max_concurrency=16,
         )
+    check(ginfo["peak_inflight"] >= 1 and not ginfo["cap_saturated"],
+          "B0 gauge: peak tracked, cap not saturated at 16")
     agg = aggregate(rows, wall)
     check(agg["n_ok"] == 3 and agg["n_error"] == 0, "B0 all 3 replayed ok")
     n_outs = sorted(r["n_out"] for r in rows)
@@ -173,7 +175,7 @@ async def test_live() -> None:
     port2 = _free_port()
     stub2 = make_stub(fail=True)
     async with _Server(stub2, port2):
-        rows2, wall2 = await replay(
+        rows2, wall2, _g2 = await replay(
             records, base_url=f"http://127.0.0.1:{port2}/v1",
             mode="closed", slowdown=1.0, max_concurrency=16,
         )
@@ -201,6 +203,16 @@ def test_sessions_pure() -> None:
     check(a["steps"][1]["gap_after"] == 0.0, "C last step gap 0")
     check(sessions[0]["start_t"] <= sessions[-1]["start_t"], "C sessions sorted by start_t")
 
+    # M4: missing ref_e2e_ms -> gap overestimated to full t_next-t_n (=1.0),
+    # not the true 0.8.  (Driver warns; here we pin the documented behavior.)
+    recs_noe2e = [
+        {"t": 0.0, "program_id": "A", "output_len": 3, "body": {}},
+        {"t": 1.0, "program_id": "A", "output_len": 4, "body": {}},
+    ]
+    a2 = build_sessions(recs_noe2e)[0]
+    check(abs(a2["steps"][0]["gap_after"] - 1.0) < 1e-9,
+          f"M4 missing ref_e2e_ms -> gap = full interval 1.0 (got {a2['steps'][0]['gap_after']})")
+
     agg = aggregate_sessions(
         [{"program_id": "A", "session_e2e_s": 1.2, "n_steps": 2},
          {"program_id": "B", "session_e2e_s": 0.3, "n_steps": 1}],
@@ -225,12 +237,12 @@ async def test_session_live() -> None:
     port = _free_port()
     stub = make_stub(per_tok_delay_s=0.001)
     async with _Server(stub, port):
-        rows, sess_rows, makespan = await replay_sessions(
+        rows, sess_rows, makespan, _g = await replay_sessions(
             sessions, base_url=f"http://127.0.0.1:{port}/v1",
             slowdown=1.0, max_concurrency=8,
         )
         # zero-tool-time variant must be faster (no 0.3s gap)
-        rows0, sess0, makespan0 = await replay_sessions(
+        rows0, sess0, makespan0, _g0 = await replay_sessions(
             sessions, base_url=f"http://127.0.0.1:{port}/v1",
             slowdown=1.0, max_concurrency=8, zero_tool_time=True,
         )

@@ -352,7 +352,9 @@ if [[ -n "${RUN_K_WORKLOAD_CMD:-}" ]]; then
         cp -- "$SGLANG_LOG_REAL" "$RESULTS_DIR/sglang_v4flash.log" 2>/dev/null || true
     fi
     echo "[run_k:$VARIANT] DONE — variant complete (replay workload)"
-    exit 0
+    # m5: propagate the workload's exit code (trap-cleanup still fires on
+    # EXIT) so run_replay.sh sees a failed trial instead of a silent rc=0.
+    exit "${HARBOR_EXIT:-0}"
 fi
 
 echo "[run_k:$VARIANT] starting harbor (n_tasks=${HARBOR_N_TASKS}, concurrent=${HARBOR_N_CONCURRENT}, max_turns=${HARBOR_MAX_TURNS}, swebenchpro/terminus-2)..."

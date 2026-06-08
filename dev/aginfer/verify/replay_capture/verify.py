@@ -91,6 +91,14 @@ def test_helpers() -> None:
     n = count_sse_content_tokens(junk, carry)
     check(n == 1, f"A1 only the one real content delta counts (got {n})")
 
+    # A1b — CRLF line endings + multiple events in one chunk.
+    carry = {}
+    crlf = (b"data: " + json.dumps({"choices": [{"delta": {"content": "x"}}]}).encode()
+            + b"\r\n\r\n"
+            + b"data: " + json.dumps({"choices": [{"delta": {"content": "y"}}]}).encode()
+            + b"\r\n\r\n")
+    check(count_sse_content_tokens(crlf, carry) == 2, "A1b CRLF + multi-event-per-chunk == 2")
+
     # A2 — usage parse.
     body = json.dumps({"usage": {"completion_tokens": 42}}).encode()
     check(usage_completion_tokens(body) == 42, "A2 usage_completion_tokens == 42")

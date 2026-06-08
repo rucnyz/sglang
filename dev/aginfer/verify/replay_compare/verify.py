@@ -18,7 +18,7 @@ from typing import List
 _REPLAY_DIR = Path(__file__).resolve().parents[2] / "scenarios" / "replay"
 sys.path.insert(0, str(_REPLAY_DIR))
 
-from compare import _band_verdict, summarize, load_dir  # noqa: E402
+from compare import _band_verdict, summarize, load_dir, sanity_check  # noqa: E402
 
 _FAILS: List[str] = []
 
@@ -31,16 +31,45 @@ def check(cond: bool, msg: str) -> None:
 
 def test_verdict() -> None:
     print("A. _band_verdict")
-    lo = {"mean": 10.0, "std": 1.0}
-    hi = {"mean": 20.0, "std": 1.0}
+    lo = {"mean": 10.0, "std": 1.0, "n": 3}
+    hi = {"mean": 20.0, "std": 1.0, "n": 3}
     check(_band_verdict(lo, hi, lower_is_better=True) == "ours STABLY LOWER",
           "A ours band fully below -> STABLY LOWER")
     check("regression" in _band_verdict(hi, lo, lower_is_better=True),
           "A ours band fully above -> regression")
-    overlap_a = {"mean": 15.0, "std": 5.0}
-    overlap_b = {"mean": 16.0, "std": 5.0}
+    overlap_a = {"mean": 15.0, "std": 5.0, "n": 3}
+    overlap_b = {"mean": 16.0, "std": 5.0, "n": 3}
     check(_band_verdict(overlap_a, overlap_b, lower_is_better=True) == "within-noise",
           "A overlapping bands -> within-noise")
+    # M5: n<2 or unequal n must REFUSE a verdict (no false stable bands)
+    check("insufficient" in _band_verdict({"mean": 10, "std": float("nan"), "n": 1},
+                                          {"mean": 20, "std": 1.0, "n": 3},
+                                          lower_is_better=True),
+          "A M5 n<2 -> insufficient samples (no verdict)")
+    check("unequal" in _band_verdict({"mean": 10, "std": 1.0, "n": 2},
+                                     {"mean": 20, "std": 1.0, "n": 3},
+                                     lower_is_better=True),
+          "A M5 unequal n -> refused")
+
+
+def test_sanity() -> None:
+    print("C2. sanity_check gates the verdict")
+    # clean: len_match 1.0, no errors, equal tokens -> ok
+    ok = summarize({"a3": [_m(100, 50, 40)] * 3, "a3_kvoff": [_m(100, 50, 40)] * 3})
+    check(sanity_check(ok)["ok"], "C2 identical work -> sanity ok")
+    # low len_match -> invalid
+    bad = _m(100, 50, 40); bad["len_match_rate"] = 0.5
+    s_bad = summarize({"a3": [bad] * 3, "a3_kvoff": [_m(100, 50, 40)] * 3})
+    res = sanity_check(s_bad)
+    check(not res["ok"] and any("len_match" in r for r in res["reasons"]),
+          "C2 low len_match -> COMPARISON INVALID")
+    # divergent total tokens -> invalid
+    hi = _m(100, 50, 40); hi["total_out_tokens"] = 5000
+    lo = _m(100, 50, 40); lo["total_out_tokens"] = 1000
+    s_div = summarize({"a3": [hi] * 3, "a3_kvoff": [lo] * 3})
+    res2 = sanity_check(s_div)
+    check(not res2["ok"] and any("total_out_tokens" in r for r in res2["reasons"]),
+          "C2 divergent tokens -> COMPARISON INVALID")
 
 
 def _m(ttft_p99: float, e2e_p50: float, thr: float) -> dict:
@@ -110,6 +139,7 @@ def test_endtoend() -> None:
 
 def main() -> int:
     test_verdict()
+    test_sanity()
     test_summarize()
     test_load_dir()
     test_endtoend()
