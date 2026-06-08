@@ -94,7 +94,8 @@ def test_pure() -> None:
 # ----------------------------------------------------------- live stub server
 
 def make_stub(per_tok_delay_s: float = 0.002, fail: bool = False,
-              reasoning_frac: float = 0.0) -> FastAPI:
+              reasoning_frac: float = 0.0, usage_total: int = 0,
+              emit_streamed: int = -1) -> FastAPI:
     app = FastAPI()
     app.state.seen_pids: List[Any] = []
 
@@ -105,14 +106,22 @@ def make_stub(per_tok_delay_s: float = 0.002, fail: bool = False,
         if fail:
             return JSONResponse({"error": "boom"}, status_code=502)
         n = int(body.get("max_tokens") or 1)  # HONOR forced length
-        n_reason = int(n * reasoning_frac)
+        # emit_streamed lets a test stream FEWER content deltas than the
+        # server's true usage (simulating uncounted role/separator deltas).
+        n_stream = n if emit_streamed < 0 else emit_streamed
+        n_reason = int(n_stream * reasoning_frac)
+        want_usage = body.get("stream_options", {}).get("include_usage")
 
         async def gen():
-            for i in range(n):
+            for i in range(n_stream):
                 await asyncio.sleep(per_tok_delay_s)
                 key = "reasoning_content" if i < n_reason else "content"
                 yield b"data: " + json.dumps(
                     {"choices": [{"delta": {key: "x"}}]}
+                ).encode() + b"\n\n"
+            if want_usage and usage_total:
+                yield b"data: " + json.dumps(
+                    {"choices": [], "usage": {"completion_tokens": usage_total}}
                 ).encode() + b"\n\n"
             yield b"data: [DONE]\n\n"
 
@@ -218,6 +227,23 @@ async def test_live() -> None:
           f"B4 reasoning+content both counted -> n_out==10 (got {rows4[0]['n_out']})")
     check(aggregate(rows4, wall4)["len_match_rate"] == 1.0,
           "B4 reasoning split -> len_match 1.0")
+
+    # B5 (authoritative usage): stub streams only 8 content deltas but
+    # reports usage.completion_tokens=10 (2 uncounted separator deltas).
+    # n_out must be the server's 10, not the streamed 8 -> len_match holds.
+    port5 = _free_port()
+    stub5 = make_stub(usage_total=10, emit_streamed=8)
+    async with _Server(stub5, port5):
+        rows5, wall5, _g5 = await replay(
+            [{"t": 0.0, "program_id": "U", "output_len": 10,
+              "body": {"model": "m", "messages": [{"role": "user", "content": "u"}]}}],
+            base_url=f"http://127.0.0.1:{port5}/v1",
+            mode="arrival", slowdown=1.0, max_concurrency=4,
+        )
+    check(rows5[0]["n_out"] == 10 and rows5[0]["n_out_streamed"] == 8,
+          f"B5 usage(10) overrides streamed(8) -> n_out={rows5[0]['n_out']}")
+    check(aggregate(rows5, wall5)["len_match_rate"] == 1.0,
+          "B5 authoritative usage -> len_match 1.0")
 
 
 def test_sessions_pure() -> None:

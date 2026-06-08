@@ -69,7 +69,11 @@ def build_payload(record: Dict[str, Any]) -> Dict[str, Any]:
         "max_tokens": max(1, out_len),
         "ignore_eos": True,
         "stream": True,
-        "stream_options": {"include_usage": False},
+        # include_usage -> the final stream chunk carries the server's
+        # authoritative completion_tokens, used as n_out (exact, immune to
+        # SSE-delta counting artifacts: role/separator/finish deltas that
+        # carry no content).  Delta parsing is kept only for TTFT/TPOT.
+        "stream_options": {"include_usage": True},
     }
     pid = record.get("program_id")
     if pid is not None:
@@ -214,7 +218,8 @@ async def _one_request(
     t0 = time.perf_counter()
     ttft_ms: Optional[float] = None
     last_tok_t: Optional[float] = None
-    n_out = 0
+    n_out = 0           # SSE-delta count (timing / fallback)
+    usage_out: Optional[int] = None  # authoritative server completion_tokens
     carry = b""
     try:
         async with cli.stream("POST", url, json=payload) as resp:
@@ -237,6 +242,9 @@ async def _one_request(
                         obj = json.loads(p)
                     except Exception:
                         continue
+                    u = obj.get("usage")
+                    if isinstance(u, dict) and u.get("completion_tokens") is not None:
+                        usage_out = int(u["completion_tokens"])
                     for ch in obj.get("choices") or ():
                         delta = ch.get("delta") or {}
                         # Count content AND reasoning_content (reasoning
@@ -268,6 +276,9 @@ async def _one_request(
         return {"ok": False, "error": str(exc), "want_out": want_out}
 
     e2e_ms = (time.perf_counter() - t0) * 1000.0
+    # TPOT from the delta-timed token count (the tokens we actually
+    # timestamped); n_out reported is the server's authoritative
+    # completion_tokens when available (exact len_match).
     tpot_ms = None
     if ttft_ms is not None and last_tok_t is not None and n_out >= 2:
         decode_ms = (last_tok_t - t0) * 1000.0 - ttft_ms
@@ -277,7 +288,8 @@ async def _one_request(
         "ttft_ms": ttft_ms,
         "e2e_ms": e2e_ms,
         "tpot_ms": tpot_ms,
-        "n_out": n_out,
+        "n_out": usage_out if usage_out is not None else n_out,
+        "n_out_streamed": n_out,
         "want_out": want_out,
     }
 
