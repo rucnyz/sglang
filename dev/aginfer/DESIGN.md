@@ -534,17 +534,25 @@ by each endpoint's temporal semantics:
 * `hints` — idempotent overwrite-by-stamp ⇒ merge the burst into ONE
   PUT, latest value per hash.  This collapses the flood so the channel
   un-clogs; a migrate no longer waits behind it.
-* `migrate` — time-sensitive, but rare; dispatched individually (FIFO +
-  per-POST sustained-escalation accounting preserved).  A migrate
-  decided on a state snapshot is a prediction with a **validity
-  horizon**: the worker drops one whose queue-age exceeds a *generous*
-  bound (a pathological-spike floor — sglang catastrophically stalled —
-  not a tight knob masking ordinary latency, which the coalescing
+* `migrate` — time-sensitive; merged into ONE POST per wake, latest
+  decision per unit hash, after the freshness drop.  (Initially kept
+  per-batch, but live evidence — a migrate *burst* of ~130 in one cycle —
+  showed individual dispatch through the single-flight channel re-clogs it
+  exactly like the hint flood: oldest-age climbs to ~700 ms and rejects
+  return.  Coalescing makes a burst one round-trip, so the single-flight
+  ceiling bounds *how often* a batch is sent, not how many actions it
+  carries.)  A migrate decided on a state snapshot is a prediction with a
+  **validity horizon**: the worker drops an action whose queue-age exceeds
+  a *generous* bound (a pathological-spike floor — sglang catastrophically
+  stalled — not a tight knob masking ordinary latency, which the coalescing
   removes at the source).  This is the proactive complement to §10's
-  reactive `APPLY_FAILED` re-issue: never actuate a decision already
-  stale against the world it was decided on.  Dispatch order is
-  liveness (`program_paused`) → eviction (`migrate`) → idempotent
-  (`hints`), so time-sensitive intents never queue behind the flood.
+  reactive `APPLY_FAILED` re-issue: never actuate a decision already stale
+  against the world it was decided on.  Dispatch order is liveness
+  (`program_paused`) → eviction (`migrate`) → idempotent (`hints`), so
+  time-sensitive intents never queue behind the flood.  The #164
+  sustained-unreachable escalation now counts failed POSTs per wake (still
+  fires on sustained failure + backlog age — coalescing only reduces the
+  POST count, not the signal).
 * `program_paused` — liveness-critical; coalesced by pid (latest state
   wins), never dropped.
 

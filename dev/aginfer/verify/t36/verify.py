@@ -96,6 +96,16 @@ class _StubHttpClient:
             raise httpx.ConnectError("stubbed connection error")
         return _StubResponse(self._status_code)
 
+    async def request(self, method, url, *, json=None):  # type: ignore[no-untyped-def]
+        # #228: PUT endpoints (hints, program_paused) route through
+        # ``.request``; mirror ``.post`` so coalesced PUTs are recorded
+        # the same way.  ``self.posts`` is the unified dispatch log.
+        await asyncio.sleep(self._post_delay_s)
+        self.posts.append((url, json or {}))
+        if self._raise:
+            raise httpx.ConnectError("stubbed connection error")
+        return _StubResponse(self._status_code)
+
     async def aclose(self) -> None:
         return None
 
@@ -135,11 +145,17 @@ def stage_a0_batch_id_is_uuid4() -> None:
 
 
 def stage_a1_handler_returns_under_1ms_regardless_of_post() -> None:
-    """**The headline property.**  Even when the downstream POST
-    sleeps 200 ms inside the stub, ``enqueue_migrate`` must return
-    in well under 1 ms (it's just an ``asyncio.Queue.put_nowait``
-    + ``uuid.uuid4()``).  The PRE-T36 sync code would block the
-    handler for the full 200 ms."""
+    """**The headline property.**  Even when the downstream PUT sleeps
+    200 ms inside the stub, ``enqueue_hints`` must return in well under
+    1 ms (it's just an ``asyncio.Queue.put_nowait`` + ``uuid.uuid4()``).
+    The PRE-T36 sync code would block the handler for the full 200 ms.
+
+    #228: the worker now COALESCES per wake — a burst of hint batches
+    collapses to at most one PUT per wake (latest value per hash).  So
+    the drain assertion is no longer "N PUTs for N enqueues"; it is
+    "every enqueued hash's CONTENT is delivered across the coalesced
+    PUT(s)".  We enqueue 50 distinct-hash hint batches and assert the
+    UNION of hashes across all dispatched PUTs == all 50."""
     async def _go():
         stub = _StubHttpClient(post_delay_ms=200.0)
         outbound = OutboundQueue(
@@ -153,9 +169,9 @@ def stage_a1_handler_returns_under_1ms_regardless_of_post() -> None:
             timings_us = []
             for i in range(50):
                 t0 = time.perf_counter()
-                outbound.enqueue_migrate([
-                    {"hash": f"h{i}", "add_tiers": [],
-                     "remove_tiers": ["HBM"], "action_id": f"a{i}"}
+                outbound.enqueue_hints([
+                    {"hash": f"h{i}", "p_hat": 0.1, "lambda": 0.01,
+                     "stamp": i}
                 ])
                 timings_us.append((time.perf_counter() - t0) * 1e6)
             # Let the worker drain.
@@ -168,50 +184,102 @@ def stage_a1_handler_returns_under_1ms_regardless_of_post() -> None:
                 f"handler-side enqueue exceeded 1 ms: max={max_us:.1f} µs; "
                 f"all={[f'{t:.0f}' for t in timings_us]}"
             )
-        # Sanity: the worker DID issue 50 posts despite each taking
-        # 200 ms — proves the worker is actually draining and the
-        # handler isn't synchronously waiting.
-        if len(stub.posts) != 50:
+        # #228: assert the worker delivered every batch's CONTENT across
+        # the coalesced PUT(s) — the union of hashes seen on the wire
+        # must equal all 50, even though the worker emitted far fewer
+        # than 50 PUTs (coalescing).  Proves the worker drained and no
+        # content was lost.
+        seen_hashes = set()
+        for _url, body in stub.posts:
+            for h in body.get("hints", []):
+                seen_hashes.add(h.get("hash"))
+        expected = {f"h{i}" for i in range(50)}
+        if seen_hashes != expected:
+            missing = expected - seen_hashes
             raise StageFail(
-                f"worker drain incomplete: {len(stub.posts)} of 50 posts"
+                f"coalesced PUTs did not deliver all 50 hashes; "
+                f"missing={sorted(missing)} "
+                f"(saw {len(seen_hashes)} across {len(stub.posts)} PUTs)"
             )
     asyncio.run(_go())
 
 
-def stage_a2_worker_drains_queue_in_order() -> None:
-    """Single worker drains FIFO.  Defends against a regression that
-    swaps the queue for a stack."""
+def stage_a2_worker_coalesces_latest_per_key_and_orders_endpoints() -> None:
+    """#228: the worker no longer dispatches per-batch FIFO — it
+    COALESCES each wake.  This stage pins the replacement contract:
+
+      * Within an endpoint, latest-enqueued value per key wins
+        (migrate: latest decision per unit hash; hints: highest stamp
+        per hash).
+      * Across endpoints, the dispatch order is
+        program_paused → migrate → hints (liveness → eviction →
+        idempotent flood), regardless of enqueue order.
+
+    All batches are enqueued BEFORE the worker starts so the first
+    ``queue.get`` + drain pulls the whole burst into ONE coalesce →
+    one dispatch per endpoint, making the order deterministic."""
     async def _go():
-        stub = _StubHttpClient(post_delay_ms=10.0)
+        stub = _StubHttpClient(post_delay_ms=1.0)
         outbound = OutboundQueue(
             sglang_base_url="http://unused", http_client=stub,
+            migrate_freshness_ms=0.0,  # disable stale-drop for the test
+        )
+        # Enqueue hints LAST and migrate/paused interleaved so the
+        # dispatch order is NOT the enqueue order — the contract must
+        # reorder them.  Within migrate, enqueue hash "u" twice; the
+        # LATER decision (remove DRAM) must win.
+        outbound.enqueue_hints(
+            [{"hash": "x", "p_hat": 0.1, "lambda": 0.01, "stamp": 1}]
+        )
+        outbound.enqueue_migrate([{"hash": "u", "remove_tiers": ["HBM"]}])
+        outbound.enqueue_program_paused(pid="p0", state="ENDED")
+        outbound.enqueue_migrate([{"hash": "u", "remove_tiers": ["DRAM"]}])
+        # hints for "x" again with a HIGHER stamp — must supersede.
+        outbound.enqueue_hints(
+            [{"hash": "x", "p_hat": 0.9, "lambda": 0.5, "stamp": 7}]
         )
         await outbound.start()
         try:
-            for i in range(10):
-                outbound.enqueue_migrate(
-                    [{"hash": f"h-{i:02d}", "add_tiers": [],
-                      "remove_tiers": ["HBM"], "action_id": f"a-{i:02d}"}]
-                )
             await outbound.queue.join()
         finally:
             await outbound.stop()
-        # Reconstruct order from posts.
-        order = [
-            p[1]["actions"][0]["hash"] for p in stub.posts
-        ]
-        expected = [f"h-{i:02d}" for i in range(10)]
-        if order != expected:
-            raise StageFail(f"FIFO violated: got {order!r}")
+        # One dispatch per endpoint, in the contract order.
+        endpoint_order = [url.rsplit("/", 1)[-1] for url, _ in stub.posts]
+        expected_order = ["program_paused", "migrate", "hints"]
+        if endpoint_order != expected_order:
+            raise StageFail(
+                f"cross-endpoint dispatch order wrong: got {endpoint_order!r}, "
+                f"want {expected_order!r}"
+            )
+        bodies = {url.rsplit("/", 1)[-1]: body for url, body in stub.posts}
+        # migrate: latest decision per hash "u" wins → remove DRAM.
+        m_actions = bodies["migrate"]["actions"]
+        if len(m_actions) != 1 or m_actions[0]["remove_tiers"] != ["DRAM"]:
+            raise StageFail(
+                f"migrate coalesce did not keep latest-per-hash; "
+                f"actions={m_actions!r}"
+            )
+        # hints: highest-stamp value per hash "x" wins → stamp 7.
+        h_hints = bodies["hints"]["hints"]
+        if len(h_hints) != 1 or h_hints[0]["stamp"] != 7:
+            raise StageFail(
+                f"hints coalesce did not keep highest-stamp; "
+                f"hints={h_hints!r}"
+            )
     asyncio.run(_go())
 
 
 def stage_a3_worker_survives_5xx() -> None:
     """5xx from sglang must NOT crash the worker.  Surfaces as a
-    log warning; the worker pops the next batch and continues.
-    DESIGN §6: APPLY_FAILED webhook is the structured-failure path;
-    a 5xx is a transient transport / overload that the next
-    joint_decide re-converges from."""
+    log warning; the worker stays alive and keeps dispatching on the
+    NEXT wake.  DESIGN §6: APPLY_FAILED webhook is the structured-
+    failure path; a 5xx is a transient transport / overload that the
+    next joint_decide re-converges from.
+
+    #228: a wake coalesces, so "N batches → N posts" is no longer the
+    contract.  Instead: enqueue a wave that fails (5xx), wait for it to
+    drain, then enqueue a SECOND wave and assert it is STILL dispatched
+    (the worker survived the error and is processing subsequent wakes)."""
     async def _go():
         stub = _StubHttpClient(post_delay_ms=2.0, status_code=503)
         outbound = OutboundQueue(
@@ -219,20 +287,27 @@ def stage_a3_worker_survives_5xx() -> None:
         )
         await outbound.start()
         try:
-            for i in range(5):
-                outbound.enqueue_migrate(
-                    [{"hash": f"h{i}", "add_tiers": [],
-                      "remove_tiers": ["HBM"], "action_id": f"a{i}"}]
-                )
+            # Wave 1 — fails with 5xx.
+            outbound.enqueue_migrate([{"hash": "w1", "remove_tiers": ["HBM"]}])
+            await outbound.queue.join()
+            posts_after_wave1 = len(stub.posts)
+            if posts_after_wave1 < 1:
+                raise StageFail("wave 1 never reached the wire")
+            # Wave 2 — if the worker died on the 5xx, this never ships.
+            outbound.enqueue_migrate([{"hash": "w2", "remove_tiers": ["HBM"]}])
             await outbound.queue.join()
         finally:
             await outbound.stop()
-        # Each batch should still have hit the wire (5xx is observed,
-        # not skipped).  Retry semantics live below (A4); A3 just
-        # asserts the worker survived the cluster of 5xx.
-        if len(stub.posts) != 5:
+        if len(stub.posts) <= posts_after_wave1:
             raise StageFail(
-                f"5xx made the worker drop posts; got {len(stub.posts)}/5"
+                f"worker did not dispatch wave 2 after a 5xx — it likely "
+                f"died; posts={len(stub.posts)} (was {posts_after_wave1})"
+            )
+        seen = {h.get("hash")
+                for _u, b in stub.posts for h in b.get("actions", [])}
+        if "w2" not in seen:
+            raise StageFail(
+                f"wave-2 content not delivered after 5xx; saw {sorted(seen)}"
             )
     asyncio.run(_go())
 
@@ -240,7 +315,11 @@ def stage_a3_worker_survives_5xx() -> None:
 def stage_a4_worker_survives_connect_error() -> None:
     """``httpx.ConnectError`` (sglang down, daemon-attached-mode race
     at restart, network blip) must NOT crash the worker.  Same
-    contract as A3: log + move on."""
+    contract as A3: log + move on, keep dispatching subsequent wakes.
+
+    #228: assert survival across wakes, not a per-batch post count —
+    enqueue a failing wave, then a second wave, and assert the second
+    is still processed."""
     async def _go():
         stub = _StubHttpClient(post_delay_ms=1.0, raise_on_post=True)
         outbound = OutboundQueue(
@@ -248,20 +327,29 @@ def stage_a4_worker_survives_connect_error() -> None:
         )
         await outbound.start()
         try:
-            for i in range(3):
-                outbound.enqueue_migrate(
-                    [{"hash": f"h{i}", "add_tiers": [],
-                      "remove_tiers": ["HBM"], "action_id": f"a{i}"}]
-                )
+            # Wave 1 — raises ConnectError on dispatch.
+            outbound.enqueue_migrate([{"hash": "w1", "remove_tiers": ["HBM"]}])
+            await outbound.queue.join()
+            posts_after_wave1 = len(stub.posts)
+            if posts_after_wave1 < 1:
+                raise StageFail("wave 1 never reached the wire")
+            # Wave 2 — proves the worker survived the transport error.
+            outbound.enqueue_migrate([{"hash": "w2", "remove_tiers": ["HBM"]}])
             await outbound.queue.join()
         finally:
             await outbound.stop()
-        # The connection-error path also attempts the post; presence
-        # in stub.posts confirms the call site reached.
-        if len(stub.posts) != 3:
+        if len(stub.posts) <= posts_after_wave1:
             raise StageFail(
-                f"connect-error made the worker drop posts; got "
-                f"{len(stub.posts)}/3"
+                f"worker did not dispatch wave 2 after a ConnectError — it "
+                f"likely died; posts={len(stub.posts)} "
+                f"(was {posts_after_wave1})"
+            )
+        seen = {h.get("hash")
+                for _u, b in stub.posts for h in b.get("actions", [])}
+        if "w2" not in seen:
+            raise StageFail(
+                f"wave-2 content not delivered after ConnectError; "
+                f"saw {sorted(seen)}"
             )
     asyncio.run(_go())
 
@@ -430,9 +518,12 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A0 batch_id is UUID4 + unique",                 stage_a0_batch_id_is_uuid4),
     ("A1 handler enqueue returns <1ms regardless of POST latency",
                                                       stage_a1_handler_returns_under_1ms_regardless_of_post),
-    ("A2 worker drains queue in FIFO order",          stage_a2_worker_drains_queue_in_order),
-    ("A3 worker survives sglang 5xx",                 stage_a3_worker_survives_5xx),
-    ("A4 worker survives httpx ConnectError",         stage_a4_worker_survives_connect_error),
+    ("A2 worker coalesces latest-per-key + orders endpoints",
+                                                      stage_a2_worker_coalesces_latest_per_key_and_orders_endpoints),
+    ("A3 worker survives sglang 5xx (keeps dispatching next wakes)",
+                                                      stage_a3_worker_survives_5xx),
+    ("A4 worker survives httpx ConnectError (keeps dispatching)",
+                                                      stage_a4_worker_survives_connect_error),
     ("A5 stop() drains in-flight then exits bounded", stage_a5_stop_drains_inflight_then_exits),
     ("A6 KvScheduler._dispatch_migrate enqueues, no sync POST",
                                                       stage_a6_kv_scheduler_uses_outbound_no_sync_post),

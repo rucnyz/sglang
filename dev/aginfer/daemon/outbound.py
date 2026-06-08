@@ -152,21 +152,41 @@ def _partition_and_coalesce(
         out.extend(kept)
         stats["paused_out"] = len(kept)
 
-    # ---- migrate: stale-drop only; dispatch each survivor individually ---
-    # Migrates are rare (≈130/cycle vs ≈11.7k hints) so they never clog the
-    # channel — the latency win is entirely from collapsing the hint flood
-    # they wait behind.  Keeping them per-batch preserves the FIFO order and
-    # the per-POST sustained-escalation accounting (#164); only the #227
-    # freshness bound applies here (drop a batch decided too long ago to
-    # still be valid against the live tree).
+    # ---- migrate: stale-drop, then COALESCE actions latest-wins per hash --
+    # Originally kept per-batch (to preserve #164 per-POST escalation), but
+    # the live a3 cycle-2 evidence showed a migrate BURST (134 in one cycle)
+    # serialising through the single-flight channel re-clogs it (oldest-age
+    # → 700 ms, rejects return).  So migrates coalesce like hints: one POST
+    # per wake carrying every fresh action (latest decision per unit hash).
+    # The single-flight ceiling still bounds throughput — that is the
+    # imperative path's structural limit (#230), not something coalescing
+    # removes — but bursts no longer stack N round-trips.  Escalation is
+    # preserved (it fires on sustained failed POSTs + backlog age over
+    # successive wakes, not on a per-batch count).
     if migrates:
-        for b in sorted(migrates, key=lambda x: x.enqueue_ts):
+        fresh: List[OutboundBatch] = []
+        for b in migrates:
             age_ms = max(0.0, (now_ts - b.enqueue_ts) * 1000.0)
             if migrate_freshness_ms > 0.0 and age_ms > migrate_freshness_ms:
                 stats["migrate_dropped_stale"] += 1
             else:
-                out.append(b)
-                stats["migrate_out"] += 1
+                fresh.append(b)
+        if fresh:
+            by_hash: Dict[Any, Dict[str, Any]] = {}
+            for b in sorted(fresh, key=lambda x: x.enqueue_ts):
+                for a in (b.body.get("actions", []) if isinstance(b.body, dict)
+                          else []):
+                    by_hash[a.get("hash")] = a   # latest decision per unit
+            merged = list(by_hash.values())
+            if merged:
+                bid = str(uuid.uuid4())
+                out.append(OutboundBatch(
+                    batch_id=bid, endpoint="migrate",
+                    body={"actions": merged, "batch_id": bid},
+                    enqueue_ts=min(b.enqueue_ts for b in fresh),
+                    method="POST",
+                ))
+                stats["migrate_out"] = 1
 
     # ---- hints: coalesce ALL into one PUT, HIGHEST stamp per hash --------
     # Key by max(stamp), not enqueue order: sglang's hint table is itself

@@ -185,8 +185,27 @@ def _enqueue(
 # ============================================================ Phase A
 
 
+def _fresh_failing_batch(i: int) -> OutboundBatch:
+    """A migrate batch the worker will try to dispatch and fail on.
+    Fresh (age ≈ 0) so the #164 oldest_age threshold is NOT crossed —
+    these stages isolate the consec-counter accounting from the age
+    gate.  ``_dispatch_one`` reads ``batch.enqueue_ts`` for its own
+    oldest_age computation, so a near-now stamp keeps age tiny."""
+    return OutboundBatch(
+        batch_id=f"a-{i}",
+        endpoint="migrate",
+        body={"actions": [{"hash": f"h{i}"}], "batch_id": f"a-{i}"},
+        enqueue_ts=time.time(),
+    )
+
+
 def stage_a0_consecutive_failures_resets_on_success() -> None:
-    """Counter increments on a 5xx, then resets on a 2xx."""
+    """#228 coalescing made the per-wake POST count != enqueued-batch
+    count, so the escalation accounting (consec counter) is now tested
+    at the per-DISPATCH unit directly: call ``_dispatch_one`` per
+    coalesced batch.  Two failed dispatches (5xx) climb consec to 2,
+    then a 2xx dispatch resets it to 0.  Thresholds high so no
+    escalation fires mid-test."""
     async def _go():
         stub = _ProgrammableHttpClient(
             [("fivexx", 503), ("fivexx", 503), ("ok", None)]
@@ -195,24 +214,29 @@ def stage_a0_consecutive_failures_resets_on_success() -> None:
             sglang_base_url="http://unused", http_client=stub,
             escalate_failures=1000, escalate_oldest_age_s=10_000,  # high
         )
-        await outbound.start()
-        try:
-            _enqueue(outbound, n=3)
-            await outbound.queue.join()
-        finally:
-            await outbound.stop()
+        # Two failing dispatches → consec climbs.
+        await outbound._dispatch_one(_fresh_failing_batch(0))
+        await outbound._dispatch_one(_fresh_failing_batch(1))
+        if outbound.consecutive_failures != 2:
+            raise StageFail(
+                f"consec should be 2 after two failed dispatches; "
+                f"got {outbound.consecutive_failures}"
+            )
+        # Third dispatch succeeds (2xx) → reset.
+        await outbound._dispatch_one(_fresh_failing_batch(2))
         return outbound.consecutive_failures
     final = asyncio.run(_go())
     if final != 0:
         raise StageFail(
-            f"counter should reset to 0 after the final 2xx; got {final}"
+            f"counter should reset to 0 after the 2xx dispatch; got {final}"
         )
 
 
 def stage_a1_consec_increments_on_each_failure_flavor() -> None:
-    """5xx, 4xx, transport-exception, transport-exception → consec=4
-    (no 2xx in the script so the counter never resets).  Thresholds
-    set high so no escalation fires."""
+    """#228: consec accounting tested per-DISPATCH (one ``_dispatch_one``
+    call per coalesced POST).  Four failed dispatches of mixed flavor
+    (5xx, 4xx, transport-exception, transport-exception) → consec=4 (no
+    2xx so it never resets).  Thresholds high so no escalation fires."""
     async def _go():
         stub = _ProgrammableHttpClient([
             ("fivexx", 503),
@@ -224,25 +248,33 @@ def stage_a1_consec_increments_on_each_failure_flavor() -> None:
             sglang_base_url="http://unused", http_client=stub,
             escalate_failures=1000, escalate_oldest_age_s=10_000,
         )
-        await outbound.start()
-        try:
-            _enqueue(outbound, n=4)
-            await outbound.queue.join()
-        finally:
-            await outbound.stop()
+        # One dispatch per scripted flavor; assert the counter ticks
+        # up by exactly one each time.
+        for i in range(4):
+            await outbound._dispatch_one(_fresh_failing_batch(i))
+            if outbound.consecutive_failures != i + 1:
+                raise StageFail(
+                    f"after {i + 1} failed dispatches consec should be "
+                    f"{i + 1}; got {outbound.consecutive_failures}"
+                )
         return outbound.consecutive_failures
     final = asyncio.run(_go())
     if final != 4:
         raise StageFail(
-            f"consec should equal 4 after 4 failures of mixed flavor; "
-            f"got {final}"
+            f"consec should equal 4 after 4 failed dispatches of mixed "
+            f"flavor; got {final}"
         )
 
 
 def stage_a2_high_consec_alone_does_not_escalate() -> None:
     """consec >> threshold BUT oldest_age < threshold (low-traffic
     dead-sglang).  Fatal must NOT fire — daemon stays alive,
-    waiting for sglang to come back."""
+    waiting for sglang to come back.
+
+    #228: tested per-DISPATCH — 10 failed dispatches of FRESH batches
+    (age ≈ 0) push consec to 10 (> escalate_failures=3) but the age
+    gate is never crossed, so ``_dispatch_one`` must NOT call fatal().
+    If it did, sys.exit/os._exit would kill this process mid-loop."""
     async def _go():
         stub = _ProgrammableHttpClient(
             [("fivexx", 503)]  # always fails (cycles)
@@ -252,21 +284,18 @@ def stage_a2_high_consec_alone_does_not_escalate() -> None:
             escalate_failures=3,             # low
             escalate_oldest_age_s=10_000,    # impossibly high
         )
-        await outbound.start()
-        try:
-            # 10 fresh batches (each just enqueued, age ≈ 0) — consec
-            # rockets to 10 but oldest_age stays at ~0.  If fatal
-            # fired, this process would die mid-drain.
-            _enqueue(outbound, n=10)
-            await outbound.queue.join()
-        finally:
-            await outbound.stop()
+        # 10 fresh failing dispatches — consec rockets to 10 but each
+        # batch's oldest_age stays ≈ 0.  Surviving the loop proves the
+        # age gate held fatal back.
+        for i in range(10):
+            await outbound._dispatch_one(_fresh_failing_batch(i))
         return outbound.consecutive_failures
-    # If fatal fired, sys.exit propagates and we'd never reach here.
+    # If fatal fired, the process would die and we'd never reach here.
     final = asyncio.run(_go())
     if final < 10:
         raise StageFail(
-            f"consec should be at least 10 (all failed); got {final}"
+            f"consec should be at least 10 (all dispatches failed); "
+            f"got {final}"
         )
 
 
@@ -416,6 +445,9 @@ class _AlwaysFail:
     async def post(self, url, *, json=None):
         raise httpx.ConnectError('simulated unreachable')
 
+    async def request(self, method, url, *, json=None):
+        raise httpx.ConnectError('simulated unreachable')
+
     async def aclose(self):
         return None
 
@@ -431,15 +463,32 @@ ob = OutboundQueue(
     escalate_failures=3,
     escalate_oldest_age_s=0.001,
 )
-# Pre-seed 10 aged batches so worker trips fatal on first failures.
+# #228: a wake coalesces to AT MOST one POST/PUT per endpoint, so 10
+# aged migrate batches would collapse to ONE failed POST (consec=1) —
+# never reaching escalate_failures=3.  Instead enqueue across THREE
+# endpoints in one wake (program_paused + migrate + hints), all aged
+# 5 s and all failing.  That yields 3 distinct coalesced dispatches
+# in the single wake → consec reaches 3 (= threshold) AND oldest_age
+# (5 s) >> 0.001 s → fatal fires.  The aged stamps are injected by
+# directly constructing OutboundBatch (enqueue_* would stamp now()).
 old_ts = time.time() - 5.0
-for i in range(10):
-    ob.queue.put_nowait(OutboundBatch(
-        batch_id='b{{}}'.format(i),
-        endpoint='migrate',
-        body={{'actions': [], 'batch_id': 'b{{}}'.format(i)}},
-        enqueue_ts=old_ts,
-    ))
+ob.queue.put_nowait(OutboundBatch(
+    batch_id='pp0', endpoint='program_paused',
+    body={{'pid': 'p0', 'state': 'ENDED',
+           'pre_pause_state': None, 'batch_id': 'pp0'}},
+    enqueue_ts=old_ts, method='PUT',
+))
+ob.queue.put_nowait(OutboundBatch(
+    batch_id='mg0', endpoint='migrate',
+    body={{'actions': [{{'hash': 'h0'}}], 'batch_id': 'mg0'}},
+    enqueue_ts=old_ts, method='POST',
+))
+ob.queue.put_nowait(OutboundBatch(
+    batch_id='hn0', endpoint='hints',
+    body={{'hints': [{{'hash': 'h', 'p_hat': 0.1, 'lambda': 0.01,
+                       'stamp': 1}}], 'batch_id': 'hn0'}},
+    enqueue_ts=old_ts, method='PUT',
+))
 app.state.outbound = ob
 
 s = socket.socket()
@@ -622,6 +671,8 @@ from daemon.outbound import OutboundQueue, OutboundBatch
 class _AlwaysFail:
     async def post(self, url, *, json=None):
         raise httpx.ConnectError('simulated unreachable')
+    async def request(self, method, url, *, json=None):
+        raise httpx.ConnectError('simulated unreachable')
     async def aclose(self): return None
 
 
@@ -633,22 +684,31 @@ async def _go():
         escalate_failures=3,
         escalate_oldest_age_s=0.001,
     )
-    # Pre-enqueue 10 batches stamped 5 s in the past so oldest_age
-    # is huge for every pop.  Worker fails on each → consec climbs;
-    # at consec >= 3 AND oldest_age >> threshold → fatal.
+    # #228: a wake coalesces to AT MOST one POST/PUT per endpoint, so
+    # N migrate batches collapse to ONE failed POST (consec=1).  To
+    # reach escalate_failures=3 in a single wake, enqueue across THREE
+    # endpoints (program_paused + migrate + hints), all aged 5 s and
+    # all failing → 3 distinct coalesced dispatches → consec=3 AND
+    # oldest_age (5 s) >> 0.001 s → fatal.  Aged stamps injected by
+    # constructing OutboundBatch directly (enqueue_* would stamp now()).
     old_ts = time.time() - 5.0
-    for i in range(10):
-        bid = outbound.enqueue_migrate(
-            [{{'hash': f'h{{i}}', 'add_tiers': [],
-              'remove_tiers': ['HBM'], 'action_id': f'a{{i}}'}}]
-        )
-        batch = outbound.queue.get_nowait()
-        outbound.queue.put_nowait(OutboundBatch(
-            batch_id=batch.batch_id,
-            endpoint=batch.endpoint,
-            body=batch.body,
-            enqueue_ts=old_ts,
-        ))
+    outbound.queue.put_nowait(OutboundBatch(
+        batch_id='pp0', endpoint='program_paused',
+        body={{'pid': 'p0', 'state': 'ENDED',
+               'pre_pause_state': None, 'batch_id': 'pp0'}},
+        enqueue_ts=old_ts, method='PUT',
+    ))
+    outbound.queue.put_nowait(OutboundBatch(
+        batch_id='mg0', endpoint='migrate',
+        body={{'actions': [{{'hash': 'h0'}}], 'batch_id': 'mg0'}},
+        enqueue_ts=old_ts, method='POST',
+    ))
+    outbound.queue.put_nowait(OutboundBatch(
+        batch_id='hn0', endpoint='hints',
+        body={{'hints': [{{'hash': 'h', 'p_hat': 0.1, 'lambda': 0.01,
+                           'stamp': 1}}], 'batch_id': 'hn0'}},
+        enqueue_ts=old_ts, method='PUT',
+    ))
     await outbound.start()
     await outbound.queue.join()  # will not return; fatal exits
 
@@ -734,41 +794,66 @@ def stage_b0_subprocess_escalates_to_fatal_with_forensic_dump() -> None:
 
 def stage_c3_live_peek_under_concurrent_worker() -> None:
     """#167 round-2 audit: demonstrate that `current_oldest_pending_
-    age_ms()` is safe AND accurate while a worker pops the queue
-    concurrently from another thread's event loop.
+    age_ms()` is safe AND accurate while a worker drains+dispatches the
+    queue concurrently from another thread's event loop.
 
-    The "GIL-atomic peek under concurrent pop" claim is asserted in
+    The "GIL-atomic peek under concurrent drain" claim is asserted in
     the method docstring + DESIGN §10 but A4/C1/C2 all monkeypatch
     the worker off — they cannot distinguish "live peek" from "field
     set once at enqueue and never touched again".
 
-    Setup: 10 aged batches (each 5 s + i*0.5 s old at enqueue time),
-    delay-stub that takes 0.2 s per POST.  Worker drains at ~5/s.
-    Poll /health every ~100 ms; collect (sample_time, age) pairs.
+    #228: a wake coalesces to AT MOST one POST/PUT per endpoint and the
+    asyncio.Queue reads EMPTY the instant the worker drains it — so the
+    in-flight backlog age now lives in ``_draining_oldest_ts``, which
+    ``current_oldest_pending_age_ms()`` folds in.  To keep that window
+    observable across multiple /health polls we (a) make the stub slow
+    (0.2 s per dispatch) and (b) enqueue across all THREE endpoints
+    (program_paused + migrate + hints) so one wake = three sequential
+    ~0.2 s dispatches ≈ 0.6 s of in-flight time, all stamped old so the
+    peeked age is large and clearly nonzero.
+
     Assertions:
       (a) No exception during any /health call.
-      (b) Final reported age ≈ 0 (queue fully drained).
-      (c) Series is "broadly decreasing": the LAST observation must
-          be < the FIRST observation (i.e. peek actually tracks the
-          head, not a frozen value).
+      (b) At least one sample reports a NONZERO in-flight age (the
+          live peek surfaces the draining burst, not 0).
+      (c) Final reported age ≈ 0 (burst fully dispatched → idle).
+      (d) Series shrinks: LAST observation < the max observation (the
+          peek tracks the draining window, not a frozen value).
     """
-    # Build the queue with a delay-stub so the worker spends 0.2 s
-    # per POST → ~10 batches takes ~2 s, plenty of time to poll.
+    # Slow stub: 0.2 s per dispatch.  Both POST and PUT route through
+    # .post()/.request(); add a .request shim that reuses .post.
     stub = _ProgrammableHttpClient([("delay", 0.2)])  # cycles 200 ms
+
+    async def _request(method, url, *, json=None):
+        return await stub.post(url, json=json)
+    stub.request = _request  # type: ignore[attr-defined]
+
     ob = OutboundQueue(
         sglang_base_url="http://unused",
         http_client=stub,
         escalate_failures=10_000, escalate_oldest_age_s=10_000,  # high
     )
     now = time.time()
-    # Enqueue oldest first: head will be the 10 s aged batch.
-    for i in range(10):
-        ob.queue.put_nowait(OutboundBatch(
-            batch_id=f"c3-b{i}",
-            endpoint="migrate",
-            body={"actions": [], "batch_id": f"c3-b{i}"},
-            enqueue_ts=now - (10.0 - i * 0.5),  # 10.0, 9.5, ..., 5.5 s
-        ))
+    # Three endpoints, all aged ~5 s, enqueued in ONE burst.  One wake
+    # coalesces to three dispatches (program_paused → migrate → hints),
+    # each ~0.2 s, so the draining window stays observable ~0.6 s.
+    ob.queue.put_nowait(OutboundBatch(
+        batch_id="c3-pp", endpoint="program_paused",
+        body={"pid": "p0", "state": "ENDED",
+              "pre_pause_state": None, "batch_id": "c3-pp"},
+        enqueue_ts=now - 5.0, method="PUT",
+    ))
+    ob.queue.put_nowait(OutboundBatch(
+        batch_id="c3-mg", endpoint="migrate",
+        body={"actions": [{"hash": "h0"}], "batch_id": "c3-mg"},
+        enqueue_ts=now - 5.0, method="POST",
+    ))
+    ob.queue.put_nowait(OutboundBatch(
+        batch_id="c3-hn", endpoint="hints",
+        body={"hints": [{"hash": "h", "p_hat": 0.1, "lambda": 0.01,
+                         "stamp": 1}], "batch_id": "c3-hn"},
+        enqueue_ts=now - 5.0, method="PUT",
+    ))
     # Start the worker via _spawn_health_server — but this time we
     # WANT the worker to actually run, so pass start_worker=True.
     port, server, t = _spawn_health_server(ob, start_worker=True)
@@ -781,6 +866,7 @@ def stage_c3_live_peek_under_concurrent_worker() -> None:
             # Poll for up to 4 s OR until queue drained for ≥1 sample.
             deadline = start + 4.0
             drained_seen_at = None
+            seen_nonzero = False
             while time.time() < deadline:
                 try:
                     r = client.get(f"http://127.0.0.1:{port}/health")
@@ -790,14 +876,18 @@ def stage_c3_live_peek_under_concurrent_worker() -> None:
                 body = r.json()
                 age = float(body.get("outbound_oldest_age_ms", -1.0))
                 samples.append((time.time() - start, age))
-                # Stop ~200 ms after we first observe drain to give
-                # the worker time to fully empty.
-                if age == 0.0 and drained_seen_at is None:
+                # Only treat a 0-age reading as "drained" AFTER we've
+                # observed the in-flight burst (nonzero age); otherwise
+                # the very first poll (worker hasn't grabbed the burst
+                # yet) would trip an early stop before any work runs.
+                if age > 0.0:
+                    seen_nonzero = True
+                if seen_nonzero and age == 0.0 and drained_seen_at is None:
                     drained_seen_at = time.time()
                 elif (drained_seen_at is not None
                       and time.time() - drained_seen_at > 0.2):
                     break
-                time.sleep(0.1)
+                time.sleep(0.05)
     finally:
         server.should_exit = True
         t.join(timeout=3.0)
@@ -813,20 +903,32 @@ def stage_c3_live_peek_under_concurrent_worker() -> None:
             f"may have completed before polling started.  samples="
             f"{samples!r}"
         )
-    first_age = samples[0][1]
+    ages = [a for _, a in samples]
+    max_age = max(ages)
     last_age = samples[-1][1]
-    # (b) eventually drained.
+    # (b) the live peek must surface the in-flight draining burst:
+    # at least one sample reports a NONZERO age while the worker is
+    # mid-dispatch (proves _draining_oldest_ts is folded in, not a
+    # field frozen at 0 the instant the queue drained).
+    if max_age <= 0.0:
+        raise StageFail(
+            f"no nonzero in-flight age observed; /health never saw the "
+            f"draining burst (live-peek not folding _draining_oldest_ts). "
+            f"samples={samples!r}"
+        )
+    # (c) eventually drained → idle → age decays to ~0.
     if last_age > 500.0:
         raise StageFail(
-            f"queue should have fully drained by the end; final age="
+            f"burst should have fully dispatched by the end; final age="
             f"{last_age} ms.  samples_tail={samples[-5:]!r}"
         )
-    # (c) live peek must track the head — series must shrink.
-    if last_age >= first_age:
+    # (d) live peek tracks the draining window — series must shrink
+    # from its peak.
+    if last_age >= max_age:
         raise StageFail(
-            f"age series did not shrink (first={first_age} ms, last="
-            f"{last_age} ms).  /health is not following the live head.  "
-            f"samples={samples!r}"
+            f"age series did not shrink (max={max_age} ms, last="
+            f"{last_age} ms).  /health is not following the live "
+            f"draining window.  samples={samples!r}"
         )
     # (a) implicit: no exceptions during polling — already verified.
 

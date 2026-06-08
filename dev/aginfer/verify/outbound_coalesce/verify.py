@@ -8,16 +8,18 @@ waits behind that idempotent flood — ageing ~1.8 s until the radix tree
 diverges and sglang rejects it (`remove_*_not_leaf`).
 
 Fix: the worker drains the queued burst and coalesces it per endpoint —
-hints merge to ONE PUT (overwrite-by-stamp, latest per hash), migrates stay
-individual (rare; FIFO + per-POST escalation preserved) but get the #227
-freshness bound (drop a migrate older than the generous pathological floor).
+hints merge to ONE PUT (overwrite-by-stamp, latest per hash); migrates ALSO
+merge to ONE POST (latest decision per hash) after the #227 freshness drop
+— the live a3 cycle-2 evidence showed a migrate BURST dispatched
+individually re-clogs the single-flight channel (oldest-age 700 ms, rejects
+back); program_paused coalesces by pid.
 
 Stages:
 
   A. _partition_and_coalesce — pure correctness (deterministic, injected clock)
     A0 N hints batches  → ONE hints PUT, every hash present, latest-stamp wins
-    A1 migrates pass through individually, FIFO, NOT merged
-    A2 #227 freshness: a migrate older than the bound is dropped; fresh kept
+    A1 migrate burst → ONE POST, every unit, latest-decision-per-hash
+    A2 #227 freshness: a stale migrate action is dropped before the merge
     A3 program_paused coalesced by pid (latest state wins), never dropped
     A4 dispatch ORDER: program_paused → migrate → hints (time-sensitive never
        waits behind the idempotent flood); unknown endpoint passes through
@@ -120,24 +122,36 @@ def stage_a0_hints_coalesce_latest_wins() -> None:
                  "(order-independent) OK"))
 
 
-def stage_a1_migrates_individual_fifo() -> None:
+def stage_a1_migrates_coalesce_latest_wins() -> None:
+    """#228-complete (cycle-2 evidence): a migrate BURST coalesces to ONE
+    POST, latest decision per unit hash — individual dispatch of a burst
+    re-clogged the single-flight channel (oldest-age 700 ms, rejects back).
+    The single-flight ceiling remains, but a burst is one round-trip, not N."""
     now = 1000.0
     batches = [
         _migrate_batch(now - 0.3, [{"hash": "u1", "add_tiers": [],
                                     "remove_tiers": ["HBM"], "action_id": "a1"}]),
         _migrate_batch(now - 0.2, [{"hash": "u2", "add_tiers": [],
                                     "remove_tiers": ["HBM"], "action_id": "a2"}]),
+        # later decision for u1 SUPERSEDES the earlier one (latest-per-hash):
+        _migrate_batch(now - 0.1, [{"hash": "u1", "add_tiers": ["DRAM"],
+                                    "remove_tiers": [], "action_id": "a3"}]),
     ]
     out, stats = _partition_and_coalesce(
         batches, now_ts=now, migrate_freshness_ms=30000)
     migs = [b for b in out if b.endpoint == "migrate"]
-    if len(migs) != 2:
-        raise StageFail(f"A1: migrates must stay individual (not merged); "
+    if len(migs) != 1:
+        raise StageFail(f"A1: a migrate burst must coalesce to 1 POST; "
                         f"got {len(migs)}")
-    order = [b.body["actions"][0]["hash"] for b in migs]
-    if order != ["u1", "u2"]:
-        raise StageFail(f"A1: migrate FIFO order must be preserved; got {order}")
-    print(_green("  [A1] migrates dispatched individually, FIFO OK"))
+    acts = {a["hash"]: a for a in migs[0].body["actions"]}
+    if set(acts) != {"u1", "u2"}:
+        raise StageFail(f"A1: coalesced POST must carry every unit; got {set(acts)}")
+    if acts["u1"]["action_id"] != "a3":
+        raise StageFail(f"A1: latest decision per hash must win — u1 should be "
+                        f"a3, got {acts['u1']['action_id']}")
+    if stats["migrate_in"] != 3 or stats["migrate_out"] != 1:
+        raise StageFail(f"A1: stats wrong: {stats}")
+    print(_green("  [A1] migrate burst → 1 POST, every unit, latest-per-hash OK"))
 
 
 def stage_a2_migrate_freshness_drop() -> None:
@@ -148,20 +162,25 @@ def stage_a2_migrate_freshness_drop() -> None:
         _migrate_batch(now - 0.1, [{"hash": "fresh", "add_tiers": [],
                                     "remove_tiers": ["HBM"], "action_id": "f"}]),
     ]
-    # freshness=1000ms: the 5 s-old batch is dropped, the 0.1 s kept.
+    # freshness=1000ms: the 5 s-old batch is stale-dropped BEFORE the merge;
+    # only the fresh action survives into the single coalesced POST.
     out, stats = _partition_and_coalesce(
         batches, now_ts=now, migrate_freshness_ms=1000)
     migs = [b for b in out if b.endpoint == "migrate"]
-    if len(migs) != 1 or migs[0].body["actions"][0]["hash"] != "fresh":
-        raise StageFail(f"A2: stale migrate must be dropped, fresh kept; "
-                        f"got {[m.body['actions'][0]['hash'] for m in migs]}")
-    if stats["migrate_dropped_stale"] != 1:
-        raise StageFail(f"A2: dropped-stale stat wrong: {stats}")
-    # freshness=0 disables the bound → both kept.
+    acts = {a["hash"] for b in migs for a in b.body["actions"]}
+    if acts != {"fresh"}:
+        raise StageFail(f"A2: stale migrate must be dropped, only fresh kept; "
+                        f"got {acts}")
+    if stats["migrate_dropped_stale"] != 1 or stats["migrate_out"] != 1:
+        raise StageFail(f"A2: stats wrong: {stats}")
+    # freshness=0 disables the bound → BOTH actions survive (in 1 coalesced POST).
     out0, _ = _partition_and_coalesce(batches, now_ts=now, migrate_freshness_ms=0)
-    if len([b for b in out0 if b.endpoint == "migrate"]) != 2:
-        raise StageFail("A2: freshness=0 must disable stale-drop (both kept)")
-    print(_green("  [A2] #227 freshness: stale dropped, fresh kept, 0=disabled OK"))
+    acts0 = {a["hash"] for b in out0 if b.endpoint == "migrate"
+             for a in b.body["actions"]}
+    if acts0 != {"stale", "fresh"}:
+        raise StageFail(f"A2: freshness=0 must keep both actions; got {acts0}")
+    print(_green("  [A2] #227 freshness: stale action dropped, fresh kept, "
+                 "0=disabled (both actions) OK"))
 
 
 def stage_a3_paused_coalesce_by_pid() -> None:
@@ -306,7 +325,7 @@ def stage_b1_latency_bounded_under_flood() -> None:
 
 _STAGES = [
     ("A0 hints coalesce latest-wins", stage_a0_hints_coalesce_latest_wins),
-    ("A1 migrates individual FIFO", stage_a1_migrates_individual_fifo),
+    ("A1 migrates coalesce latest-wins", stage_a1_migrates_coalesce_latest_wins),
     ("A2 migrate freshness drop", stage_a2_migrate_freshness_drop),
     ("A3 paused coalesce by pid", stage_a3_paused_coalesce_by_pid),
     ("A4 dispatch order", stage_a4_dispatch_order),
