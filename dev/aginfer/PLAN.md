@@ -804,6 +804,30 @@ note covers the framework's extensibility — instantiate an
 `per_program_usage[p].hbm.inflight["adapter"]` when a scenario
 lights this up.
 
+### Eviction & hint-latency characterization (#230)
+
+A cross-cutting characterization suite (not a single DESIGN §12
+scenario) that maps **where each eviction-related mechanism binds**
+across pressure regimes and the hint-freshness dimension, to
+*understand and document* the design-ideal system — NOT to cut
+features.  Lives in `scenarios/5_eviction_characterization/`:
+
+- **Tier-1** (`harness/`, deterministic CPU): a trace-replay
+  eviction simulator sweeping policy (LRU / hint-steered / const-V_u)
+  × pressure × hint-delay × reuse-pattern × migrate, counting
+  re-prefill tokens.  Self-test `harness/verify.py`; sweep
+  `harness/sweep.py`; findings in `RESULTS.md`.  Headline: steering
+  value is pressure-dependent (+49% under headroom → +3% saturated,
+  quantitatively explaining the A3 `ours ≈ baseline` / `migrate ≈ 6`
+  observation); the hint-latency budget ≈ the predictable-reuse lead
+  time.
+- **Tier-2** (`e2e/`): real-stack arms via `run_k.sh` with the
+  inline scorer + `AGINFER_HINT_DELAY_MS` knob (#230 daemon) swapped
+  per arm, sweeping `lru / ours-fresh / ours-d{250,1000}ms`.  Grounds
+  the Tier-1 trends in real TTFT / cache-hit; follows §5 methodology
+  (N ≥ 3, mean ± std).  Open output: `scenarios/5_eviction_
+  characterization/RESULTS.md` Tier-2 section.
+
 ## 6. Revisit triggers
 
 Conditions that flip an out-of-scope item back into the work plan.

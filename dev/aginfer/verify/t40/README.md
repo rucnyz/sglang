@@ -79,6 +79,11 @@ B. daemon kv_scheduler emitter (drives handle())
   B2 empty D_t (LLM_PREFILL) → no hints, no migrate
   B3 NO shadow cache: 2 events re-push the SAME unit (no "unchanged"
      suppression), 2nd stamp strictly newer
+  B4 AGINFER_HINT_DELAY_MS knob (#230): when set, _dispatch_hints
+     DEFERS delivery (computed now, delivered stale) via loop.call_
+     later — the hint appears in the outbound queue only after the
+     delay; immediate + production-byte-identical when 0/unset.  Used
+     by the Tier-2 hint-latency-budget e2e arms (scenarios/5).
 C. sglang validator
   C0 _validate_hints_body accepts well-formed, returns normalized
   C1 rejects: not-dict / missing hints / hint-not-dict / missing or
@@ -143,7 +148,9 @@ AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \
 
 ## RESULTS
 
-**PASSED** — all 18 stages (incl. F0 live e2e against real sglang).
+**PASSED** — 18 pure stages green + F0 live e2e (env-gated, skipped
+without `AGINFER_VERIFY_BASE`).  (Includes B4 hint-delay knob, #230;
+and the #229 stub refresh for the evolved kv_scheduler interface.)
 
 * date: 2026-06-02
 * raw logs: `results/20260602_t40_initial_pass.log` (14),
