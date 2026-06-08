@@ -16,11 +16,11 @@
 
 set -euo pipefail
 
-VARIANT="${1:?usage: run_k.sh <full|ka|J|kv_off|a3>}"
+VARIANT="${1:?usage: run_k.sh <full|ka|J|kv_off|a3|a3_kvoff>}"
 case "$VARIANT" in
-    full|ka|J|kv_off|a3) ;;
+    full|ka|J|kv_off|a3|a3_kvoff) ;;
     *)
-        echo "[run_k] invalid variant: $VARIANT (expected: full|ka|J|kv_off|a3)" >&2
+        echo "[run_k] invalid variant: $VARIANT (expected: full|ka|J|kv_off|a3|a3_kvoff)" >&2
         exit 2
         ;;
 esac
@@ -79,6 +79,20 @@ case "$VARIANT" in
         export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-262144}"
         # 4k-cap completion → kills runaway 60k-token decode tail.
         # parse_kwargs JSON-decodes the value into a dict.
+        EXTRA_AK_OPTS=("--ak" 'llm_call_kwargs={"max_tokens":4096}')
+        ;;
+    a3_kvoff)
+        # A3 BASELINE: identical workload regime to `a3` (256K pool + 4k
+        # completion cap + HiCache + inline ours_greedy_score scorer) but the
+        # daemon's kv_scheduler + admission_controller are OFF — it proxies
+        # requests and no-ops on events, issuing NO migrate/pause/resume.
+        # Isolates the DAEMON's scheduling effect: a3 vs a3_kvoff under the
+        # same pressure = the value-gated daemon's contribution (do-no-harm
+        # ⇒ a3 ≈ a3_kvoff within noise).
+        HICACHE_FLAG="--enable-hierarchical-cache"
+        DAEMON_KV="disabled"
+        DAEMON_ADMISSION="disabled"
+        export MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-262144}"
         EXTRA_AK_OPTS=("--ak" 'llm_call_kwargs={"max_tokens":4096}')
         ;;
 esac
@@ -186,19 +200,19 @@ fi
 echo "[run_k:$VARIANT] starting aginfer-daemon (kv=$DAEMON_KV admission=$DAEMON_ADMISSION)..."
 PYTHONPATH="$AGINFER_DIR:${PYTHONPATH:-}" \
     python -m daemon.main \
-        --sglang-base-url=http://127.0.0.1:30000 \
-        --port=9100 \
+        --sglang-base-url=http://127.0.0.1:${SGLANG_PORT:-30000} \
+        --port=${DAEMON_PORT:-9100} \
         --kv-scheduler="$DAEMON_KV" \
         --admission-controller="$DAEMON_ADMISSION" \
         >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 for i in $(seq 1 30); do
-    if grep -q "Uvicorn running on http://0.0.0.0:9100" "$DAEMON_LOG" 2>/dev/null; then
+    if grep -q "Uvicorn running on http://0.0.0.0:${DAEMON_PORT:-9100}" "$DAEMON_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
 done
-if ! grep -q "Uvicorn running on http://0.0.0.0:9100" "$DAEMON_LOG" 2>/dev/null; then
+if ! grep -q "Uvicorn running on http://0.0.0.0:${DAEMON_PORT:-9100}" "$DAEMON_LOG" 2>/dev/null; then
     echo "[run_k:$VARIANT] daemon never started; see $DAEMON_LOG" >&2
     exit 8
 fi
@@ -214,14 +228,17 @@ echo "[run_k:$VARIANT] starting sglang (TP=${SGLANG_TP:-2}, GPUs=$AGINFER_GPUS, 
 # T9 README §"For ALL variants": ours_greedy_score scorer is the
 # load-bearing inline path; without it, the floor argument breaks.
 # Export here (NOT in env.sh) so the env stays local to Run K.
-export SGLANG_KV_POLICY_MODULE="baselines.sglang_adapter:ours_greedy_score"
+# #230: respect a pre-set value so the eviction-characterization arms can
+# swap the inline scorer (lru_score / const_v_u_score / empty=stock LRU)
+# without forking run_k.sh.  Unset → the production default below.
+export SGLANG_KV_POLICY_MODULE="${SGLANG_KV_POLICY_MODULE:-baselines.sglang_adapter:ours_greedy_score}"
 
 # Pre-rotate the launch-script's internal log so our grep-wait doesn't
 # race the launch-script's own rotate_log and match stale content.
 # (Bug observed on the second run after a halt: orchestrator's grep
 # saw the prior run's "Uvicorn running" line before the launch script
 # had a chance to wipe the log.)
-SGLANG_LOG_REAL="$AGINFER_LOGS/sglang_v4flash.log"
+SGLANG_LOG_REAL="${SGLANG_LOG_FILE:-$AGINFER_LOGS/sglang_v4flash.log}"
 [[ -e "$SGLANG_LOG_REAL" ]] && mv "$SGLANG_LOG_REAL" "${SGLANG_LOG_REAL}.run_k_prev"
 
 if [[ -n "$HICACHE_FLAG" ]]; then
@@ -323,7 +340,7 @@ echo "[run_k:$VARIANT] starting harbor (n_tasks=${HARBOR_N_TASKS}, concurrent=${
         -p datasets/swebenchpro \
         -a terminus-2 \
         -m openai/deepseek-ai/DeepSeek-V4-Flash \
-        --ak api_base=http://172.17.0.1:9100/v1 \
+        --ak api_base=http://172.17.0.1:${DAEMON_PORT:-9100}/v1 \
         --ak api_key="${OPENAI_API_KEY}" \
         --ak max_turns="${HARBOR_MAX_TURNS}" \
         --ak temperature=0.0 \

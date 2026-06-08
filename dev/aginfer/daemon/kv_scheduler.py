@@ -1095,6 +1095,14 @@ class KvScheduler:
         self.pause_calls: int = 0    # #194: program pauses dispatched
         self.resume_calls: int = 0   # #194: program resumes dispatched
         self.hint_calls: int = 0  # T40 (#184): hint PUTs enqueued
+        # #230 Tier-2 characterization knob: artificially defer hint
+        # DELIVERY by this many ms (the hint is computed now but reaches
+        # sglang stale).  0 = off (production default).  Used ONLY by the
+        # hint-latency-budget e2e arms to measure the freshness knee on the
+        # real stack; never set in production.
+        self._hint_delay_s: float = _env_float(
+            "AGINFER_HINT_DELAY_MS", "0") / 1000.0
+        self.hint_delayed_calls: int = 0
         self.last_action: Optional[Action] = None
         self.last_plan: Optional[List[Any]] = None
         self.last_decision_set_size: int = 0
@@ -1386,9 +1394,22 @@ class KvScheduler:
                 "constructing KvScheduler directly must pass "
                 "outbound=OutboundQueue(...)."
             )
+        from ._metrics import m as _m
+        # #230: defer hint DELIVERY (computed-now, delivered-stale) for the
+        # latency-budget arms.  The list is already shaped; call_later just
+        # enqueues it later so sglang sees it ``_hint_delay_s`` late.
+        if self._hint_delay_s > 0.0:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            loop.call_later(self._hint_delay_s,
+                            self.outbound.enqueue_hints, list(hints))
+            self.hint_calls += 1
+            self.hint_delayed_calls += 1
+            _m("hints_enqueued", batch_id="deferred",
+               n_hints=len(hints), delay_ms=int(self._hint_delay_s * 1000))
+            return
         batch_id = self.outbound.enqueue_hints(hints)
         self.hint_calls += 1
-        from ._metrics import m as _m
         _m(
             "hints_enqueued",
             batch_id=batch_id,

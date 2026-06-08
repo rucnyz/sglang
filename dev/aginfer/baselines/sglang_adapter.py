@@ -163,6 +163,16 @@ def lfu_score(node: Any, layer: Any) -> float:
     return float(node.hit_count)
 
 
+def const_v_u_score(node: Any, layer: Any) -> float:
+    """#230 ablation: uniform score for every node, so eviction order falls
+    back to sglang's structural tie-break (≈ insertion / LRU) with NO
+    reuse-value information.  Isolates "does the *content* of V_u matter"
+    from "does having a daemon-pushed score at all matter": const_v_u keeps
+    the hint plumbing live but strips the signal.  Compare against
+    ours_greedy_score (signal present) and lru_score (no plumbing)."""
+    return 0.0
+
+
 def recency_freq_score(node: Any, layer: Any) -> float:
     """LFU normalised by age. Approximates a TTL/Continuum-style score."""
     age = max(1, _current_time_counter() - int(node.last_access_time))

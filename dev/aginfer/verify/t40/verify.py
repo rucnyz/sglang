@@ -729,6 +729,52 @@ class _Skip(Exception):
     pass
 
 
+def stage_b4_hint_delay_knob() -> None:
+    """#230 Tier-2 knob: AGINFER_HINT_DELAY_MS defers hint DELIVERY (computed
+    now, delivered stale) so the latency-budget e2e arms can sweep the
+    freshness knee.  With the knob set, _dispatch_hints must NOT enqueue
+    immediately; the batch appears only after the delay elapses.  Off (0)
+    keeps the production path byte-identical."""
+    async def _go():
+        os.environ["AGINFER_HINT_DELAY_MS"] = "80"
+        try:
+            tracker = ProgramTracker(); tracker.observe_arrival("p0")
+            ob = _new_outbound()
+            sched = _sched(tracker, ob, _DeclinePolicy())
+            await sched._dispatch_hints(
+                [{"hash": "u0", "p_hat": 0.5, "lambda": 0.01, "stamp": 1}])
+            immediate = ob.queue.qsize()
+            await asyncio.sleep(0.15)          # > 80 ms
+            after = ob.queue.qsize()
+            return immediate, after, sched.hint_delayed_calls
+        finally:
+            os.environ.pop("AGINFER_HINT_DELAY_MS", None)
+    immediate, after, delayed = asyncio.run(_go())
+    if immediate != 0:
+        raise StageFail(f"hint must NOT enqueue immediately under delay; "
+                        f"got qsize={immediate}")
+    if after != 1:
+        raise StageFail(f"hint must appear AFTER the delay elapses; "
+                        f"got qsize={after}")
+    if delayed != 1:
+        raise StageFail(f"hint_delayed_calls should be 1; got {delayed}")
+    # off path: no delay → immediate enqueue (production unchanged).
+    async def _off():
+        os.environ.pop("AGINFER_HINT_DELAY_MS", None)
+        tracker = ProgramTracker(); tracker.observe_arrival("p0")
+        ob = _new_outbound()
+        sched = _sched(tracker, ob, _DeclinePolicy())
+        await sched._dispatch_hints(
+            [{"hash": "u0", "p_hat": 0.5, "lambda": 0.01, "stamp": 1}])
+        return ob.queue.qsize(), sched.hint_delayed_calls
+    q, d = asyncio.run(_off())
+    if q != 1 or d != 0:
+        raise StageFail(f"delay=0 must enqueue immediately, no defer; "
+                        f"got qsize={q} delayed={d}")
+    print(_green("  [B4] AGINFER_HINT_DELAY_MS defers delivery (on); "
+                 "immediate when off (#230) OK"))
+
+
 # ============================================================ run
 
 
@@ -739,6 +785,7 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("B1b hints pushed alongside a migrate",        stage_b1b_push_alongside_migrate),
     ("B2 empty D_t → no hints",                     stage_b2_empty_dt_no_hints),
     ("B3 no shadow cache: re-push same unit, newer stamp", stage_b3_no_shadow_cache_repush),
+    ("B4 hint-delay knob defers delivery (#230)",   stage_b4_hint_delay_knob),
     ("C0 _validate_hints_body accepts well-formed", stage_c0_validator_accepts),
     ("C1 _validate_hints_body rejects malformed",   stage_c1_validator_rejects),
     ("D0 set_aginfer_hints applies",                stage_d0_set_hints_applies),
