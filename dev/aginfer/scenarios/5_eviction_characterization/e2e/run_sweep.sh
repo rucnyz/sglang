@@ -22,15 +22,26 @@ PRESSURE="${MAX_TOTAL_TOKENS:-262144}"
 ADAPT="baselines.sglang_adapter"
 
 # arm = "tag|SGLANG_KV_POLICY_MODULE|AGINFER_HINT_DELAY_MS"
-ARMS=(
-  "lru|${ADAPT}:lru_score|0"                 # S1 baseline (no reuse steering)
-  "constvu|${ADAPT}:const_v_u_score|0"       # S1 ablation (plumbing, no signal)
-  "ours_fresh|${ADAPT}:ours_greedy_score|0"  # S1/S2 reference
-  "ours_d100|${ADAPT}:ours_greedy_score|100" # S2 gradient
-  "ours_d250|${ADAPT}:ours_greedy_score|250"
-  "ours_d500|${ADAPT}:ours_greedy_score|500"
-  "ours_d1000|${ADAPT}:ours_greedy_score|1000"
-)
+# CHAR_HEADLINE=1 (default) → the 4-arm headline pass (S1 + S2 knee), the
+# agreed first cut (~6 h at N=2).  CHAR_HEADLINE=0 → the full 7-arm matrix.
+if [[ "${CHAR_HEADLINE:-1}" == "1" ]]; then
+  ARMS=(
+    "lru|${ADAPT}:lru_score|0"                  # S1 baseline (no steering)
+    "ours_fresh|${ADAPT}:ours_greedy_score|0"   # S1 reference / S2 anchor
+    "ours_d250|${ADAPT}:ours_greedy_score|250"  # S2 knee probe
+    "ours_d1000|${ADAPT}:ours_greedy_score|1000"# S2 far end
+  )
+else
+  ARMS=(
+    "lru|${ADAPT}:lru_score|0"
+    "constvu|${ADAPT}:const_v_u_score|0"
+    "ours_fresh|${ADAPT}:ours_greedy_score|0"
+    "ours_d100|${ADAPT}:ours_greedy_score|100"
+    "ours_d250|${ADAPT}:ours_greedy_score|250"
+    "ours_d500|${ADAPT}:ours_greedy_score|500"
+    "ours_d1000|${ADAPT}:ours_greedy_score|1000"
+  )
+fi
 
 echo "[sweep] $(date '+%F %T') N=$N pressure(MAX_TOTAL_TOKENS)=$PRESSURE"
 for arm in "${ARMS[@]}"; do
