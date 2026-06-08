@@ -520,6 +520,34 @@ serialization), a synchronous awaited POST would freeze the entire
 event router; fire-and-forget keeps the inbound queue draining and
 defers the action to the outbound worker.
 
+**Endpoint-aware coalescing + freshness-bounded actuation.**  The
+outbound channel is single-flight at sglang (one control communicator;
+apply is serialised against the scheduler loop, ≈ one iteration per
+POST).  Because the daemon re-pushes a `hints` PUT *every event* (§10:
+no daemon-side hint cache), hints dominate outbound traffic by ~100×,
+and a naïve FIFO queue makes every time-sensitive `migrate` wait behind
+that idempotent flood — ageing it until the radix tree diverges and the
+apply-time leaf check (§7) rejects it.  The worker therefore drains the
+queued burst each wake and emits **at most one dispatch per endpoint**,
+by each endpoint's temporal semantics:
+
+* `hints` — idempotent overwrite-by-stamp ⇒ merge the burst into ONE
+  PUT, latest value per hash.  This collapses the flood so the channel
+  un-clogs; a migrate no longer waits behind it.
+* `migrate` — time-sensitive, but rare; dispatched individually (FIFO +
+  per-POST sustained-escalation accounting preserved).  A migrate
+  decided on a state snapshot is a prediction with a **validity
+  horizon**: the worker drops one whose queue-age exceeds a *generous*
+  bound (a pathological-spike floor — sglang catastrophically stalled —
+  not a tight knob masking ordinary latency, which the coalescing
+  removes at the source).  This is the proactive complement to §10's
+  reactive `APPLY_FAILED` re-issue: never actuate a decision already
+  stale against the world it was decided on.  Dispatch order is
+  liveness (`program_paused`) → eviction (`migrate`) → idempotent
+  (`hints`), so time-sensitive intents never queue behind the flood.
+* `program_paused` — liveness-critical; coalesced by pid (latest state
+  wins), never dropped.
+
 **Identifier model.**  Each outbound HTTP request carries a
 `batch_id` (UUID generated at the daemon at enqueue time, written
 into the request body envelope).  Each individual action inside

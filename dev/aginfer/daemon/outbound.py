@@ -32,7 +32,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -75,6 +75,124 @@ class OutboundBatch:
                 f"negative value would compute age ≈ time.time()*1000 "
                 f"and instantly trip the sustained-escalation fatal."
             )
+
+
+# ------------------------------------------------------- coalesce (#228)
+
+
+def _partition_and_coalesce(
+    batches: List[OutboundBatch],
+    *,
+    now_ts: float,
+    migrate_freshness_ms: float,
+) -> Tuple[List[OutboundBatch], Dict[str, int]]:
+    """Collapse a drained burst of queued batches into at most one dispatch
+    per endpoint, honouring each endpoint's temporal semantics (#228).
+
+    The outbound channel is single-flight at sglang (one communicator,
+    serialised apply ≈ one scheduler iteration per POST).  The T40 design
+    pushes a ``hints`` PUT EVERY event, so hints are ~99% of outbound
+    traffic (≈11.7k vs ≈130 migrate per cycle observed) and the FIFO makes
+    every time-sensitive ``migrate`` wait behind that idempotent flood —
+    ageing it ~1.8 s until the tree diverges and sglang rejects it.
+
+    Coalescing fixes the root cause:
+
+      * ``hints``  — overwrite-by-stamp + idempotent ⇒ merge ALL pending
+        hint batches into ONE PUT (latest value per hash wins).  Collapses
+        the flood to one PUT per worker wake, which un-clogs the channel.
+      * ``migrate`` — time-sensitive (a stale remove races the tree → reject).
+        Drop any batch older than ``migrate_freshness_ms`` (#227 freshness
+        bound — generous, a pathological-spike floor, NOT a tight storm
+        suppressor; the coalescing is what removes the normal-operation
+        latency), then dispatch survivors individually.  NOTE (audit #2): a
+        stale-dropped migrate produces no dispatch and hence no failure
+        signal, so the #164 sustained-unreachable backstop relies on the
+        always-on ``hints`` traffic (pushed every event) as its stall canary,
+        not on migrates.
+      * ``program_paused`` — liveness-critical (a dropped resume starves a
+        paused program, #211).  NEVER dropped; coalesced by pid (latest
+        state wins) so a stale transition can't override a newer one.
+
+    Dispatch order: program_paused (liveness) → migrate (eviction) → hints
+    (idempotent), so time-sensitive intents never wait behind the flood.
+
+    Pure — no I/O, no clock read (``now_ts`` injected) — so the latency and
+    correctness tests drive it deterministically.
+    """
+    migrates: List[OutboundBatch] = []
+    hints: List[OutboundBatch] = []
+    paused: List[OutboundBatch] = []
+    passthrough: List[OutboundBatch] = []
+    for b in batches:
+        if b.endpoint == "migrate":
+            migrates.append(b)
+        elif b.endpoint == "hints":
+            hints.append(b)
+        elif b.endpoint == "program_paused":
+            paused.append(b)
+        else:
+            # Unknown endpoint (forward-compat): dispatch untouched, first.
+            passthrough.append(b)
+
+    stats: Dict[str, int] = {
+        "migrate_in": len(migrates), "hints_in": len(hints),
+        "paused_in": len(paused), "migrate_dropped_stale": 0,
+        "migrate_out": 0, "hints_out": 0, "paused_out": 0,
+    }
+    out: List[OutboundBatch] = list(passthrough)
+
+    # ---- program_paused: coalesce by pid (latest wins), never drop -------
+    if paused:
+        by_pid: Dict[Any, OutboundBatch] = {}
+        for b in sorted(paused, key=lambda x: x.enqueue_ts):
+            pid = b.body.get("pid") if isinstance(b.body, dict) else None
+            by_pid[pid] = b  # later enqueue supersedes
+        kept = list(by_pid.values())
+        out.extend(kept)
+        stats["paused_out"] = len(kept)
+
+    # ---- migrate: stale-drop only; dispatch each survivor individually ---
+    # Migrates are rare (≈130/cycle vs ≈11.7k hints) so they never clog the
+    # channel — the latency win is entirely from collapsing the hint flood
+    # they wait behind.  Keeping them per-batch preserves the FIFO order and
+    # the per-POST sustained-escalation accounting (#164); only the #227
+    # freshness bound applies here (drop a batch decided too long ago to
+    # still be valid against the live tree).
+    if migrates:
+        for b in sorted(migrates, key=lambda x: x.enqueue_ts):
+            age_ms = max(0.0, (now_ts - b.enqueue_ts) * 1000.0)
+            if migrate_freshness_ms > 0.0 and age_ms > migrate_freshness_ms:
+                stats["migrate_dropped_stale"] += 1
+            else:
+                out.append(b)
+                stats["migrate_out"] += 1
+
+    # ---- hints: coalesce ALL into one PUT, HIGHEST stamp per hash --------
+    # Key by max(stamp), not enqueue order: sglang's hint table is itself
+    # overwrite-by-stamp (§10), so forwarding the highest-stamp value is the
+    # correct merge even if a burst enqueues stamps out of order (audit #4).
+    if hints:
+        by_hash_h: Dict[Any, Dict[str, Any]] = {}
+        for b in hints:
+            for h in (b.body.get("hints", []) if isinstance(b.body, dict)
+                      else []):
+                hsh = h.get("hash")
+                prev = by_hash_h.get(hsh)
+                if prev is None or h.get("stamp", -1) >= prev.get("stamp", -1):
+                    by_hash_h[hsh] = h
+        merged_h = list(by_hash_h.values())
+        if merged_h:
+            bid = str(uuid.uuid4())
+            out.append(OutboundBatch(
+                batch_id=bid, endpoint="hints",
+                body={"hints": merged_h, "batch_id": bid},
+                enqueue_ts=min(b.enqueue_ts for b in hints),
+                method="PUT",
+            ))
+            stats["hints_out"] = 1
+
+    return out, stats
 
 
 # --------------------------------------------------------------- queue
@@ -131,12 +249,27 @@ class OutboundQueue:
         # Operator-tunable via main.py CLI flags.
         escalate_failures: int = 100,
         escalate_oldest_age_s: float = 300.0,
+        # #227/#228: per-dispatch freshness bound for the time-sensitive
+        # ``migrate`` endpoint.  A migrate decided on a state snapshot is a
+        # prediction with a validity horizon; the worker drops one aged past
+        # this before dispatch (coalescing handles the normal-operation
+        # latency, so this is a GENEROUS pathological-spike floor, not a
+        # tight tuner).  0 disables.  Env AGINFER_MIGRATE_FRESHNESS_MS.
+        migrate_freshness_ms: Optional[float] = None,
     ) -> None:
         self.sglang_base_url = sglang_base_url.rstrip("/")
         self._client = http_client
         self._owns_client = http_client is None
         self.observability = observability
         self.queue: asyncio.Queue[OutboundBatch] = asyncio.Queue()
+        # #228: the worker drains the whole queue into a local burst before
+        # dispatching (to coalesce), so the asyncio.Queue can read empty
+        # while a large burst is still in-flight.  Track the oldest
+        # enqueue_ts of the burst currently being dispatched so /health's
+        # current_oldest_pending_age_ms() still reflects real backlog age
+        # (the #166 live-peek contract) instead of decaying to 0 the instant
+        # the worker drains.  GIL-atomic float assignment; None when idle.
+        self._draining_oldest_ts: Optional[float] = None
         self._worker_task: Optional[asyncio.Task[None]] = None
         # T36/F3 #164: counter resets on every 2xx success.  /health
         # exposes the current value so an operator can alert before
@@ -144,6 +277,26 @@ class OutboundQueue:
         self.consecutive_failures: int = 0
         self._escalate_failures = int(escalate_failures)
         self._escalate_oldest_age_s = float(escalate_oldest_age_s)
+        if migrate_freshness_ms is None:
+            import os
+            # GENEROUS default (30 s): the hints COALESCING removes the
+            # normal-operation latency, so this is purely a pathological-
+            # spike floor — it drops only a migrate so old (sglang
+            # catastrophically stalled) that its decision is certainly dead,
+            # never a tight knob masking ordinary dispatch latency.
+            raw = os.environ.get("AGINFER_MIGRATE_FRESHNESS_MS", "30000")
+            try:
+                migrate_freshness_ms = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"AGINFER_MIGRATE_FRESHNESS_MS must be a float; got {raw!r}"
+                )
+        self._migrate_freshness_ms = float(migrate_freshness_ms)
+        if self._migrate_freshness_ms < 0:
+            raise ValueError(
+                f"migrate_freshness_ms must be >= 0; "
+                f"got {migrate_freshness_ms}"
+            )
         if self._escalate_failures < 1:
             raise ValueError(
                 f"escalate_failures must be >= 1; got {escalate_failures}"
@@ -172,14 +325,19 @@ class OutboundQueue:
         valid coarse observations).  We tolerate ``IndexError`` /
         ``AttributeError`` for the empty-queue race."""
         import time
+        now = time.time()
+        ages = []
+        # In-flight drained burst (#228): counts as backlog until dispatched.
+        drain_ts = self._draining_oldest_ts
+        if drain_ts is not None:
+            ages.append((now - drain_ts) * 1000.0)
         q_internal = getattr(self.queue, "_queue", None)
-        if q_internal is None:
-            return 0.0
-        try:
-            head = q_internal[0]
-        except IndexError:
-            return 0.0
-        return max(0.0, (time.time() - head.enqueue_ts) * 1000.0)
+        if q_internal is not None:
+            try:
+                ages.append((now - q_internal[0].enqueue_ts) * 1000.0)
+            except IndexError:
+                pass
+        return max(0.0, max(ages)) if ages else 0.0
 
     # ---- enqueue (handler-facing) -----------------------------------
 
@@ -305,77 +463,84 @@ class OutboundQueue:
     async def _worker_loop(self) -> None:
         import time
         while True:
-            batch = await self.queue.get()
-            # T36 audit (#163): sample outbound queue health BEFORE
-            # POSTing the batch we just popped.  qsize() = "backlog
-            # still waiting"; batch.enqueue_ts → wall-clock age of
-            # the (was-) oldest pending batch.
-            #
-            # #166: `oldest_age_ms` here is the JUST-POPPED batch's
-            # queue-wait time — the correct signal for the
-            # escalation trigger ("how long did this batch sit?").
-            # /health exposes a DIFFERENT metric:
-            # `current_oldest_pending_age_ms()` peeks the LIVE in-
-            # queue head (decays to 0 when the queue drains).  Don't
-            # conflate them — caching just-popped into a sticky field
-            # for /health was the bug closed by #166.
-            depth_after_pop = self.queue.qsize()
-            oldest_age_ms = max(
-                0.0, (time.time() - batch.enqueue_ts) * 1000.0,
-            )
-            if self.observability is not None:
-                self.observability.record_outbound(
-                    queue_depth=depth_after_pop,
-                    oldest_age_ms=oldest_age_ms,
-                )
-            try:
-                success = await self._post_one(batch)
-            except asyncio.CancelledError:
-                # Re-raise so stop() sees clean termination.
-                self.queue.task_done()
-                raise
-            except Exception:  # noqa: BLE001
-                # Any uncaught exception in _post_one is a
-                # programmer bug — log + continue so one bad batch
-                # doesn't kill the worker.  Treat as failure for
-                # the escalation counter.
-                logger.exception(
-                    "outbound worker: unexpected exception while "
-                    "POSTing batch %s",
-                    batch.batch_id,
-                )
-                success = False
-                self.consecutive_failures += 1
-            finally:
+            first = await self.queue.get()
+            # #228: drain everything ELSE currently queued so a wake
+            # coalesces to at most one POST/PUT per endpoint.  Under the
+            # T40 every-event hints push (≈99% of traffic) on a single-
+            # flight channel, this is what stops time-sensitive migrates
+            # ageing behind the idempotent flood.  get_nowait() is the
+            # whole burst that arrived while the prior dispatch was in
+            # flight — bounded by how fast handlers enqueue.
+            drained: List[OutboundBatch] = [first]
+            while True:
                 try:
-                    self.queue.task_done()
-                except ValueError:
-                    # Already done on the cancel path; tolerate.
-                    pass
-            # T36/F3 (#164): sustained-escalation fatal.  Both BOTH
-            # conditions must trip: streak length AND queue
-            # backlog age.  Low-traffic dead-sglang fails consec but
-            # drains fast (oldest_age stays small) → no fatal,
-            # daemon survives until sglang returns.  High-traffic
-            # dead-sglang fails consec AND oldest_age grows → fatal
-            # → supervisor restart.  DESIGN §10 "sustained tier".
-            if (
-                not success
-                and self.consecutive_failures >= self._escalate_failures
-                and oldest_age_ms >= self._escalate_oldest_age_s * 1000.0
-            ):
-                from ._fatal import fatal
-                fatal(
-                    "sglang_sustained_unreachable",
-                    sglang_base_url=self.sglang_base_url,
-                    consecutive_failures=self.consecutive_failures,
-                    oldest_age_ms=oldest_age_ms,
-                    queue_depth=depth_after_pop,
-                    escalate_failures_threshold=self._escalate_failures,
-                    escalate_oldest_age_s_threshold=(
-                        self._escalate_oldest_age_s
-                    ),
+                    drained.append(self.queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            # #228: expose the burst's oldest wait to /health while in flight.
+            self._draining_oldest_ts = min(b.enqueue_ts for b in drained)
+            try:
+                to_dispatch, stats = _partition_and_coalesce(
+                    drained,
+                    now_ts=time.time(),
+                    migrate_freshness_ms=self._migrate_freshness_ms,
                 )
+                if (stats["migrate_dropped_stale"]
+                        or stats["hints_in"] != stats["hints_out"]
+                        or stats["migrate_in"] != stats["migrate_out"]
+                        or stats["paused_in"] != stats["paused_out"]):
+                    from ._metrics import m as _m
+                    _m("outbound_coalesce", **stats)
+                for batch in to_dispatch:
+                    await self._dispatch_one(batch)
+            finally:
+                self._draining_oldest_ts = None
+                # One task_done per DRAINED item (queue accounting is by
+                # get, not by dispatch — coalescing emits fewer POSTs).
+                for _ in drained:
+                    try:
+                        self.queue.task_done()
+                    except ValueError:
+                        pass
+
+    async def _dispatch_one(self, batch: OutboundBatch) -> None:
+        """Issue one (already-coalesced) batch + run the #164 sustained-
+        escalation check.  Cancellation propagates so ``stop()`` sees clean
+        termination; the worker loop's ``finally`` still drains task_done."""
+        import time
+        oldest_age_ms = max(0.0, (time.time() - batch.enqueue_ts) * 1000.0)
+        if self.observability is not None:
+            self.observability.record_outbound(
+                queue_depth=self.queue.qsize(),
+                oldest_age_ms=oldest_age_ms,
+            )
+        try:
+            success = await self._post_one(batch)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "outbound worker: unexpected exception while POSTing "
+                "batch %s", batch.batch_id,
+            )
+            success = False
+            self.consecutive_failures += 1
+        # T36/F3 (#164): both streak length AND backlog age must trip.
+        if (
+            not success
+            and self.consecutive_failures >= self._escalate_failures
+            and oldest_age_ms >= self._escalate_oldest_age_s * 1000.0
+        ):
+            from ._fatal import fatal
+            fatal(
+                "sglang_sustained_unreachable",
+                sglang_base_url=self.sglang_base_url,
+                consecutive_failures=self.consecutive_failures,
+                oldest_age_ms=oldest_age_ms,
+                queue_depth=self.queue.qsize(),
+                escalate_failures_threshold=self._escalate_failures,
+                escalate_oldest_age_s_threshold=self._escalate_oldest_age_s,
+            )
 
     async def _post_one(self, batch: OutboundBatch) -> bool:
         """Issue one POST; update the sustained-escalation counter.
