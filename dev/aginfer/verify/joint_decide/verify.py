@@ -343,6 +343,113 @@ def stage_a_leaf_filter() -> None:
                  "guards (remove-HBM/DRAM/full-drop) (#210) OK"))
 
 
+def stage_a_inflight_holder_gate() -> None:
+    """#224: migrate_candidates must NOT propose a remove-HBM for a unit any
+    of whose holder programs is actively decoding — i.e. has a request in the
+    running batch (T26 ``per_program_usage[pid].hbm.inflight`` > 0).
+
+    Root cause of the TP=4 A3 ``remove_hbm_not_device_leaf`` storm (1384/cycle,
+    187 hot units re-failing ~15×): such a unit is a device-leaf *at dump time*
+    only in the brief gap between the active program's forward passes; by apply
+    time (state-fetch p99≈80 ms, max≈840 ms later) the holder has re-locked its
+    session tail, so sglang rejects.  Node-level ``lock_ref`` is the WRONG
+    signal (0 at the dump instant — that is exactly why the node dumped as a
+    leaf); the program-level ``inflight`` signal is STABLE across the per-pass
+    lock oscillation.
+
+    Crucially, a TOOL-PARKED program (awaiting a tool result → NOT in the
+    running batch → ``inflight`` empty) keeps its idle tail EVICTABLE — that
+    demote-during-the-tool-gap is the core §7/§9 value and must survive."""
+    GB = 1024 ** 3
+    nb = 2_000_000
+    hd = {"HBM": nb, "DRAM": nb}
+
+    def _removes(holders, programs):
+        tracker = ProgramTracker()
+        for h in holders:
+            tracker.observe_arrival(h)
+        sj = _state_json(
+            units=[_unit(uhash="u1", residence=["HBM", "DRAM"],
+                         holders=holders, n_bytes_per_tier=hd)],
+            programs=programs, hbm={"kv": _sp(5 * GB, 10 * GB)})
+        st = _build_state(
+            sj, tracker,
+            Event(kind=EventKind.MEMORY_PRESSURE, session=holders[0]))
+        return {tuple(sorted(t.name for t in c.id[2]))
+                for c in migrate_candidates(st, ["u1"], default_costs())}
+
+    # (a) sole holder ACTIVELY DECODING (inflight>0) → NO remove-HBM at all.
+    active = _removes(["p_act"],
+                      {"p_act": _program("REASONING", inflight={"kv": GB})})
+    if any("HBM" in rs for rs in active):
+        raise StageFail(
+            f"#224: active-holder (inflight>0) unit must yield NO remove-HBM "
+            f"(races the device lock → remove_hbm_not_device_leaf); got {active}")
+    # …but the device-retaining drop-DRAM (lock-safe) must NOT be over-filtered.
+    if ("DRAM",) not in active:
+        raise StageFail(
+            f"#224 over-filter: remove-DRAM (keeps device, lock-safe) must "
+            f"survive for an active holder; got {active}")
+
+    # (b) sole holder TOOL-PARKED (inflight empty) → remove-HBM PRESERVED.
+    parked = _removes(["p_park"], {"p_park": _program("ACTING")})
+    if ("HBM",) not in parked:
+        raise StageFail(
+            f"#224: tool-parked holder (inflight empty) MUST keep its "
+            f"remove-HBM demote — the core demote-during-tool-gap value; "
+            f"got {parked}")
+
+    # (c) SHARED unit, one active + one parked holder → ANY active holder
+    #     blocks remove-HBM (the node is locked by the active one).
+    shared = _removes(["p_act", "p_park"],
+                      {"p_act": _program("REASONING", inflight={"kv": GB}),
+                       "p_park": _program("ACTING")})
+    if any("HBM" in rs for rs in shared):
+        raise StageFail(
+            f"#224: a shared unit with ANY actively-decoding holder must yield "
+            f"NO remove-HBM (locked by the active holder); got {shared}")
+
+    # (d) inflight signal absent (cold-start / pre-T26) → must NOT suppress
+    #     (no false strand of the policy when the signal is unpopulated).
+    cold = _removes(["p_x"], {})
+    if ("HBM",) not in cold:
+        raise StageFail(
+            f"#224: absent inflight signal must NOT suppress remove-HBM "
+            f"(cold-start safety); got {cold}")
+
+    # (e) inflight present-but-ZERO {"kv": 0} → program is NOT in the running
+    #     batch → must NOT suppress.  (Guards against a future refactor to a
+    #     truthiness test that would gate a populated-but-idle program.)
+    zero = _removes(["p_idle"],
+                    {"p_idle": _program("ACTING", inflight={"kv": 0})})
+    if ("HBM",) not in zero:
+        raise StageFail(
+            f"#224: present-but-zero inflight must NOT suppress remove-HBM "
+            f"(zero bytes = not decoding); got {zero}")
+
+    # (f) holder present in per_program_usage but with NO "hbm" key at all →
+    #     treated as not-decoding (defensive .get chain); must NOT suppress.
+    nohbm = _removes(["p_nh"], {"p_nh": {"state": "ACTING", "dram":
+                                         {"committed": {}}}})
+    if ("HBM",) not in nohbm:
+        raise StageFail(
+            f"#224: holder with no hbm key must NOT suppress remove-HBM; "
+            f"got {nohbm}")
+
+    # (g) multi-subpool inflight with ONE nonzero sp → suppress (any sp>0 means
+    #     the program holds running-batch KV somewhere).
+    multi = _removes(["p_m"],
+                     {"p_m": _program("REASONING",
+                                      inflight={"full": 0, "swa": GB})})
+    if any("HBM" in rs for rs in multi):
+        raise StageFail(
+            f"#224: any nonzero inflight subpool must suppress remove-HBM; "
+            f"got {multi}")
+
+    print(_green("  [A-inflight] active blocked, parked/zero/no-hbm/cold "
+                 "preserved, shared+multi-sp blocked (#224) OK"))
+
+
 def _program(state="REASONING", *, inflight=None, committed=None,
              unit_hashes=None, pre_pause_state=None):
     return {
@@ -1275,6 +1382,7 @@ def stage_k_no_evict_reuse_imminent_tail() -> None:
 _STAGES = [
     ("A", stage_a_migrate_candidates),
     ("A-leaf", stage_a_leaf_filter),
+    ("A-inflight", stage_a_inflight_holder_gate),
     ("B", stage_b_forecast),
     ("C", stage_c_program_candidates),
     ("D", stage_d_joint_decide_select),

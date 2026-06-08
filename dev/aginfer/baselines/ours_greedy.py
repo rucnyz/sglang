@@ -125,6 +125,43 @@ def migration_cost_effective(
     return base * g
 
 
+def _holder_actively_decoding(u: ReuseUnit, state: SchedulerState) -> bool:
+    """#224: True iff any holder program of ``u`` currently has a request in
+    the running batch — T26 ``per_program_usage[pid].hbm.inflight`` carries
+    a non-zero byte count on some subpool.
+
+    A unit held by an actively-decoding program is a device-leaf *at dump
+    time* only in the brief gap between that program's forward passes; the
+    node's ``lock_ref`` oscillates (locked during each pass, released
+    between), and the dump samples it in a released instant.  By apply time
+    (state-fetch p99≈80 ms, max≈840 ms later) the holder has re-locked its
+    session tail, so sglang rejects the remove with ``remove_hbm_not_device_
+    leaf`` — the persistent TP=4 A3 storm (1384/cycle, 187 hot units).  The
+    node's instantaneous ``lock_ref`` is the WRONG signal to gate on (0 at
+    the dump instant — that is exactly why the node dumped as a leaf); the
+    program-level ``inflight`` signal is STABLE across the per-pass
+    oscillation, so it cleanly excludes the storm units.
+
+    A TOOL-PARKED program (awaiting a tool result → NOT in the running batch
+    → ``inflight`` empty) returns False here, so its idle session tail stays
+    evictable — that demote-during-the-tool-gap is the core §7/§9 value.
+
+    Absent / cold-start ``per_program_usage`` (pre-T26 or empty) returns
+    False, so the gate never strands the policy when the signal is
+    unpopulated (#161 cold-start discipline)."""
+    ppu = state.per_program_usage
+    if not ppu:
+        return False
+    for sid in u.holders:
+        inflight = ppu.get(sid, {}).get("hbm", {}).get("inflight", {})
+        # ``bool`` is an ``int`` subclass — exclude it so a stray True can
+        # never masquerade as a positive byte count.
+        if any(isinstance(b, (int, float)) and not isinstance(b, bool)
+               and b > 0 for b in inflight.values()):
+            return True
+    return False
+
+
 def _authoritative_of(residence: List[Tier]) -> Tier:
     """Highest-compute-readiness tier in ``residence`` (HBM > DRAM >
     DISK); empty residence ≡ DROP (DESIGN §7 ``authoritative_tier``)."""
@@ -228,6 +265,14 @@ def migrate_candidates(
             if Tier.HBM in remove_tiers and not u.is_device_leaf:
                 continue
             if Tier.DRAM in remove_tiers and not u.is_host_leaf:
+                continue
+            # #224: even a device-leaf-at-dump-time remove-HBM is reject-
+            # guaranteed when a holder program is actively decoding — the node
+            # re-locks between dump and apply (see _holder_actively_decoding).
+            # Suppress remove-HBM for such units; the device-retaining
+            # remove-DRAM stays allowed (host-side, lock-safe), and tool-parked
+            # holders (inflight empty) keep their evictable idle tail.
+            if Tier.HBM in remove_tiers and _holder_actively_decoding(u, state):
                 continue
 
             cost = value_residence(u, current, state, costs, pi_u) \

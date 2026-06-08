@@ -1125,6 +1125,56 @@ def migrate_candidates(state, D_t) -> list[Migrate]:
     return out
 ```
 
+**Apply-feasibility pre-filter.**  A `Migrate` whose `remove` sglang
+is *structurally guaranteed to reject* frees nothing yet costs a
+webhook round-trip, so candidate generation never emits one.  Two
+classes of reject are pre-filtered, both mirroring sglang's
+apply-site guards:
+
+* **Structural leaf guards.**  A remove is rejected unless the unit
+  is the relevant leaf: `remove {HBM}` needs a *device leaf* (no
+  child holds device-resident KV); `remove {DRAM}` needs a *host
+  leaf*; a full DROP needs a *tree leaf* (no children at all —
+  stricter than device-leaf, since a node with disk-only children
+  is a device leaf yet not a tree leaf).  These flags come straight
+  from the state dump.
+
+* **Active-decode holder guard.**  Even a unit that *is* a device
+  leaf in the dump is reject-guaranteed for `remove {HBM}` when one
+  of its holder programs is **actively decoding** — i.e. has a
+  request in the running batch (`per_program_usage[pid].hbm.inflight`
+  > 0).  Such a node is a device leaf only in the brief gap between
+  that program's forward passes; its `lock_ref` oscillates (locked
+  during each pass, released between), and the dump samples it in a
+  released instant.  By apply time — the dump is up to ~1 s old under
+  load — the holder has re-locked its session tail and sglang rejects
+  with `remove_hbm_not_device_leaf`.  The node's instantaneous
+  `lock_ref` is the **wrong** signal to gate on (it reads 0 at the
+  dump instant — that is *why* the node dumped as a leaf); the
+  program-level `inflight` signal is **stable across the per-pass
+  oscillation**, so it cleanly excludes these hot tails.  A
+  tool-parked program (awaiting a tool result → not in the running
+  batch → `inflight` empty) is *not* gated, so its idle session tail
+  stays evictable — the demote-during-the-tool-gap that is the
+  scheduler's core source of relief.  Absent / cold-start `inflight`
+  never suppresses, so the gate cannot strand the policy before the
+  signal populates.
+
+  *Bound.*  The holder set comes from the unit's `session_ids`, which
+  sglang accumulates add-only over a program's lifetime, so the guard
+  is a slight **over**-approximation: a device-leaf on an abandoned
+  branch a still-decoding program touched earlier is gated even though
+  that program will not re-lock it.  This is deliberately on the safe
+  side — it only forgoes a demote that *would* have been valid, never
+  proposes an invalid one — and is small in practice because (i) a
+  program's ancestors on its live root→tail path are non-leaves (so
+  already excluded by the structural device-leaf guard) and (ii)
+  temperature-0 agentic decode grows each session as a single chain
+  with few abandoned branches.  The exact-but-unstable alternative
+  (the node's instantaneous `lock_ref`) is rejected for the reason
+  above; a future exact-and-stable signal would have sglang emit each
+  active program's current decode frontier.
+
 **Action set semantics summary.**  Three physically distinct
 "costs" decompose cleanly under the residence-set framing:
 
