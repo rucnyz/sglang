@@ -265,13 +265,17 @@ fi
 # ---- 3. Startup invariants (T9 README §"Pre-run startup invariants") ----
 echo "[run_k:$VARIANT] checking startup invariants..."
 
-# 3a. kv_policy_loaded grep — MUST be the ours_greedy_score module.
-if ! grep -E "kv_policy_loaded=baselines.sglang_adapter:ours_greedy_score" "$SGLANG_LOG_REAL" >/dev/null; then
-    echo "[run_k:$VARIANT] HALT — kv_policy_loaded did not match" >&2
+# 3a. kv_policy_loaded grep — MUST be the configured inline scorer.  Default
+# is ours_greedy_score; the #230 characterization sweep swaps it per-arm
+# (lru_score / const_v_u_score) via SGLANG_KV_POLICY_MODULE, so pin against
+# the value run_k actually exported rather than a hardcoded string.
+EXPECT_POLICY="${SGLANG_KV_POLICY_MODULE:-baselines.sglang_adapter:ours_greedy_score}"
+if ! grep -E "kv_policy_loaded=${EXPECT_POLICY//./\\.}" "$SGLANG_LOG_REAL" >/dev/null; then
+    echo "[run_k:$VARIANT] HALT — kv_policy_loaded did not match (expected ${EXPECT_POLICY})" >&2
     grep "kv_policy_loaded=" "$SGLANG_LOG_REAL" | head -1 >&2 || echo "  (line not found at all)" >&2
     exit 5
 fi
-echo "[run_k:$VARIANT]   ✓ kv_policy_loaded=baselines.sglang_adapter:ours_greedy_score"
+echo "[run_k:$VARIANT]   ✓ kv_policy_loaded=${EXPECT_POLICY}"
 
 # 3b. write_through_loaded grep (#178 T9 parity) — MUST be the default
 # hit_count trigger.  The daemon V_u-aware write-through is deferred
