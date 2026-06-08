@@ -50,12 +50,14 @@ def build_payload(record: Dict[str, Any]) -> Dict[str, Any]:
     machinery runs on the a3 arm — including admission, which may PAUSE a
     replayed request (its TTFT then includes gate-park time that a3_kvoff,
     admission-off, never sees).  This is deliberate: the do-no-harm question
-    is the daemon's *whole* latency footprint.  In open-loop `arrival` mode
-    it is CONSERVATIVE for a3 — admission's cost is counted but its
-    open-loop-invisible benefit (back-pressure → the next arrival backing
-    off) is not; that benefit shows up in closed-loop `session` mode.  So
-    arrival-mode is a pessimistic do-no-harm bound for a3, session-mode the
-    realistic one.  (To isolate pure serving latency, run an admission-off
+    is the daemon's *whole* latency footprint.  Open-loop `arrival` mode is
+    MIXED-SIGN for a3 (not a strict bound): a pause adds the parked request's
+    own gate latency, but the HBM it frees can SPEED UP other concurrent a3
+    requests' decode — that intra-batch relief IS visible open-loop, while
+    the closed-loop back-pressure benefit (the next arrival backing off) is
+    NOT (it needs `session` mode).  So read arrival latency as "serving +
+    admission park cost − intra-batch relief"; session mode is the realistic
+    end-to-end view.  (To isolate pure serving latency, run an admission-off
     variant; see README.)
     """
     body = record.get("body") or {}
