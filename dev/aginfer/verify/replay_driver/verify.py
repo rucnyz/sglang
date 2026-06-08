@@ -93,7 +93,8 @@ def test_pure() -> None:
 
 # ----------------------------------------------------------- live stub server
 
-def make_stub(per_tok_delay_s: float = 0.002, fail: bool = False) -> FastAPI:
+def make_stub(per_tok_delay_s: float = 0.002, fail: bool = False,
+              reasoning_frac: float = 0.0) -> FastAPI:
     app = FastAPI()
     app.state.seen_pids: List[Any] = []
 
@@ -104,12 +105,14 @@ def make_stub(per_tok_delay_s: float = 0.002, fail: bool = False) -> FastAPI:
         if fail:
             return JSONResponse({"error": "boom"}, status_code=502)
         n = int(body.get("max_tokens") or 1)  # HONOR forced length
+        n_reason = int(n * reasoning_frac)
 
         async def gen():
-            for _ in range(n):
+            for i in range(n):
                 await asyncio.sleep(per_tok_delay_s)
+                key = "reasoning_content" if i < n_reason else "content"
                 yield b"data: " + json.dumps(
-                    {"choices": [{"delta": {"content": "x"}}]}
+                    {"choices": [{"delta": {key: "x"}}]}
                 ).encode() + b"\n\n"
             yield b"data: [DONE]\n\n"
 
@@ -199,6 +202,22 @@ async def test_live() -> None:
     check(rows3[0]["ok"] is False and rows3[0].get("error") == "request-deadline",
           "B3 hung request -> counted deadline error")
     check(elapsed < 4.0, f"B3 deadline fired fast (not the 50s hang) ({elapsed:.1f}s)")
+
+    # B4 (reasoning models): a server that streams 60% reasoning_content +
+    # 40% content must still count ALL forced tokens (else len_match breaks).
+    port4 = _free_port()
+    stub4 = make_stub(reasoning_frac=0.6)
+    async with _Server(stub4, port4):
+        rows4, wall4, _g4 = await replay(
+            [{"t": 0.0, "program_id": "R", "output_len": 10,
+              "body": {"model": "m", "messages": [{"role": "user", "content": "r"}]}}],
+            base_url=f"http://127.0.0.1:{port4}/v1",
+            mode="arrival", slowdown=1.0, max_concurrency=4,
+        )
+    check(rows4[0]["n_out"] == 10,
+          f"B4 reasoning+content both counted -> n_out==10 (got {rows4[0]['n_out']})")
+    check(aggregate(rows4, wall4)["len_match_rate"] == 1.0,
+          "B4 reasoning split -> len_match 1.0")
 
 
 def test_sessions_pure() -> None:

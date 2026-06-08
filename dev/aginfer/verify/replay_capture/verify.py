@@ -99,6 +99,17 @@ def test_helpers() -> None:
             + b"\r\n\r\n")
     check(count_sse_content_tokens(crlf, carry) == 2, "A1b CRLF + multi-event-per-chunk == 2")
 
+    # A1c — reasoning_content deltas count as tokens (reasoning models split
+    # the chain-of-thought into reasoning_content; they are real decode
+    # tokens occupying KV).  Mix of reasoning + content + a [DONE].
+    carry = {}
+    rc = (b'data: {"choices":[{"delta":{"reasoning_content":"think1"}}]}\n\n'
+          + b'data: {"choices":[{"delta":{"reasoning_content":"think2"}}]}\n\n'
+          + _sse("answer")
+          + b"data: [DONE]\n\n")
+    check(count_sse_content_tokens(rc, carry) == 3,
+          "A1c reasoning_content + content both counted (2+1=3)")
+
     # A2 — usage parse.
     body = json.dumps({"usage": {"completion_tokens": 42}}).encode()
     check(usage_completion_tokens(body) == 42, "A2 usage_completion_tokens == 42")

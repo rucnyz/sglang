@@ -51,16 +51,20 @@ def count_sse_content_tokens(chunk: bytes, _carry: Dict[str, bytes]) -> int:
     """Count generated tokens in a streamed SSE byte chunk.
 
     sglang streams OpenAI-style ``data: {...}\\n\\n`` events, one token per
-    event in the default per-token streaming mode, each carrying
-    ``choices[0].delta.content``.  We count events with a non-empty
-    content delta.  ``_carry`` holds a partial trailing line across chunk
-    boundaries (httpx ``aiter_bytes`` does not split on event lines).
+    event in the default per-token streaming mode.  We count an event as a
+    token if its delta carries EITHER ``content`` OR ``reasoning_content``.
 
-    This is the replay's ``output_len`` source.  It is exact under
-    per-token streaming; if a backend ever coalesces tokens per event it
-    becomes a lower bound, which we accept (and document) because the
-    replay forces the length regardless — the captured value only needs
-    to reproduce the real generation magnitude.
+    The reasoning_content half matters for reasoning models (DeepSeek-V4-
+    Flash runs ``--reasoning-parser deepseek-r1``): depending on the request
+    shape the server may split the chain-of-thought into ``reasoning_content``
+    deltas, which are still real decode tokens occupying KV.  Counting both
+    makes ``output_len`` == the server's total ``completion_tokens`` on both
+    the capture and replay sides, regardless of whether reasoning is split
+    out or inlined — so the forced-length replay's len_match holds.
+
+    ``_carry`` holds a partial trailing line across chunk boundaries (httpx
+    ``aiter_bytes`` does not split on event lines).  Exact under per-token
+    streaming; a lower bound if a backend coalesces tokens per event.
     """
     buf = _carry.get("buf", b"") + chunk
     n = 0
@@ -80,7 +84,7 @@ def count_sse_content_tokens(chunk: bytes, _carry: Dict[str, bytes]) -> int:
             continue
         for ch in obj.get("choices") or ():
             delta = ch.get("delta") or {}
-            if delta.get("content"):
+            if delta.get("content") or delta.get("reasoning_content"):
                 n += 1
     return n
 

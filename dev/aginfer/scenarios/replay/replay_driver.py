@@ -238,7 +238,11 @@ async def _one_request(
                     except Exception:
                         continue
                     for ch in obj.get("choices") or ():
-                        if (ch.get("delta") or {}).get("content"):
+                        delta = ch.get("delta") or {}
+                        # Count content AND reasoning_content (reasoning
+                        # tokens are real decode tokens; the reasoning model
+                        # may stream them split out — see trace_capture).
+                        if delta.get("content") or delta.get("reasoning_content"):
                             if ttft_ms is None:
                                 ttft_ms = (now - t0) * 1000.0
                             n_out += 1
@@ -252,7 +256,8 @@ async def _one_request(
                     try:
                         obj = json.loads(p)
                         for ch in obj.get("choices") or ():
-                            if (ch.get("delta") or {}).get("content"):
+                            delta = ch.get("delta") or {}
+                            if delta.get("content") or delta.get("reasoning_content"):
                                 if ttft_ms is None:
                                     ttft_ms = (time.perf_counter() - t0) * 1000.0
                                 n_out += 1
