@@ -85,10 +85,34 @@ def test_load_dir() -> None:
         check(len(by["a3"]) == 2 and len(by["a3_kvoff"]) == 1, "C trial grouping by arm")
 
 
+def _ms(makespan: float) -> dict:
+    m = _m(100, 50, 40)
+    m["sessions"] = {"makespan_s": makespan, "session_e2e_s": {"p50": makespan / 2, "p99": makespan},
+                     "n_sessions": 5, "total_steps": 20}
+    return m
+
+
+def test_endtoend() -> None:
+    print("D. closed-loop end-to-end comparison")
+    # ours makespan stably LOWER -> benefit
+    by_arm = {
+        "a3": [_ms(80), _ms(82), _ms(81)],
+        "a3_kvoff": [_ms(100), _ms(101), _ms(99)],
+    }
+    s = summarize(by_arm)
+    check("endtoend" in s, "D endtoend block present when sessions carried")
+    ms = next(r for r in s["endtoend"] if r["metric"] == "makespan_s")
+    check("STABLY LOWER" in ms["verdict"], "D ours makespan stably lower -> benefit")
+    # no sessions -> no endtoend block
+    s2 = summarize({"a3": [_m(100, 50, 40)], "a3_kvoff": [_m(100, 50, 40)]})
+    check("endtoend" not in s2, "D no endtoend block without session data")
+
+
 def main() -> int:
     test_verdict()
     test_summarize()
     test_load_dir()
+    test_endtoend()
     print()
     if _FAILS:
         print(f"FAILED ({len(_FAILS)}):")

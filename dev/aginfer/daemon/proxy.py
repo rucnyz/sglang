@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
@@ -356,6 +357,7 @@ def create_app(
         # is filled in at completion below.  Zero-cost when capture is off.
         recorder = getattr(app.state, "trace_recorder", None)
         _cap_arrival = recorder.note_arrival() if recorder is not None else None
+        _cap_t_entry = time.monotonic() if recorder is not None else None
 
         # 1. Gate on pause/resume — racing client disconnect (F1).
         if pid is not None:
@@ -479,6 +481,7 @@ def create_app(
                         program_id=pid,
                         body=body,
                         output_len=usage_completion_tokens(body_bytes) or 0,
+                        ref_e2e_ms=(time.monotonic() - _cap_t_entry) * 1000.0,
                     )
             except httpx.RequestError as exc:
                 pass_resp = JSONResponse(
@@ -576,6 +579,7 @@ def create_app(
                         program_id=pid,
                         body=body,
                         output_len=_cap_count,
+                        ref_e2e_ms=(time.monotonic() - _cap_t_entry) * 1000.0,
                     )
 
         # Preserve upstream content-type if present (defaults to SSE).

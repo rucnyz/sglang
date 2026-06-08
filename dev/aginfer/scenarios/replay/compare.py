@@ -64,6 +64,29 @@ def summarize(metrics_by_arm: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]
         arm: _mean_std([t.get("throughput_tok_s") for t in trials])
         for arm, trials in metrics_by_arm.items()
     }
+    # Closed-loop (session mode) end-to-end metrics, if present.  makespan
+    # + session-e2e are THE headline for benefit: lower = the workload
+    # finishes sooner.  Only emitted when trials carry a "sessions" block.
+    if any("sessions" in t for trials in metrics_by_arm.values() for t in trials):
+        ms_rows: List[Dict[str, Any]] = []
+        for metric, lower in [("makespan_s", True), ("session_e2e_s.p50", True),
+                              ("session_e2e_s.p99", True)]:
+            row: Dict[str, Any] = {"metric": metric}
+            for arm, trials in metrics_by_arm.items():
+                vals = []
+                for t in trials:
+                    sess = t.get("sessions") or {}
+                    if metric == "makespan_s":
+                        vals.append(sess.get("makespan_s"))
+                    else:
+                        stat = metric.split(".")[1]
+                        vals.append((sess.get("session_e2e_s") or {}).get(stat))
+                row[arm] = _mean_std(vals)
+            a, b = row.get("a3"), row.get("a3_kvoff")
+            if a and b and a["n"] and b["n"]:
+                row["verdict"] = _band_verdict(a, b, lower_is_better=lower)
+            ms_rows.append(row)
+        out["endtoend"] = ms_rows
     for grp, stat in _LATENCY:
         row: Dict[str, Any] = {"metric": f"{grp}.{stat}"}
         for arm, trials in metrics_by_arm.items():
@@ -127,6 +150,14 @@ def main() -> int:
     for arm, d in s["throughput"].items():
         print(f"  {arm:9s} {_fmt(d)}")
 
+    if s.get("endtoend"):
+        print("\n=== END-TO-END closed-loop (lower better) — the benefit metric ===")
+        print(f"  {'metric':18s} {'a3 (ours)':16s} {'a3_kvoff (base)':16s}  verdict")
+        for row in s["endtoend"]:
+            a = _fmt(row.get("a3", {"n": 0}))
+            b = _fmt(row.get("a3_kvoff", {"n": 0}))
+            print(f"  {row['metric']:18s} {a:16s} {b:16s}  {row.get('verdict','')}")
+
     print("\n=== latency (lower better) — ours=a3 vs baseline=a3_kvoff ===")
     print(f"  {'metric':12s} {'a3 (ours)':16s} {'a3_kvoff (base)':16s}  verdict")
     for row in s["latency"]:
@@ -134,13 +165,18 @@ def main() -> int:
         b = _fmt(row.get("a3_kvoff", {"n": 0}))
         print(f"  {row['metric']:12s} {a:16s} {b:16s}  {row.get('verdict','')}")
 
-    regressions = [r["metric"] for r in s["latency"]
+    regressions = [r["metric"] for r in s["latency"] + s.get("endtoend", [])
                    if "regression" in str(r.get("verdict", ""))]
     print()
     if regressions:
         print(f"DO-NO-HARM: VIOLATED on {regressions}")
     else:
-        print("DO-NO-HARM: HOLDS (no latency metric stably worse than baseline)")
+        print("DO-NO-HARM: HOLDS (no latency/end-to-end metric stably worse than baseline)")
+    # Benefit call-out: closed-loop makespan stably lower = the workload
+    # finishes sooner with the daemon on.
+    for r in s.get("endtoend", []):
+        if r["metric"] == "makespan_s" and "STABLY LOWER" in str(r.get("verdict", "")):
+            print("BENEFIT: makespan STABLY LOWER — daemon finishes the workload sooner")
     return 0
 
 

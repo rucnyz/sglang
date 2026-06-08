@@ -120,6 +120,75 @@ def aggregate(rows: List[Dict[str, Any]], wall_s: float) -> Dict[str, Any]:
     }
 
 
+def build_sessions(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group a trace into closed-loop sessions (pure).
+
+    Records are grouped by ``program_id`` (program_id=None → each its own
+    singleton session), ordered by arrival ``t``.  For each step we derive
+    the **tool-think gap** before the NEXT request from the captured timing:
+
+        gap_after_N = max(0, t_{N+1} - (t_N + ref_e2e_N))
+
+    i.e. the real wall time the agent spent between request N's response
+    landing and issuing request N+1 — the tool/bash/reasoning the daemon
+    cannot speed up.  Replaying steps as ``dispatch N → await → sleep
+    gap_N → dispatch N+1`` reproduces the closed loop: faster serving makes
+    the next request arrive sooner, so the session finishes sooner.
+
+    Each session: {program_id, start_t, steps:[{record, gap_after}]}.
+    """
+    by_pid: Dict[Any, List[Dict[str, Any]]] = {}
+    singletons: List[List[Dict[str, Any]]] = []
+    for r in records:
+        pid = r.get("program_id")
+        if pid is None:
+            singletons.append([r])
+        else:
+            by_pid.setdefault(pid, []).append(r)
+
+    groups: List[List[Dict[str, Any]]] = [
+        sorted(recs, key=lambda r: float(r.get("t", 0.0))) for recs in by_pid.values()
+    ] + singletons
+
+    out: List[Dict[str, Any]] = []
+    for recs in groups:
+        steps: List[Dict[str, Any]] = []
+        for i, r in enumerate(recs):
+            gap = 0.0
+            if i + 1 < len(recs):
+                t_n = float(r.get("t", 0.0))
+                e2e_n = float(r.get("ref_e2e_ms", 0.0)) / 1000.0
+                t_next = float(recs[i + 1].get("t", 0.0))
+                gap = max(0.0, t_next - (t_n + e2e_n))
+            steps.append({"record": r, "gap_after": gap})
+        out.append(
+            {
+                "program_id": recs[0].get("program_id"),
+                "start_t": float(recs[0].get("t", 0.0)),
+                "steps": steps,
+            }
+        )
+    out.sort(key=lambda s: s["start_t"])
+    return out
+
+
+def aggregate_sessions(
+    session_rows: List[Dict[str, Any]], makespan_s: float
+) -> Dict[str, Any]:
+    """Pure: per-session completion times → end-to-end summary.
+
+    makespan_s (total wall to drain all sessions) is THE closed-loop
+    headline — it captures the feedback open-loop replay cannot.
+    """
+    e2e = [r["session_e2e_s"] for r in session_rows if r.get("session_e2e_s") is not None]
+    return {
+        "n_sessions": len(session_rows),
+        "makespan_s": round(makespan_s, 3),
+        "session_e2e_s": _summ(e2e),
+        "total_steps": sum(int(r.get("n_steps") or 0) for r in session_rows),
+    }
+
+
 # -------------------------------------------------------------- replay engine
 
 
@@ -218,6 +287,62 @@ async def replay(
     return rows, wall_s
 
 
+async def replay_sessions(
+    sessions: List[Dict[str, Any]],
+    *,
+    base_url: str,
+    slowdown: float,
+    max_concurrency: int,
+    zero_tool_time: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float]:
+    """Closed-loop replay: each session is a dependent request chain.
+
+    Sessions start at their recorded first-arrival offset (preserving
+    inter-session concurrency); within a session, request N+1 is dispatched
+    only after N completes + its tool-think gap.  ``zero_tool_time`` drops
+    the gaps (benefit upper bound).  Returns (per-request rows, per-session
+    rows, makespan_s).
+    """
+    url = base_url.rstrip("/") + "/chat/completions"
+    rows: List[Dict[str, Any]] = []
+    sess_rows: List[Dict[str, Any]] = []
+    sem = asyncio.Semaphore(max_concurrency)
+    limits = httpx.Limits(max_connections=max_concurrency + 8)
+    base_t = min((s["start_t"] for s in sessions), default=0.0)
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=30.0),
+        limits=limits,
+    ) as cli:
+        wall0 = time.perf_counter()
+
+        async def run_session(s: Dict[str, Any]) -> None:
+            delay = (s["start_t"] - base_t) * slowdown
+            wait = wall0 + delay - time.perf_counter()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            sess_start = time.perf_counter()
+            last_done = sess_start
+            for step in s["steps"]:
+                async with sem:
+                    row = await _one_request(cli, url, step["record"])
+                rows.append(row)
+                last_done = time.perf_counter()
+                gap = 0.0 if zero_tool_time else step["gap_after"]
+                if gap > 0:
+                    await asyncio.sleep(gap * slowdown)
+            sess_rows.append(
+                {
+                    "program_id": s["program_id"],
+                    "session_e2e_s": last_done - sess_start,
+                    "n_steps": len(s["steps"]),
+                }
+            )
+
+        await asyncio.gather(*[run_session(s) for s in sessions])
+        makespan_s = time.perf_counter() - wall0
+    return rows, sess_rows, makespan_s
+
+
 def load_trace(path: str, limit: Optional[int]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     with open(path) as fh:
@@ -239,34 +364,58 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True)
     ap.add_argument("--base-url", default="http://127.0.0.1:9100/v1")
-    ap.add_argument("--mode", choices=["arrival", "closed"], default="arrival")
+    ap.add_argument(
+        "--mode", choices=["arrival", "closed", "session"], default="arrival",
+        help="arrival/closed = open-loop (per-request latency, do-no-harm); "
+             "session = closed-loop dependent chains (end-to-end makespan)",
+    )
     ap.add_argument("--slowdown", type=float, default=1.0)
     ap.add_argument("--max-concurrency", type=int, default=64)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--label", default="run")
     ap.add_argument("--out", default="")
+    ap.add_argument("--zero-tool-time", action="store_true",
+                    help="session mode: drop tool-think gaps (benefit upper bound)")
     args = ap.parse_args()
 
     records = load_trace(args.trace, args.limit or None)
     if not records:
         print("no records in trace")
         return 1
-    rows, wall_s = asyncio.run(
-        replay(
-            records,
-            base_url=args.base_url,
-            mode=args.mode,
-            slowdown=args.slowdown,
-            max_concurrency=args.max_concurrency,
+
+    if args.mode == "session":
+        sessions = build_sessions(records)
+        rows, sess_rows, makespan = asyncio.run(
+            replay_sessions(
+                sessions,
+                base_url=args.base_url,
+                slowdown=args.slowdown,
+                max_concurrency=args.max_concurrency,
+                zero_tool_time=args.zero_tool_time,
+            )
         )
-    )
-    metrics = aggregate(rows, wall_s)
+        metrics = aggregate(rows, makespan)
+        metrics["sessions"] = aggregate_sessions(sess_rows, makespan)
+        extra_rows: Dict[str, Any] = {"session_rows": sess_rows}
+    else:
+        rows, wall_s = asyncio.run(
+            replay(
+                records,
+                base_url=args.base_url,
+                mode=args.mode,
+                slowdown=args.slowdown,
+                max_concurrency=args.max_concurrency,
+            )
+        )
+        metrics = aggregate(rows, wall_s)
+        extra_rows = {}
+
     metrics["label"] = args.label
     metrics["mode"] = args.mode
     print(json.dumps(metrics, indent=2))
     if args.out:
         with open(args.out, "w") as fh:
-            json.dump({"metrics": metrics, "rows": rows}, fh)
+            json.dump({"metrics": metrics, "rows": rows, **extra_rows}, fh)
     return 0
 
 

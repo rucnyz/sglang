@@ -131,6 +131,7 @@ def test_recorder() -> None:
                 "extra_body": {"x": 1},    # dropped
             },
             output_len=5,
+            ref_e2e_ms=123.4,
         )
         # B2 — non-dict body must not raise / must not write.
         rec.write(arrival_offset=0.0, program_id=None, body="not-a-dict", output_len=0)
@@ -148,6 +149,7 @@ def test_recorder() -> None:
               "B1 sampling key kept")
         check("stream" not in r["body"] and "extra_body" not in r["body"],
               "B1 bulk/non-sampling keys dropped")
+        check(abs(r.get("ref_e2e_ms", 0) - 123.4) < 1e-6, "B1 ref_e2e_ms captured")
 
 
 # ------------------------------------------------------------ C. integration
@@ -255,6 +257,10 @@ async def test_integration() -> None:
             by_pid.get("sess-A", {}).get("body", {}).get("messages")
             == [{"role": "user", "content": "go"}],
             "C0 messages captured",
+        )
+        check(
+            all(r.get("ref_e2e_ms", 0) > 0 for r in recs),
+            "C ref_e2e_ms measured (>0) for both real requests",
         )
 
     # C2 — capture OFF: request still served, recorder is None.

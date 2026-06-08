@@ -33,8 +33,11 @@ sys.path.insert(0, str(_REPLAY_DIR))
 
 from replay_driver import (  # noqa: E402
     aggregate,
+    aggregate_sessions,
     build_payload,
+    build_sessions,
     replay,
+    replay_sessions,
     _pct,
     _summ,
 )
@@ -178,9 +181,70 @@ async def test_live() -> None:
     check(agg2["n_error"] == 3 and agg2["n_ok"] == 0, "B2 502s counted as errors")
 
 
+def test_sessions_pure() -> None:
+    print("C. closed-loop session reconstruction (pure)")
+    # program A: 2 turns; gap before turn2 = t1 - (t0 + ref_e2e0/1000)
+    #   t0=0.0 ref_e2e0=200ms -> done at 0.2; t1=1.0 -> gap 0.8
+    # program B: 1 turn; one None-singleton
+    recs = [
+        {"t": 0.0, "program_id": "A", "ref_e2e_ms": 200.0, "output_len": 3, "body": {}},
+        {"t": 1.0, "program_id": "A", "ref_e2e_ms": 100.0, "output_len": 4, "body": {}},
+        {"t": 0.5, "program_id": "B", "ref_e2e_ms": 50.0, "output_len": 2, "body": {}},
+        {"t": 0.7, "program_id": None, "ref_e2e_ms": 10.0, "output_len": 1, "body": {}},
+    ]
+    sessions = build_sessions(recs)
+    check(len(sessions) == 3, f"C n_sessions == 3 (got {len(sessions)})")
+    a = next(s for s in sessions if s["program_id"] == "A")
+    check(len(a["steps"]) == 2, "C session A has 2 steps")
+    check(abs(a["steps"][0]["gap_after"] - 0.8) < 1e-9,
+          f"C A gap = t1-(t0+e2e0) = 0.8 (got {a['steps'][0]['gap_after']})")
+    check(a["steps"][1]["gap_after"] == 0.0, "C last step gap 0")
+    check(sessions[0]["start_t"] <= sessions[-1]["start_t"], "C sessions sorted by start_t")
+
+    agg = aggregate_sessions(
+        [{"program_id": "A", "session_e2e_s": 1.2, "n_steps": 2},
+         {"program_id": "B", "session_e2e_s": 0.3, "n_steps": 1}],
+        makespan_s=2.5,
+    )
+    check(agg["n_sessions"] == 2 and agg["total_steps"] == 3, "C aggregate_sessions counts")
+    check(agg["makespan_s"] == 2.5, "C makespan carried")
+    check(abs(agg["session_e2e_s"]["mean"] - 0.75) < 1e-9, "C session e2e mean")
+
+
+async def test_session_live() -> None:
+    print("D. live closed-loop replay (gaps honored, makespan measured)")
+    # one session, 2 turns, a 0.3s tool gap between them.
+    recs = [
+        {"t": 0.0, "program_id": "S", "ref_e2e_ms": 0.0, "output_len": 3,
+         "body": {"model": "m", "messages": [{"role": "user", "content": "1"}]}},
+        {"t": 0.3, "program_id": "S", "ref_e2e_ms": 0.0, "output_len": 3,
+         "body": {"model": "m", "messages": [{"role": "user", "content": "2"}]}},
+    ]
+    sessions = build_sessions(recs)
+    check(abs(sessions[0]["steps"][0]["gap_after"] - 0.3) < 1e-9, "D gap 0.3 derived")
+    port = _free_port()
+    stub = make_stub(per_tok_delay_s=0.001)
+    async with _Server(stub, port):
+        rows, sess_rows, makespan = await replay_sessions(
+            sessions, base_url=f"http://127.0.0.1:{port}/v1",
+            slowdown=1.0, max_concurrency=8,
+        )
+        # zero-tool-time variant must be faster (no 0.3s gap)
+        rows0, sess0, makespan0 = await replay_sessions(
+            sessions, base_url=f"http://127.0.0.1:{port}/v1",
+            slowdown=1.0, max_concurrency=8, zero_tool_time=True,
+        )
+    check(len(rows) == 2 and all(r["ok"] for r in rows), "D both turns served")
+    check(len(sess_rows) == 1, "D one session row")
+    check(sess_rows[0]["session_e2e_s"] >= 0.3, "D session e2e includes the 0.3s gap")
+    check(makespan0 < makespan, "D zero-tool-time makespan < real-gap makespan")
+
+
 def main() -> int:
     test_pure()
     asyncio.run(test_live())
+    test_sessions_pure()
+    asyncio.run(test_session_live())
     print()
     if _FAILS:
         print(f"FAILED ({len(_FAILS)}):")

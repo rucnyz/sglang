@@ -27,7 +27,10 @@ Design
       {"t": <arrival offset s, float>,   # honoured by the replay scheduler
        "program_id": <str|null>,          # drives the daemon's per-program logic
        "body": {"messages": [...], "model": ...},  # replayed verbatim (prefix reuse)
-       "output_len": <int>}               # forced on replay (ignore_eos)
+       "output_len": <int>,               # forced on replay (ignore_eos)
+       "ref_e2e_ms": <float>}             # this request's real serve time, used
+                                          # to derive closed-loop tool-think gaps:
+                                          #   tool_time_N = t_{N+1} - (t_N + ref_e2e_N)
 
 * **Arrival offset** is taken from a monotonic clock at request entry and
   rebased to the first request, so the replay scheduler can reproduce the
@@ -135,6 +138,7 @@ class TraceRecorder:
         program_id: Optional[str],
         body: Any,
         output_len: int,
+        ref_e2e_ms: Optional[float] = None,
     ) -> None:
         """Append one captured request.  Never raises into the hot path."""
         try:
@@ -150,6 +154,8 @@ class TraceRecorder:
                 "body": slim,
                 "output_len": int(output_len),
             }
+            if ref_e2e_ms is not None:
+                rec["ref_e2e_ms"] = round(float(ref_e2e_ms), 3)
             line = json.dumps(rec, ensure_ascii=False)
             with self._lock:
                 self._fh.write(line + "\n")
