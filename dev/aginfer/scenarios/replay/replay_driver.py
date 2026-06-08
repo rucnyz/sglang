@@ -391,8 +391,16 @@ async def replay_sessions(
     max_concurrency: int,
     zero_tool_time: bool = False,
     request_deadline_s: float = 300.0,
+    gap_scale: float = 1.0,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], float, Dict[str, Any]]:
     """Closed-loop replay: each session is a dependent request chain.
+
+    ``gap_scale`` multiplies every tool-think gap. The captured fast-
+    exploration trace has ~0.2s gaps, so the KV is never idle long enough
+    to be evicted — the daemon's tier management (demote-during-tool,
+    proactive promote, value-aware DRAM retention) has no window. Scaling
+    the gaps simulates the realistic tool latency of agents that run tests/
+    builds (seconds to minutes), which is where the design's benefit binds.
 
     Sessions start at their recorded first-arrival offset (preserving
     inter-session concurrency); within a session, request N+1 is dispatched
@@ -439,7 +447,7 @@ async def replay_sessions(
                         gauge.exit()
                 rows.append(row)
                 last_done = time.perf_counter()
-                gap = 0.0 if zero_tool_time else step["gap_after"]
+                gap = 0.0 if zero_tool_time else step["gap_after"] * gap_scale
                 if gap > 0:
                     await asyncio.sleep(gap * slowdown)
             sess_rows.append(
@@ -496,6 +504,9 @@ def main() -> int:
     ap.add_argument("--out", default="")
     ap.add_argument("--zero-tool-time", action="store_true",
                     help="session mode: drop tool-think gaps (benefit upper bound)")
+    ap.add_argument("--gap-scale", type=float, default=1.0,
+                    help="session mode: multiply tool-think gaps (simulate "
+                         "realistic slow tools so KV goes idle / evictable)")
     ap.add_argument("--request-deadline", type=float, default=300.0,
                     help="per-request wall deadline (s); a parked/hung request "
                          "becomes a counted error instead of wedging the run")
@@ -522,6 +533,7 @@ def main() -> int:
                 max_concurrency=args.max_concurrency,
                 zero_tool_time=args.zero_tool_time,
                 request_deadline_s=args.request_deadline,
+                gap_scale=args.gap_scale,
             )
         )
         metrics = aggregate(rows, makespan)
