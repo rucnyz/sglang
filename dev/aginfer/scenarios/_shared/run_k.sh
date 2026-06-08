@@ -337,6 +337,24 @@ HARBOR_N_CONCURRENT="${SMOKE_N_CONCURRENT:-32}"
 HARBOR_MAX_TURNS="${SMOKE_MAX_TURNS:-200}"
 HARBOR_ATTEMPTS="${SMOKE_ATTEMPTS:-1}"
 
+# #231 — replay hook: if RUN_K_WORKLOAD_CMD is set, run it instead of
+# harbor (the stack is fully up + invariants passed at this point).  The
+# trace-replay driver uses this to drive the SAME launched stack with a
+# fixed request trace, then the trap tears the stack down.  The command
+# is run with DAEMON_PORT / RESULTS_DIR exported so it can find the proxy
+# and write its metrics next to the other cycle artifacts.
+if [[ -n "${RUN_K_WORKLOAD_CMD:-}" ]]; then
+    echo "[run_k:$VARIANT] RUN_K_WORKLOAD_CMD set — running replay workload instead of harbor"
+    export DAEMON_PORT RESULTS_DIR VARIANT
+    ( eval "$RUN_K_WORKLOAD_CMD" ) || HARBOR_EXIT=$?
+    echo "[run_k:$VARIANT] workload exit code: ${HARBOR_EXIT:-0}"
+    if [[ -e "$SGLANG_LOG_REAL" ]]; then
+        cp -- "$SGLANG_LOG_REAL" "$RESULTS_DIR/sglang_v4flash.log" 2>/dev/null || true
+    fi
+    echo "[run_k:$VARIANT] DONE — variant complete (replay workload)"
+    exit 0
+fi
+
 echo "[run_k:$VARIANT] starting harbor (n_tasks=${HARBOR_N_TASKS}, concurrent=${HARBOR_N_CONCURRENT}, max_turns=${HARBOR_MAX_TURNS}, swebenchpro/terminus-2)..."
 
 (cd /scratch/yuzhou/projects/harbor && \

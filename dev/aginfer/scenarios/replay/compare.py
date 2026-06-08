@@ -1,0 +1,148 @@
+"""#231 — compare replay metrics across arms (ours a3 vs baseline a3_kvoff).
+
+Reads the per-trial ``metrics_<arm>_c<i>.json`` written by replay_driver,
+groups by arm, and reports mean±std per latency/throughput metric across
+trials.  The do-no-harm verdict is per-metric and uses disjoint mean±std
+bands (same significance bar as the campaign): ours is "stably worse" on a
+latency metric only if its whole band sits above baseline's.
+
+Because both arms replay the SAME trace with output length forced, the
+len_match_rate sanity (≈1.0 both arms, equal total tokens) is what licenses
+the comparison in the first place — it is printed up front.
+
+Usage:  python compare.py <results_dir>
+"""
+from __future__ import annotations
+
+import glob
+import json
+import math
+import os
+import sys
+from typing import Any, Dict, List, Optional
+
+
+# Metrics we compare.  (key path into the metrics dict, lower-is-better?)
+_LATENCY = [
+    ("ttft_ms", "p50"),
+    ("ttft_ms", "p99"),
+    ("tpot_ms", "mean"),
+    ("tpot_ms", "p99"),
+    ("e2e_ms", "p50"),
+    ("e2e_ms", "p99"),
+]
+
+
+def _mean_std(xs: List[float]) -> Dict[str, float]:
+    xs = [x for x in xs if x is not None and x == x]
+    if not xs:
+        return {"mean": float("nan"), "std": float("nan"), "n": 0}
+    m = sum(xs) / len(xs)
+    var = sum((x - m) ** 2 for x in xs) / len(xs)
+    return {"mean": m, "std": math.sqrt(var), "n": len(xs)}
+
+
+def _get(metrics: Dict[str, Any], grp: str, stat: str) -> Optional[float]:
+    g = metrics.get(grp)
+    if isinstance(g, dict):
+        v = g.get(stat)
+        return float(v) if isinstance(v, (int, float)) else None
+    return None
+
+
+def summarize(metrics_by_arm: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Pure: {arm -> [per-trial metrics dict]} -> structured comparison."""
+    out: Dict[str, Any] = {"arms": {}, "latency": [], "throughput": {}, "sanity": {}}
+    for arm, trials in metrics_by_arm.items():
+        out["arms"][arm] = len(trials)
+        out["sanity"][arm] = {
+            "len_match_rate": _mean_std([t.get("len_match_rate") for t in trials]),
+            "total_out_tokens": _mean_std([t.get("total_out_tokens") for t in trials]),
+            "n_error": _mean_std([t.get("n_error") for t in trials]),
+        }
+    out["throughput"] = {
+        arm: _mean_std([t.get("throughput_tok_s") for t in trials])
+        for arm, trials in metrics_by_arm.items()
+    }
+    for grp, stat in _LATENCY:
+        row: Dict[str, Any] = {"metric": f"{grp}.{stat}"}
+        for arm, trials in metrics_by_arm.items():
+            row[arm] = _mean_std([_get(t, grp, stat) for t in trials])
+        # verdict (ours a3 vs baseline a3_kvoff), if both present
+        a, b = row.get("a3"), row.get("a3_kvoff")
+        if a and b and a["n"] and b["n"]:
+            row["verdict"] = _band_verdict(a, b, lower_is_better=True)
+        out["latency"].append(row)
+    return out
+
+
+def _band_verdict(ours: Dict[str, float], base: Dict[str, float], *, lower_is_better: bool) -> str:
+    """Disjoint mean±std bands -> stable better/worse; else within-noise."""
+    o_lo, o_hi = ours["mean"] - ours["std"], ours["mean"] + ours["std"]
+    b_lo, b_hi = base["mean"] - base["std"], base["mean"] + base["std"]
+    if o_hi < b_lo:
+        return "ours STABLY LOWER" if lower_is_better else "ours STABLY WORSE"
+    if o_lo > b_hi:
+        return "ours STABLY HIGHER (regression)" if lower_is_better else "ours STABLY BETTER"
+    return "within-noise"
+
+
+def load_dir(results_dir: str) -> Dict[str, List[Dict[str, Any]]]:
+    by_arm: Dict[str, List[Dict[str, Any]]] = {}
+    for pf in sorted(glob.glob(os.path.join(results_dir, "metrics_*.json"))):
+        base = os.path.basename(pf)[len("metrics_"):-len(".json")]  # <arm>_c<i>
+        arm = base.rsplit("_c", 1)[0]
+        try:
+            doc = json.load(open(pf))
+        except Exception:
+            continue
+        m = doc.get("metrics", doc)
+        by_arm.setdefault(arm, []).append(m)
+    return by_arm
+
+
+def _fmt(d: Dict[str, float]) -> str:
+    if not d.get("n"):
+        return "    n/a   "
+    return f"{d['mean']:8.1f}±{d['std']:5.1f}"
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: compare.py <results_dir>")
+        return 2
+    by_arm = load_dir(sys.argv[1])
+    if not by_arm:
+        print("no metrics_*.json found")
+        return 1
+    s = summarize(by_arm)
+
+    print(f"arms: " + ", ".join(f"{a}(n={n})" for a, n in s["arms"].items()))
+    print("\n=== sanity (must hold to license the comparison) ===")
+    for arm, san in s["sanity"].items():
+        print(f"  {arm:9s} len_match={_fmt(san['len_match_rate'])}  "
+              f"total_tok={_fmt(san['total_out_tokens'])}  n_err={_fmt(san['n_error'])}")
+
+    print("\n=== throughput tok/s (higher better) ===")
+    for arm, d in s["throughput"].items():
+        print(f"  {arm:9s} {_fmt(d)}")
+
+    print("\n=== latency (lower better) — ours=a3 vs baseline=a3_kvoff ===")
+    print(f"  {'metric':12s} {'a3 (ours)':16s} {'a3_kvoff (base)':16s}  verdict")
+    for row in s["latency"]:
+        a = _fmt(row.get("a3", {"n": 0}))
+        b = _fmt(row.get("a3_kvoff", {"n": 0}))
+        print(f"  {row['metric']:12s} {a:16s} {b:16s}  {row.get('verdict','')}")
+
+    regressions = [r["metric"] for r in s["latency"]
+                   if "regression" in str(r.get("verdict", ""))]
+    print()
+    if regressions:
+        print(f"DO-NO-HARM: VIOLATED on {regressions}")
+    else:
+        print("DO-NO-HARM: HOLDS (no latency metric stably worse than baseline)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
