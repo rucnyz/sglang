@@ -74,3 +74,57 @@ identical-work result the agentic-e2e could not produce.
 bash scenarios/replay/run_replay.sh scenarios/replay/traces/a3real.jsonl 3 arrival
 python scenarios/replay/compare.py scenarios/replay/results/a3real_arrival
 ```
+
+---
+
+# #231 BENEFIT — ours (4-tier) vs LRU (HBM-only), realistic slow tools
+
+The do-no-harm above compares ours vs ours-inline (both HiCache); that isolates
+the daemon's *marginal* overhead and is ≈0 — but it does NOT show the design's
+benefit, because the baseline already had the DRAM tier. The design's benefit is
+vs the paper's **LRU (literature)** baseline: residence restricted to
+`{{HBM}, ∅}`, **no DRAM/DISK tier** (HiCache OFF). Under pressure LRU must DROP
+the reused prefix → re-prefill it; ours keeps it in DRAM (the 4-tier residence).
+
+## Why this regime
+
+The captured trace has ~0.2s inter-turn gaps, so KV is never idle long enough to
+be evicted — the daemon's tier management has no window (3 migrates). We replay
+in closed-loop `session` mode with the tool-think gaps stretched ×30 (`--gap-scale 30`),
+i.e. realistic slow-tool latency (running tests/builds), so idle KV becomes
+evictable. The daemon then actively migrates (**39 migrates, 1101 demote +
+576 promote decisions** per trial). Regime: TP=2, pool `MAX_TOTAL_TOKENS=98304`,
+30 programs × ~25 turns, both arms hit 100% HBM occupancy (real eviction
+pressure). Output length forced (identical 2,296,910 prompt tokens both arms).
+
+## Result — the design avoids 5.2× the re-prefill
+
+| arm | prompt tok | re-prefilled tok | cache-hit |
+|---|---|---|---|
+| ours (4-tier: daemon + HiCache, `ours_greedy_score`) | 2,296,910 | **359,246** | **84.4 %** |
+| LRU HBM-only (`lru_score`, HiCache OFF) | 2,296,910 | **1,878,862** | **18.2 %** |
+
+- **LRU re-prefills 5.2× more tokens** (1.88 M vs 0.36 M) — it drops the reused
+  prefix and recomputes it; ours keeps it resident across tiers.
+- **Cache-hit 84.4 % vs 18.2 %** — a 66-percentage-point gain.
+- ours saves **~1.52 M tokens of prefill compute (80 % fewer re-prefilled
+  tokens)** on the same workload. This is the reward's "prefill saved by hits"
+  term, measured on the real stack.
+- Both arms 0 errors; makespan ours 795 s vs LRU 820 s (ours slightly faster).
+  TTFT/makespan are close because at this batch-saturated scale the extra
+  prefill compute is absorbed; the *work saved* (re-prefilled tokens) is the
+  direct, scale-independent benefit and binds harder in throughput-limited /
+  larger-fan-out regimes.
+
+## Honest attribution
+
+This benefit is the **4-tier residence** (keeping reused KV in DRAM instead of
+dropping it) vs an HBM-only baseline — the paper's thesis. The daemon's
+*value-aware* management on top of a reactive-HiCache baseline is do-no-harm at
+saturation (above) and engages (39 migrates) under realistic gaps; isolating its
+marginal contribution over reactive HiCache eviction is the #230 characterization
+follow-up. The headline: the design's 4-tier value-aware residence cuts
+re-prefill 5.2× vs the LRU baseline it subsumes.
+
+(N=1 ours vs N=1 LRU shown here; signal is 5.2× — far beyond noise, identical
+prompt tokens. N=3 confirmation completing in the same run.)
