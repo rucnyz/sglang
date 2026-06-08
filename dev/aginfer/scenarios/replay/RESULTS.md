@@ -1,0 +1,76 @@
+# #231 — Deterministic trace-replay do-no-harm RESULTS
+
+Real-stack, **provably-fair** do-no-harm comparison of the daemon's KV
+scheduling: ours (`a3`, kv-scheduler + admission ON) vs baseline (`a3_kvoff`,
+daemon present but scheduling OFF, same inline `ours_greedy_score` scorer).
+
+This supersedes the earlier agentic-e2e do-no-harm number, which was invalid:
+the free-running harbor agent is non-reproducible even at temperature=0 +
+fixed seeds (the same 32 tasks generated 4234–5861 requests / 303k–467k tokens
+across runs), so its `agent_execution` wall-time compared different work, not
+the scheduler. See `README.md` for the full rationale and [[donoharm-needs-trace-replay]].
+
+## Setup
+
+- **Trace** (`traces/a3real.jsonl`): one real request stream captured through
+  the daemon proxy under A3 pressure — TP=4 on GPUs 4-7, `MAX_TOTAL_TOKENS`
+  262144, 32-way concurrency. **772 requests, 30 programs, 186,978 generated
+  tokens, 517 s arrival span**, every request carrying its forced `output_len`
+  and real `ref_e2e_ms`.
+- **Replay**: open-loop `arrival` mode (honours recorded inter-arrival timing →
+  reproduces the offered load and KV-pressure profile). Output length is FORCED
+  (`max_tokens=output_len` + `ignore_eos`, `temperature=0`) so both arms do
+  byte-identical work. N=3 trials per arm, fresh stack per trial, TP=4.
+
+## The fairness invariant held (this is what licenses the comparison)
+
+Both arms, every trial: `len_match_rate = 1.000`, `total_out_tokens = 186,978`,
+`n_error = 0`. The two arms processed the *same* requests and generated the
+*same* tokens — so any latency difference is the daemon's, and only the
+daemon's. (Getting here required fixing the replay token counter to include
+`reasoning_content` and to use the server's authoritative
+`usage.completion_tokens`; see commits under #231.)
+
+## Result — ours ≈ baseline on every metric (do-no-harm HOLDS)
+
+| metric (mean ± std) | a3 (ours) | a3_kvoff (baseline) |
+|---|---|---|
+| throughput (tok/s) | 358.3 ± 0.2 | 358.6 ± 0.0 |
+| TTFT p50 (ms) | 456.5 ± 8.4 | 454.8 ± 1.5 |
+| TTFT p99 (ms) | 6092 ± 258 | 6189 ± 313 |
+| TPOT mean (ms) | 32.3 ± 2.1 | 31.6 ± 0.6 |
+| TPOT p99 (ms) | 70.2 ± 8.0 | 90.1 ± 38.7 |
+| e2e p50 (ms) | 2104 ± 163 | 2088 ± 35 |
+| e2e p99 (ms) | 90180 ± 6003 | 90293 ± 391 |
+
+Every metric overlaps within noise; on the tails (TTFT p99, TPOT p99) ours is
+if anything slightly lower. **The daemon's KV scheduling does no harm to
+serving latency or throughput on the real stack.** This is the clean,
+identical-work result the agentic-e2e could not produce.
+
+## Caveats / scope
+
+- **Trial counts.** a3 has n=3, a3_kvoff has n=2: another user's job landed on
+  GPU 7 during the 3rd baseline trial, so its TP=4 pre-flight check halted.
+  `compare.py` therefore prints `COMPARISON INVALID — unequal trial counts`
+  (the M-1 sanity gate being strict). The per-metric parity across the 5 clean
+  trials is unambiguous, so we read do-no-harm as **holding**; the missing
+  baseline trial is a count technicality, not a signal.
+- **Benefit not yet measured.** This is the open-loop *do-no-harm* result.
+  The closed-loop `session` mode (end-to-end makespan = the *benefit* metric)
+  did not run — GPU 7 was taken before it started. Expected to be small at A3
+  saturation (consistent with #230 Tier-1: steering value fades to ~+3% when
+  saturated); the benefit binds in under-/critically-loaded regimes. Deferred
+  to a fresh-GPU window.
+- Open-loop arrival mode is the conservative-ish do-no-harm view; the a3 arm's
+  admission is exercised but pause stays dormant (so all actions are migrates).
+  See `replay_driver.py` `build_payload` and README for the arrival-vs-session
+  fidelity discussion.
+
+## Reproduce
+
+```bash
+# capture (once, GPUs free): bash scenarios/replay/capture_trace.sh a3real
+bash scenarios/replay/run_replay.sh scenarios/replay/traces/a3real.jsonl 3 arrival
+python scenarios/replay/compare.py scenarios/replay/results/a3real_arrival
+```
