@@ -73,6 +73,7 @@ if _SGLANG_PY not in sys.path:
 import asyncio  # noqa: E402
 
 from baselines.base import Action, Tier  # noqa: E402
+from baselines.costs import default_costs  # noqa: E402
 from daemon import kv_scheduler as kvs  # noqa: E402
 from daemon.events import Event, EventKind  # noqa: E402
 from daemon.outbound import OutboundBatch, OutboundQueue  # noqa: E402
@@ -153,6 +154,9 @@ def _state_json(
     units: List[Dict[str, Any]],
     time_counter: int = 100,
     subpool: str = "kv",
+    hbm_used_gb: float = 1.0,   # B1b raises this + h_max so a demote is
+    hbm_cap_gb: float = 10.0,   # net-positive under value-gated joint_decide
+    h_max_per_byte_sec: float = 0.0,
 ) -> Dict[str, Any]:
     GB = 1024 * 1024 * 1024
 
@@ -166,7 +170,7 @@ def _state_json(
         "time_counter": time_counter,
         "throughput_ema": {"prefill_bps": 0.0, "decode_per_program": {}},
         "pool_usage": {
-            "HBM": _pool(1 * GB, 10 * GB),
+            "HBM": _pool(int(hbm_used_gb * GB), int(hbm_cap_gb * GB)),
             "DRAM": _pool(1 * GB, 40 * GB),
             "DISK": _pool(0, 200 * GB),
         },
@@ -176,17 +180,23 @@ def _state_json(
             "peak_bw_bps": 64 * GB, "recent_throughput_bps": 0.0,
             "time_since_last_sample_s": 5.0,
         } for link in ("HBM->DRAM", "DRAM->HBM", "DRAM->DISK", "DISK->DRAM")},
-        "tier_holding_cost": {tier: {subpool: {"h_max_per_byte_sec": 0.0}}
+        "tier_holding_cost": {tier: {subpool:
+                              {"h_max_per_byte_sec": h_max_per_byte_sec}}
                               for tier in ("HBM", "DRAM", "DISK")},
     }
 
 
 class _FakeRouter:
-    """Minimal EventRouter stand-in: handle() only needs fetch_state()
-    + observability."""
+    """Minimal EventRouter stand-in.  handle() reads fetch_state +
+    observability, and (since the §9 joint_decide wiring) the admission
+    thresholds theta_hi / theta_lo + the §8 forecast heartbeat_s."""
     def __init__(self, state_json: Dict[str, Any]):
         self._sj = state_json
         self.observability = None
+        # Match EventRouter defaults (event_router.py:73-80, launch flags).
+        self.theta_hi = 0.85
+        self.theta_lo = 0.70
+        self.heartbeat_s = 5.0
 
     async def fetch_state(self) -> Dict[str, Any]:
         return self._sj
@@ -194,6 +204,10 @@ class _FakeRouter:
 
 class _DeclinePolicy:
     """Returns no migrate assignments (Vt non-positive everywhere)."""
+    # kv_scheduler reads policy.costs + policy.pi_u for the §7 migrate
+    # candidate generator (real OursGreedyPolicy carries both).
+    costs = default_costs()
+    pi_u = 1.0e-4
     def decide(self, state) -> Action:  # noqa: ANN001
         return Action(assignments=[])
 
@@ -201,6 +215,8 @@ class _DeclinePolicy:
 class _MigratePolicy:
     """Demotes the first D_t unit HBM→DRAM, so handle() also enqueues
     a migrate POST alongside the hints PUT."""
+    costs = default_costs()
+    pi_u = 1.0e-4
     def decide(self, state) -> Action:  # noqa: ANN001
         for uid in state.decision_set:
             u = state.units.get(uid)
@@ -338,16 +354,24 @@ def stage_b1_push_unconditional_when_policy_declines() -> None:
 
 
 def stage_b1b_push_alongside_migrate() -> None:
-    """When the policy DOES migrate, the hints PUT is enqueued alongside
-    the migrate POST (both, independently)."""
+    """When value-gated joint_decide DOES migrate, the hints PUT is enqueued
+    alongside the migrate POST (both, independently).  Post-#194 the migrate
+    comes from joint_decide (state-driven, value-gated), not the policy's
+    Action — so the unit must be an idle device-leaf under real HBM pressure
+    (high occ + h_max>0) for the demote to be net-positive."""
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p0")
         sj = _state_json(
             units=[_unit(uhash="u0", residence=["HBM"], holders=["p0"])],
             time_counter=100,
+            hbm_used_gb=9.5, hbm_cap_gb=10.0,      # 95% HBM pressure
+            h_max_per_byte_sec=1.0,                # holding cost dominates
         )
-        ev = Event(EventKind.TOOL_CALL_END, session="p0")
+        # MEMORY_PRESSURE → demote candidates by regret.  (NOT TOOL_CALL_END:
+        # #223's reuse-imminent carve-out suppresses evicting the tail there,
+        # since the tool is about to return and reuse it.)
+        ev = Event(EventKind.MEMORY_PRESSURE, session="p0")
         ob = _new_outbound()
         sched = _sched(tracker, ob, _MigratePolicy())
         await sched.handle(ev, _FakeRouter(sj))
