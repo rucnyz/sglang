@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
     next_component_uuid,
+    peek_time_counter,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "_NUM_COMPONENT_TYPES",
     "next_component_uuid",
     "get_and_increase_time_counter",
+    "peek_time_counter",
 ]

@@ -742,6 +742,422 @@ async def server_info():
     }
 
 
+# ---- aginfer external scheduler API ----
+# Read-only snapshot of the radix cache + per-tier occupancy that the
+# aginfer daemon (see dev/aginfer/DESIGN.md) consumes on every event.
+# Single-DP deployments get a flat dict; multi-DP deployments get
+# {"per_rank": [...]} so the daemon can still address each rank.
+#
+# #160 / F3-revisit (2026-06-01): direct synchronous dump under load
+# hits scheduler-loop tick variance (p99 ~340 ms when scheduler is
+# busy with prefill/decode batches).  Fix: HTTP-layer cache + a
+# background refresh task that absorbs the variance.  Daemon sees
+# bounded staleness (~refresh-interval) instead of unbounded latency.
+#
+# Cache invariants:
+#  * Bytes payload (or per_rank dict) cached in a single module-
+#    level slot, guarded by a lock.
+#  * Background task refreshes at AGINFER_STATE_REFRESH_MS cadence
+#    (default 50 ms).  Refresh blocks on the scheduler the same way
+#    the old synchronous path did; the variance lives in the
+#    background task's own loop, not the user-facing handler.
+#  * First-ever request: if cache is empty, do a synchronous fetch
+#    (one-time cold start; subsequent requests see the cache).
+#  * Refresh task auto-stops if the response shape regresses to
+#    `unsupported_tree_cache` (e.g. CLI launch without
+#    SGLANG_ENABLE_UNIFIED_RADIX_TREE=1) — no point repeatedly
+#    fetching a static error envelope.
+import os
+import threading
+
+_AGINFER_REFRESH_MS = float(
+    os.environ.get("AGINFER_STATE_REFRESH_MS", "50.0")
+)
+# Per #160 closure: a 50ms refresh cadence at ~5ms dump cost is <1%
+# scheduler overhead.  Operators can tune via the env var.
+
+_AGINFER_CACHE_LOCK = threading.Lock()
+_aginfer_cached_body: Optional[bytes] = None
+_aginfer_cached_media: str = "application/json"
+_aginfer_refresh_task: Optional[asyncio.Task] = None
+_aginfer_refresh_started: bool = False
+
+
+async def _aginfer_serialise(responses) -> tuple:
+    """Run the same single-rank / per_rank branch the synchronous
+    handler used to run; return (body_bytes, media_type)."""
+    if len(responses) == 1:
+        r = responses[0]
+        if r.state_bytes is not None:
+            return r.state_bytes, "application/json"
+        import orjson
+        return orjson.dumps(r.state), "application/json"
+    import orjson
+    per_rank = [
+        orjson.loads(r.state_bytes) if r.state_bytes is not None else r.state
+        for r in responses
+    ]
+    return orjson.dumps({"per_rank": per_rank}), "application/json"
+
+
+async def _aginfer_refresh_one() -> None:
+    """Single refresh tick: fetch from scheduler, update cache.
+    Exceptions are logged + swallowed; the cache holds stale data
+    until the next successful tick."""
+    global _aginfer_cached_body, _aginfer_cached_media
+    try:
+        responses = (
+            await _global_state.tokenizer_manager.get_aginfer_state()
+        )
+        body, media = await _aginfer_serialise(responses)
+        with _AGINFER_CACHE_LOCK:
+            _aginfer_cached_body = body
+            _aginfer_cached_media = media
+    except Exception:  # noqa: BLE001
+        logger.exception("aginfer state refresh failed; keeping stale cache")
+
+
+async def _aginfer_refresh_loop() -> None:
+    """Background refresh task — re-fetches at the configured
+    cadence.  Survives forever (until process exit) so the cache
+    stays fresh under sustained traffic."""
+    interval_s = _AGINFER_REFRESH_MS / 1000.0
+    while True:
+        await _aginfer_refresh_one()
+        await asyncio.sleep(interval_s)
+
+
+@app.get("/aginfer/state")
+async def aginfer_state():
+    global _aginfer_refresh_task, _aginfer_refresh_started
+
+    # Lazy-start the refresh task on the first request.  Single-flight
+    # guarded by _aginfer_refresh_started (Python attr write is atomic).
+    if not _aginfer_refresh_started:
+        _aginfer_refresh_started = True
+        # Synchronous cold-start fetch so the FIRST response has fresh
+        # data (subsequent ones return cache).
+        await _aginfer_refresh_one()
+        _aginfer_refresh_task = asyncio.create_task(
+            _aginfer_refresh_loop(), name="aginfer-state-refresh",
+        )
+
+    with _AGINFER_CACHE_LOCK:
+        body = _aginfer_cached_body
+        media = _aginfer_cached_media
+    if body is None:
+        # Should not happen post-cold-start; refresh raised and left
+        # cache empty.  Fall back to a synchronous fetch so the
+        # caller doesn't get a confusing 500.
+        responses = (
+            await _global_state.tokenizer_manager.get_aginfer_state()
+        )
+        body, media = await _aginfer_serialise(responses)
+    return Response(content=body, media_type=media)
+
+
+# POST /aginfer/migrate -- apply paper §6 residence-set transitions.
+# Body: {"actions": [{"hash": str,
+#                     "add_tiers":    ["HBM"|"DRAM"|"DISK", ...],
+#                     "remove_tiers": ["HBM"|"DRAM"|"DISK", ...],
+#                     "action_id":    "<opaque correlator>"}, ...]}
+# Response: {"applied": int, "applied_hashes": [...],
+#            "skipped": [{"hash":..., "action_id":..., "reason":...}, ...]}
+# Skip reasons per DESIGN §6 + verify/t20/README.md table.
+# Unresolved actions are listed in `skipped` rather than raised, so the
+# daemon's idempotent re-issue loop stays simple.
+@app.post("/aginfer/migrate")
+async def aginfer_migrate(raw_request: Request):
+    try:
+        payload = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    actions = payload.get("actions") if isinstance(payload, dict) else None
+    if not isinstance(actions, list):
+        raise HTTPException(
+            status_code=400, detail="missing or non-list 'actions' field"
+        )
+    # Caps protect the scheduler against adversarial payloads: a 1MB hash
+    # string would consume O(len) on every dict-lookup, and a 1M-action
+    # batch would block the scheduler event loop for seconds.  Real daemon
+    # batches are ~hundreds of actions with hex-SHA256 or "node-N" hashes.
+    AGINFER_MAX_ACTIONS_PER_BATCH = 100_000
+    AGINFER_MAX_HASH_LEN = 1024
+    if len(actions) > AGINFER_MAX_ACTIONS_PER_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"too many actions in one batch ({len(actions)} > "
+                f"{AGINFER_MAX_ACTIONS_PER_BATCH})"
+            ),
+        )
+    # DESIGN §6 wire payload: each action MUST carry these four
+    # fields.  Validate at the HTTP boundary (where "fail loud" means
+    # 400, not "scheduler subprocess KeyError + crash") so a malformed
+    # daemon POST surfaces to ops without taking sglang down.
+    _AGINFER_REQUIRED_ACTION_FIELDS = (
+        "hash", "add_tiers", "remove_tiers", "action_id",
+    )
+    for _i, _a in enumerate(actions):
+        if not isinstance(_a, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"actions[{_i}] must be a dict, got "
+                       f"{type(_a).__name__}",
+            )
+        _missing = [f for f in _AGINFER_REQUIRED_ACTION_FIELDS
+                    if f not in _a]
+        if _missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"actions[{_i}] missing required field(s): "
+                       f"{_missing!r}",
+            )
+        _h = _a["hash"]
+        if isinstance(_h, str) and len(_h) > AGINFER_MAX_HASH_LEN:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"hash too long ({len(_h)} > {AGINFER_MAX_HASH_LEN})"
+                ),
+            )
+    from sglang.srt.managers.io_struct import MigrateAginferReq
+
+    responses = await _global_state.tokenizer_manager.migrate_aginfer(
+        MigrateAginferReq(actions=actions)
+    )
+    if len(responses) == 1:
+        out = responses[0]
+        return ORJSONResponse(
+            {
+                "applied": out.applied,
+                "applied_hashes": out.applied_hashes,
+                "skipped": out.skipped,
+            }
+        )
+    return ORJSONResponse(
+        {
+            "per_rank": [
+                {
+                    "applied": r.applied,
+                    "applied_hashes": r.applied_hashes,
+                    "skipped": r.skipped,
+                }
+                for r in responses
+            ]
+        }
+    )
+
+
+# T22 (#155): daemon → sglang threshold broadcast.  Body is the
+# four-field hysteresis dict (DESIGN §6 round-6 H3).  Sglang's
+# AginferWebhookFirer applies atomically per rank; the daemon's
+# next state-fetch reconciles any one-update lag.
+@app.put("/aginfer/thresholds")
+async def aginfer_thresholds_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail="body must be a JSON object",
+        )
+    required = ("theta_hi", "theta_lo", "theta_crit", "heartbeat_s")
+    missing = [k for k in required if k not in body]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"missing required field(s): {missing}",
+        )
+    from sglang.srt.managers.io_struct import UpdateAginferThresholdsReq
+    req = UpdateAginferThresholdsReq(
+        theta_hi=float(body["theta_hi"]),
+        theta_lo=float(body["theta_lo"]),
+        theta_crit=float(body["theta_crit"]),
+        heartbeat_s=float(body["heartbeat_s"]),
+    )
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_thresholds(req)
+    )
+    # Aggregate: success only if all ranks ok.  First rank's reason
+    # propagates on failure so the daemon's APPLY_FAILED handler can
+    # surface a specific cause.
+    all_ok = all(r.ok for r in responses)
+    if not all_ok:
+        first_fail = next(r for r in responses if not r.ok)
+        raise HTTPException(
+            status_code=400,
+            detail=f"validation: {first_fail.reason}",
+        )
+    return ORJSONResponse({"ok": True, "ranks": len(responses)})
+
+
+def _validate_program_paused_body(body):
+    """T21 (#181) + #186 audit: validate a PUT /aginfer/program_paused
+    body.  Returns ``(pid, state, pre_pause_state)`` or raises
+    ``ValueError`` with a 400-able message.
+
+    Pure function (no FastAPI deps) so verify/t21 can unit-test the
+    type checks directly.  Type-validate BEFORE coercion — a prior
+    ``str(body["pid"])`` silently turned JSON null/number into
+    "None"/"123", bypassing the setter's empty-pid guard.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("body must be a JSON object")
+    for k in ("pid", "state"):
+        if k not in body:
+            raise ValueError(f"missing required field: {k!r}")
+    pid = body["pid"]
+    if not isinstance(pid, str) or not pid:
+        raise ValueError("pid must be a non-empty string")
+    state = body["state"]
+    if not isinstance(state, str) or not state:
+        raise ValueError("state must be a non-empty string")
+    pre = body.get("pre_pause_state")
+    if pre is not None and not isinstance(pre, str):
+        raise ValueError("pre_pause_state must be string or null")
+    return pid, state, pre
+
+
+# T21 (#181): daemon → sglang program-state broadcast.  Body is
+# {pid, state, pre_pause_state?}.  Sglang stores per-pid on each
+# rank's tree cache (set_aginfer_program_state); the next
+# /aginfer/state dump echoes the state back in
+# per_program_usage[pid].  Idempotent: applied=0 if already at
+# requested state (DESIGN §10 R2).
+@app.put("/aginfer/program_paused")
+async def aginfer_program_paused_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    from sglang.srt.managers.io_struct import (
+        UpdateAginferProgramPausedReq,
+    )
+    try:
+        pid, state, pre = _validate_program_paused_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    req = UpdateAginferProgramPausedReq(
+        pid=pid,
+        state=state,
+        pre_pause_state=pre,
+    )
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_program_paused(req)
+    )
+    all_ok = all(r.ok for r in responses)
+    if not all_ok:
+        first_fail = next(r for r in responses if not r.ok)
+        raise HTTPException(
+            status_code=400,
+            detail=f"validation: {first_fail.reason}",
+        )
+    # Sum applied across ranks (typically 1 OR len(responses); they
+    # share the same daemon view so all flip in unison).  Caller
+    # treats >0 as "state changed", 0 as "idempotent no-op".
+    return ORJSONResponse({
+        "ok": True,
+        "ranks": len(responses),
+        "applied": sum(int(r.applied) for r in responses),
+    })
+
+
+def _validate_hints_body(body):
+    """T40 (#184): validate a PUT /aginfer/hints body.  Returns the
+    normalized list of hint dicts (``[{hash, p_hat, lambda, stamp}]``)
+    or raises ``ValueError`` with a 400-able message.
+
+    Pure function (no FastAPI deps) so verify/t40 can unit-test the
+    type checks + round-trip the daemon's exact wire body.  Rejects
+    out-of-range V_u inputs here so a malformed daemon push fails at
+    the door rather than silently poisoning the inline scorer's
+    eviction order: ``p_hat`` ∈ [0, 1], ``lambda`` ≥ 0, ``stamp`` a
+    non-negative int.
+    """
+    import math
+    if not isinstance(body, dict):
+        raise ValueError("body must be a JSON object")
+    hints = body.get("hints")
+    if not isinstance(hints, list):
+        raise ValueError("'hints' must be a list")
+    out = []
+    for i, h in enumerate(hints):
+        if not isinstance(h, dict):
+            raise ValueError(f"hints[{i}] must be an object")
+        uhash = h.get("hash")
+        if not isinstance(uhash, str) or not uhash:
+            raise ValueError(f"hints[{i}].hash must be a non-empty string")
+        # bool is an int subclass — reject it explicitly for numerics.
+        # Reject non-finite (NaN/inf) at the door: the validator is the
+        # safety boundary for the inline scorer's eviction order; a
+        # NaN p_hat / inf lambda would silently corrupt comparisons
+        # downstream (audit A4).
+        p_hat = h.get("p_hat")
+        if isinstance(p_hat, bool) or not isinstance(p_hat, (int, float)):
+            raise ValueError(f"hints[{i}].p_hat must be a number")
+        if not math.isfinite(p_hat):
+            raise ValueError(f"hints[{i}].p_hat must be finite; got {p_hat}")
+        if not (0.0 <= float(p_hat) <= 1.0):
+            raise ValueError(f"hints[{i}].p_hat must be in [0, 1]; got {p_hat}")
+        lam = h.get("lambda")
+        if isinstance(lam, bool) or not isinstance(lam, (int, float)):
+            raise ValueError(f"hints[{i}].lambda must be a number")
+        if not math.isfinite(lam):
+            raise ValueError(f"hints[{i}].lambda must be finite; got {lam}")
+        if float(lam) < 0.0:
+            raise ValueError(f"hints[{i}].lambda must be >= 0; got {lam}")
+        stamp = h.get("stamp")
+        if isinstance(stamp, bool) or not isinstance(stamp, int):
+            raise ValueError(f"hints[{i}].stamp must be an int")
+        if stamp < 0:
+            raise ValueError(f"hints[{i}].stamp must be >= 0; got {stamp}")
+        out.append({
+            "hash": uhash,
+            "p_hat": float(p_hat),
+            "lambda": float(lam),
+            "stamp": int(stamp),
+        })
+    return out
+
+
+# T40 (#184, DESIGN §6 PUT /aginfer/hints): daemon → sglang push of
+# V_u inputs (p_hat / lambda) for the inline scorer.  Body is
+# {hints: [{hash, p_hat, lambda, stamp}]}.  Each rank's tree cache
+# applies overwrite-by-stamp (set_aginfer_hints); the daemon keeps no
+# shadow cache and re-pushes D_t every event (DESIGN §10).
+@app.put("/aginfer/hints")
+async def aginfer_hints_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    from sglang.srt.managers.io_struct import UpdateAginferHintsReq
+    try:
+        hints = _validate_hints_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    req = UpdateAginferHintsReq(hints=hints)
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_hints(req)
+    )
+    all_ok = all(r.ok for r in responses)
+    if not all_ok:
+        first_fail = next(r for r in responses if not r.ok)
+        raise HTTPException(
+            status_code=400,
+            detail=f"validation: {first_fail.reason}",
+        )
+    # Sum applied across ranks; ranks share the daemon's hash space so
+    # they advance in unison.  Caller treats 0 as idempotent no-op.
+    return ORJSONResponse({
+        "ok": True,
+        "ranks": len(responses),
+        "applied": sum(int(r.applied) for r in responses),
+    })
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).

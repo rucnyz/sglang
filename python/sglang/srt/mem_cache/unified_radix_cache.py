@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 import time
@@ -50,6 +51,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
+    peek_time_counter,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
@@ -62,6 +64,152 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.session.streaming_session import StreamingSession
+
+# --- aginfer: pluggable eviction scorer -------------------------------------
+# When set, replaces the default LRU heap key (= node.last_access_time) used by
+# component drive_eviction / drive_host_eviction.  Lower score -> evict first.
+#
+# Wired via the env var SGLANG_KV_POLICY_MODULE="pkg.module:callable".  The
+# callable signature is (node: UnifiedTreeNode, layer: EvictLayer) -> float.
+# The default fallback below preserves stock sglang LRU behaviour.
+import os
+import importlib
+
+
+# #177 (T38 follow-on, DESIGN §3 "one code path"): the in-process
+# eviction DEFAULT is the LRU-equivalent V_u — bare last_access_time
+# ("last_access as p_hat surrogate", DESIGN §3).  This is byte-for-byte
+# stock sglang LRU AND literally the same function as the daemon-side
+# default policy module
+# (dev/aginfer/baselines/sglang_adapter.py:default_policy_score), so
+# "aginfer disabled" and "aginfer default policy" are one code path —
+# baseline-vs-ours ablations flip a policy parameter, not a path.
+#
+# hit_count is deliberately NOT used here: DESIGN §3 places hit_count in
+# the WRITE-THROUGH trigger (_default_should_write_through / #178), not
+# in eviction ordering.  (An earlier attempt at a `+ hit_count·2^-50`
+# eviction tie-break was both non-functional — the bonus is below the
+# float64 ULP at any realistic last_access_time — and near-pointless:
+# the match path stamps ancestor nodes at cur_time, cur_time-1e-5, …
+# (see update path), so exact last_access_time ties are effectively
+# absent for realistic counter values.  At extreme counter magnitudes
+# (≳2^40 cumulative accesses, where the 1e-5 spacing itself falls below
+# the ULP) ancestor nodes DO tie — but there stock-sglang bare LRU ties
+# arbitrarily too, so this is no regression vs stock.  See #177.)
+# verify/t28 stage A3 is the cross-tree drift guard that pins this ==
+# the adapter's default_policy_score.
+def _default_eviction_score(node, layer) -> float:
+    return float(node.last_access_time)
+
+
+def _default_should_write_through(node, threshold) -> bool:
+    """#178 (T28, DESIGN §3 write-through plugin) DEFAULT: the
+    historical ``hit_count >= write_through_threshold`` trigger.
+    Preserves stock sglang behaviour exactly when no daemon-/env-
+    supplied policy is registered."""
+    return node.hit_count >= threshold
+
+
+def _load_eviction_scorer():
+    """Resolve the inline scorer per SGLANG_KV_POLICY_MODULE.
+
+    Always emits a single canonical startup line ``kv_policy_loaded=<spec>``
+    so the T9 startup-invariant grep can detect (a) which scorer is
+    active and (b) failed loads (which silently fall back to LRU).
+
+    Accepted ``kv_policy_loaded`` values for T9 to match:
+      * ``default_lru`` — env var unset (stock sglang behavior)
+      * ``<module>:<callable>`` — env var set + loaded successfully
+      * ``default_lru (load_failed:<reason>)`` — env var set but load
+        failed; T9 should HALT the run on this value
+    """
+    spec = os.environ.get("SGLANG_KV_POLICY_MODULE", "").strip()
+    if not spec:
+        logger.info("[aginfer] kv_policy_loaded=default_lru")
+        return _default_eviction_score
+    if ":" not in spec:
+        logger.warning(
+            "[aginfer] kv_policy_loaded=default_lru "
+            "(load_failed:malformed_spec=%r; expected module:callable)",
+            spec,
+        )
+        return _default_eviction_score
+    mod_name, attr = spec.split(":", 1)
+    try:
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, attr)
+        logger.info("[aginfer] kv_policy_loaded=%s", spec)
+        return fn
+    except Exception as e:
+        logger.warning(
+            "[aginfer] kv_policy_loaded=default_lru "
+            "(load_failed:%r exception=%s)",
+            spec,
+            e,
+        )
+        return _default_eviction_score
+
+
+def _load_write_through_policy():
+    """#178 (T28, DESIGN §3): resolve the write-through trigger per
+    ``SGLANG_WRITE_THROUGH_MODULE="pkg.module:callable"``.  The callable
+    signature is ``(node: UnifiedTreeNode, threshold: int) -> bool`` —
+    True = create the host backup now.  Mirrors ``_load_eviction_scorer``
+    exactly: emits one canonical ``write_through_loaded=<spec>`` startup
+    line (T9 grep), and any failure falls back to the historical
+    ``hit_count >= threshold`` default (logged as a load_failed so T9
+    can HALT a misconfigured run rather than run baseline silently).
+
+    Aginfer registers a V_u-aware version (fires when
+    ``V_u(residence ∪ {DRAM}) > V_u(residence)``, DESIGN §3) once the
+    in-process hint-table consumer exists; until then the default is
+    the only policy and behaviour is identical to stock sglang."""
+    spec = os.environ.get("SGLANG_WRITE_THROUGH_MODULE", "").strip()
+    if not spec:
+        logger.info("[aginfer] write_through_loaded=default_hitcount")
+        return _default_should_write_through
+    if ":" not in spec:
+        logger.warning(
+            "[aginfer] write_through_loaded=default_hitcount "
+            "(load_failed:malformed_spec=%r; expected module:callable)",
+            spec,
+        )
+        return _default_should_write_through
+    mod_name, attr = spec.split(":", 1)
+    try:
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, attr)
+        logger.info("[aginfer] write_through_loaded=%s", spec)
+        return fn
+    except Exception as e:
+        logger.warning(
+            "[aginfer] write_through_loaded=default_hitcount "
+            "(load_failed:%r exception=%s)",
+            spec,
+            e,
+        )
+        return _default_should_write_through
+
+
+# T27 (#188): the sentinel SGLANG_KV_POLICY_MODULE value that selects the
+# aginfer hint-AWARE eviction scorer (a cache-bound method reading
+# _aginfer_hints, not a free module:callable).  Distinct from
+# `baselines.sglang_adapter:ours_greedy_score` (hint-UNAWARE, derives
+# p_hat from hits/age) and from default_lru.
+_AGINFER_HINT_SCORER_SPEC = "aginfer:hint_v_u"
+# Birth-seed lambda for a newborn unit ("near-term expected-use", DESIGN
+# §6): the unit was just created so a reuse is plausibly imminent.  Same
+# order as the daemon's ACTING lambda default.
+_AGINFER_BIRTH_LAMBDA = 0.2
+# Birth-seed STAMP — strictly below any real daemon stamp (the daemon's
+# stamp is int(time_counter) >= 1, the counter starts at 1.0).  The
+# birth seed is a FLOOR; overwrite-by-stamp in set_aginfer_hints skips
+# on `stamp <= existing`, so a real-clock stamp here would let the seed
+# SHADOW the daemon's first refinement if the counter hadn't advanced
+# between birth and that unit's first dump (#188 audit C7).  -1 makes
+# every real daemon push strictly win.
+_AGINFER_BIRTH_STAMP = -1
+# ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -101,6 +249,11 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+
+        # aginfer §3 state: set of program_ids that touched this node.
+        # Populated on insert/cache_finished_req from req.program_id; read
+        # by dump_aginfer_state.  Empty for untagged requests.
+        self.session_ids: set[str] = set()
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -302,6 +455,93 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+class _StateDumpMetrics:
+    """PLAN T14 — bounded ring buffer of recent ``_dump_aginfer_state_impl``
+    latencies + emitted-byte counts.  Piggybacked into ``/aginfer/state``
+    under the ``state_dump_metrics`` top-level key so monitoring scripts
+    (and PLAN §2's "p99 > 50 ms → F3-revisit trigger") can poll on the
+    same hot path the daemon already uses.
+
+    Single-threaded by construction: only the scheduler process'
+    ``_dump_aginfer_state_impl`` calls into this class, and the
+    scheduler serialises requests on the event loop.  No lock.
+    """
+
+    __slots__ = (
+        "_capacity", "_samples", "_first_recorded_perf_ns",
+        "_total_count",
+    )
+
+    def __init__(self, capacity: int = 1024) -> None:
+        self._capacity = int(capacity)
+        # (elapsed_ns, dump_bytes); dump_bytes == -1 for the dict path
+        # (we never measure serialised size there).
+        self._samples: list[tuple[int, int]] = []
+        self._first_recorded_perf_ns: Optional[int] = None
+        self._total_count = 0
+
+    def record(self, elapsed_ns: int, dump_bytes: int) -> None:
+        if self._first_recorded_perf_ns is None:
+            self._first_recorded_perf_ns = time.perf_counter_ns()
+        self._samples.append((int(elapsed_ns), int(dump_bytes)))
+        if len(self._samples) > self._capacity:
+            # Pop from the front; cheap at our sizes (1k entries, O(N)
+            # once per recorded sample after wrap).  Deque would be O(1)
+            # but disallows random indexing for quantile sort.
+            del self._samples[0]
+        self._total_count += 1
+
+    def summary(self) -> dict:
+        """Snapshot the contract field set the verify/t14 probe asserts.
+
+        Cold start (n=0): all numeric quantiles report 0.0; the
+        sentinel last_dump_bytes=-1 differentiates 'no dump yet'
+        from 'dump path saw bytes=0'.
+        """
+        n = len(self._samples)
+        if n == 0:
+            return {
+                "n_samples": 0,
+                "n_recorded_total": 0,
+                "capacity": self._capacity,
+                "window_seconds": 0.0,
+                "p50_ms": 0.0,
+                "p95_ms": 0.0,
+                "p99_ms": 0.0,
+                "max_ms": 0.0,
+                "mean_ms": 0.0,
+                "last_dump_ms": 0.0,
+                "last_dump_bytes": -1,
+            }
+        times = sorted(s[0] for s in self._samples)
+
+        def _q(p: float) -> float:
+            if n == 1:
+                return times[0] / 1e6
+            idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+            return times[idx] / 1e6
+
+        last_ns, last_bytes = self._samples[-1]
+        now_ns = time.perf_counter_ns()
+        window_s = (
+            (now_ns - self._first_recorded_perf_ns) / 1e9
+            if self._first_recorded_perf_ns is not None else 0.0
+        )
+        return {
+            "n_samples": n,
+            "n_recorded_total": self._total_count,
+            "capacity": self._capacity,
+            "window_seconds": window_s,
+            "p50_ms": _q(0.50),
+            "p95_ms": _q(0.95),
+            "p99_ms": _q(0.99),
+            "max_ms": times[-1] / 1e6,
+            "mean_ms": sum(times) / n / 1e6,
+            "last_dump_ms": last_ns / 1e6,
+            "last_dump_bytes": int(last_bytes),
+        }
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -375,6 +615,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
+        # aginfer: pluggable eviction scorer (default = LRU-equivalent
+        # V_u, #177; aginfer:hint_v_u = hint-aware, T27 #188) + write-
+        # through trigger (default = hit_count >= threshold, #178).
+        self._init_aginfer_eviction_scoring()
+        self._write_through_policy = _load_write_through_policy()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
@@ -466,6 +711,48 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         }
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        # T24 — set of (id_a, id_b) hash-collision pairs already logged.
+        # Cached on the instance so a persistent collision doesn't spam
+        # the warning log every batch.  Populated by
+        # apply_aginfer_migrations.
+        self._aginfer_collision_seen: set[tuple[int, int]] = set()
+        # T14 — per-call state-dump latency + emitted bytes.  Piggybacked
+        # into /aginfer/state under the ``state_dump_metrics`` top-level
+        # key.  Capacity 1024 ≈ 5 minutes at the daemon's typical 3.4 Hz
+        # poll rate; deep enough for a meaningful p99 over recent window
+        # but bounded so it doesn't blow up memory under year-long uptime.
+        self._aginfer_state_dump_metrics = _StateDumpMetrics(capacity=1024)
+        # T21 (#181, DESIGN §6 round-6 H2): daemon-pushed program state.
+        # The daemon owns the (REASONING / ACTING / PAUSED / ENDED)
+        # state transition; sglang stores the daemon's view as a
+        # passthrough and echoes it back in the next /aginfer/state
+        # dump.  Set via PUT /aginfer/program_paused → scheduler →
+        # set_aginfer_program_state.  Empty cold-start: dumps default
+        # state="REASONING", pre_pause_state=None for every pid that
+        # has live units cited in session_ids.
+        self._aginfer_program_states: dict[str, dict] = {}
+        # T26 (#200): scheduler-pushed throughput / in-flight measurement
+        # (the scheduler owns the running batch + forward timing; the
+        # cache only stores + serialises).  ``decode_per_program`` =
+        # {pid: tokens/sec EMA}; ``prefill_bps`` = bytes/sec EMA;
+        # ``inflight`` = {pid: {subpool: HBM bytes}}.  Empty cold-start →
+        # the dump emits the same placeholders as before until the
+        # scheduler pushes real numbers (set_aginfer_runtime_metrics).
+        self._aginfer_runtime_metrics: dict = {
+            "decode_per_program": {},
+            "prefill_bps": 0.0,
+            "inflight": {},
+        }
+        # T40 (#184, DESIGN §6 PUT /aginfer/hints + §10 overwrite-by-
+        # stamp): daemon-pushed V_u inputs for the inline scorer,
+        # keyed by unit hash → {"p_hat", "lambda", "stamp"}.  The
+        # daemon re-scores D_t every event and pushes unconditionally
+        # (no daemon-side shadow cache); this table dedupes by keeping
+        # only the newest-stamp entry per hash.  The inline scorer's
+        # CONSUMPTION of this table (eviction order) is wired
+        # separately (T27 / T28 / #177); this is the storage + the
+        # overwrite-by-stamp contract only.
+        self._aginfer_hints: dict[str, dict] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -541,7 +828,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 10
+        self.load_back_threshold = 256
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         if storage_backend is not None:
@@ -702,6 +989,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                program_id=req.program_id,
             )
 
             # components prepare insert data + return effective cache_len
@@ -771,6 +1059,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            program_id=req.program_id,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1000,6 +1289,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        # aginfer: the new internal node inherits every program_id that
+        # touched the original (longer) prefix.  Without this the radix
+        # split loses session_ids on the ancestor path and admission_
+        # controller under-counts ownership.
+        new_node.session_ids |= child.session_ids
 
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
@@ -1015,6 +1309,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             child, UnifiedLRUList.insert_mru, skip_existing=True
         )
         child.last_access_time = get_and_increase_time_counter()
+
+        # T27 (#188, DESIGN §3 "covers every live unit"): the split's
+        # new INTERNAL node is a newly-live unit (the shared prefix);
+        # birth-seed it too.  The child keeps its hint — split moves the
+        # prefix hashes to new_node but the child's last hash
+        # (get_last_hash_value) is unchanged, so its key is stable.
+        self._aginfer_seed_birth(new_node)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
@@ -1043,6 +1344,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+
+        # T27 (#188, DESIGN §3): a unit is born here (post-commit leaf).
+        # Seed its hint (p_hat≈1) so the hint-aware scorer never sees an
+        # absent entry and the table covers every live unit.  No-op
+        # unless hint-aware; never clobbers a daemon hint.  Seed AFTER
+        # hash_value is set so the key matches the daemon's view.
+        self._aginfer_seed_birth(new_node)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
@@ -1077,6 +1385,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             priority = 0
         self._touch_node(node)
         node.priority = max(node.priority, priority)
+        # aginfer: tag root + every node we visit with the program_id.
+        # ``params.program_id`` is sanitized at Req construction so it is
+        # safe to insert into a set; None skips silently for untagged
+        # requests (the worst-case "no program_id" row).
+        pid = params.program_id
         if len(key) == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
@@ -1085,6 +1398,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
+            if pid is not None:
+                node.session_ids.add(pid)
             prefix_len = node.key.match(key, page_size=self.page_size)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
@@ -1151,6 +1466,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             is_new_leaf = True
         else:
             target_node = node
+        if pid is not None:
+            target_node.session_ids.add(pid)
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
@@ -1271,6 +1588,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
+        # T27 (#188, DESIGN §10 'Hint clear ordering'): this is the one
+        # death/commit chokepoint (device-evict-death / host-evict /
+        # tombstone cascade / migrate-DROP all funnel here).  Clear the
+        # unit's hint AFTER the detach above — scorer-read (heap build)
+        # happens-before evict-commit (this pop) happens-before clear.
+        # Guarded on a non-empty table so non-aginfer mode pays nothing.
+        if getattr(self, "_aginfer_hints", None):
+            self.clear_aginfer_hint(self._aginfer_unit_hash(node))
 
     def _evict_component_and_detach_lru(
         self,
@@ -1625,7 +1950,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req=None,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
+        self._last_load_back_decline = None
         if self.cache_controller is None:
+            self._last_load_back_decline = "no_cache_controller"
             return False
 
         start_time = time.perf_counter()
@@ -1657,9 +1984,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
-        ):
+        if kv_tokens < self.load_back_threshold and not comp_xfers:
+            self._last_load_back_decline = (
+                f"below_threshold:kv_tokens={kv_tokens}<thr={self.load_back_threshold}"
+            )
+            self.dec_lock_ref(best_match_node, ancestor_lock_params)
+            return False
+        if mem_quota is not None and kv_tokens > mem_quota + result.delta:
+            self._last_load_back_decline = (
+                f"exceeds_mem_quota:kv_tokens={kv_tokens}>quota={mem_quota}+delta={result.delta}"
+            )
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
@@ -1672,6 +2006,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
+                self._last_load_back_decline = (
+                    f"evict_short:needed={needed}>evicted={result.num_tokens_evicted}"
+                )
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
@@ -1688,6 +2025,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
+            sub = (
+                getattr(self.cache_controller, "_last_load_decline", None)
+                or "unknown"
+            )
+            self._last_load_back_decline = (
+                f"controller_load_returned_none:{sub}"
+            )
             return False
 
         # Commit: each component gets only its own transfers
@@ -1778,10 +2122,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             return
         node.hit_count += 1
-        if (
-            self.cache_controller is not None
-            and not node.backuped
-            and node.hit_count >= self.write_through_threshold
+        # #178 (DESIGN §3): pluggable write-through trigger.  Default
+        # is the historical hit_count >= threshold; aginfer can
+        # register a V_u-aware version.  `not node.backuped` stays a
+        # hard precondition (no point re-backing-up an existing copy).
+        # SCOPE (#192, resolved out-of-scope): only THIS cache
+        # (UnifiedRadixCache) routes the trigger through the hook.  The
+        # sibling HiRadixCache / HiMambaRadixCache `_inc_hit_count` keep
+        # the hardcoded `hit_count >= threshold` BY DESIGN — they carry
+        # ZERO aginfer surface (no _aginfer_hints, no eviction scorer,
+        # no /aginfer/state schema) and aginfer CANNOT run on them:
+        # every aginfer endpoint returns `unsupported_tree_cache` unless
+        # SGLANG_ENABLE_UNIFIED_RADIX_TREE=1.  So the aginfer plugins
+        # live only where aginfer runs; the siblings stay stock-sglang.
+        # The default here is byte-identical to their hardcoded check
+        # (verify/t28 B4), so the no-daemon baseline is unchanged.
+        if not node.backuped and self._write_through_policy(
+            node, self.write_through_threshold
         ):
             self.write_backup(node)
 
@@ -2436,6 +2793,1363 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
         self.writing_check()
+
+    # ---- aginfer daemon migrate (paper §4 action a_t) ----
+    def apply_aginfer_migrations(self, actions: list[dict]) -> dict:
+        """Apply a batch of DESIGN §6 residence-set migrate actions.
+
+        Each action: ``{"hash", "add_tiers": [...], "remove_tiers": [...],
+                        "action_id": "<correlator>"}``.  See verify/t20/
+        README.md for the full per-tier semantics + skip-reason table.
+
+        Returns ``{"applied": int, "applied_hashes": [...],
+                    "skipped": [{"hash", "action_id", "reason"}, ...]}``.
+
+        Order within one action: ``add_tiers`` applied first, then
+        ``remove_tiers``.  Synthesise the new copy BEFORE freeing the
+        old one so the ``{HBM} → {DRAM}`` path doesn't drop data
+        between write_through and the device evict.
+
+        Per-tier dispatch:
+          add HBM   → ``load_back`` (host→device promote)
+          add DRAM  → ``write_backup`` (device→host backup)
+          add DISK  → ``disk_tier_not_yet_wired`` (Mooncake L3 future-task)
+          remove HBM   → ``evict_component(target=DEVICE)``
+          remove DRAM  → ``evict_component(target=HOST)``
+          remove DISK  → noop (DISK currently never populated)
+          remove all current tiers → DROP (full evict + tree leaf removal)
+        """
+        # Build hash → node lookup with one DFS (O(N), same cost as
+        # state walk).  Two hash schemes: HiCache-finalised nodes have
+        # a real hash_value (hex SHA-256); transient nodes fall back
+        # to ``node-<id>`` where ``id`` is a class-level monotonic
+        # counter that is NEVER recycled (UnifiedTreeNode.counter
+        # strictly increases), so the fallback name is also stable
+        # for the daemon's lifetime.
+        #
+        # T24 (DESIGN §10) HASH_COLLISION detection lives here: if two
+        # distinct radix nodes ever map to the same hash key, fire the
+        # HASH_COLLISION webhook.  Probability is < 10⁻²² at any tree
+        # size aginfer encounters, but the check is amortised free
+        # (one extra dict-membership test per node).
+        #
+        # #182 closure (2026-06-01): the caller (scheduler.migrate_
+        # aginfer) reads ``result["hash_collisions"]`` and fires the
+        # HASH_COLLISION webhook per pair via aginfer_webhook.fire_
+        # hash_collision().  Detection here is dedupe-guarded by the
+        # instance-level ``_aginfer_collision_seen`` set so a
+        # persistent collision doesn't spam ~36k webhook fires/hour.
+        hash_to_node: dict[str, UnifiedTreeNode] = {}
+        hash_collisions: list[dict] = []
+        stack = [self.root_node]
+        root = self.root_node
+        while stack:
+            node = stack.pop()
+            if node is not root:
+                if node.hash_value:
+                    key = str(node.hash_value[-1])
+                else:
+                    key = f"node-{node.id}"
+                # T24 collision check (lazy: only checks pairs that
+                # actually share a key, which is O(1) per node).
+                existing = hash_to_node.get(key)
+                if existing is not None and existing is not node:
+                    pair = (
+                        (existing.id, node.id) if existing.id < node.id
+                        else (node.id, existing.id)
+                    )
+                    if pair not in self._aginfer_collision_seen:
+                        self._aginfer_collision_seen.add(pair)
+                        logger.warning(
+                            "[aginfer] HASH_COLLISION key=%s nodes "
+                            "%d vs %d (firing webhook)",
+                            key, existing.id, node.id,
+                        )
+                        hash_collisions.append({
+                            "key": key,
+                            "node_a_summary": self._aginfer_node_summary(existing),
+                            "node_b_summary": self._aginfer_node_summary(node),
+                        })
+                hash_to_node[key] = node
+            stack.extend(node.children.values())
+
+        applied = 0
+        applied_hashes: list[str] = []
+        skipped: list[dict] = []
+        # Tracks nodes we've already mutated in this batch.  A duplicate
+        # hash in `actions` would re-enter the DROP / evict code with
+        # a stale view of the node (cd.value is left dangling because
+        # FullComponent.evict_component DEFERS the ``cd.value = None``
+        # to a later trigger -- see _cascade_evict).  The second pass
+        # would then crash inside _remove_leaf_from_parent or double-
+        # free the device buffer.
+        acted_node_ids: set[int] = set()
+        components = self._components_tuple
+        base = BASE_COMPONENT_TYPE
+        _VALID_TIERS = {"HBM", "DRAM", "DISK"}
+
+        def _skip(h, action_id, reason):
+            skipped.append({"hash": h, "action_id": action_id, "reason": reason})
+
+        for action in actions:
+            # Direct subscript: every action is contractually
+            # required to carry hash + add_tiers + remove_tiers +
+            # action_id (DESIGN §6 wire payload; verify/t20 enforces).
+            # Malformed POSTs surface as 500 → ops sees the schema
+            # break instead of silently being coerced to a noop.
+            h = action["hash"]
+            action_id = action["action_id"]
+            add_tiers = set(action["add_tiers"])
+            remove_tiers = set(action["remove_tiers"])
+
+            # Validate tier strings.
+            unknown_tiers = (add_tiers | remove_tiers) - _VALID_TIERS
+            if unknown_tiers:
+                _skip(h, action_id,
+                      f"unknown_tier:{','.join(sorted(unknown_tiers))}")
+                continue
+
+            # Resolve hash.
+            node = hash_to_node.get(h)
+            if node is None:
+                _skip(h, action_id, "not_in_tree")
+                continue
+            if node.id in acted_node_ids:
+                _skip(h, action_id, "already_acted_this_batch")
+                continue
+
+            # No-op action: refuse rather than silently apply nothing.
+            if not add_tiers and not remove_tiers:
+                _skip(h, action_id, "noop_action")
+                continue
+
+            # Compute current residence from component_data.
+            cd = node.component_data[base]
+            has_device = cd.value is not None and len(cd.value) > 0
+            has_host = cd.host_value is not None and len(cd.host_value) > 0
+            current: set[str] = set()
+            if has_device:
+                current.add("HBM")
+            if has_host:
+                current.add("DRAM")
+            # DISK is never in current_residence — Mooncake L3 not wired.
+
+            # Validate add: tiers must not already be in residence.
+            already_in = add_tiers & current
+            if already_in:
+                _skip(h, action_id,
+                      f"add_already_present:{','.join(sorted(already_in))}")
+                continue
+
+            # Validate remove: tiers must be in current residence.
+            # (DISK in remove is always 'absent' since current never
+            # has DISK; we allow it as a noop so the daemon can
+            # speculatively remove DISK during a transition without
+            # tripping this check.)
+            missing = remove_tiers - current - {"DISK"}
+            if missing:
+                _skip(h, action_id,
+                      f"remove_already_absent:{','.join(sorted(missing))}")
+                continue
+
+            # DISK in add → not implemented.
+            if "DISK" in add_tiers:
+                _skip(h, action_id, "disk_tier_not_yet_wired")
+                continue
+
+            # Will the unit be fully removed (post-add residence ⊆ remove)?
+            post_residence = (current | add_tiers) - remove_tiers
+            is_full_drop = not post_residence
+            is_leaf = len(node.children) == 0
+            if is_full_drop and not is_leaf:
+                _skip(h, action_id, "remove_not_leaf")
+                continue
+            # Per-tier leaf invariant: sglang's `inc_lock_ref` walks
+            # from a backed-up node up to root and asserts every
+            # ancestor has cd.value (DEVICE).  If we device-evict a
+            # non-leaf node, any later write_backup on that node's
+            # descendants trips the assert + crashes the scheduler.
+            # Same logic for HOST evict on a host-non-leaf.  Daemon's
+            # policy SHOULD only emit migrate actions for leaves —
+            # this is a defense-in-depth guard.
+            if "HBM" in remove_tiers and not self._is_device_leaf(node):
+                _skip(h, action_id, "remove_hbm_not_device_leaf")
+                continue
+            if "DRAM" in remove_tiers and not self._is_host_leaf(node):
+                _skip(h, action_id, "remove_dram_not_host_leaf")
+                continue
+
+            # ---- Apply adds first ----
+            skip_this = False
+
+            if "DRAM" in add_tiers:
+                # write_through HBM → DRAM via cache_controller.
+                if self.cache_controller is None:
+                    _skip(h, action_id, "write_through_declined:no_hicache")
+                    skip_this = True
+                else:
+                    try:
+                        n_written = self.write_backup(node)
+                    except Exception as exc:  # noqa: BLE001
+                        import traceback as _tb
+                        msg = str(exc) or "<empty>"
+                        loc = "?"
+                        st = _tb.extract_tb(exc.__traceback__)
+                        if st:
+                            last = st[-1]
+                            fname = last.filename.rsplit("/", 1)[-1]
+                            loc = f"{fname}:{last.lineno}:{last.name}"
+                        short = "_".join(msg.split())[:60]
+                        _skip(h, action_id,
+                              f"write_through_raised:"
+                              f"{type(exc).__name__}:{loc}:{short}")
+                        skip_this = True
+                    else:
+                        if n_written == 0:
+                            _skip(h, action_id,
+                                  "write_through_declined:zero_tokens")
+                            skip_this = True
+            if skip_this:
+                continue
+
+            if "HBM" in add_tiers:
+                # load_back DRAM → HBM via the same path the cache-hit
+                # fast-path uses.
+                try:
+                    ok = self.load_back(node)
+                except Exception as exc:  # noqa: BLE001
+                    import traceback as _tb
+                    msg = str(exc) or "<empty>"
+                    loc = "?"
+                    st = _tb.extract_tb(exc.__traceback__)
+                    if st:
+                        last = st[-1]
+                        fname = last.filename.rsplit("/", 1)[-1]
+                        loc = f"{fname}:{last.lineno}:{last.name}"
+                    short = "_".join(msg.split())[:60]
+                    _skip(h, action_id,
+                          f"promote_raised:"
+                          f"{type(exc).__name__}:{loc}:{short}")
+                    skip_this = True
+                else:
+                    if not ok:
+                        detail = (
+                            getattr(self, "_last_load_back_decline", None)
+                            or "unknown"
+                        )
+                        category = ":".join(detail.split(":", 2)[:2])
+                        _skip(h, action_id,
+                              f"promote_load_back_declined:{category}")
+                        skip_this = True
+            if skip_this:
+                continue
+
+            # ---- Drain pending write_through before removes ----
+            # write_backup (add=DRAM path) is ASYNC: it enqueues the
+            # D→H copy on cache_controller's background thread and
+            # records the pending lock in ongoing_write_through.  If
+            # we now evict the device buffer (remove=HBM), the copy
+            # would be reading freed memory + sglang's
+            # invariant_checker would trip on the categories-no-
+            # longer-disjoint state.
+            #
+            # writing_check(write_back=True) synchronizes ALL pending
+            # write_through events (sees `finish_event.synchronize()`
+            # per ack queue entry) AND properly releases locks via
+            # dec_lock_ref(node, params).  Called only when this
+            # action's adds actually produced async work (i.e.
+            # DRAM was in add_tiers and write_backup returned > 0).
+            if add_tiers and remove_tiers and self.cache_controller is not None:
+                self.writing_check(write_back=True)
+
+            # ---- Apply removes ----
+            tracker = {ct: 0 for ct in self.tree_components}
+            base_comp = self.components[BASE_COMPONENT_TYPE]
+            if is_full_drop:
+                # Full evict + remove leaf from tree.
+                for comp in components:
+                    self._evict_component_and_detach_lru(
+                        node, comp, target=EvictLayer.ALL, tracker=tracker)
+                self.evictable_device_leaves.discard(node)
+                self.evictable_host_leaves.discard(node)
+                self._remove_leaf_from_parent(node)
+                self._iteratively_delete_tombstone_leaf(node, tracker)
+            else:
+                if "HBM" in remove_tiers:
+                    # Use the existing `_evict_to_host` helper rather
+                    # than rolling our own evict + cascade.  It does
+                    # FOUR things in the right order:
+                    #   1. evict_component_and_detach_lru DEVICE
+                    #      (frees the buffer + detaches from device LRU)
+                    #   2. _cascade_evict (nulls cd.value via tombstone
+                    #      since SWA's free_swa needed it earlier,
+                    #      then re-leaf-set the node)
+                    #   3. _for_each_component_lru insert_mru HOST
+                    #      (the node now has only host data → belongs
+                    #      in host LRU so future host-pressure can
+                    #      evict it)
+                    #   4. _update_evictable_leaf_sets(node.parent)
+                    #      (parent may now be a leaf again after
+                    #      child's tier transition)
+                    # Steps 3 + 4 were missing from the previous T20
+                    # impl, causing pool-accounting drift across
+                    # multiple migrates that triggered sglang's
+                    # invariant_checker (e2e_smoke 1st run).
+                    self._evict_to_host(node, tracker=tracker)
+                if "DRAM" in remove_tiers:
+                    # Host eviction: evict_component sets cd.host_value
+                    # = None inline (no defer; SWA doesn't pin host
+                    # state).  Cascade still needed so aux components'
+                    # host state is consistent.
+                    self._evict_component_and_detach_lru(
+                        node, base_comp, target=EvictLayer.HOST,
+                        tracker=tracker)
+                    self._cascade_evict(
+                        node, base_comp, tracker, target=EvictLayer.HOST)
+                # DISK in remove is a noop (never populated).
+                self._update_evictable_leaf_sets(node)
+
+            applied += 1
+            applied_hashes.append(h)
+            acted_node_ids.add(node.id)
+
+        return {"applied": applied, "applied_hashes": applied_hashes,
+                "skipped": skipped,
+                "hash_collisions": hash_collisions}
+
+    _AGINFER_VALID_STATES = ("REASONING", "ACTING", "PAUSED", "ENDED")
+
+    def set_aginfer_program_state(
+        self,
+        *,
+        pid: str,
+        state: str,
+        pre_pause_state: "Optional[str]",
+    ) -> tuple:
+        """T21 (#181, DESIGN §6 round-6 H2): daemon → sglang PUT
+        ``/aginfer/program_paused`` storage.
+
+        Returns ``(ok: bool, reason: str, applied: int)`` where
+        ``applied == 0`` if the (state, pre_pause_state) for this
+        pid was already at the requested value (idempotent re-apply
+        per DESIGN §10 R2).
+
+        ``state`` must be one of ``{REASONING, ACTING, PAUSED, ENDED}``.
+        ``pre_pause_state`` is the same set or None.
+        """
+        valid = self._AGINFER_VALID_STATES
+        if not isinstance(pid, str) or not pid:
+            return (False, f"pid must be non-empty string; got {pid!r}", 0)
+        if state not in valid:
+            return (
+                False,
+                f"state must be in {valid}; got {state!r}",
+                0,
+            )
+        if pre_pause_state is not None and pre_pause_state not in valid:
+            return (
+                False,
+                f"pre_pause_state must be None or in {valid}; "
+                f"got {pre_pause_state!r}",
+                0,
+            )
+        existing = self._aginfer_program_states.get(pid)
+        new_entry = {"state": state, "pre_pause_state": pre_pause_state}
+        if existing is not None and existing == new_entry:
+            return (True, "ok", 0)  # idempotent no-op
+        self._aginfer_program_states[pid] = new_entry
+        return (True, "ok", 1)
+
+    def set_aginfer_hints(self, hints: "list") -> tuple:
+        """T40 (#184, DESIGN §6 PUT /aginfer/hints + §10 overwrite-by-
+        stamp): apply a batch of daemon-pushed V_u hints.
+
+        Each ``hint`` is ``{"hash", "p_hat", "lambda", "stamp"}``
+        (already type-validated by the HTTP layer's
+        ``_validate_hints_body``; re-checked here so a direct caller /
+        a future non-HTTP path cannot poison the table).
+
+        Overwrite-by-stamp: a hash is written only when the incoming
+        ``stamp`` is STRICTLY newer than the stored one.  An equal
+        stamp is an idempotent no-op (the daemon re-pushed the same
+        D_t against the same sglang time_counter — DESIGN §10 R2); an
+        older stamp is a stale out-of-order delivery and is dropped
+        (it must not clobber a newer value).
+
+        Returns ``(ok, reason, applied)`` where ``applied`` counts the
+        hashes whose stamp advanced (so an idempotent re-push of a
+        whole batch returns ``applied == 0``).
+        """
+        if not isinstance(hints, list):
+            return (False, f"hints must be a list; got {type(hints).__name__}", 0)
+        applied = 0
+        for h in hints:
+            if not isinstance(h, dict):
+                return (False, f"hint must be an object; got {h!r}", 0)
+            uhash = h.get("hash")
+            if not isinstance(uhash, str) or not uhash:
+                return (False, f"hint hash must be non-empty string; got {uhash!r}", 0)
+            try:
+                stamp = int(h["stamp"])
+                p_hat = float(h["p_hat"])
+                lam = float(h["lambda"])
+            except (KeyError, TypeError, ValueError) as exc:
+                return (False, f"hint {uhash!r}: bad numeric field ({exc})", 0)
+            existing = self._aginfer_hints.get(uhash)
+            if existing is not None and stamp <= existing["stamp"]:
+                # equal stamp = idempotent no-op; older = stale drop.
+                continue
+            self._aginfer_hints[uhash] = {
+                "p_hat": p_hat, "lambda": lam, "stamp": stamp,
+            }
+            applied += 1
+        return (True, "ok", applied)
+
+    def get_aginfer_hint(self, uhash: str) -> "Optional[dict]":
+        """T40 (#184): read the current hint entry for a unit hash, or
+        None if the daemon has not pushed one (and no birth-seed
+        exists yet — birth-seeding is a separate task).  Returns the
+        stored ``{"p_hat", "lambda", "stamp"}`` dict."""
+        return self._aginfer_hints.get(uhash)
+
+    def clear_aginfer_hint(self, uhash: str) -> bool:
+        """T40 (#184, DESIGN §10 'Hint clear ordering'): drop the hint
+        entry for a unit on its death (eviction / drop).  Returns True
+        if an entry was removed.  Called by ``_remove_leaf_from_parent``
+        (T27 #188) — the single death/commit chokepoint — AFTER the node
+        is detached (scorer read → evict commit → hint clear)."""
+        return self._aginfer_hints.pop(uhash, None) is not None
+
+    # ---- T27 (#188): hint-table CONSUMER (DESIGN §3 / §10) ----
+
+    def _aginfer_unit_hash(self, node) -> str:
+        """The hint-table key for a node — IDENTICAL to the unit ``hash``
+        the daemon receives in ``/aginfer/state`` (``hash_value[-1]`` or
+        the ``node-{id}`` fallback for transient nodes).  Keeping this
+        in lockstep with ``_dump_aginfer_state_*`` is what lets the
+        scorer / clear find the entry the daemon PUT."""
+        hv = node.get_last_hash_value()
+        return hv if hv is not None else f"node-{node.id}"
+
+    def _init_aginfer_eviction_scoring(self) -> None:
+        """Resolve the eviction scorer (T27 #188 extends #177's
+        ``_load_eviction_scorer``).  The sentinel
+        ``SGLANG_KV_POLICY_MODULE=aginfer:hint_v_u`` selects the hint-
+        AWARE scorer — a cache-bound method reading ``_aginfer_hints``
+        (a free ``module:callable`` can't reach the cache's dict).  Any
+        other spec resolves through ``_load_eviction_scorer`` (default
+        LRU / a custom module).  Always sets ``_aginfer_hint_aware`` so
+        birth-seeding can gate on it.  Failure to import the adapter's
+        ``hint_v_u`` falls back to LRU (logged) rather than crashing
+        launch."""
+        self._aginfer_hint_aware = False
+        self._aginfer_hint_v_u_fn = None
+        spec = os.environ.get("SGLANG_KV_POLICY_MODULE", "").strip()
+        if spec == _AGINFER_HINT_SCORER_SPEC:
+            try:
+                from baselines.sglang_adapter import hint_v_u
+                self._aginfer_hint_v_u_fn = hint_v_u
+                self._eviction_scorer = self._aginfer_eviction_score
+                self._aginfer_hint_aware = True
+                logger.info("[aginfer] kv_policy_loaded=%s", spec)
+                return
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[aginfer] kv_policy_loaded=default_lru "
+                    "(load_failed:%r exception=%s)", spec, e,
+                )
+                self._eviction_scorer = _default_eviction_score
+                return
+        self._eviction_scorer = _load_eviction_scorer()
+
+    def _aginfer_eviction_score(self, node, layer) -> float:
+        """T27 (#188): hint-aware eviction heap key.  Looks up the
+        node's daemon hint and computes the paper-§7 V_u via the adapter
+        (one V_u formula — no reimplementation/drift).  Absent hint →
+        the adapter falls back to the local hits/age derivation (never
+        bare LRU).  Single-threaded scheduler → the dict read needs no
+        lock (DESIGN §10 'Hint atomicity' satisfied by serialisation)."""
+        hint = self._aginfer_hints.get(self._aginfer_unit_hash(node))
+        return self._aginfer_hint_v_u_fn(node, layer, hint)
+
+    def _aginfer_seed_birth(self, node) -> None:
+        """T27 (#188, DESIGN §3 'Hint table covers every live unit'):
+        seed a fresh-access entry (``p_hat = 1.0``) for a newborn unit
+        so the scorer never sees an absent hint and the table tracks the
+        live-unit set.  No-op unless hint-aware.  Never clobbers an
+        existing (daemon-pushed or already-seeded) entry — overwrite-by-
+        stamp is the daemon's job (#184); birth only fills the gap."""
+        if not getattr(self, "_aginfer_hint_aware", False):
+            return
+        uhash = self._aginfer_unit_hash(node)
+        if uhash in self._aginfer_hints:
+            return
+        self._aginfer_hints[uhash] = {
+            "p_hat": 1.0,
+            "lambda": _AGINFER_BIRTH_LAMBDA,
+            # Floor stamp (#188 audit C7): below any real daemon stamp so
+            # the daemon's FIRST refinement always wins, even if the
+            # counter didn't advance between birth and that unit's first
+            # dump (equal-stamp would be skipped by overwrite-by-stamp).
+            "stamp": _AGINFER_BIRTH_STAMP,
+        }
+
+    def _aginfer_overlay_program_states(self, per_program: dict) -> dict:
+        """T21 (#181): overlay daemon-pushed program states onto the
+        unit-walk-derived ``per_program`` dict, IN PLACE.
+
+        Shared by ``_dump_aginfer_state_dict`` and
+        ``_dump_aginfer_state_bytes`` so the two dump paths cannot
+        diverge by construction (the #181 audit flagged that the
+        previous duplicated loops were a divergence risk + that the
+        verify only tested a hand-copied replica).
+
+        Two jobs:
+          1. **Overlay**: for every stored pid, set the dump entry's
+             ``state`` / ``pre_pause_state`` to the daemon's view.
+             Programs with no live units still get an (empty-residue)
+             entry so the daemon can read its own PAUSED-with-no-
+             residue bookkeeping.
+          2. **Lazy GC** (#181 audit — unbounded-growth fix): an
+             ENDED program with NO live units needs no daemon
+             bookkeeping; drop it from ``_aginfer_program_states``
+             instead of echoing it forever.  Without this, every
+             program ever PUT would accumulate and pollute every
+             subsequent dump's ``per_program_usage``.  ENDED programs
+             that still have residual units ARE echoed (the daemon
+             needs to see the terminal state while cleanup completes).
+        """
+        unit_pids = set(per_program.keys())  # pids with live units
+        ended_no_units: list = []
+        for pid, stored in self._aginfer_program_states.items():
+            if stored["state"] == "ENDED" and pid not in unit_pids:
+                ended_no_units.append(pid)
+                continue
+            e = per_program.setdefault(pid, {
+                "hbm":  {"committed": {}, "inflight": {}},
+                "dram": {"committed": {}},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": [],
+            })
+            e["state"] = stored["state"]
+            e["pre_pause_state"] = stored["pre_pause_state"]
+        ended_gcd = set(ended_no_units)
+        for pid in ended_no_units:
+            del self._aginfer_program_states[pid]
+        # T26 (#200): overlay scheduler-pushed per-program in-flight HBM
+        # bytes.  A program can have running (in-flight) bytes with NO
+        # radix-committed units yet (first request still prefilling /
+        # decoding), so create an entry if absent — its in-flight bytes
+        # are the §8 snapshot_relief the daemon would free by pausing it.
+        # Skip pids the ENDED-GC just dropped (#200 audit): an ENDED
+        # program with a still-draining running req must NOT be resurrected
+        # here as REASONING (the GC is authoritative about termination).
+        # #217: default via getattr — runtime metrics (T26/#200) may not be
+        # pushed yet (cold start before the scheduler's first
+        # set_aginfer_runtime_metrics), and the overlay must still build a
+        # valid program-state map rather than AttributeError.
+        for pid, sp_bytes in getattr(
+            self, "_aginfer_runtime_metrics", {}
+        ).get("inflight", {}).items():
+            if pid in ended_gcd:
+                continue
+            e = per_program.setdefault(pid, {
+                "hbm":  {"committed": {}, "inflight": {}},
+                "dram": {"committed": {}},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": [],
+            })
+            e["hbm"]["inflight"] = {sp: int(b) for sp, b in sp_bytes.items()}
+        return per_program
+
+    def _aginfer_node_summary(self, node) -> dict:
+        """T24 (#182): compact summary of a radix-tree node for the
+        HASH_COLLISION webhook payload.  Daemon-side fatal()
+        consumes this to identify which two nodes collided.
+
+        Keep cheap — this runs inside the apply_aginfer_migrations
+        DFS.  Hash collisions are < 10⁻²² probable, so we never
+        amortise; pay a bit of Python here only when one actually
+        happens.
+        """
+        # Residence: which tiers currently hold this node's KV.
+        residence: list[str] = []
+        cd = node.component_data[0] if node.component_data else None
+        if cd is not None:
+            if getattr(cd, "value", None) is not None:
+                residence.append("HBM")
+            if getattr(cd, "host_value", None) is not None:
+                residence.append("DRAM")
+        # n_tokens on whichever layer holds it.
+        n_tokens = 0
+        if cd is not None:
+            if cd.value is not None:
+                n_tokens = max(n_tokens, len(cd.value))
+            if getattr(cd, "host_value", None) is not None:
+                n_tokens = max(n_tokens, len(cd.host_value))
+        # Hex hash-value (post-compute_node_hash_values) iff present.
+        hv = node.hash_value[-1] if getattr(node, "hash_value", None) else None
+        sids = []
+        try:
+            sids = list(node.session_ids)
+        except (AttributeError, TypeError):
+            pass
+        return {
+            "node_id": int(node.id),
+            "hash_value": str(hv) if hv is not None else None,
+            "residence": residence,
+            "n_tokens": int(n_tokens),
+            "session_ids": [str(s) for s in sids][:8],
+            "hit_count": int(getattr(node, "hit_count", 0) or 0),
+        }
+
+    # ---- aginfer daemon snapshot (paper §3 state s_t) ----
+    def _aginfer_bytes_per_token(self) -> int:
+        """Best-effort device-KV bytes-per-token.
+
+        Used to convert n_tokens -> n_bytes in /aginfer/state.  The daemon's
+        per-unit value rule (paper §7) compares units by value-per-byte, so
+        we need a precise byte count.  Per-pool API:
+
+          * DSV4 / HiSparse: ``KVCache.get_bytes_per_token()`` (precise)
+          * MHA / MLA       : derive from ``get_kv_size_bytes() / size``
+          * unknown         : return 0 — the daemon falls back to tokens
+
+        Only a POSITIVE result is cached — the KV layout never changes once
+        known, but an early/transient 0 (kvcache not yet wired when a hot-
+        path caller asks) must NOT poison the cache.  Before #200/#206 the
+        first caller was always the cold dump (kvcache ready → bpt>0); the
+        T26 hot-path hooks now call this much earlier, and caching their
+        transient 0 zeroed every pool_usage cap_bytes → occ_hbm≡0 → the
+        daemon never saw HBM pressure (#209).
+        """
+        cached = getattr(self, "_aginfer_bpt_cache", 0)
+        if cached:
+            return cached
+        pool_alloc = self.token_to_kv_pool_allocator
+        kv = None
+        if pool_alloc is not None:
+            kv = getattr(pool_alloc, "_kvcache", None)
+            if kv is None and hasattr(pool_alloc, "get_kvcache"):
+                try:
+                    kv = pool_alloc.get_kvcache()
+                except Exception:
+                    kv = None
+        bpt = 0
+        if kv is not None:
+            if hasattr(kv, "get_bytes_per_token"):
+                try:
+                    bpt = int(kv.get_bytes_per_token())
+                except Exception:
+                    bpt = 0
+            if bpt == 0 and hasattr(kv, "get_kv_size_bytes"):
+                try:
+                    k_size, v_size = kv.get_kv_size_bytes()
+                    total_bytes = int(k_size) + int(v_size)
+                    size = int(getattr(kv, "size", 0) or 0)
+                    if size > 0:
+                        bpt = total_bytes // size
+                except Exception:
+                    bpt = 0
+            if bpt == 0:
+                # SWA / multi-component pools (e.g. DeepSeekV4TokenToKVPool, a
+                # BaseSWAKVPool wrapper) do NOT expose get_bytes_per_token on
+                # the wrapper — it lives on the per-component single pools it
+                # holds (swa_kv_pool / c128_kv_pool, each a
+                # DeepSeekV4SingleKVPool).  Probe them so DSV4's byte
+                # accounting isn't 0 → occ_hbm≡0 → daemon-blind (#209).
+                for _attr in ("full_kv_pool", "swa_kv_pool", "c128_kv_pool",
+                              "kv_pool", "_pool"):
+                    _sub = getattr(kv, _attr, None)
+                    if _sub is not None and hasattr(_sub, "get_bytes_per_token"):
+                        try:
+                            bpt = int(_sub.get_bytes_per_token())
+                        except Exception:
+                            bpt = 0
+                        if bpt > 0:
+                            break
+        if bpt > 0:  # never cache a transient 0 (#209) — recompute next call
+            self._aginfer_bpt_cache = bpt
+        return bpt
+
+    @staticmethod
+    def _aginfer_subpool_name(ct) -> str:
+        """Map a sglang ComponentType to its DESIGN §5 subpool name.
+
+        The aginfer wire format uses architecture-determined component
+        names; sglang's ``ComponentType`` enum is the authoritative
+        source of which subpools a model carries.  Names are
+        lower-case strings (DESIGN §12 examples: "full", "swa",
+        "mamba", "draft", "attn").  We use sglang's own internal
+        names verbatim so the daemon ↔ scheduler vocabularies stay
+        identical and a typo on either side fails loudly.
+        """
+        return str(ct).rsplit(".", 1)[-1].lower()
+
+    def _aginfer_decode_bytes_per_token(self, ct) -> int:
+        """Per-token HBM byte growth during DECODE for a subpool whose
+        component is ``ct`` (DESIGN §8 ``bytes_per_token_in_subpool``).
+
+        Attention components (full / SWA) grow monotonically: each
+        decoded token appends one token's worth of KV, so the per-token
+        decode growth is ``_aginfer_bytes_per_token()``.  Mamba state is
+        allocated ONCE per sequence at a snapshot boundary, NOT per
+        decoded token, so its in-flight decode growth is 0 — the daemon's
+        ``forecast_inflight_demand`` must not project Mamba growth from
+        decode throughput (it would over-forecast and over-pause).  This
+        is the only piece of the §8 forecast trajectory term the daemon
+        cannot derive itself (decode throughput + E[remaining_tokens] are
+        T26/T11); exposing it here lets the daemon assemble the product
+        once those measurements land (#199).
+        """
+        if ct == ComponentType.MAMBA:
+            return 0
+        return self._aginfer_bytes_per_token()
+
+    def _aginfer_pool_usage(self) -> dict:
+        """Per-(tier, subpool) allocator-truth occupancy (DESIGN §5).
+
+        Shape::
+
+            {"HBM":  {"subpools": {sp: {used, cap, available,
+                                        evictable, page_bytes}}},
+             "DRAM": {"subpools": {...}},
+             "DISK": {"subpools": {...}}}
+
+        Each tier carries a ``subpools`` dict keyed by architecture-
+        determined component name.  For S1 (single-stack attention,
+        e.g. DeepSeek-V4-Flash) the HBM dict has exactly one entry
+        keyed by the FULL component's name.  For S2 (SWA-hybrid) the
+        dict has ``{"full", "swa"}``; for S3 (Mamba+attn) it has
+        ``{"full", "mamba"}``.
+
+        This is the AUTHORITATIVE pool-occupancy signal the daemon's
+        admission controller and §7 value rule both consume.  The
+        radix-tree-keyed sum of ``units[*].n_bytes[tier][sp]`` is a
+        SUBSET of the allocator total (in-flight decode bytes are
+        not in the tree), so admission must gate on this, not on
+        the radix view.
+        """
+        pool = self.token_to_kv_pool_allocator
+        bpt = self._aginfer_bytes_per_token()
+        page_bytes_default = int(self.page_size) * max(1, bpt)
+        # DESIGN §8 bytes_per_token_in_subpool (#199): per-token DECODE
+        # growth, by component.  Attention (full / SWA) = bpt; Mamba = 0
+        # (allocated per-sequence, not per-token).  DRAM/DISK carry bpt
+        # for schema-key uniformity but the daemon only reads HBM's.
+        dbpt_full = self._aginfer_decode_bytes_per_token(BASE_COMPONENT_TYPE)
+        dbpt_swa = self._aginfer_decode_bytes_per_token(ComponentType.SWA)
+
+        hbm_subpools: dict = {}
+        dram_subpools: dict = {}
+
+        # Determine the FULL subpool name for this cache instance.
+        # When the cache supports SWA, ``pool`` exposes both
+        # full_available_size() and swa_available_size(); otherwise
+        # only available_size() and size.
+        #
+        # Semantics: ``used_bytes`` = total allocator-occupied bytes
+        # (= cap − available; includes evictable radix-resident bytes).
+        # ``evictable_bytes`` reports how much of `used` could be freed
+        # if pressure demands it.  Admission's `theta_hi` gates on
+        # `used / cap` per subpool so radix-eviction pressure registers;
+        # legacy `pool_size − avail − evictable` (in-flight only) under-
+        # reports occupancy when the radix tree fills the device.
+        full_sp = self._aginfer_subpool_name(BASE_COMPONENT_TYPE)
+        if pool is not None:
+            is_swa = self.supports_swa() and hasattr(pool, "full_available_size")
+            if is_swa:
+                full_size = int(getattr(pool, "size_full", 0)) or int(
+                    getattr(pool, "size", 0)
+                )
+                full_avail = int(pool.full_available_size())
+                full_evictable = int(self.full_evictable_size())
+                full_used = max(0, full_size - full_avail)
+                hbm_subpools[full_sp] = {
+                    "used_bytes": full_used * bpt,
+                    "cap_bytes": full_size * bpt,
+                    "available_bytes": full_avail * bpt,
+                    "evictable_bytes": full_evictable * bpt,
+                    "page_bytes": page_bytes_default,
+                    "decode_bytes_per_token": dbpt_full,
+                }
+                swa_sp = self._aginfer_subpool_name(ComponentType.SWA)
+                swa_size = int(getattr(pool, "size_swa", 0))
+                swa_avail = int(pool.swa_available_size())
+                swa_evictable = int(self.swa_evictable_size())
+                swa_used = max(0, swa_size - swa_avail)
+                hbm_subpools[swa_sp] = {
+                    "used_bytes": swa_used * bpt,
+                    "cap_bytes": swa_size * bpt,
+                    "available_bytes": swa_avail * bpt,
+                    "evictable_bytes": swa_evictable * bpt,
+                    "page_bytes": page_bytes_default,
+                    "decode_bytes_per_token": dbpt_swa,
+                }
+            else:
+                pool_size = int(getattr(pool, "size", 0))
+                avail = int(pool.available_size())
+                evictable = int(self.evictable_size())
+                num_used = max(0, pool_size - avail)
+                hbm_subpools[full_sp] = {
+                    "used_bytes": num_used * bpt,
+                    "cap_bytes": pool_size * bpt,
+                    "available_bytes": avail * bpt,
+                    "evictable_bytes": evictable * bpt,
+                    "page_bytes": page_bytes_default,
+                    "decode_bytes_per_token": dbpt_full,
+                }
+        else:
+            hbm_subpools[full_sp] = {
+                "used_bytes": 0, "cap_bytes": 0,
+                "available_bytes": 0, "evictable_bytes": 0,
+                "page_bytes": page_bytes_default,
+                "decode_bytes_per_token": dbpt_full,
+            }
+
+        # DRAM (HiCache host pool).  Treated as a single subpool
+        # keyed by the FULL component name — sglang does not split the
+        # host pool by sub-pool today (SWA/Mamba KV write through to
+        # the same host pool).  Subpool refinement is T26-future work.
+        dram_cap = 0
+        if self.cache_controller is not None:
+            host_pool = getattr(self.cache_controller, "host_mem_pool", None)
+            if host_pool is None:
+                host_pool = getattr(self.cache_controller, "host_pool", None)
+            if host_pool is not None:
+                dram_cap = int(getattr(host_pool, "size", 0)) * bpt
+        # DRAM used bytes are filled in by the dump walker; pool_usage
+        # itself doesn't have a fast aggregate.  Caller patches in.
+        dram_subpools[full_sp] = {
+            "used_bytes": 0,           # patched in by dump_aginfer_state_impl
+            "cap_bytes": dram_cap,
+            "available_bytes": dram_cap,  # patched
+            "evictable_bytes": 0,         # patched
+            "page_bytes": page_bytes_default,
+            "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
+        }
+
+        # DISK — Mooncake/SSD spill not yet wired (apply_aginfer_migrations
+        # returns "disk_tier_not_yet_wired"); emit a single placeholder
+        # subpool so the schema's tier+subpool key set is consistent.
+        disk_subpools = {full_sp: {
+            "used_bytes": 0, "cap_bytes": 0,
+            "available_bytes": 0, "evictable_bytes": 0,
+            "page_bytes": page_bytes_default,
+            "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
+        }}
+
+        return {
+            "HBM":  {"subpools": hbm_subpools},
+            "DRAM": {"subpools": dram_subpools},
+            "DISK": {"subpools": disk_subpools},
+        }
+
+    def _aginfer_link_stats(self) -> dict:
+        """Cold-start link_stats; T26 fills `recent_throughput_bps` /
+        `time_since_last_sample_s` via HiCache + Mooncake instrumentation.
+
+        Daemon's §7 bw_free branches on
+        ``time_since_last_sample_s > LINK_IDLE_SECONDS`` to choose
+        peak vs measured throughput; ``+Inf`` on cold-start so the
+        peak path is taken (correct — an unused link IS idle by
+        definition).
+
+        Peak values are realistic defaults for a B300 box with PCIe
+        gen5 x16 + NVMe; T26 calibration replaces them with the
+        operator-provided / device-probed numbers.
+
+        ``time_since_last_sample_s`` uses 1e9 (≈ 31 years) as the
+        cold-start sentinel instead of ``math.inf`` because orjson
+        rejects non-finite floats as invalid JSON.  Daemon's bw_free
+        branch is ``> LINK_IDLE_SECONDS = 1.0`` so any value above
+        the threshold takes the peak path.
+        """
+        PEAK_HBM_DRAM = 64 * 1024 * 1024 * 1024 * 8   # ~64 GB/s PCIe 5.0 x16
+        PEAK_DRAM_DISK = 12 * 1024 * 1024 * 1024 * 8  # ~12 GB/s NVMe
+        return {
+            "HBM->DRAM": {"peak_bw_bps": PEAK_HBM_DRAM,
+                          "recent_throughput_bps": 0,
+                          "time_since_last_sample_s": 1.0e12},
+            "DRAM->HBM": {"peak_bw_bps": PEAK_HBM_DRAM,
+                          "recent_throughput_bps": 0,
+                          "time_since_last_sample_s": 1.0e12},
+            "DRAM->DISK": {"peak_bw_bps": PEAK_DRAM_DISK,
+                           "recent_throughput_bps": 0,
+                           "time_since_last_sample_s": 1.0e12},
+            "DISK->DRAM": {"peak_bw_bps": PEAK_DRAM_DISK,
+                           "recent_throughput_bps": 0,
+                           "time_since_last_sample_s": 1.0e12},
+        }
+
+    def _aginfer_tier_holding_cost(self, pool_usage: dict) -> dict:
+        """Per-(tier, subpool) h_max_per_byte_sec placeholder.
+
+        T12 calibrates the shape; T17 just exposes the field with
+        a static placeholder per (tier, subpool) declared in
+        pool_usage.  Subpool key set matches pool_usage by
+        construction.
+        """
+        # Placeholder: linear holding cost per byte per second.
+        # T12 calibration replaces these.
+        H = 0.0
+        out: dict = {}
+        for tier, entry in pool_usage.items():
+            out[tier] = {
+                sp: {"h_max_per_byte_sec": H}
+                for sp in entry["subpools"].keys()
+            }
+        return out
+
+    def set_aginfer_runtime_metrics(
+        self, *, decode_per_program: dict, prefill_bps: float, inflight: dict
+    ) -> None:
+        """T26 (#200): scheduler pushes its measured throughput EMAs +
+        per-program in-flight bytes here before each dump (the scheduler
+        owns the running batch + forward timing; the cache only stores).
+        ``decode_per_program`` = {pid: tokens/sec}; ``prefill_bps`` =
+        bytes/sec; ``inflight`` = {pid: {subpool: HBM bytes}}."""
+        self._aginfer_runtime_metrics = {
+            "decode_per_program": dict(decode_per_program or {}),
+            "prefill_bps": float(prefill_bps or 0.0),
+            "inflight": {pid: dict(sp) for pid, sp in (inflight or {}).items()},
+        }
+
+    def _aginfer_throughput_ema(self) -> dict:
+        """``throughput_ema`` for the dump — the scheduler-pushed EMAs
+        (T26 #200; was a hardcoded 0.0/{} placeholder).
+
+        Daemon's §8 ``marginal_pause_cost`` (prefill_bps) and
+        ``forecast_inflight_demand`` (decode_per_program) read these.
+        Empty until the scheduler pushes a measurement, so the formulas
+        still degenerate to their no-signal branches at cold-start.
+        """
+        m = getattr(self, "_aginfer_runtime_metrics", {})   # #217: cold-start safe
+        return {
+            "prefill_bps": float(m.get("prefill_bps", 0.0)),
+            "decode_per_program": dict(m.get("decode_per_program", {})),
+        }
+
+    def dump_aginfer_state(self) -> dict:
+        """Walk the radix tree once and return the DESIGN §5 snapshot
+        for the aginfer external scheduler.  Read-only, no locks held.
+
+        Top-level shape (full schema in `dev/aginfer/DESIGN.md` §5)::
+
+            {
+              "time_counter":      int,
+              "throughput_ema":    {prefill_bps, decode_per_program},
+              "pool_usage":        {tier: {subpools: {sp: {...}}}},
+              "per_program_usage": {pid: {hbm, dram, state,
+                                          pre_pause_state, unit_hashes}},
+              "units":             [{hash, residence: [tier, ...],
+                                     n_tokens,
+                                     n_bytes: {tier: {sp: int}},
+                                     last_access_time, hit_count,
+                                     session_ids}],
+              "link_stats":        {"σ->τ": {...}},
+              "tier_holding_cost": {tier: {sp: {h_max_per_byte_sec}}},
+            }
+
+        Residence is a SET per unit (a post-write_through unit lives in
+        both HBM and DRAM simultaneously); n_bytes is nested per
+        (tier, subpool) to feed the §9 multi-axis DP.
+
+        Subpool keys are derived from the cache's component types
+        (``ComponentType.FULL`` → "full", etc.).  S1 single-stack
+        attention has exactly one subpool; SWA-hybrid / Mamba-hybrid
+        / spec-decoding add more (DESIGN §12).
+
+        ``link_stats`` / ``tier_holding_cost`` / ``throughput_ema``
+        are emitted with cold-start defaults; T26 / T29 wire actual
+        instrumentation.  See the per-helper docstrings.
+        """
+        return self._dump_aginfer_state_impl(want_bytes=False)
+
+    def dump_aginfer_state_bytes(self) -> bytes:
+        """Same snapshot as :meth:`dump_aginfer_state`, but pre-serialised to
+        JSON bytes inside the scheduler process.
+
+        Two wins vs returning a dict:
+          1. We avoid pickling a 10k-element list-of-dicts across the ZMQ
+             control channel; a single ``bytes`` payload is much cheaper.
+          2. The HTTP layer can stream the bytes through ``Response`` without
+             re-encoding via orjson.
+
+        The wire format (the JSON the daemon parses) is identical.
+        """
+        return self._dump_aginfer_state_impl(want_bytes=True)
+
+    def _dump_aginfer_state_impl(self, want_bytes: bool):
+        """Build the DESIGN §5 snapshot.
+
+        Two paths to keep per-dump GC pressure bounded:
+
+        * ``want_bytes=True`` (HTTP hot path): single walk that writes
+          units directly into a ``bytearray`` and aggregates
+          per_program_usage / DRAM-used into small dicts.  No per-
+          node Python dict allocated for the units list, so a 10 k-node
+          dump does not trip the scheduler's Gen-2 cyclic GC sweep
+          (empirically ~500 ms stall — the dominant p99 tail).
+          Final assembly orjson-encodes the small auxiliary dicts
+          once.
+
+        * ``want_bytes=False`` (in-process callers / tests): same walk
+          but builds Python dicts per unit.  Convenient, not allocation-
+          bounded; not on the HTTP hot path.
+
+        T14: wraps the inner build with a ``perf_counter_ns`` so each
+        call lands a (elapsed, dump_bytes) sample in the ring buffer.
+        The summary embedded INTO this dump is from samples PRIOR to
+        this call (chicken-and-egg: we can't include our own latency
+        before we've finished measuring it).  Each /aginfer/state poll
+        therefore advances ``n_recorded_total`` by exactly 1.
+        """
+        t0 = time.perf_counter_ns()
+        bytes_per_token = self._aginfer_bytes_per_token()
+        sp_full = self._aginfer_subpool_name(BASE_COMPONENT_TYPE)
+        metrics_summary = self._aginfer_state_dump_metrics.summary()
+        if want_bytes:
+            result = self._dump_aginfer_state_bytes(
+                bytes_per_token, sp_full, metrics_summary,
+            )
+            dump_bytes = len(result)
+        else:
+            result = self._dump_aginfer_state_dict(
+                bytes_per_token, sp_full, metrics_summary,
+            )
+            # Dict path: serialised size isn't measured (the call site
+            # doesn't go through orjson).  Sentinel.
+            dump_bytes = -1
+        elapsed_ns = time.perf_counter_ns() - t0
+        self._aginfer_state_dump_metrics.record(
+            elapsed_ns=elapsed_ns, dump_bytes=dump_bytes,
+        )
+        return result
+
+    def _dump_aginfer_state_dict(
+        self,
+        bytes_per_token: int,
+        sp_full: str,
+        metrics_summary: dict,
+    ) -> dict:
+        """Dict-path snapshot.  Convenient for in-process callers; not
+        on the HTTP hot path so per-unit Python dict allocations are
+        acceptable."""
+        # Walk: collect units + per-subpool DRAM aggregates.
+        units: list = []
+        units_append = units.append
+        dram_used_by_sp: dict[str, int] = {sp_full: 0}
+        root = self.root_node
+        base_ct = BASE_COMPONENT_TYPE
+        stack = [root]
+        stack_pop = stack.pop
+        stack_extend = stack.extend
+        while stack:
+            node = stack_pop()
+            stack_extend(node.children.values())
+            if node is root:
+                continue
+            cd = node.component_data[base_ct]
+            v = cd.value
+            n_tokens_hbm = len(v) if v is not None else 0
+            hv = cd.host_value
+            n_tokens_dram = len(hv) if hv is not None else 0
+            n_bytes: dict[str, dict[str, int]] = {}
+            if n_tokens_hbm > 0:
+                n_bytes["HBM"] = {sp_full: n_tokens_hbm * bytes_per_token}
+            if n_tokens_dram > 0:
+                n_bytes["DRAM"] = {sp_full: n_tokens_dram * bytes_per_token}
+                dram_used_by_sp[sp_full] += n_tokens_dram * bytes_per_token
+            if not n_bytes:
+                continue
+            residence = list(n_bytes.keys())
+            n_tokens = max(n_tokens_hbm, n_tokens_dram)
+            hv_list = node.hash_value
+            if hv_list:
+                unit_hash = hv_list[-1]
+                if type(unit_hash) is not str:
+                    unit_hash = str(unit_hash)
+            else:
+                unit_hash = f"node-{node.id}"
+            try:
+                sids = node.session_ids
+            except AttributeError:
+                sids = None
+            units_append({
+                "hash": unit_hash,
+                "residence": residence,
+                "n_tokens": n_tokens,
+                "n_bytes": n_bytes,
+                "last_access_time": int(node.last_access_time),
+                "hit_count": int(node.hit_count),
+                "session_ids": sorted(sids) if sids else [],
+                # #210: the three structural leaf predicates the daemon's
+                # migrate_candidates needs to mirror sglang's apply-site
+                # guards (2673/2684/2687) — else reject storms under
+                # pressure (remove_not_leaf / remove_hbm_not_device_leaf /
+                # remove_dram_not_host_leaf).  is_host_leaf ⟹ is_tree_leaf,
+                # but is_device_leaf does NOT, so all three are dumped.
+                "is_device_leaf": self._is_device_leaf(node),
+                "is_host_leaf": self._is_host_leaf(node),
+                "is_tree_leaf": len(node.children) == 0,
+            })
+
+        pool_usage = self._aginfer_pool_usage()
+        self._aginfer_patch_dram_used(pool_usage, dram_used_by_sp)
+
+        # Per-program post-walk aggregation (1/holders attribution).
+        per_program: dict[str, dict] = {}
+        for u in units:
+            sids = u["session_ids"]
+            if not sids:
+                continue
+            n_holders = len(sids)
+            for pid in sids:
+                e = per_program.setdefault(pid, {
+                    "hbm":  {"committed": {}, "inflight": {}},
+                    "dram": {"committed": {}},
+                    "state": "REASONING",
+                    "pre_pause_state": None,
+                    "unit_hashes": [],
+                })
+                e["unit_hashes"].append(u["hash"])
+                for tier, sp_dict in u["n_bytes"].items():
+                    if tier == "DISK":
+                        continue
+                    side = "hbm" if tier == "HBM" else "dram"
+                    bucket = e[side]["committed"]
+                    for sp, bytes_total in sp_dict.items():
+                        bucket[sp] = bucket.get(sp, 0) + bytes_total // n_holders
+
+        # T21 (#181): overlay daemon-pushed program states + GC
+        # terminal entries.  Shared helper so dict-path and bytes-
+        # path can NEVER diverge (#181 audit).
+        self._aginfer_overlay_program_states(per_program)
+
+        return {
+            "time_counter": int(peek_time_counter()),
+            "throughput_ema": self._aginfer_throughput_ema(),
+            "pool_usage": pool_usage,
+            "per_program_usage": per_program,
+            "units": units,
+            "link_stats": self._aginfer_link_stats(),
+            "tier_holding_cost": self._aginfer_tier_holding_cost(pool_usage),
+            # T40 (#184): count of live daemon-pushed hint entries.  A
+            # COUNT, not the table itself — the daemon keeps no shadow
+            # cache and never reads hints back (it re-scores from
+            # state), so echoing the whole table would only bloat the
+            # dump.  Exposed for observability + e2e verification that
+            # PUT /aginfer/hints landed.
+            "n_aginfer_hints": len(self._aginfer_hints),
+            # T14 — piggybacked observability; pre-this-call summary.
+            "state_dump_metrics": metrics_summary,
+        }
+
+    def _aginfer_patch_dram_used(self, pool_usage: dict,
+                                 dram_used_by_sp: dict) -> None:
+        """Post-walk DRAM-used patch on pool_usage."""
+        for sp, used in dram_used_by_sp.items():
+            if sp in pool_usage["DRAM"]["subpools"]:
+                e = pool_usage["DRAM"]["subpools"][sp]
+                e["used_bytes"] = used
+                e["available_bytes"] = max(0, e["cap_bytes"] - used)
+                e["evictable_bytes"] = used
+
+    def _dump_aginfer_state_bytes(
+        self,
+        bytes_per_token: int,
+        sp_full: str,
+        metrics_summary: dict,
+    ) -> bytes:
+        """Allocation-light bytes-path snapshot.
+
+        Hot loop writes each unit's JSON directly into a ``bytearray``
+        instead of building a per-unit Python dict.  Per-program
+        accumulators are small (one dict-of-dicts per program) so
+        their post-walk orjson encode is cheap.
+
+        Wire JSON is byte-equivalent to the dict path's
+        ``orjson.dumps(_dump_aginfer_state_dict(...))`` output up to
+        key ordering — daemon parses by key, not by position.
+        """
+        # Pre-bind locals for inner-loop speed.
+        base_ct = BASE_COMPONENT_TYPE
+        root = self.root_node
+
+        # Per-program accumulators (built during the walk so we don't
+        # have to re-iterate units after).
+        # pid → {"hbm_committed": {sp: int}, "dram_committed": {sp: int},
+        #        "unit_hashes": [hash, ...]}
+        pp: dict[str, dict] = {}
+        dram_used_by_sp: dict[str, int] = {sp_full: 0}
+
+        units_buf = bytearray()
+        first = True
+
+        stack = [root]
+        stack_pop = stack.pop
+        stack_extend = stack.extend
+        while stack:
+            node = stack_pop()
+            stack_extend(node.children.values())
+            if node is root:
+                continue
+            cd = node.component_data[base_ct]
+            v = cd.value
+            n_tokens_hbm = len(v) if v is not None else 0
+            hv = cd.host_value
+            n_tokens_dram = len(hv) if hv is not None else 0
+            if n_tokens_hbm == 0 and n_tokens_dram == 0:
+                continue
+            hbm_bytes = n_tokens_hbm * bytes_per_token if n_tokens_hbm else 0
+            dram_bytes = (n_tokens_dram * bytes_per_token
+                          if n_tokens_dram else 0)
+            if dram_bytes:
+                dram_used_by_sp[sp_full] += dram_bytes
+
+            hv_list = node.hash_value
+            if hv_list:
+                unit_hash = hv_list[-1]
+                if type(unit_hash) is not str:
+                    unit_hash = str(unit_hash)
+            else:
+                unit_hash = f"node-{node.id}"
+            try:
+                sids = node.session_ids
+            except AttributeError:
+                sids = None
+            sids_sorted = sorted(sids) if sids else None
+
+            # ---- write the unit JSON directly into units_buf ----
+            if first:
+                first = False
+            else:
+                units_buf.append(0x2C)  # ','
+            # {"hash":"<hash>","residence":[...],"n_tokens":N,
+            #  "n_bytes":{...},"last_access_time":N,"hit_count":N,
+            #  "session_ids":[...]}
+            units_buf.extend(b'{"hash":"')
+            units_buf.extend(unit_hash.encode("ascii", "backslashreplace"))
+            units_buf.extend(b'","residence":[')
+            if hbm_bytes and dram_bytes:
+                units_buf.extend(b'"HBM","DRAM"')
+            elif hbm_bytes:
+                units_buf.extend(b'"HBM"')
+            else:
+                units_buf.extend(b'"DRAM"')
+            units_buf.extend(b'],"n_tokens":')
+            units_buf.extend(str(max(n_tokens_hbm, n_tokens_dram))
+                             .encode("ascii"))
+            units_buf.extend(b',"n_bytes":{')
+            n_bytes_pieces = []
+            if hbm_bytes:
+                n_bytes_pieces.append(
+                    b'"HBM":{"' + sp_full.encode("ascii") + b'":'
+                    + str(hbm_bytes).encode("ascii") + b'}')
+            if dram_bytes:
+                n_bytes_pieces.append(
+                    b'"DRAM":{"' + sp_full.encode("ascii") + b'":'
+                    + str(dram_bytes).encode("ascii") + b'}')
+            units_buf.extend(b",".join(n_bytes_pieces))
+            units_buf.extend(b'},"last_access_time":')
+            units_buf.extend(str(int(node.last_access_time)).encode("ascii"))
+            units_buf.extend(b',"hit_count":')
+            units_buf.extend(str(int(node.hit_count)).encode("ascii"))
+            if sids_sorted:
+                # orjson on the rare non-empty branch (~free vs json.dumps).
+                import orjson as _o
+                units_buf.extend(b',"session_ids":')
+                units_buf.extend(_o.dumps(sids_sorted))
+            else:
+                units_buf.extend(b',"session_ids":[]')
+            # #210: the three structural leaf predicates (see dict-path
+            # dump) — migrate_candidates mirrors sglang's apply-site guards
+            # 2673/2684/2687 so it never proposes a reject-guaranteed migrate.
+            units_buf.extend(
+                b',"is_device_leaf":'
+                + (b"true" if self._is_device_leaf(node) else b"false"))
+            units_buf.extend(
+                b',"is_host_leaf":'
+                + (b"true" if self._is_host_leaf(node) else b"false"))
+            units_buf.extend(
+                b',"is_tree_leaf":'
+                + (b"true" if len(node.children) == 0 else b"false"))
+            units_buf.extend(b"}")
+
+            # ---- per-program accumulator (single dict-of-dicts per pid) ----
+            if sids_sorted:
+                n_holders = len(sids_sorted)
+                hbm_share = hbm_bytes // n_holders if hbm_bytes else 0
+                dram_share = dram_bytes // n_holders if dram_bytes else 0
+                for pid in sids_sorted:
+                    e = pp.get(pid)
+                    if e is None:
+                        e = {
+                            "hbm_committed": {},
+                            "dram_committed": {},
+                            "unit_hashes": [],
+                        }
+                        pp[pid] = e
+                    e["unit_hashes"].append(unit_hash)
+                    if hbm_share:
+                        c = e["hbm_committed"]
+                        c[sp_full] = c.get(sp_full, 0) + hbm_share
+                    if dram_share:
+                        c = e["dram_committed"]
+                        c[sp_full] = c.get(sp_full, 0) + dram_share
+
+        # ---- finalise pool_usage / aux fields (small dicts) ----
+        pool_usage = self._aginfer_pool_usage()
+        self._aginfer_patch_dram_used(pool_usage, dram_used_by_sp)
+        link_stats = self._aginfer_link_stats()
+        tier_holding_cost = self._aginfer_tier_holding_cost(pool_usage)
+        throughput_ema = self._aginfer_throughput_ema()
+
+        # Reshape per_program accumulators into DESIGN §5 form.
+        per_program = {
+            pid: {
+                "hbm":  {"committed": e["hbm_committed"], "inflight": {}},
+                "dram": {"committed": e["dram_committed"]},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": e["unit_hashes"],
+            }
+            for pid, e in pp.items()
+        }
+        # T21 (#181): overlay daemon-pushed program states + GC
+        # terminal entries.  SAME helper the dict-path calls — the
+        # two cannot diverge by construction (#181 audit).
+        self._aginfer_overlay_program_states(per_program)
+
+        # ---- assemble final wire JSON ----
+        import orjson
+        out = bytearray()
+        out.extend(b'{"time_counter":')
+        out.extend(str(int(peek_time_counter())).encode("ascii"))
+        out.extend(b',"throughput_ema":')
+        out.extend(orjson.dumps(throughput_ema))
+        out.extend(b',"pool_usage":')
+        out.extend(orjson.dumps(pool_usage))
+        out.extend(b',"per_program_usage":')
+        out.extend(orjson.dumps(per_program))
+        out.extend(b',"units":[')
+        out.extend(units_buf)
+        out.extend(b'],"link_stats":')
+        out.extend(orjson.dumps(link_stats))
+        out.extend(b',"tier_holding_cost":')
+        out.extend(orjson.dumps(tier_holding_cost))
+        # T40 (#184): live hint-entry count (see dict-path note).  MUST
+        # match the dict path's key so the two dumps stay schema-equal.
+        out.extend(b',"n_aginfer_hints":')
+        out.extend(str(len(self._aginfer_hints)).encode("ascii"))
+        # T14 — piggybacked state-dump cost observability.
+        out.extend(b',"state_dump_metrics":')
+        out.extend(orjson.dumps(metrics_summary))
+        out.extend(b'}')
+        return bytes(out)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

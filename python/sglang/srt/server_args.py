@@ -435,6 +435,16 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
+    # aginfer T5: outbound webhook to the daemon's /aginfer/event endpoint.
+    # When set, sglang's scheduler fires a fire-and-forget POST on HBM
+    # watermark transitions ({OK, HIGH, CRITICAL}) AND on a heartbeat
+    # cadence while in {HIGH, CRITICAL}.  When unset (default), no
+    # webhook code runs -- stock sglang behaviour.
+    aginfer_notify_url: Optional[str] = None
+    aginfer_heartbeat_s: float = 5.0
+    aginfer_theta_hi: float = 0.7
+    aginfer_theta_lo: float = 0.55
+    aginfer_theta_crit: float = 0.9
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
@@ -5048,6 +5058,42 @@ class ServerArgs:
             "This option is typically used for development and debugging purposes."
             + f"\n\n{human_readable_int.__doc__}",
         )
+        # aginfer T5: webhook to daemon's /aginfer/event.
+        parser.add_argument(
+            "--aginfer-notify-url",
+            type=str,
+            default=ServerArgs.aginfer_notify_url,
+            help="aginfer: URL to POST memory_pressure / pressure_resolved "
+            "webhooks to (typically the daemon's /aginfer/event endpoint). "
+            "When unset, no webhook is fired (stock sglang behaviour).",
+        )
+        parser.add_argument(
+            "--aginfer-heartbeat-s",
+            type=float,
+            default=ServerArgs.aginfer_heartbeat_s,
+            help="aginfer: seconds between heartbeat webhooks while in "
+            "HIGH or CRITICAL state (default 5.0).",
+        )
+        parser.add_argument(
+            "--aginfer-theta-hi",
+            type=float,
+            default=ServerArgs.aginfer_theta_hi,
+            help="aginfer: HBM occupancy upward threshold OK -> HIGH (default 0.7).",
+        )
+        parser.add_argument(
+            "--aginfer-theta-lo",
+            type=float,
+            default=ServerArgs.aginfer_theta_lo,
+            help="aginfer: HBM occupancy downward threshold HIGH -> OK (hysteresis; default 0.55). "
+                 "MUST be < theta_hi.  When admission's pause has cleared pressure, the down-crossing "
+                 "of this threshold is what fires the daemon's PRESSURE_RESOLVED → resume.",
+        )
+        parser.add_argument(
+            "--aginfer-theta-crit",
+            type=float,
+            default=ServerArgs.aginfer_theta_crit,
+            help="aginfer: HBM occupancy threshold for HIGH -> CRITICAL (default 0.9).",
+        )
         parser.add_argument(
             "--chunked-prefill-size",
             type=int,
@@ -8370,7 +8416,19 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         force=True,
     )
 
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+
+    # T22 (#155, #165): if --aginfer-notify-url is set, bootstrap
+    # the four canonical thresholds from the daemon BEFORE the
+    # scheduler subprocess starts and constructs AginferWebhookFirer.
+    # Halts loudly if the daemon is unreachable (DESIGN §6 step 1) —
+    # this is the real closure of G9 (theta drift between sglang and
+    # daemon).  No-op in daemon-less / legacy deployments.
+    from sglang.srt.managers.aginfer_webhook import (
+        bootstrap_thresholds_into_server_args,
+    )
+    bootstrap_thresholds_into_server_args(server_args)
+    return server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233

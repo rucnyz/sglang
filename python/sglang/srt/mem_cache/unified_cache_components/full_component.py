@@ -133,8 +133,10 @@ class FullComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.num_tokens
+        # aginfer: heap key from pluggable eviction scorer (LRU by default).
+        score_fn = self.cache._eviction_scorer
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
+            (score_fn(n, EvictLayer.DEVICE), n)
             for n in self.cache.evictable_device_leaves
         ]
         heapq.heapify(heap)
@@ -146,16 +148,16 @@ class FullComponent(TreeComponent):
             self.cache._evict_device_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
                 heapq.heappush(
-                    heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    heap, (score_fn(x.parent, EvictLayer.DEVICE), x.parent)
                 )
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:
         """Evict host leaves to free KV host pool space."""
+        score_fn = self.cache._eviction_scorer
         heap = [
-            (self.cache.eviction_strategy.get_priority(n), n)
+            (score_fn(n, EvictLayer.HOST), n)
             for n in self.cache.evictable_host_leaves
         ]
         heapq.heapify(heap)
@@ -167,8 +169,7 @@ class FullComponent(TreeComponent):
             self.cache._evict_host_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
                 heapq.heappush(
-                    heap,
-                    (self.cache.eviction_strategy.get_priority(x.parent), x.parent),
+                    heap, (score_fn(x.parent, EvictLayer.HOST), x.parent)
                 )
 
     def acquire_component_lock(

@@ -244,6 +244,17 @@ class GenerateReqInput(BaseReq):
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
+    # aginfer §3 state: program-level identity that the daemon's
+    # admission_controller / kv_scheduler uses to aggregate per-program
+    # value (paper §7).  Every radix-tree node touched by this request
+    # adds ``program_id`` to its ``session_ids`` set; daemon reads this
+    # via /aginfer/state.  Passed through from the OpenAI request's
+    # top-level ``program_id`` field (or ``extra_body.program_id``).
+    # Typed as ``Any`` so bogus shapes (dict / int / list / very long
+    # string) are sanitized at Req construction instead of failing
+    # Pydantic validation at the HTTP layer.
+    program_id: Optional[Any] = None
+
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
 
@@ -730,6 +741,11 @@ class GenerateReqInput(BaseReq):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
+            program_id=(
+                self.program_id[i]
+                if isinstance(self.program_id, list) and i < len(self.program_id)
+                else self.program_id
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -816,6 +832,11 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+
+    # aginfer §3 state: program-level identity, see GenerateReqInput.program_id.
+    # Typed as Any so bogus shapes survive serialization through ZMQ;
+    # sanitized at Req construction.
+    program_id: Optional[Any] = None
 
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
@@ -1743,6 +1764,121 @@ class GetInternalStateReq(BaseReq):
 @dataclass
 class GetInternalStateReqOutput(BaseReq):
     internal_state: Dict[Any, Any]
+
+
+@dataclass
+class GetAginferStateReq(BaseReq):
+    """Snapshot the radix cache for the aginfer daemon.
+
+    Returns per-unit state (tier, age, hit_count, session_ids) and per-tier
+    occupancy.  Cheap; read-only; safe to call frequently from an external
+    process.
+    """
+
+    pass
+
+
+@dataclass
+class MigrateAginferReq(BaseReq):
+    """Apply a batch of paper §4 ``(u, τ_target)`` migration actions.
+
+    ``actions`` is a list of ``{"hash": str, "target_tier": "HBM"|"DRAM"|
+    "DISK"|"DROP"}``.  Unresolved or unsupported actions are reported in
+    ``MigrateAginferReqOutput.skipped`` rather than raised, so the daemon
+    can keep its idempotent re-issue loop simple.
+    """
+
+    actions: List[Dict[str, Any]]
+
+
+@dataclass
+class MigrateAginferReqOutput(BaseReq):
+    applied: int
+    applied_hashes: List[str]
+    skipped: List[Dict[str, Any]]
+
+
+@dataclass
+class UpdateAginferThresholdsReq(BaseReq):
+    """T22 (#155): daemon → sglang PUT /aginfer/thresholds.
+
+    Carries the four hysteresis values; sglang's scheduler applies
+    them to AginferWebhookFirer atomically.  Returns whether
+    validation succeeded + reason string (DESIGN §6 round-6 H3).
+    """
+
+    theta_hi: float
+    theta_lo: float
+    theta_crit: float
+    heartbeat_s: float
+
+
+@dataclass
+class UpdateAginferThresholdsReqOutput(BaseReq):
+    ok: bool
+    reason: str
+
+
+@dataclass
+class UpdateAginferProgramPausedReq(BaseReq):
+    """T21 (#181, DESIGN §6 round-6 H2): daemon → sglang PUT
+    /aginfer/program_paused.
+
+    Daemon owns the program-state transition (REASONING / ACTING /
+    PAUSED / ENDED); sglang stores it as a passthrough and echoes
+    it back in the next /aginfer/state dump's per_program_usage[pid]
+    entry.  Idempotent re-application returns applied=0
+    (DESIGN §10 R2).
+    """
+
+    pid: str
+    state: str
+    pre_pause_state: Optional[str] = None
+
+
+@dataclass
+class UpdateAginferProgramPausedReqOutput(BaseReq):
+    ok: bool
+    reason: str
+    applied: int = 0  # 0 = idempotent no-op; 1 = state changed
+
+
+@dataclass
+class UpdateAginferHintsReq(BaseReq):
+    """T40 (#184, DESIGN §6 PUT /aginfer/hints): daemon → sglang push
+    of V_u inputs for the inline scorer.
+
+    ``hints`` is a list of ``{"hash": str, "p_hat": float,
+    "lambda": float, "stamp": int}`` (validated at the HTTP layer).
+    Fans out to every rank's scheduler (the hint table is per-rank);
+    each rank applies overwrite-by-stamp and reports its ``applied``
+    count.  Idempotent re-application of an unchanged-stamp batch
+    returns applied=0 (DESIGN §10 R2)."""
+
+    hints: List[Dict[str, Any]]
+
+
+@dataclass
+class UpdateAginferHintsReqOutput(BaseReq):
+    ok: bool
+    reason: str
+    applied: int = 0  # count of hashes whose stamp advanced
+
+
+@dataclass
+class GetAginferStateReqOutput(BaseReq):
+    """Per-DP-rank snapshot.  aginfer state is the JSON-serialisable dict
+    described in dev/aginfer/DESIGN.md §sglang surface.
+
+    Fast path: when the underlying tree cache supports it the scheduler
+    pre-serialises the snapshot to JSON bytes (``state_bytes``) inside its
+    own process, so the ZMQ pickle hop only carries a single bytes payload
+    and the HTTP layer can write it without re-encoding.  ``state`` stays
+    populated only when the cache cannot pre-serialise (e.g. the
+    "unsupported" placeholder)."""
+
+    state: Optional[Dict[str, Any]] = None
+    state_bytes: Optional[bytes] = None
 
 
 @dataclass

@@ -423,6 +423,19 @@ class SWAComponent(TreeComponent):
         lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
+
+        # Host-side single-node lock (mirrors FullComponent / MambaComponent).
+        # The HiCache D<->H pipeline calls inc_host_lock_ref on the last host
+        # node it backed up; we only need to protect that node's host_value,
+        # not walk the SWA window (which only matters for device-side locks).
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return result
+            cd.host_lock_ref += 1
+            self.cache._update_evictable_leaf_sets(node)
+            return result
+
         root = self.cache.root_node
         sliding_window_size = self.sliding_window_size
         swa_lock_size = 0
@@ -475,6 +488,17 @@ class SWAComponent(TreeComponent):
         lock_host: bool = False,
     ) -> None:
         ct = self.component_type
+
+        # Pair with acquire_component_lock(lock_host=True): release the host
+        # lock_ref on this single node without touching the SWA window state.
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None or cd.host_lock_ref == 0:
+                return
+            cd.host_lock_ref -= 1
+            self.cache._update_evictable_leaf_sets(node)
+            return
+
         root = self.cache.root_node
         swa_uuid_for_lock = (
             (params.swa_uuid_for_host_lock if lock_host else params.swa_uuid_for_lock)
@@ -569,13 +593,29 @@ class SWAComponent(TreeComponent):
         if phase == CacheTransferPhase.LOAD_BACK:
             # `node` is best_match_node; the SWA validator guarantees every
             # ancestor within `sliding_window_size` has value or host_value.
+            #
+            # 2026-05-30 aginfer: the daemon's `/aginfer/migrate` promote
+            # path arrives asynchronously vs HiCache's eviction passes.
+            # A node whose `has_host` was True at /aginfer/state fetch
+            # time can have ancestors whose host backup was reaped between
+            # then and now (host LRU + write_through_selective).  When
+            # that happens, the prefix chain is broken — promoting this
+            # leaf alone wouldn't help (sglang's prefix matcher can't
+            # walk past the gap).  Old code asserted hard; now we break
+            # early so the caller (load_back) declines cleanly and
+            # daemon idempotently retries on the next event.
             n_swa = 0
             backed_up: list[torch.Tensor] = []
             nodes: list = []
             cur = node
             while cur is not self.cache.root_node and n_swa < self.sliding_window_size:
                 cd = cur.component_data[ct]
-                assert cd.host_value is not None or cd.value is not None
+                if cd.host_value is None and cd.value is None:
+                    # Race: ancestor lost both tiers since daemon's read.
+                    # Break the walk; load_back will get backed_up=[]
+                    # (or partial) and return False → apply_aginfer
+                    # reports `promote_load_back_declined`.
+                    return None
                 if cd.value is not None:
                     # device exists, skip it
                     n_swa += len(cd.value)

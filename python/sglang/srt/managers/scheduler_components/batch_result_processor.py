@@ -58,6 +58,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _aginfer_force_token(req, sampled):
+    """aginfer teacher-forcing (wherewewin/harness/teacher_forcing): if the req
+    carries ``sampling_params.custom_params["forced_output_ids"]``, return the
+    forced token for the current step instead of the sampled one, so a replay
+    reproduces a captured decode EXACTLY (faithful multi-turn KV continuation).
+
+    Done at the authoritative output-commit point (not via a logit processor,
+    which adds ~30% under the overlap scheduler) so it is a true no-op: the next
+    forward's ``input_ids`` is built from ``req.output_ids[-1]``, so overriding
+    the committed token propagates with no extra tensor write. The per-req step
+    counter is overlap-safe (one commit per token, in order). Returns ``sampled``
+    unchanged when no forcing is configured (single cheap branch off the hot path).
+    """
+    sp = getattr(req, "sampling_params", None)
+    cp = getattr(sp, "custom_params", None) if sp is not None else None
+    if not cp:
+        return sampled
+    forced = cp.get("forced_output_ids")
+    if not forced:
+        return sampled
+    step = getattr(req, "_tf_step", 0)
+    if step >= len(forced):
+        return sampled
+    req._tf_step = step + 1
+    return int(forced[step])
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -224,6 +251,7 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
+                    next_token_id = _aginfer_force_token(req, next_token_id)
                     req.output_ids.append(next_token_id)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
@@ -645,8 +673,20 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
+                next_token_id = _aginfer_force_token(req, next_token_id)
                 req.output_ids.append(next_token_id)
             else:
+                # aginfer teacher-forcing is NOT applied on the speculative-decode
+                # path (multi-token accept). Forced replay must not silently
+                # degrade to length-only here, so reject the combination loudly.
+                _sp = getattr(req, "sampling_params", None)
+                _cp = getattr(_sp, "custom_params", None) if _sp is not None else None
+                if _cp and _cp.get("forced_output_ids"):
+                    raise NotImplementedError(
+                        "aginfer forced_output_ids (teacher-forcing) is not "
+                        "supported with speculative decoding; disable spec for "
+                        "faithful replay."
+                    )
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 

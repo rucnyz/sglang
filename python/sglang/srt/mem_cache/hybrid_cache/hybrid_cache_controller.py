@@ -441,6 +441,7 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        self._last_load_decline = None
         need_load_kv = host_indices.numel() > 0
 
         full_allocator = getattr(
@@ -451,8 +452,14 @@ class HybridCacheController(BaseHiCacheController):
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:
-            device_indices = full_allocator.alloc(len(host_indices))
+            requested = len(host_indices)
+            avail_full = full_allocator.available_size()
+            device_indices = full_allocator.alloc(requested)
             if device_indices is None:
+                self._last_load_decline = (
+                    f"full_alloc_returned_none:requested={requested}"
+                    f":avail_full_at_call={avail_full}"
+                )
                 return None
 
         pool_transfers = self._resolve_pool_transfers_allocation(
@@ -462,6 +469,9 @@ class HybridCacheController(BaseHiCacheController):
             kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
+            self._last_load_decline = (
+                f"pool_transfers_alloc_failed:extra_pools={len(extra_pools)}"
+            )
             if need_load_kv:
                 full_allocator.free(device_indices)
             return None
@@ -663,6 +673,11 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+
+        # Skip anchor backup when the anchor holds no real KV (V4 case); the
+        # per-sidecar bytes are already in flight via batch_set_v2 above.
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return
 
         # Backup kv pools
         super()._page_backup(operation)

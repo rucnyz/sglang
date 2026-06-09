@@ -108,8 +108,18 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetAginferStateReq,
+    GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    MigrateAginferReq,
+    MigrateAginferReqOutput,
+    UpdateAginferProgramPausedReq,
+    UpdateAginferProgramPausedReqOutput,
+    UpdateAginferHintsReq,
+    UpdateAginferHintsReqOutput,
+    UpdateAginferThresholdsReq,
+    UpdateAginferThresholdsReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -218,6 +228,13 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.aginfer_metrics import (
+    AGINFER_THROUGHPUT_EMA_ALPHA,
+    decode_tokens_by_program,
+    ema_update,
+    inflight_bytes_by_program,
+    running_program_view,
+)
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -314,6 +331,20 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch: Optional[ScheduleBatch] = None
+
+        # T26 (#200): aginfer throughput / in-flight measurement.  Per-
+        # program decode tokens/sec EMA + prefill bytes/sec EMA, sampled
+        # once per forward in ``process_batch_result``; pushed onto the
+        # radix cache before each ``/aginfer/state`` dump so the daemon's
+        # §8 admission math (marginal_pause_cost, pause_relief snapshot,
+        # and — once T11 lands E[remaining] — the forecast trajectory)
+        # reads real numbers instead of the 0.0 / {} placeholders.  Gated
+        # on the cache exposing the aginfer schema, so non-aginfer
+        # deployments pay nothing.
+        self._aginfer_decode_ema: Dict[str, float] = {}
+        self._aginfer_prefill_bps_ema: Optional[float] = None
+        self._aginfer_last_decode_t: Optional[float] = None
+        self._aginfer_last_prefill_t: Optional[float] = None
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -467,6 +498,28 @@ class Scheduler(
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
+
+        # aginfer T5: outbound webhook to daemon's /aginfer/event.  No-op
+        # when --aginfer-notify-url is unset.
+        self.aginfer_webhook = None
+        if getattr(server_args, "aginfer_notify_url", None):
+            from sglang.srt.managers.aginfer_webhook import AginferWebhookFirer
+
+            self.aginfer_webhook = AginferWebhookFirer(
+                notify_url=server_args.aginfer_notify_url,
+                heartbeat_s=getattr(server_args, "aginfer_heartbeat_s", 5.0),
+                theta_hi=getattr(server_args, "aginfer_theta_hi", 0.7),
+                theta_lo=getattr(server_args, "aginfer_theta_lo", 0.55),
+                theta_crit=getattr(server_args, "aginfer_theta_crit", 0.9),
+            )
+            logger.info(
+                "aginfer webhook armed: url=%s heartbeat_s=%.1f theta_hi=%.2f theta_lo=%.2f theta_crit=%.2f",
+                server_args.aginfer_notify_url,
+                self.aginfer_webhook.heartbeat_s,
+                self.aginfer_webhook.theta_hi,
+                self.aginfer_webhook.theta_lo,
+                self.aginfer_webhook.theta_crit,
+            )
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
@@ -1389,6 +1442,11 @@ class Scheduler(
                 ),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
+                (GetAginferStateReq, self.get_aginfer_state),
+                (MigrateAginferReq, self.migrate_aginfer),
+                (UpdateAginferThresholdsReq, self.update_aginfer_thresholds),
+                (UpdateAginferProgramPausedReq, self.update_aginfer_program_paused),
+                (UpdateAginferHintsReq, self.update_aginfer_hints),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -1492,6 +1550,23 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            # aginfer T5: fire webhook on watermark transition / heartbeat.
+            # Use the SAME occupancy view the daemon reads
+            # (/aginfer/state.pool_usage.HBM.token_usage) so sglang and
+            # daemon never disagree about pressure.  The old
+            # `pool.size_full - pool.available_size()` formula inflated
+            # "used" under SWA because available_size() = min(full,swa).
+            if self.aginfer_webhook is not None:
+                try:
+                    occ = 0.0
+                    pu = getattr(self.tree_cache, "_aginfer_pool_usage", None)
+                    if pu is not None:
+                        occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
+                    self.aginfer_webhook.maybe_fire(occ=occ)
+                except Exception:
+                    logger.exception("aginfer webhook check raised")
+
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -1550,6 +1625,22 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            # aginfer T5: fire webhook on watermark transition / heartbeat.
+            # Use the SAME occupancy view the daemon reads
+            # (/aginfer/state.pool_usage.HBM.token_usage) so sglang and
+            # daemon never disagree about pressure.  The old
+            # `pool.size_full - pool.available_size()` formula inflated
+            # "used" under SWA because available_size() = min(full,swa).
+            if self.aginfer_webhook is not None:
+                try:
+                    occ = 0.0
+                    pu = getattr(self.tree_cache, "_aginfer_pool_usage", None)
+                    if pu is not None:
+                        occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
+                    self.aginfer_webhook.maybe_fire(occ=occ)
+                except Exception:
+                    logger.exception("aginfer webhook check raised")
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -2013,6 +2104,7 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                program_id=recv_req.program_id,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -3063,6 +3155,11 @@ class Scheduler(
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
+        # T26 (#200): sample aginfer decode/prefill throughput EMAs from the
+        # FRESH batch (pre-forward) — extend_num_tokens / input_ids are
+        # consumed by the forward and gone by process_batch_result time
+        # under overlap scheduling.  Cheap; no-op on non-aginfer caches.
+        self._aginfer_record_throughput(batch)
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
@@ -3283,6 +3380,11 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
+            # T26 (#206): spec-v2 (overlap) resolves the real accepted-token
+            # count (accept_lens) during the call above — record it now.  v1
+            # spec doesn't expose it and is counted 1/req pre-forward instead.
+            if getattr(batch, "is_spec_v2", False):
+                self._aginfer_record_spec_throughput(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -3606,6 +3708,427 @@ class Scheduler(
         ret.pop("model_config", None)
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def _aginfer_record_throughput(self, batch: ScheduleBatch) -> None:
+        """T26 (#200): update the per-program decode tokens/sec EMA and the
+        prefill bytes/sec EMA from one forward.  Called per ``run_batch``;
+        a no-op when the cache isn't aginfer-capable (no
+        ``_aginfer_bytes_per_token``).
+
+        Timing uses ``perf_counter`` deltas between consecutive forwards of
+        the SAME mode — so interleaved prefills slightly inflate the decode
+        gap and the decode rate reads marginally LOW, the safe direction
+        (a lower decode_throughput → smaller forecast → less over-pause).
+
+        Mode classification (#200 audit + #206):
+        * pure ``DECODE`` → decode EMA (1 token/req) — UNLESS the batch is
+          spec-v2 (overlap-on spec), where the real accepted-token count is
+          only known post-forward, so decode is recorded by
+          ``_aginfer_record_spec_decode`` (from ``process_batch_result``)
+          and skipped here to avoid the 1/req undercount.  spec-v1 (e.g.
+          ngram, overlap off) does NOT expose accept_lens, so it keeps the
+          conservative 1/req here (#206).
+        * pure ``EXTEND`` → prefill bytes/sec EMA (``extend_num_tokens``).
+        * ``MIXED`` (chunked prefill + running decode) → split via
+          ``batch.decoding_reqs``: the prefill reqs' ``extend_input_len``
+          feeds prefill_bps, the decode reqs feed the decode EMA (#206).
+          ``extend_num_tokens`` is NOT usable here — it covers the whole
+          batch (1 per decode req included), which would pollute prefill.
+        * ``TARGET_VERIFY`` / ``DRAFT_EXTEND`` are set INSIDE the worker
+          forward, never present on this pre-forward batch; if one ever
+          reaches here it updates neither (drafts aren't committed output).
+
+        Wrapped in a blanket ``except`` (#200 audit): this is brand-new
+        per-forward instrumentation; an unhandled error here would kill the
+        scheduler event loop.  Losing a throughput sample is harmless —
+        the daemon degrades to its no-signal branch.
+        """
+        try:
+            self._aginfer_record_throughput_inner(batch)
+        except Exception:  # noqa: BLE001
+            if not getattr(self, "_aginfer_throughput_warned", False):
+                self._aginfer_throughput_warned = True
+                logger.warning(
+                    "aginfer throughput measurement raised (suppressed; "
+                    "metric degrades to no-signal)", exc_info=True)
+
+    def _aginfer_record_throughput_inner(self, batch: ScheduleBatch) -> None:
+        cache = getattr(self, "tree_cache", None)
+        if cache is None or not hasattr(cache, "_aginfer_bytes_per_token"):
+            return
+        fm = getattr(batch, "forward_mode", None)
+        if fm is None:
+            return
+        now = time.perf_counter()
+        # A pure-DECODE spec-v2 batch (overlap-on EAGLE) resolves the real
+        # per-req accepted-token count (accept_lens) post-forward — recorded
+        # by _aginfer_record_spec_decode — so skip the pre-forward decode
+        # count for it (else we'd undercount at 1/req).  spec-v1 (e.g. ngram,
+        # overlap OFF) does NOT expose that count, and the post-forward hook
+        # only fires for is_decode() batches (not MIXED), so both of those
+        # keep the conservative 1/req here — never empty, never a regression.
+        defer_decode = bool(getattr(batch, "is_spec_v2", False))
+        if fm == ForwardMode.DECODE:
+            if defer_decode:
+                return
+            self._aginfer_update_decode(
+                decode_tokens_by_program(batch.reqs), now)
+        elif fm == ForwardMode.EXTEND:
+            self._aginfer_update_prefill(
+                self._aginfer_extend_token_count(batch), cache, now)
+        elif fm.is_mixed():
+            # MIXED = chunked prefill + running decode in one batch.  Split
+            # by identity against batch.decoding_reqs (sglang's own metrics
+            # discriminator): prefill reqs → prefill_bps, decode reqs →
+            # decode EMA (#206).  extend_num_tokens spans the whole batch
+            # (1 per decode req), so it can't stand in for the prefill count.
+            decode_ids = {id(r) for r in (getattr(batch, "decoding_reqs", None) or [])}
+            reqs = list(getattr(batch, "reqs", None) or [])
+            prefill_reqs = [r for r in reqs if id(r) not in decode_ids]
+            ntok = sum(int(getattr(r, "extend_input_len", 0) or 0)
+                       for r in prefill_reqs)
+            self._aginfer_update_prefill(ntok, cache, now)
+            # Decode portion is always counted 1/req HERE — even under
+            # spec-v2.  The post-forward accept_lens hook only fires for
+            # pure is_decode() batches (process_batch_result routes MIXED to
+            # the is_extend() branch), so deferring a MIXED batch's decode
+            # would drop it entirely.  1/req under-counts the acceptance
+            # length for spec-v2 MIXED (rare combo) but is never zero and is
+            # never double-counted (the post-forward hook can't reach MIXED).
+            decode_reqs = [r for r in reqs if id(r) in decode_ids]
+            self._aginfer_update_decode(
+                decode_tokens_by_program(decode_reqs), now)
+
+    @staticmethod
+    def _aginfer_extend_token_count(batch: ScheduleBatch) -> int:
+        """Prefill-token count for a pure EXTEND batch.  ``extend_num_tokens``
+        is reset by result-processing time (overlap scheduling), so fall
+        back to the per-req extend lengths, then the input-id tensor."""
+        ntok = int(getattr(batch, "extend_num_tokens", 0) or 0)
+        if ntok <= 0:
+            el = getattr(batch, "extend_lens", None)
+            if el:
+                ntok = int(sum(el))
+        if ntok <= 0:
+            ii = getattr(batch, "input_ids", None)
+            if ii is not None:
+                try:
+                    ntok = int(len(ii))
+                except TypeError:
+                    ntok = 0
+        return ntok
+
+    def _aginfer_update_prefill(self, ntok: int, cache, now: float) -> None:
+        """Blend ``ntok × bytes_per_token / dt`` into the prefill_bps EMA,
+        timed off the previous prefill-bearing forward."""
+        last = self._aginfer_last_prefill_t
+        self._aginfer_last_prefill_t = now
+        if last is None or ntok <= 0:
+            return
+        dt = now - last
+        if dt <= 0.0:
+            return
+        bpt = int(cache._aginfer_bytes_per_token())
+        if bpt <= 0:
+            return
+        self._aginfer_prefill_bps_ema = ema_update(
+            self._aginfer_prefill_bps_ema, (ntok * bpt) / dt,
+            AGINFER_THROUGHPUT_EMA_ALPHA)
+
+    def _aginfer_update_decode(self, counts: Dict[str, int], now: float) -> None:
+        """Blend per-program ``tokens / dt`` into the decode EMA, timed off
+        the previous decode-bearing forward."""
+        last = self._aginfer_last_decode_t
+        self._aginfer_last_decode_t = now
+        if last is None:
+            return
+        dt = now - last
+        if dt <= 0.0:
+            return
+        for pid, n in counts.items():
+            self._aginfer_decode_ema[pid] = ema_update(
+                self._aginfer_decode_ema.get(pid), n / dt,
+                AGINFER_THROUGHPUT_EMA_ALPHA)
+
+    def _aginfer_record_spec_throughput(self, batch: ScheduleBatch, result) -> None:
+        """Raise-safe wrapper for the spec-decode post-forward hook (#206):
+        a crash in brand-new instrumentation must never break the result
+        path.  Losing a sample degrades the metric to the no-signal branch."""
+        try:
+            self._aginfer_record_spec_decode(batch, result)
+        except Exception:  # noqa: BLE001
+            if not getattr(self, "_aginfer_throughput_warned", False):
+                self._aginfer_throughput_warned = True
+                logger.warning(
+                    "aginfer spec-decode measurement raised (suppressed; "
+                    "metric degrades to no-signal)", exc_info=True)
+
+    def _aginfer_record_spec_decode(self, batch: ScheduleBatch, result) -> None:
+        """T26 (#206): record spec-v2 decode throughput from the POST-forward
+        result.  A verify step commits ``accept_lens[i]`` tokens per req (the
+        bonus token + accepted drafts), not 1 — so the pre-forward DECODE
+        branch (which skips for spec-v2) would undercount by the acceptance
+        length.  ``num_correct_drafts_per_req_cpu`` is ``accept_lens − 1`` per
+        req, resolved to a CPU list during ``process_batch_result_decode`` and
+        index-aligned with ``batch.reqs``; accepted = that + 1.  Wrapped
+        raise-safe by the caller's guard.
+
+        No-op when the result carries no spec accept counts (spec-v1 keeps
+        its pre-forward 1/req count; a config that doesn't expose them)."""
+        cache = getattr(self, "tree_cache", None)
+        if cache is None or not hasattr(cache, "_aginfer_bytes_per_token"):
+            return
+        ncd = getattr(result, "num_correct_drafts_per_req_cpu", None)
+        if not ncd:
+            return
+        per_req = [int(n) + 1 for n in ncd]
+        counts = decode_tokens_by_program(
+            getattr(batch, "reqs", None) or [], per_req_tokens=per_req)
+        if counts:
+            self._aginfer_update_decode(counts, time.perf_counter())
+
+    def _aginfer_push_runtime_metrics(self) -> None:
+        """T26 (#200): assemble the measured decode/prefill EMAs +
+        per-program in-flight bytes and push them onto the radix cache so
+        the next ``dump_aginfer_state`` reflects real numbers.  Cold path
+        (per dump cadence); a no-op when the cache can't store them."""
+        cache = getattr(self, "tree_cache", None)
+        setter = getattr(cache, "set_aginfer_runtime_metrics", None)
+        if setter is None:
+            return
+        from sglang.srt.mem_cache.unified_cache_components import (
+            BASE_COMPONENT_TYPE,
+        )
+
+        try:
+            rb = getattr(self, "running_batch", None)
+            reqs = list(rb.reqs) if rb is not None else []
+            running_pids = {
+                str(r.program_id) for r in reqs
+                if getattr(r, "program_id", None) is not None
+            }
+            # Prune decode EMAs for programs that are no longer running so
+            # the dict stays bounded by the live set (not every program
+            # ever seen) — the ONLY prune point, so a never-dumped daemon
+            # can't make the dict grow unbounded on the hot path.
+            self._aginfer_decode_ema = {
+                p: v for p, v in self._aginfer_decode_ema.items()
+                if p in running_pids
+            }
+            decode_pp = running_program_view(
+                self._aginfer_decode_ema, running_pids)
+            bpt = int(cache._aginfer_bytes_per_token())
+            subpool = cache._aginfer_subpool_name(BASE_COMPONENT_TYPE)
+            inflight = inflight_bytes_by_program(reqs, bpt, subpool)
+        except Exception:  # noqa: BLE001 — never break the state dump
+            logger.warning(
+                "aginfer runtime-metric push raised; emitting empty",
+                exc_info=True)
+            decode_pp, inflight = {}, {}
+        setter(
+            decode_per_program=decode_pp,
+            prefill_bps=float(self._aginfer_prefill_bps_ema or 0.0),
+            inflight=inflight,
+        )
+
+    def get_aginfer_state(self, recv_req: GetAginferStateReq) -> GetAginferStateReqOutput:
+        """Snapshot the radix cache for the aginfer daemon (paper §3 s_t).
+
+        Only UnifiedRadixCache supports this; for other cache implementations
+        the daemon receives an explicit "unsupported" marker.
+
+        Fast path: when the cache exposes ``dump_aginfer_state_bytes`` we
+        serialise to JSON bytes inside this process so the ZMQ pickle hop
+        carries a single ``bytes`` payload (much cheaper than pickling a
+        10k-element list-of-dicts) and the HTTP layer can stream the bytes
+        without re-encoding.
+        """
+        # T26 (#200): refresh the cache's measured throughput / in-flight
+        # snapshot before EITHER dump path serialises it.
+        self._aginfer_push_runtime_metrics()
+        dump_bytes = getattr(self.tree_cache, "dump_aginfer_state_bytes", None)
+        if dump_bytes is not None:
+            return GetAginferStateReqOutput(state_bytes=dump_bytes())
+        dump = getattr(self.tree_cache, "dump_aginfer_state", None)
+        if dump is None:
+            # Tree cache doesn't expose the aginfer state schema (e.g.,
+            # non-Unified tree).  DESIGN §5: "Daemon halts loudly on this
+            # — running aginfer against an incompatible cache is a
+            # deployment bug."  We return only the marker; the daemon
+            # is supposed to fatal() on receipt rather than continue
+            # with a synthesised empty snapshot.
+            return GetAginferStateReqOutput(
+                state={
+                    "unsupported_tree_cache": type(self.tree_cache).__name__,
+                }
+            )
+        return GetAginferStateReqOutput(state=dump())
+
+    def migrate_aginfer(self, recv_req: MigrateAginferReq) -> MigrateAginferReqOutput:
+        """Apply paper §4 (u, τ_target) migrations dispatched by the daemon.
+
+        T23: every skipped action ALSO fires an `APPLY_FAILED` webhook
+        back to the daemon's `/aginfer/event` (DESIGN §4 round-9 B4 /
+        §6 L506 fire-and-forget).  The synchronous response.skipped[]
+        is preserved for the cold-start / debug code paths that still
+        read it; the webhook is the authoritative source the daemon's
+        observability counter listens to.
+        """
+        apply = getattr(self.tree_cache, "apply_aginfer_migrations", None)
+        if apply is None:
+            skipped = [
+                {
+                    "hash": a.get("hash"),
+                    "reason": f"unsupported_tree_cache:{type(self.tree_cache).__name__}",
+                    "action_id": a.get("action_id"),
+                }
+                for a in (recv_req.actions or [])
+            ]
+            self._fire_apply_failed_for_skipped(skipped)
+            return MigrateAginferReqOutput(
+                applied=0,
+                applied_hashes=[],
+                skipped=skipped,
+            )
+        result = apply(recv_req.actions or [])
+        skipped_list = list(result.get("skipped", []))
+        self._fire_apply_failed_for_skipped(skipped_list)
+        # T24 (#182): fire one HASH_COLLISION webhook per pair the
+        # cache's DFS surfaced.  Detection is dedupe-guarded inside
+        # the cache (_aginfer_collision_seen set), so a persistent
+        # collision fires the daemon's fatal exactly once.
+        self._fire_hash_collisions(result.get("hash_collisions") or [])
+        return MigrateAginferReqOutput(
+            applied=int(result.get("applied", 0)),
+            applied_hashes=list(result.get("applied_hashes", [])),
+            skipped=skipped_list,
+        )
+
+    def _fire_apply_failed_for_skipped(self, skipped_list) -> None:
+        """T23: one APPLY_FAILED webhook per skipped/failed action."""
+        if self.aginfer_webhook is None:
+            return
+        for entry in skipped_list:
+            reason = entry.get("reason")
+            if not isinstance(reason, str) or not reason:
+                continue
+            self.aginfer_webhook.fire_apply_failed(
+                endpoint="migrate",
+                action_id=str(entry.get("action_id") or ""),
+                reason=reason,
+                hash_=entry.get("hash"),
+            )
+
+    def _fire_hash_collisions(self, collisions) -> None:
+        """T24 (#182): one HASH_COLLISION webhook per (node_a,
+        node_b) pair the cache's DFS surfaced.  Cache's
+        ``_aginfer_collision_seen`` set dedupes pair-by-pair, so
+        a persistent collision triggers exactly one daemon fatal.
+        """
+        if self.aginfer_webhook is None:
+            return
+        for entry in collisions:
+            key = entry.get("key")
+            if not isinstance(key, str) or not key:
+                continue
+            self.aginfer_webhook.fire_hash_collision(
+                key=key,
+                node_a_summary=entry.get("node_a_summary") or {},
+                node_b_summary=entry.get("node_b_summary") or {},
+            )
+
+    def update_aginfer_thresholds(
+        self, recv_req: UpdateAginferThresholdsReq,
+    ) -> UpdateAginferThresholdsReqOutput:
+        """T22 (#155): daemon → sglang PUT /aginfer/thresholds handler.
+
+        DESIGN §6 round-6 H3 / §10 'Threshold parity': daemon is the
+        canonical source, sglang applies atomically.  Validation
+        lives in ``apply_thresholds_payload``; on success the
+        scheduler's AginferWebhookFirer instance has the new values
+        by next ``maybe_fire``.
+        """
+        if self.aginfer_webhook is None:
+            return UpdateAginferThresholdsReqOutput(
+                ok=False,
+                reason=(
+                    "sglang launched without --aginfer-notify-url; "
+                    "no webhook firer to update"
+                ),
+            )
+        from sglang.srt.managers.aginfer_webhook import (
+            apply_thresholds_payload,
+        )
+        body = {
+            "theta_hi":    recv_req.theta_hi,
+            "theta_lo":    recv_req.theta_lo,
+            "theta_crit":  recv_req.theta_crit,
+            "heartbeat_s": recv_req.heartbeat_s,
+        }
+        ok, reason = apply_thresholds_payload(self.aginfer_webhook, body)
+        return UpdateAginferThresholdsReqOutput(ok=ok, reason=reason)
+
+    def update_aginfer_program_paused(
+        self, recv_req: UpdateAginferProgramPausedReq,
+    ) -> UpdateAginferProgramPausedReqOutput:
+        """T21 (#181): daemon → sglang PUT /aginfer/program_paused.
+
+        DESIGN §6 round-6 H2: daemon owns the program-state
+        transition (REASONING / ACTING / PAUSED / ENDED); sglang
+        stores it as a passthrough and echoes it back in the next
+        /aginfer/state dump's per_program_usage[pid] entry.
+        Idempotent re-apply returns applied=0 (DESIGN §10 R2).
+
+        Storage lives on the radix cache so the dump-path can read
+        it without a scheduler round-trip.  Tree caches without
+        the setter (legacy HiRadixCache) reject the PUT.
+        """
+        setter = getattr(
+            self.tree_cache, "set_aginfer_program_state", None,
+        )
+        if setter is None:
+            return UpdateAginferProgramPausedReqOutput(
+                ok=False,
+                reason=(
+                    f"tree cache {type(self.tree_cache).__name__} "
+                    f"does not support set_aginfer_program_state; "
+                    f"set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1"
+                ),
+                applied=0,
+            )
+        ok, reason, applied = setter(
+            pid=recv_req.pid,
+            state=recv_req.state,
+            pre_pause_state=recv_req.pre_pause_state,
+        )
+        return UpdateAginferProgramPausedReqOutput(
+            ok=ok, reason=reason, applied=applied,
+        )
+
+    def update_aginfer_hints(
+        self, recv_req: UpdateAginferHintsReq,
+    ) -> UpdateAginferHintsReqOutput:
+        """T40 (#184): daemon → sglang PUT /aginfer/hints handler.
+
+        DESIGN §6: the daemon re-scores D_t every event and pushes the
+        V_u inputs unconditionally; sglang's hint table dedupes by
+        overwrite-by-stamp.  Storage lives on the radix cache (the
+        inline scorer reads it at its allocation callsite without a
+        scheduler round-trip).  Tree caches without the setter reject
+        the PUT (same contract as program_paused)."""
+        setter = getattr(self.tree_cache, "set_aginfer_hints", None)
+        if setter is None:
+            return UpdateAginferHintsReqOutput(
+                ok=False,
+                reason=(
+                    f"tree cache {type(self.tree_cache).__name__} "
+                    f"does not support set_aginfer_hints; "
+                    f"set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1"
+                ),
+                applied=0,
+            )
+        ok, reason, applied = setter(recv_req.hints)
+        return UpdateAginferHintsReqOutput(ok=ok, reason=reason, applied=applied)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -4143,3 +4666,12 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            # aginfer T5: tear down the webhook firer's background asyncio
+            # loop + httpx client.  Without this, the daemon thread + open
+            # connections leak across scheduler restarts (audit-round-1
+            # BLOCKER 2).
+            if getattr(scheduler, "aginfer_webhook", None) is not None:
+                try:
+                    scheduler.aginfer_webhook.close()
+                except Exception:
+                    logger.exception("aginfer_webhook.close() failed")
