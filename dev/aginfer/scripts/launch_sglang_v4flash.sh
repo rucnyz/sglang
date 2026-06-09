@@ -11,9 +11,11 @@ MODEL_PATH="deepseek-ai/DeepSeek-V4-Flash"
 # Bind to all interfaces so harbor agents in Docker containers can reach the
 # server at host.docker.internal:30000 (= 172.17.0.1 from the bridge).
 HOST="0.0.0.0"
-PORT=30000
+# Port + log overridable so two stacks can run in parallel on disjoint GPU
+# pairs (instance B passes SGLANG_PORT / SGLANG_LOG_FILE / MOONCAKE_MASTER).
+PORT="${SGLANG_PORT:-30000}"
 
-LOG="$AGINFER_LOGS/sglang_v4flash.log"
+LOG="${SGLANG_LOG_FILE:-$AGINFER_LOGS/sglang_v4flash.log}"
 rotate_log "$LOG"
 echo "[launch_sglang] GPUs=$AGINFER_GPUS MODEL=$MODEL_PATH PORT=$PORT"
 echo "[launch_sglang] logging to $LOG"
@@ -23,12 +25,12 @@ echo "[launch_sglang] logging to $LOG"
 # enable_ssd_offload: spill to /scratch/yuzhou/mooncake_ssd.
 MOONCAKE_EXTRA=$(cat <<EOF
 {
-  "master_server_address": "127.0.0.1:50051",
+  "master_server_address": "${MOONCAKE_MASTER:-127.0.0.1:50051}",
   "local_hostname": "localhost",
   "metadata_server": "P2PHANDSHAKE",
   "protocol": "tcp",
   "device_name": "",
-  "global_segment_size": "200gb",
+  "global_segment_size": "${HICACHE_STORE_SIZE:-200gb}",
   "local_buffer_size": "4gb"
 }
 EOF
@@ -51,6 +53,15 @@ fi
 
 TP="${SGLANG_TP:-2}"
 EP="${SGLANG_EP:-$TP}"
+
+# Explicit nccl/dist port so two parallel stacks don't collide on sglang's
+# port-derived internal TCP ports (a +100 HTTP offset was NOT enough — the
+# second stack's HTTP bind landed on the first's nccl/dist range).  Unset =
+# sglang's default (random) for the single-instance path.
+NCCL_ARG=()
+if [[ -n "${SGLANG_NCCL_PORT:-}" ]]; then
+    NCCL_ARG=(--nccl-port "$SGLANG_NCCL_PORT")
+fi
 
 # aginfer T5 webhook target.  sglang's AginferWebhookFirer POSTs
 # memory_pressure / pressure_resolved transitions here.  Default
@@ -92,6 +103,7 @@ CUDA_VISIBLE_DEVICES="$AGINFER_GPUS" \
 python -m sglang.launch_server \
     --model-path "$MODEL_PATH" \
     --host "$HOST" --port "$PORT" \
+    "${NCCL_ARG[@]}" \
     --tp "$TP" --ep "$EP" \
     --moe-a2a-backend none \
     --moe-runner-backend deep_gemm \
@@ -101,7 +113,7 @@ python -m sglang.launch_server \
     $MAX_RUNNING_ARG \
     $EVICTION_POLICY_ARG \
     --enable-hierarchical-cache \
-    --hicache-ratio 1.5 \
+    --hicache-ratio "${HICACHE_RATIO:-1.5}" \
     --hicache-write-policy write_through_selective \
     --hicache-storage-backend mooncake \
     --hicache-storage-prefetch-policy best_effort \
