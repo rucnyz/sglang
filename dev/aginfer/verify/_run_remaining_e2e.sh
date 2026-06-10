@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run the 3 settle-fixed e2e verifies, each on a FRESH sglang (clean tree).
 # t17 has a slow 10k-unit stress stage -> 1500s budget. session needs chunked-64.
-WT=/scratch/yuzhou/projects/sglang-sync
+WT=/scratch/yuzhou/projects/sglang
 PY=/scratch/yuzhou/miniconda3/envs/agsched-rebase/bin/python
 DA="$WT/dev/aginfer"
 cd "$DA"

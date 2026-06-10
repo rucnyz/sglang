@@ -4,7 +4,7 @@
 # (daemon proxy) forwarding to sglang on :30000.  HiCache HBM<->DRAM only (no
 # mooncake L3 needed for these). GPU 7 so it can run alongside integration_stress.
 set -uo pipefail
-WT=/scratch/yuzhou/projects/sglang-sync
+WT=/scratch/yuzhou/projects/sglang
 PY=/scratch/yuzhou/miniconda3/envs/agsched-rebase/bin/python
 DA="$WT/dev/aginfer"
 GPU="${STACK_GPU:-7}"

@@ -2,7 +2,7 @@
 # Single sglang on :30000 with the t17 README canonical profile (write_through
 # forces unit population; flashinfer attn; small KV pool; chunked64 for
 # session_id_passthrough). No daemon -- these tests hit sglang directly.
-WT=/scratch/yuzhou/projects/sglang-sync
+WT=/scratch/yuzhou/projects/sglang
 PY=/scratch/yuzhou/miniconda3/envs/agsched-rebase/bin/python
 for p in $(pgrep -f "launch_server.*--port 30000"); do kill -9 "$p" 2>/dev/null; done
 sleep 3

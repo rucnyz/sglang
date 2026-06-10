@@ -2,7 +2,7 @@
 # Bring up the S1 "ours" stack (a3 config) on the REBASED build and HOLD it so
 # s1_driver can run against it.  Order: mooncake -> daemon (kv+admission ON) ->
 # sglang (V4-Flash flashinfer_mxfp4 + HiCache + mooncake, 256K KV pool).
-# Env (agsched-rebase + sglang-sync) comes from scripts/env.sh.
+# Env (agsched-rebase + sglang) comes from scripts/env.sh.
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1   # dev/aginfer
 source scripts/env.sh

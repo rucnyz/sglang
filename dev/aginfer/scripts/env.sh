@@ -10,9 +10,11 @@ set -euo pipefail
 # 0.4.3 / flashinfer 0.6.12) required by the upstream-main rebase on this branch.
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
 conda activate agsched-rebase
-# Import the REBASED sglang (this worktree's python/), not the editable install
-# that still points at the old fork.
-export PYTHONPATH="/scratch/yuzhou/projects/sglang-sync/python:${PYTHONPATH:-}"
+# Import this checkout's sglang python/ (the rebased build), not the editable
+# install that still points at the old fork.  Derived from THIS script's location
+# (dev/aginfer/scripts/env.sh -> ../../.. = the sglang checkout root) so it
+# survives moving/renaming the checkout (worktree consolidation) — no hardcode.
+export PYTHONPATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/python:${PYTHONPATH:-}"
 
 # Load .env. set -a auto-exports every assignment.
 _ENV_DIR="$(dirname "${BASH_SOURCE[0]}")/.."

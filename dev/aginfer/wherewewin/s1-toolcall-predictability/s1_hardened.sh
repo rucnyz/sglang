@@ -8,7 +8,7 @@
 #  4) offset-bounded daemon counters captured BEFORE any further restart.
 # Env: POOL, MAXRUN, PROGRAMS, PREFIX, OUT_TOK, TURNS, GAP, ETA, STAGGER.
 set +e
-WT=/scratch/yuzhou/projects/sglang-sync
+WT=/scratch/yuzhou/projects/sglang
 cd "$WT/dev/aginfer" || exit 1
 PY=/scratch/yuzhou/miniconda3/envs/agsched-rebase/bin/python
 POOL="${POOL:-28672}"; MAXRUN="${MAXRUN:-1}"; PROGRAMS="${PROGRAMS:-2}"

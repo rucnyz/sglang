@@ -1,7 +1,7 @@
 #!/bin/bash
 # Parametrized Qwen3-0.6B launcher for verify e2e. Env knobs:
 #   GPU (default 7)  PORT (30000)  WRITE_POLICY (write_through)  CHUNKED (unset)
-WT=/scratch/yuzhou/projects/sglang-sync
+WT=/scratch/yuzhou/projects/sglang
 PY=/scratch/yuzhou/miniconda3/envs/agsched-rebase/bin/python
 GPU="${GPU:-7}"; PORT="${PORT:-30000}"; WP="${WRITE_POLICY:-write_through}"
 for p in $(pgrep -f "launch_server.*--port $PORT"); do kill -9 "$p" 2>/dev/null; done

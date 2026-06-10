@@ -5,7 +5,7 @@
 # N>=3. Prints the resume-TTFT line for each arm.
 cd "$(dirname "$0")/../.." || exit 1   # dev/aginfer
 PY=/scratch/yuzhou/miniconda3/envs/agsched-rebase/bin/python
-WT=/scratch/yuzhou/projects/sglang-sync
+WT=/scratch/yuzhou/projects/sglang
 PROGRAMS="${PROGRAMS:-10}"; PREFIX="${PREFIX:-12000}"; GAP="${GAP:-20}"
 ETA="${ETA:-20}"; OUT_TOK="${OUT_TOK:-1000}"; TURNS="${TURNS:-4}"; STAGGER="${STAGGER:-2.5}"
 POOL="${POOL:-98304}"; MAXRUN="${MAXRUN:-6}"

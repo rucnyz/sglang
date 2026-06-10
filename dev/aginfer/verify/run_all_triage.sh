@@ -3,7 +3,7 @@
 # Runs every verify/*/verify.py with the rebased sglang on PYTHONPATH, captures
 # exit code + last error line. NOT a pass/fail gate -- a landscape sweep so we
 # can fix rebase-induced breakage one-by-one.
-WT=/scratch/yuzhou/projects/sglang-sync
+WT=/scratch/yuzhou/projects/sglang
 PY=/scratch/yuzhou/miniconda3/envs/agsched-rebase/bin/python
 DA="$WT/dev/aginfer"
 export AGINFER_ROOT="$DA"
