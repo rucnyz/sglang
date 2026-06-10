@@ -1384,6 +1384,8 @@ class KvScheduler:
                 kind=event.kind.value,
                 dset_size=self.last_decision_set_size,
                 outcome="policy_declined",
+                eta=event.payload.get("tool_eta_s"),
+                cmd=str((event.payload.get("tool_args") or {}).get("command", ""))[:16],
             )
             return
         await self._dispatch_plan(plan, sched_state)
