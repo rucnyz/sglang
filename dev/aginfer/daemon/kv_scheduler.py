@@ -863,6 +863,29 @@ def build_paper_state(
             is_tree_leaf=bool(raw.get("is_tree_leaf", True)),
         )
 
+    # DESIGN §7 per-event override (estimator priority #1).  On TOOL_CALL_START
+    # the caller is about to be idle for *this* tool's ETA, and §7 makes that
+    # ETA both the reuse horizon (Δt) and the holding window (hold_time) for
+    # demoting its session tail.  Plug the per-event ETA in as hold_time —
+    # `_value` integrates the HBM holding tax over `hold_time = 1/lambda_rate`,
+    # so set `lambda_rate = 1/ETA` on the caller's exclusive tail.  This
+    # REPLACES the constant `λ_ACTING` fallback (the Poisson `1/λ` collapse §7
+    # explicitly drops) for the one case where a sharper signal exists.  Without
+    # it the demote value cannot tell a 0.5 s tool from a 60 s one — exactly the
+    # long-predictable-gap signal S1 exploits.  hold_time is a per-DECISION
+    # quantity (§7), and `units` is rebuilt every event, so this override is
+    # naturally scoped to this decision and does not persist.
+    if event.kind == EventKind.TOOL_CALL_START and event.session:
+        _eta_raw = event.payload.get("tool_eta_s")
+        try:
+            _eta = float(_eta_raw) if _eta_raw is not None else 0.0
+        except (TypeError, ValueError):
+            _eta = 0.0
+        if _eta > 0.0:
+            for _uid in _units_for_session(units, event.session):
+                if _uid in units:
+                    units[_uid].lambda_rate = 1.0 / _eta
+
     decision_set = _build_decision_set(event, units, tracker)
 
     return SchedulerState(
