@@ -1085,7 +1085,16 @@ def authoritative_tier(residence):
 # authoritative tier (= the tier serving the next access).
 def _value(u, residence, state):
     a = authoritative_tier(residence)
-    return  p_hat(u, Δt) * (reload_from_DROP(u) - reload_from(u, a)) \
+    # reuse_tier = the tier that ACTUALLY serves the next access.  Normally
+    # `a` (the candidate residence).  EXCEPTION — a `promote_pending` unit
+    # (the tool-gap tail with a paired predictive promote-back, below): the
+    # promote pre-stages it to HBM before the resume, so the reuse is served
+    # from HBM regardless of where it sits during the gap.  Charging `a`'s
+    # load_back here would double-count a cost the promote eliminates, and a
+    # soon-reused tail would never demote.  The holding tax still accrues at
+    # `a` (where the unit physically sits during the gap).
+    reuse_tier = HBM if u.promote_pending else a
+    return  p_hat(u, Δt) * (reload_from_DROP(u) - reload_from(u, reuse_tier)) \
           - sum(h_(a, sp)(occupancy_of(a, sp, state)) *
                 u.n_bytes[a][sp] * hold_time
                 for sp in u.n_bytes[a])
@@ -1219,6 +1228,20 @@ apply-site guards:
   is a device leaf yet not a tree leaf).  These flags come straight
   from the state dump.
 
+  > **Exception — `promote_pending` whole-chain demote.**  The device-leaf
+  > guard is *per-unit*: it assumes each `remove {HBM}` is evaluated against
+  > a tree that is otherwise unchanged.  That holds for an isolated pressure
+  > demote, but NOT for the tool-gap demote of a program's whole exclusive
+  > chain, where the bulk prefix is an internal (non-device-leaf) node that
+  > becomes removable only after its own descendants are removed *in the same
+  > batch*.  For a `promote_pending` chain, candidate generation therefore
+  > proposes `remove {HBM}` for EVERY unit of the chain (non-leaves included),
+  > and sglang's apply peels them leaf-inward (deepest-node-first), so each
+  > parent is a device-leaf by the time its own remove is reached.  The chain
+  > must be dispatched as ONE coordinated group — the §9 selector must not
+  > cherry-pick the bulk non-leaf without the descendant leaves that start the
+  > peel, or sglang rejects the lot with `remove_hbm_not_device_leaf`.
+
 * **Active-decode holder guard.**  Even a unit that *is* a device
   leaf in the dump is reject-guaranteed for `remove {HBM}` when one
   of its holder programs is **actively decoding** — i.e. has a
@@ -1239,6 +1262,18 @@ apply-site guards:
   scheduler's core source of relief.  Absent / cold-start `inflight`
   never suppresses, so the gate cannot strand the policy before the
   signal populates.
+
+  > **Exception — `promote_pending` overrides the gate at `TOOL_CALL_START`.**
+  > The gate reads `inflight` from the dump, which lags the request lifecycle:
+  > at the instant the daemon processes `TOOL_CALL_START`, the just-finished
+  > turn's `inflight` may not have cleared yet, so the gate would wrongly
+  > suppress the tail's demote on a lagging signal.  But the *event itself* is
+  > the authoritative statement that the holder is now tool-parked for the ETA
+  > — a stronger signal than the lagging metric — and a parked unit will not
+  > re-lock (so there is no evict-storm to fear).  A `promote_pending` unit
+  > therefore bypasses this gate.  (The gate still protects genuinely
+  > decoding holders outside the tool-gap path — pressure demotes, SUB_RETURN,
+  > etc. — where no such authoritative parked-signal exists.)
 
   *Bound.*  The holder set comes from the unit's `session_ids`, which
   sglang accumulates add-only over a program's lifetime, so the guard
