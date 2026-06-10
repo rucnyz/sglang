@@ -1440,6 +1440,12 @@ class KvScheduler:
         consistency lag.  Reconstructed from scratch on restart (no persistence)."""
         self._dump_gen += 1
         if not self._pending_demote:
+            # Recovery drift: with nothing pending, slowly relax the apply-rate
+            # EMA back toward 1.0 so a sustained yield re-probes demotes once
+            # pressure eases — otherwise the yield (which suppresses dispatch,
+            # hence new measurements) would lock in permanently.
+            if self._demote_apply_ema < 1.0:
+                self._demote_apply_ema = min(1.0, self._demote_apply_ema + 0.02)
             return
         for h, gen in list(self._pending_demote.items()):
             if self._dump_gen - gen < 1:
