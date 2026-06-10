@@ -12,6 +12,10 @@ arm=b does not (recompute).  Same background both arms.
 import requests, time, statistics, sys, threading, json as J
 B = "http://127.0.0.1:30000"; D = "http://127.0.0.1:9100"; V = 129000
 ARM = sys.argv[1] if len(sys.argv) > 1 else "ours"
+# arm=ta routes /generate through the ThunderAgent proxy (:9000), which does its
+# own router-side admission and forwards to sglang; ta uses NO aginfer events
+# (TA is HiCache-blind, never promotes — so its resume still recomputes).
+GEN = "http://127.0.0.1:9000" if ARM == "ta" else B
 import os
 VICT = int(os.environ.get("LC_VICT", "30000")); ETA = float(os.environ.get("LC_ETA", "16.0"))
 N_VICT = int(os.environ.get("LC_NVICT", "6")); BG_THREADS = int(os.environ.get("LC_BG", "0"))
@@ -25,7 +29,7 @@ def seq(s, n): return [(s + i) % V for i in range(n)]
 
 def gen(ids, pid, mx=2):
     try:
-        requests.post(B + "/generate", json={"input_ids": ids, "sampling_params":
+        requests.post(GEN + "/generate", json={"input_ids": ids, "sampling_params":
             {"temperature": 0, "max_new_tokens": mx, "ignore_eos": True},
             "program_id": pid}, timeout=300)
     except Exception:
@@ -52,7 +56,7 @@ def ttft(ids, pid):
     body = {"input_ids": ids, "sampling_params": {"temperature": 0,
             "max_new_tokens": 6, "ignore_eos": True}, "program_id": pid, "stream": True}
     t0 = time.perf_counter(); tt = None; c = 0
-    with requests.post(B + "/generate", json=body, timeout=300, stream=True) as r:
+    with requests.post(GEN + "/generate", json=body, timeout=300, stream=True) as r:
         for line in r.iter_lines():
             if not line:
                 continue
@@ -91,7 +95,7 @@ def victim(vid_i):
     (the prefixes evict each other), then everyone parks → GPU goes IDLE → the
     daemon warms each evicted prefix back using that idle → resume hits HBM.  No
     continuous background (which would remove the idle the warm needs)."""
-    inject = (ARM in ("ours", "ta"))
+    inject = (ARM == "ours")
     pid = f"VIC{vid_i}"
     time.sleep(vid_i * STAGGER)                        # stagger the establish burst
     vids = seq((vid_i * 7001 + 1) % V, VICT)
@@ -123,7 +127,7 @@ def ticker():
 
 
 bg = [threading.Thread(target=background, args=(i,), daemon=True) for i in range(BG_THREADS)]
-if ARM in ("ours", "ta"):
+if ARM == "ours":
     bg.append(threading.Thread(target=ticker, daemon=True))
 vt = [threading.Thread(target=victim, args=(i,), daemon=True) for i in range(N_VICT)]
 for t in bg:
