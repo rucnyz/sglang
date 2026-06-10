@@ -6,9 +6,13 @@
 
 set -euo pipefail
 
-# Conda env (preinstalled: torch 2.11.0+cu130, sglang dev, mooncake, sgl_kernel, flash_mla).
+# Conda env. agsched-rebase = clone of agsched with bumped deps (sglang-kernel
+# 0.4.3 / flashinfer 0.6.12) required by the upstream-main rebase on this branch.
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
-conda activate agsched
+conda activate agsched-rebase
+# Import the REBASED sglang (this worktree's python/), not the editable install
+# that still points at the old fork.
+export PYTHONPATH="/scratch/yuzhou/projects/sglang-sync/python:${PYTHONPATH:-}"
 
 # Load .env. set -a auto-exports every assignment.
 _ENV_DIR="$(dirname "${BASH_SOURCE[0]}")/.."
