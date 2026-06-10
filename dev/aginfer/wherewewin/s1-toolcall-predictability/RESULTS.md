@@ -101,11 +101,19 @@ the per-program freed footprint and the mechanism are established here.)
   (DESIGN §3/§9, committed).
 - **Win measured** end-to-end (above), via **manual pre-access** standing in for the
   daemon's automatic promote.
-- **Remaining (productionization)**: wire the daemon's automatic DISK→HBM promote (#238) —
-  `disk_tier_not_yet_wired` in `apply_aginfer_migrations`; = `prefetch_from_storage`
-  (DISK→DRAM, async/request-oriented) + `load_back` (DRAM→HBM) plumbing, node-targeted.
-  The daemon's decision logic is already proven; this is the sglang storage-load transfer
-  path. Outcome is predictable from the measured win + characterized links.
+- **Autonomous DISK→HBM promote DONE + measured (#238)**: the original "wire
+  `prefetch_from_storage` into the apply" scope was MISCONCEIVED — a DISK-evicted prefix
+  *leaves the radix tree* (`_evict_host_leaf` → `_remove_leaf_from_parent`), so the
+  node-based migrate plane can't reach it. The clean path needs **zero** sglang
+  storage-controller change: a `/generate(input_ids, max_new_tokens=0)` is `is_prefill_only`
+  — it runs the native prefix-match → storage-prefetch → load_back (KV → HBM), skips
+  decode, retains it cached. Uniform across DRAM/DISK/dropped. Plumbed end-to-end: the
+  proxy/driver registers each session's prefix (`POST /aginfer/session_prefix`); the
+  action-timeline promote fires `warm_to_hbm` (prefer warm; per-unit DRAM `load_back`
+  migrate is the fallback). **Measured fully daemon-driven** (`auto_victim_warm.py`, N=3):
+  daemon warms a fully-evicted 50K victim → resume `cached=49920` = 274 ms vs B recompute
+  3094 ms = **91% / 2.82 s**, `via=warm` 3/3. (A 10-program live A/B gives ~18% p50 —
+  partial eviction + event-cadence timing jitter; the clean magnitude is the 91% above.)
 
 ## Honest caveats
 
