@@ -152,6 +152,14 @@ _DEMOTE_YIELD_EMA = _env_float("AGINFER_DEMOTE_YIELD_EMA", "0.4")
 # start); a conservative DRAM-class rate keeps the lead time from collapsing
 # to zero (which would degenerate to a TOOL_CALL_END-time promote).
 _PROMOTE_SAFETY_MARGIN_S = _env_float("AGINFER_PROMOTE_MARGIN_S", "0.05")
+# #241: the predictive promote now executes as a prefill-only WARM (#238) — a
+# full /generate(max_new_tokens=0), not a pure KV load_back.  Its completion
+# cost is therefore a PREFILL (storage-load + any recompute + scheduler queue),
+# ~seconds under load, not the ~0.1s of a DRAM/DISK transfer.  So the promote
+# must be scheduled this many seconds before the resume (a FLOOR on the lead) so
+# the warm completes in time; the data-transfer ``load_back_s`` is only a lower
+# bound.  Win-preserving to overshoot (prefix simply HBM-resident a bit earlier).
+_WARM_LEAD_S = _env_float("AGINFER_WARM_LEAD_S", "2.5")
 _PROMOTE_FALLBACK_BW_BPS = _env_float("AGINFER_PROMOTE_FALLBACK_BW_BPS", "5e9")
 
 
@@ -1671,8 +1679,12 @@ class KvScheduler:
         total_bytes = sum(sched_state.units[uid].n_bytes
                           for uid in tail if uid in sched_state.units)
         load_back_s = _estimate_load_back_s(sched_state, total_bytes)
+        # #241: the promote runs as a prefill-only WARM (#238), whose completion
+        # is prefill-class (queue+compute+load), not transfer-class.  Use
+        # _WARM_LEAD_S as a FLOOR on the lead so the warm lands before the resume.
+        eff_lead_cost = max(load_back_s, _WARM_LEAD_S)
         now = event.enqueue_time  # event-stream clock (perf_counter frame)
-        lead = max(0.0, eta - load_back_s - _PROMOTE_SAFETY_MARGIN_S)
+        lead = max(0.0, eta - eff_lead_cost - _PROMOTE_SAFETY_MARGIN_S)
         due = now + lead
         from_tiers = tuple({t for uid in tail if uid in sched_state.units
                             for t in sched_state.units[uid].residence})
