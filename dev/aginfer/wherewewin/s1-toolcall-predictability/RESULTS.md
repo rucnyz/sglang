@@ -112,8 +112,19 @@ the per-program freed footprint and the mechanism are established here.)
   action-timeline promote fires `warm_to_hbm` (prefer warm; per-unit DRAM `load_back`
   migrate is the fallback). **Measured fully daemon-driven** (`auto_victim_warm.py`, N=3):
   daemon warms a fully-evicted 50K victim → resume `cached=49920` = 274 ms vs B recompute
-  3094 ms = **91% / 2.82 s**, `via=warm` 3/3. (A 10-program live A/B gives ~18% p50 —
-  partial eviction + event-cadence timing jitter; the clean magnitude is the 91% above.)
+  3094 ms = **91% / 2.82 s**, `via=warm` 3/3.
+- **Clean STABLE multi-program live win (#241)**: 6 concurrent programs, realistic
+  establish→park→resume (a burst of memory pressure, then idle gaps) with a dense event
+  stream (`live_clean.py`, N=3). **ours TTFT 1251±71 ms vs B 2109±314 ms = 41% faster, every
+  cycle ours wins**; ours `cached ≈ 29881/30000` (full hit) vs B 0 (recompute) every cycle.
+  Three diagnosis-driven fixes got here from an earlier −27% *unstable* result: (1) a
+  `WARM_LEAD` floor (the warm is a prefill, not a ~0.1 ms transfer, so it must fire
+  seconds early); (2) a dense event clock (so the action-timeline fires the warm on time —
+  production posts events per request); (3) the realistic agentic STRUCTURE (burst-then-
+  idle, not a continuous flood that removes the GPU idle the warm needs). **Honest finding:
+  the S1 win is clean under the GPU-idle premise (real tool-parking); a compute-saturated
+  synthetic regime hides it because the warm — an extra prefill — has no free GPU and its
+  cached-saving is eaten by queue (the documented "spare GPU during the gap" caveat).**
 
 ## Honest caveats
 
