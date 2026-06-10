@@ -82,16 +82,30 @@ the per-program freed footprint and the mechanism are established here.)
 
 - **Mechanism proven**: whole-chain demote applies leaf-inward (`probe_mimic.py`
   applied=5/5); predictive-promote logic dispatches (mimic, and §3 action-timeline).
+- **Autonomous ETA learning + value-gating proven LIVE** (#239): the daemon learns the
+  per-command ETA online — `bash/ls`=0.8s vs `bash/sleep`=20s, learned *separately* at
+  command-token granularity (`ls` is a `bash` argument), no hardcoding — and value-gates
+  the demote: under pressure `ls` is **declined every time** (gap can't cover the
+  migration round-trip), `sleep` is **dispatched as whole chains** (13× in a 9-program
+  run). `daemon/eta_estimator.py`; gating observable via the `kv_decide eta=… cmd=…`
+  metric.
+- **Saturation yield proven LIVE (do-no-harm, #240)**: the daemon's explicit demote
+  loses the lock-race to sglang's own write-through / reactive-eviction lock at the apply
+  moment (`remove_hbm_not_device_leaf:locked`). The daemon **self-measures** whether its
+  demotes land (hash still HBM-resident a dump later → didn't) and **yields** below a 0.4
+  apply-rate EMA. Live: yield fired 29×, **`:locked` churn 157 → 0**, daemon clean — the
+  5× do-no-harm regression eliminated. sglang's V_u-guided reactive eviction does the
+  demote; the daemon keeps the promote. A recovery drift re-probes once pressure eases.
 - **Design finalized**: single V_u over two execution timescales (sync reactive scorer +
   async proactive migrate), proactive-first/reactive-fallback, saturation yield
   (DESIGN §3/§9, committed).
 - **Win measured** end-to-end (above), via **manual pre-access** standing in for the
   daemon's automatic promote.
-- **Remaining (productionization)**: wire the daemon's automatic DISK→HBM promote —
+- **Remaining (productionization)**: wire the daemon's automatic DISK→HBM promote (#238) —
   `disk_tier_not_yet_wired` in `apply_aginfer_migrations`; = `prefetch_from_storage`
-  (DISK→DRAM) + `load_back` (DRAM→HBM) plumbing. The daemon's decision logic is already
-  proven; this is the sglang storage-load transfer path. Outcome is predictable from the
-  measured win + characterized links.
+  (DISK→DRAM, async/request-oriented) + `load_back` (DRAM→HBM) plumbing, node-targeted.
+  The daemon's decision logic is already proven; this is the sglang storage-load transfer
+  path. Outcome is predictable from the measured win + characterized links.
 
 ## Honest caveats
 
