@@ -291,7 +291,15 @@ def migrate_candidates(
             # Suppress remove-HBM for such units; the device-retaining
             # remove-DRAM stays allowed (host-side, lock-safe), and tool-parked
             # holders (inflight empty) keep their evictable idle tail.
-            if Tier.HBM in remove_tiers and _holder_actively_decoding(u, state):
+            # #224 suppresses remove-HBM for actively-decoding holders (their
+            # node re-locks between dump and apply).  EXCEPT a `promote_pending`
+            # tail: the TOOL_CALL_START event AUTHORITATIVELY says the holder is
+            # now tool-parked for the ETA, so a non-zero `inflight` here is the
+            # just-finished turn's snapshot lag, not active decoding — and a
+            # parked unit will NOT re-lock, so there is no evict-storm to fear.
+            # The event is the stronger signal than the lagging metric.
+            if (Tier.HBM in remove_tiers and not _chain
+                    and _holder_actively_decoding(u, state)):
                 continue
 
             cost = value_residence(u, current, state, costs, pi_u) \
