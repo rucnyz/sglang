@@ -2910,6 +2910,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # would then crash inside _remove_leaf_from_parent or double-
         # free the device buffer.
         acted_node_ids: set[int] = set()
+        # S1 whole-chain demote: a remove-HBM device-evict nulls the node's
+        # device cd.value VIA TOMBSTONE (deferred — see `_evict_to_host`), so a
+        # parent processed LATER in this same batch still sees the just-evicted
+        # child's stale `cd.value is not None` and fails the device-leaf guard
+        # (`remove_hbm_not_device_leaf:dev_children`).  Track nodes whose HBM
+        # was removed in THIS batch and treat them as device-cleared when
+        # re-deriving a parent's device-leaf-ness — so an exclusive chain peels
+        # leaf-inward in one batch (deepest-first sort guarantees the child is
+        # evicted before its parent, so the descendant's device KV is already
+        # being freed → evicting the parent now is invariant-safe).
+        batch_removed_hbm: set[int] = set()
+
+        def _is_device_leaf_in_batch(node) -> bool:
+            if self._is_device_leaf(node):
+                return True
+            ct = BASE_COMPONENT_TYPE
+            if node is self.root_node or node.evicted:
+                return False
+            if any(cd.lock_ref > 0 for cd in node.component_data):
+                return False
+            for child in node.children.values():
+                if (child.component_data[ct].value is not None
+                        and child.id not in batch_removed_hbm):
+                    return False
+            return True
+
         components = self._components_tuple
         base = BASE_COMPONENT_TYPE
         _VALID_TIERS = {"HBM", "DRAM", "DISK"}
@@ -2998,8 +3024,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Same logic for HOST evict on a host-non-leaf.  Daemon's
             # policy SHOULD only emit migrate actions for leaves —
             # this is a defense-in-depth guard.
-            if "HBM" in remove_tiers and not self._is_device_leaf(node):
-                _skip(h, action_id, "remove_hbm_not_device_leaf")
+            if "HBM" in remove_tiers and not _is_device_leaf_in_batch(node):
+                # Diagnostic detail: WHY is it not a device-leaf right now?
+                _ct = BASE_COMPONENT_TYPE
+                _locked = any(cd.lock_ref > 0 for cd in node.component_data)
+                _dev_children = sum(
+                    1 for c in node.children.values()
+                    if c.component_data[_ct].value is not None)
+                _why = ("locked" if _locked
+                        else f"dev_children={_dev_children}/{len(node.children)}"
+                        if _dev_children else
+                        ("evicted" if node.evicted else "root_or_other"))
+                _skip(h, action_id,
+                      f"remove_hbm_not_device_leaf:{_why}")
                 continue
             if "DRAM" in remove_tiers and not self._is_host_leaf(node):
                 _skip(h, action_id, "remove_dram_not_host_leaf")
@@ -3122,6 +3159,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # multiple migrates that triggered sglang's
                     # invariant_checker (e2e_smoke 1st run).
                     self._evict_to_host(node, tracker=tracker)
+                    # Mark device-cleared for the in-batch leaf re-derivation
+                    # so this node's PARENT (processed later, deepest-first) is
+                    # recognised as a device-leaf despite the tombstoned (not
+                    # yet nulled) cd.value — lets the exclusive chain peel.
+                    batch_removed_hbm.add(node.id)
                 if "DRAM" in remove_tiers:
                     # Host eviction: evict_component sets cd.host_value
                     # = None inline (no defer; SWA doesn't pin host
