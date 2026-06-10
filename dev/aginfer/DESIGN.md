@@ -193,6 +193,27 @@ on-access load_back) are expressed as aginfer's **default
 policy module**: the policy module that runs when no daemon is
 attached.
 
+"Single decision pipeline" means **one value function (V_u),
+executed at two timescales** — NOT one executor.  The same V_u
+drives both: (a) a **synchronous, reactive** path — sglang's
+in-critical-path eviction scorer (below), which must run
+in-process because a prefill needing room cannot await a daemon
+round-trip; and (b) an **asynchronous, proactive** path — the
+daemon's `joint_decide` migrates (§7), which act *ahead* of
+pressure (e.g. demote a caller's idle tail during a tool gap,
+pre-stage a promote).  These are **value-consistent** (one V_u →
+they never decide against each other) and **proactive-first,
+reactive-fallback**: in a gap the daemon frees room ahead of
+need, so the reactive scorer rarely has to fire; the scorer is
+the in-the-moment safety net for room the daemon did not pre-free.
+The two only *contend* when the proactive window vanishes — under
+sustained saturation, where "ahead of pressure" does not exist and
+both collapse onto the same low-V_u idle tails (the eviction-vs-
+migrate lock race).  That is a regime symptom, not a second
+decision-maker: the relief phase's **saturation yield** (a proactive
+demote with ~zero marginal benefit over the reactive scorer steps
+aside — see §9 relief) keeps it a single policy.
+
 The implication is symmetric across three modes:
 
 | mode | daemon | scorer / write-through policy | behaviour |
@@ -1845,6 +1866,26 @@ all paused programs would tie at 0 and the value knapsack's
 §9 consumes these candidates: relief takes net-positive Migrates from
 §7 (the Pause lever is dormant, §9); the resume phase takes net-positive
 Resumes.
+
+This relief is the **proactive** half of the two-timescale policy (§3):
+it acts ahead of pressure (the §7 `decision_set` is dominated by the
+caller's idle tail at a `TOOL_CALL_START` gap), freeing room the
+**reactive** in-process eviction scorer would otherwise have to free
+synchronously — so in a well-provisioned, *cycling* workload the proactive
+migrate runs in the gap and the reactive scorer rarely fires.  The two share
+V_u, so they never disagree; they only **contend for the same idle tails
+under sustained saturation**, where no pre-pressure window exists and the
+proactive demote duplicates an eviction the reactive scorer is already doing
+in-critical-path (the lock race that strands `migrate_applied`).  The relief
+phase therefore **yields when its marginal benefit over the reactive scorer
+is ~zero** — i.e. when HBM is so saturated that any room the migrate frees is
+reclaimed before the next event AND the reactive scorer is already evicting
+the same low-V_u tails.  Yielding there is value-optimal, not a workaround:
+a proactive move whose room is instantly reused buys nothing the synchronous
+path was not about to buy, so withholding it (no wasted migrate churn, no
+lock race) strictly dominates.  This is also the do-no-harm floor — when the
+proactive levers cannot pay off, the policy degenerates cleanly to the
+reactive scorer (== baseline), never below it.
 
 ### Component definitions
 
