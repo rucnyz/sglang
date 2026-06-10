@@ -129,6 +129,20 @@ _EVICT_COOLDOWN_S = _env_float("AGINFER_EVICT_COOLDOWN_S", "5.0")
 # normal PUT round-trip while bounding the worst-case re-starve to ≤2 events.
 _RESUME_DEDUP_WINDOW = _env_int("AGINFER_RESUME_DEDUP_WINDOW", "2")
 
+# #240 do-no-harm SATURATION YIELD.  The daemon's explicit demote of a caller's
+# idle tail races sglang's OWN lock on the same node at apply time (in-flight
+# write_through of the just-finished turn, or sglang's V_u-guided reactive
+# eviction under pressure) → `remove_hbm_not_device_leaf:locked`, migrate never
+# lands.  Re-dispatching it every event only churns (the 5× do-no-harm regression
+# at occ≈0.99).  We SELF-MEASURE whether recent demotes actually landed (the
+# hash's residence in the next fresh dump no longer has HBM); below this apply-
+# rate EMA the relief phase YIELDS the explicit demote.  This is value-optimal,
+# not a workaround (DESIGN §9 saturation yield): the room is freed by sglang's
+# reactive eviction regardless, so the proactive migrate buys nothing it can land
+# — withholding it (no lock-race churn) strictly dominates, and the daemon keeps
+# its unique lever, the predictive promote.
+_DEMOTE_YIELD_EMA = _env_float("AGINFER_DEMOTE_YIELD_EMA", "0.4")
+
 # DESIGN §3/§7 predictive-promote (action-timeline) scheduling constants.
 # The promote-back of a tool-bound agent's idle tail is scheduled for
 # ``T_start + tool_ETA − load_back_latency − margin`` so it lands in HBM a
@@ -1185,6 +1199,13 @@ class KvScheduler:
         self.last_action: Optional[Action] = None
         self.last_plan: Optional[List[Any]] = None
         self.last_decision_set_size: int = 0
+        # #240 saturation-yield self-measurement: hashes we dispatched a
+        # remove-HBM for, with the dump generation, + an EMA of whether they
+        # actually left HBM by a later dump.  Bounded by the in-flight demote
+        # count; pruned on check; reconstructed-from-scratch on restart.
+        self._pending_demote: Dict[str, int] = {}
+        self._demote_apply_ema: float = 1.0
+        self._dump_gen: int = 0
         # Audit round-2 R2-N2: per-instance unknown-tier log set so
         # cross-test / cross-restart state doesn't leak.
         self._unknown_tier_log: set = set()
@@ -1314,6 +1335,11 @@ class KvScheduler:
             sid for u in sched_state.units.values() for sid in u.holders
         }
         self.tracker.gc_ended(live_pids)
+        # #240 saturation-yield: measure whether our recently-dispatched demotes
+        # actually landed (the hash is no longer HBM-resident in THIS fresh dump)
+        # and update the apply-rate EMA; the post-joint_decide filter below uses
+        # it to yield futile explicit demotes (lock-race vs sglang's own eviction).
+        self._update_demote_apply_rate(sched_state.units)
         self.last_decision_set_size = len(sched_state.decision_set)
         # DESIGN §3/§7 action-timeline plane: on TOOL_CALL_START schedule the
         # caller's idle-tail predictive promote-back for ``T_start + tool_ETA −
@@ -1366,6 +1392,22 @@ class KvScheduler:
                 _cd.pop(_h, None)
             if _cd:
                 plan = _filter_cooled_evicts(plan, _cd, _now)
+        # #240 SATURATION YIELD: if our recent explicit demotes aren't landing
+        # (apply-rate EMA below threshold → racing sglang's own lock at apply),
+        # strip remove-HBM migrates from the plan.  sglang's V_u-guided reactive
+        # eviction frees the same idle tails anyway; the daemon keeps promotes /
+        # pauses / resumes.  Value-optimal do-no-harm (DESIGN §9 saturation yield).
+        if plan and self._demote_apply_ema < _DEMOTE_YIELD_EMA:
+            from baselines.knapsack import Migrate as _Migrate
+            _before = len(plan)
+            plan = [c for c in plan if not (
+                isinstance(c, _Migrate)
+                and isinstance(getattr(c, "id", None), tuple)
+                and len(c.id) >= 3 and Tier.HBM in c.id[2])]
+            if len(plan) < _before:
+                _m("demote_saturation_yield",
+                   ema=round(self._demote_apply_ema, 3),
+                   stripped=_before - len(plan))
         self.decisions += 1
         self.last_plan = plan
         # #215: reconcile in-flight resumes against the fresh dump — runs EVERY
@@ -1389,6 +1431,26 @@ class KvScheduler:
             )
             return
         await self._dispatch_plan(plan, sched_state)
+
+    def _update_demote_apply_rate(self, units: Dict[str, Any]) -> None:
+        """#240: did our recently-dispatched remove-HBM demotes actually land?
+        A dispatched hash STILL HBM-resident a dump-generation later did not
+        apply (lock-race vs sglang's own eviction).  Update the apply-rate EMA
+        the saturation yield reads.  The EMA tolerates the dump's <1s eventual-
+        consistency lag.  Reconstructed from scratch on restart (no persistence)."""
+        self._dump_gen += 1
+        if not self._pending_demote:
+            return
+        for h, gen in list(self._pending_demote.items()):
+            if self._dump_gen - gen < 1:
+                continue  # give the apply at least one fresh dump to show up
+            u = units.get(h)
+            landed = (u is None) or (Tier.HBM not in u.residence)
+            self._demote_apply_ema = (
+                0.7 * self._demote_apply_ema + 0.3 * (1.0 if landed else 0.0))
+            del self._pending_demote[h]
+        if len(self._pending_demote) > 4096:   # safety: never grow unbounded
+            self._pending_demote.clear()
 
     async def _dispatch_plan(self, plan: List[Any], sched_state) -> None:
         """Dispatch a §9 ``joint_decide`` mixed plan (#194).
@@ -1421,6 +1483,12 @@ class KvScheduler:
             outcome="dispatched",
         )
         if migrates:
+            # #240: remember remove-HBM hashes so the next fresh dump tells us
+            # whether they landed (feeds the saturation-yield apply-rate EMA).
+            for m in migrates:
+                _mid = getattr(m, "id", None)
+                if isinstance(_mid, tuple) and len(_mid) >= 3 and Tier.HBM in _mid[2]:
+                    self._pending_demote[_mid[0]] = self._dump_gen
             await self._dispatch_migrate([m.id for m in migrates])
         for c in pauses:
             await self._dispatch_pause(c.pid, sched_state)
