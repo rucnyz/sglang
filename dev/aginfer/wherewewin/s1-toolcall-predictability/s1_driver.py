@@ -106,15 +106,21 @@ def run_program(idx: int, args) -> Dict[str, Any]:
     # while still building enough working set to pressure a small KV pool.
     if args.stagger_s:
         time.sleep(idx * args.stagger_s)
-    # distinct, page-aligned base prefix per program (no cross-program dedup)
-    salt = 100000 + idx * 50000
-    seq = list(range(salt, salt + args.prefix_tokens))
+    # All token ids MUST be < vocab (DeepSeek-V4-Flash vocab_size=129280); an
+    # out-of-vocab id is an OOB embedding gather that crashes the server.  Keep
+    # ids in [0, _VOCAB) via modulo.  A distinct per-program LEAD token (salt)
+    # makes each program branch at the radix-tree root → no cross-program dedup,
+    # even though mid-sequence ids may coincide after the wrap (dedup is
+    # prefix-from-root only).
+    _VOCAB = 129000
+    salt = (idx * 3001) % _VOCAB          # distinct lead per program
+    seq = [(salt + i) % _VOCAB for i in range(args.prefix_tokens)]
     if inject:
         post_event(daemon, "session_arrival", pid)
     resume_rows: List[Dict[str, Any]] = []
     for turn in range(args.turns):
-        out = list(range(salt + 1_000_000 + turn * 10000,
-                         salt + 1_000_000 + turn * 10000 + args.output_tokens))
+        _ob = (salt + 64000 + turn * 9000)   # output band, disjoint-ish from prefix
+        out = [(_ob + i) % _VOCAB for i in range(args.output_tokens)]
         if inject:
             post_event(daemon, "llm_prefill", pid)
         is_resume = turn > 0
@@ -123,10 +129,25 @@ def run_program(idx: int, args) -> Dict[str, Any]:
             resume_rows.append({"turn": turn, **g})
         seq = seq + out
         if turn < args.turns - 1:
+            # Per-turn tool: alternate a FAST tool (ls, sub-second — must NOT
+            # trigger a demote: the gap can't cover the migration round-trip) and
+            # a SLOW tool (sleep ≈ gap_s — SHOULD trigger a demote). Both are the
+            # SAME `bash` tool; `ls`/`sleep` differ only in the COMMAND argument,
+            # so a tool-TYPE estimator can't tell them apart — the daemon's
+            # fine-grained (tool, command-token) estimator learns the split online.
+            slow = (turn % 2 == 0)
+            tool_name = "bash"
+            if slow:
+                command, real_gap = f"sleep {int(max(1, args.gap_s))}", float(args.gap_s)
+            else:
+                command, real_gap = "ls -la /tmp", max(0.3, args.gap_s * 0.04)
             if inject:
-                post_event(daemon, "tool_call_start", pid,
-                           {"tool_eta_s": args.tool_eta_s})
-            time.sleep(args.gap_s)
+                post_event(daemon, "tool_call_start", pid, {
+                    "tool_name": tool_name,
+                    "tool_args": {"command": command},
+                    "tool_eta_s": real_gap,   # bootstrap until the estimator has obs
+                })
+            time.sleep(real_gap)
             if inject:
                 post_event(daemon, "tool_call_end", pid)
     if inject:

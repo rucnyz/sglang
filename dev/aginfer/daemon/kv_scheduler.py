@@ -1138,6 +1138,13 @@ class KvScheduler:
         self.sglang_base_url = sglang_base_url.rstrip("/")
         self.policy = policy or OursGreedyPolicy(default_costs())
         self.lambda_acting = lambda_acting
+        # T11 / §1 online ETA estimator: learns the per-tool-call ETA from
+        # observed TOOL_CALL_START→END intervals at a FINE granularity (a call
+        # signature — `ls` vs `sleep` within the `bash` tool), so the §7 demote
+        # value-gate uses a SELF-LEARNED ETA instead of an externally-fed
+        # constant.  Cold start falls back to the event-provided `tool_eta_s`.
+        from .eta_estimator import ETAEstimator
+        self.eta_estimator = ETAEstimator()
         # T42: optional injection from main.py (router.observability).
         # When set, ``_record_skips`` and other failure paths can bump
         # the per-reason counter.  Left None for unit tests that only
@@ -1202,6 +1209,23 @@ class KvScheduler:
         # target states as the proxy's observe_* calls, so double-driving
         # (proxy + event, when both are active) converges harmlessly.
         self._apply_belief_transition(event)
+        # T11 §1: drive the online ETA estimator from the tool-call lifecycle.
+        # On START, replace the demote value-gate's ETA with the LEARNED one once
+        # the call's fine-grained signature (tool + command-token; `ls` vs `sleep`
+        # within `bash`) has enough observations — so the §7 gate keys on a
+        # self-learned ETA, not an external constant.  Cold start keeps the
+        # event-provided `tool_eta_s` as a bootstrap.  On END, record the observed
+        # interval so future calls of the same signature predict from it.
+        if event.kind == EventKind.TOOL_CALL_START and event.session:
+            _tn = event.payload.get("tool_name")
+            _ta = event.payload.get("tool_args") or event.payload.get("args") or {}
+            self.eta_estimator.on_tool_call_start(
+                event.session, _tn, _ta, event.enqueue_time)
+            _learned = self.eta_estimator.predict(_tn, _ta)
+            if _learned is not None and _learned > 0.0:
+                event.payload["tool_eta_s"] = _learned
+        elif event.kind == EventKind.TOOL_CALL_END and event.session:
+            self.eta_estimator.on_tool_call_end(event.session, event.enqueue_time)
         try:
             state_json = await router.fetch_state()
         except Exception as exc:  # noqa: BLE001
