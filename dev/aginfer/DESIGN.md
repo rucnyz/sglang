@@ -1463,6 +1463,41 @@ is available (e.g. an untyped `bash` whose duration spans ms–min),
 it degrades to **promote-at-`TOOL_CALL_END`** — still earlier than
 HiCache's on-access load_back, just without the full pre-stage.
 
+**Demote↔promote are a PAIR, valued together (2026-06-10).**  The
+`TOOL_CALL_START` demote of the caller's exclusive tail and the
+predictive promote-back scheduled for that *same* tail are one
+mechanism, not two independent decisions.  The reuse after the tool
+gap is therefore served from **HBM** (the promote pre-stages it before
+the resume prefill), so the demote's `_value` MUST value the saved
+prefill at the **HBM reload (≈0)**, NOT this candidate tier's
+DRAM/DISK `load_back`.  Valuing the demote in isolation double-charges
+a `load_back` the promote eliminates → `_value(HBM) − _value(DRAM)`
+stays positive and the demote of a soon-reused tail is always
+declined, defeating S1's whole proactive lever.  Realization: a
+`promote_pending` flag on the tail units (set when the promote is
+scheduled) tells `value_residence` to use the HBM reload.  Worst case
+— the promote fails to land — equals the baseline (the reuse pays the
+`load_back` it would have paid anyway), so crediting the promote is a
+sound proactive bet, not unsafe optimism.
+
+**The demote acts on the WHOLE exclusive chain, peeled leaf-inward.**
+A program's contiguous tail is a *chain* of radix nodes (one per turn:
+`[prefix → out0 → … → outN]`); the bulk early prefix is an INTERNAL
+node (ancestor of its own later turns), hence NOT a device-leaf and
+not individually removable from HBM (`remove_hbm_not_device_leaf`).
+"Demote the session tail" (§7 decision_set) therefore means demote the
+program's ENTIRE exclusive chain, and the realization is leaf-inward:
+the daemon proposes a remove-HBM for every unit of the exclusive chain
+in ONE batch; sglang's `apply_aginfer_migrations` processes the
+batch's remove-HBM actions **deepest-node-first**, so each node
+becomes a device-leaf (its only device-resident descendant was just
+removed) before its own remove is reached — peeling the chain to DRAM
+in a single batch (the bulk prefix included).  A `promote_pending`
+chain bypasses both the per-unit device-leaf filter (the chain peels
+together) and the `inflight`/`_holder_actively_decoding` gate (the
+event authoritatively says the holder is now tool-parked, so a
+non-zero `inflight` is the just-finished turn's snapshot lag).
+
 ### Inputs to `_value`
 
 `_value` takes five quantities defined below.  The system is
