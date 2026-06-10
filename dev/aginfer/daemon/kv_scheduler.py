@@ -1219,11 +1219,15 @@ class KvScheduler:
         if event.kind == EventKind.TOOL_CALL_START and event.session:
             _tn = event.payload.get("tool_name")
             _ta = event.payload.get("tool_args") or event.payload.get("args") or {}
-            self.eta_estimator.on_tool_call_start(
+            _sig = self.eta_estimator.on_tool_call_start(
                 event.session, _tn, _ta, event.enqueue_time)
             _learned = self.eta_estimator.predict(_tn, _ta)
             if _learned is not None and _learned > 0.0:
                 event.payload["tool_eta_s"] = _learned
+            from ._metrics import m as _m
+            _m("eta_estimate", sig="/".join(_sig),
+               learned=("none" if _learned is None else round(_learned, 3)),
+               bootstrap=round(float(event.payload.get("tool_eta_s") or 0.0), 3))
         elif event.kind == EventKind.TOOL_CALL_END and event.session:
             self.eta_estimator.on_tool_call_end(event.session, event.enqueue_time)
         try:
