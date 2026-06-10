@@ -885,6 +885,12 @@ def build_paper_state(
             for _uid in _units_for_session(units, event.session):
                 if _uid in units:
                     units[_uid].lambda_rate = 1.0 / _eta
+                    # Coupled with the predictive promote-back scheduled for
+                    # this same tail (handle() → _schedule_promote_back): the
+                    # reuse will be served from HBM, so the demote value must
+                    # not charge it a DRAM/DISK load_back (DESIGN §7/§3 S1
+                    # coupling).  value_residence reads this flag.
+                    units[_uid].promote_pending = True
 
     decision_set = _build_decision_set(event, units, tracker)
 

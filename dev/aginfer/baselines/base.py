@@ -83,6 +83,16 @@ class ReuseUnit:
     is_host_leaf: bool = True
     is_tree_leaf: bool = True
 
+    # DESIGN §7/§3 (S1 demote↔predictive-promote coupling): set True on the
+    # caller's exclusive tail at TOOL_CALL_START, when the scheduler is ALSO
+    # placing a predictive promote-back (T_start+ETA−load_back) for this unit.
+    # The pair means the next reuse is served from HBM (the promote pre-stages
+    # it), so the demote's value must NOT charge the reuse a DRAM/DISK load_back
+    # — value_residence reads this to value the reuse at the HBM reload (0).
+    # Worst case if the promote fails to land == baseline (reuse pays load_back),
+    # so crediting it is the correct proactive bet, not an unsafe optimism.
+    promote_pending: bool = False
+
     @property
     def n_bytes(self) -> int:
         """Total bytes across all (tier, subpool).  Convenience for

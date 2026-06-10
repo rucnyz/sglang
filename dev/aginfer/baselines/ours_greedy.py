@@ -184,9 +184,19 @@ def value_residence(u: ReuseUnit, next_residence: List[Tier],
     and the holding tax.
     """
     tier = _authoritative_of(next_residence)
+    # S1 demote↔predictive-promote coupling (DESIGN §7/§3): when a predictive
+    # promote-back is scheduled for this unit (``promote_pending``), the reuse
+    # will be served from HBM (the promote pre-stages it before the resume), so
+    # the saved prefill is valued at the HBM reload (≈0), NOT this candidate
+    # tier's DRAM/DISK load_back.  Without this, demoting a soon-reused tail
+    # double-charges a load_back the promote eliminates → the demote is always
+    # declined and S1's whole proactive lever never fires.  The holding tax
+    # below still accrues at the candidate ``tier`` (where the unit sits during
+    # the tool gap), which is the actual benefit of demoting.
+    reuse_tier = Tier.HBM if getattr(u, "promote_pending", False) else tier
     save_prefill = u.p_hat * (
         reload_cost(u, Tier.DROP, costs, pi_u)
-        - reload_cost(u, tier, costs, pi_u)
+        - reload_cost(u, reuse_tier, costs, pi_u)
     )
     occ = state.tier_usage.occupancy_ratio(tier) if tier != Tier.DROP else 0.0
     h = holding_unit_cost(tier, occ, costs)
