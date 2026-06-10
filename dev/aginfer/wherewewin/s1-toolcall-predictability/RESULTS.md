@@ -49,10 +49,19 @@ the headline magnitude just happens to be largest under deep eviction on this bo
 
 ## Aggregate space-freeing (the capacity / throughput half)
 
-The per-resume TTFT win above is only one half. The other half: **the moment a program
-enters a tool call, its entire idle prefix becomes evictable — that frees a large block
-of HBM at once**, and the predictive promote brings it back before the resume, so the
-eviction is harm-free.
+The per-resume TTFT win above is only one half. The other half: **when a program enters
+a tool call whose ETA is long enough to be worth it, its idle prefix becomes worth
+evicting — freeing a large block of HBM at once**, and the predictive promote brings it
+back before the resume, so it's harm-free.
+
+**The eviction is value-gated, NOT unconditional.** It is the §7 cost-benefit emerging
+naturally from the value rule: a demote is taken iff `h_(τ,sp)(occ)·bytes·ETA` (holding
+relief over the gap, `hold_time = ETA`) exceeds the demote+promote round-trip migration
+cost. A short tool — e.g. `ls` (~ms) — has too short a gap to cover the round-trip, so
+its demote value is negative and `migrate_candidates` simply never proposes it; no
+special-casing needed. Only tool calls whose ETA clears the round-trip get demoted (and
+the longer/slower the tool, the more worth it). This needs a per-tool ETA estimate
+(T11's `p_hat`/ETA estimator).
 
 - Per program: a 50K-token prefix ≈ **58 MB** (1.17 KB/token) freed on tool-call entry;
   a 100K prefix ≈ 117 MB.
