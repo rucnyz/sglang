@@ -272,7 +272,16 @@ def migrate_candidates(
             #     device-resident node can never drop its host backup here).
             if not new_residence and not u.is_tree_leaf:
                 continue
-            if Tier.HBM in remove_tiers and not u.is_device_leaf:
+            # S1 whole-chain demote: a non-device-leaf remove-HBM is normally
+            # reject-guaranteed (#210) — EXCEPT for a `promote_pending` unit, the
+            # caller's EXCLUSIVE tool-gap tail.  Those form a private chain that
+            # sglang's apply peels leaf-inward in one batch (deepest-first sort),
+            # so the internal bulk prefix DOES become removable once its own
+            # descendants in the same batch are peeled.  Proposing the whole
+            # chain is what actually frees the bulk idle prefix during the gap
+            # (the leaf-only filter is why S1's demote never freed real HBM).
+            _chain = getattr(u, "promote_pending", False)
+            if Tier.HBM in remove_tiers and not u.is_device_leaf and not _chain:
                 continue
             if Tier.DRAM in remove_tiers and not u.is_host_leaf:
                 continue

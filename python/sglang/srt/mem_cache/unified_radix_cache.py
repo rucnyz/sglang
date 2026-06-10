@@ -2873,6 +2873,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 hash_to_node[key] = node
             stack.extend(node.children.values())
 
+        # S1 whole-chain demote (DESIGN §7 "demote the session tail"): a
+        # remove-HBM on a non-device-leaf becomes VALID once its device-children
+        # are removed first — the device-leaf invariant peels a chain leaf-inward
+        # (empirically: a 4 MB internal prefix reaches DRAM after its small
+        # descendants are peeled).  When the daemon sends a program's whole
+        # exclusive chain in one batch (so the bulk idle prefix can be demoted
+        # during a tool gap), process the remove-HBM actions DEEPEST-NODE-FIRST
+        # so each parent has already become a device-leaf when its own remove is
+        # reached.  Stable for non-remove-HBM actions and within equal depth, so
+        # single-action / non-chain batches are unaffected.
+        def _node_depth(n: "UnifiedTreeNode") -> int:
+            d, cur = 0, n
+            while cur is not root and getattr(cur, "parent", None) is not None:
+                cur = cur.parent
+                d += 1
+            return d
+
+        def _peel_key(item):
+            idx, a = item
+            nd = hash_to_node.get(a["hash"])
+            if nd is not None and "HBM" in set(a.get("remove_tiers") or []):
+                return (0, -_node_depth(nd), idx)   # remove-HBM: deepest first
+            return (1, 0, idx)                        # others: original order
+
+        actions = [a for _, a in sorted(enumerate(actions), key=_peel_key)]
+
         applied = 0
         applied_hashes: list[str] = []
         skipped: list[dict] = []
