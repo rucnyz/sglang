@@ -13,9 +13,9 @@ import requests, time, statistics, sys, threading, json as J
 B = "http://127.0.0.1:30000"; D = "http://127.0.0.1:9100"; V = 129000
 ARM = sys.argv[1] if len(sys.argv) > 1 else "ours"
 import os
-VICT = int(os.environ.get("LC_VICT", "30000")); ETA = float(os.environ.get("LC_ETA", "12.0"))
-N_VICT = int(os.environ.get("LC_NVICT", "3")); BG_THREADS = int(os.environ.get("LC_BG", "1"))
-BG_LEN = int(os.environ.get("LC_BGLEN", "30000")); RUN_S = float(os.environ.get("LC_RUN", "100"))
+VICT = int(os.environ.get("LC_VICT", "30000")); ETA = float(os.environ.get("LC_ETA", "16.0"))
+N_VICT = int(os.environ.get("LC_NVICT", "6")); BG_THREADS = int(os.environ.get("LC_BG", "0"))
+BG_LEN = int(os.environ.get("LC_BGLEN", "30000")); STAGGER = float(os.environ.get("LC_STAGGER", "2.5"))
 
 stop = threading.Event()
 
@@ -86,39 +86,54 @@ rlock = threading.Lock()
 
 
 def victim(vid_i):
+    """ONE establish→park→resume round (the controlled 91% structure, scaled to
+    N concurrent programs).  Staggered establishes form a BURST of memory pressure
+    (the prefixes evict each other), then everyone parks → GPU goes IDLE → the
+    daemon warms each evicted prefix back using that idle → resume hits HBM.  No
+    continuous background (which would remove the idle the warm needs)."""
     inject = (ARM in ("ours", "ta"))
     pid = f"VIC{vid_i}"
-    cycle = 0
-    time.sleep(vid_i * 2.0)                           # stagger victims
-    while not stop.is_set():
-        vids = seq((vid_i * 7001 + 1 + cycle * 97) % V, VICT)
-        gen(vids, pid, mx=4)                          # establish/refresh the prefix
-        if inject:
-            ev("session_arrival", pid); ev("llm_prefill", pid)
-            reg(pid, vids)
-            ev("tool_call_start", pid, {"tool_name": "bash",
-               "tool_args": {"command": f"sleep {int(ETA)}"}, "tool_eta_s": ETA})
-        gap_end = time.time() + ETA
-        while time.time() < gap_end and not stop.is_set():
-            time.sleep(0.3)                           # parked: background evicts the prefix
-        to, co = ttft(vids, pid)                      # resume
-        with rlock:
-            resume_rows.append((to, co))
-        cycle += 1
+    time.sleep(vid_i * STAGGER)                        # stagger the establish burst
+    vids = seq((vid_i * 7001 + 1) % V, VICT)
+    gen(vids, pid, mx=4)                               # establish the prefix
+    if inject:
+        ev("session_arrival", pid); ev("llm_prefill", pid)
+        reg(pid, vids)
+        ev("tool_call_start", pid, {"tool_name": "bash",
+           "tool_args": {"command": f"sleep {int(ETA)}"}, "tool_eta_s": ETA})
+    # park for ETA, measured from this program's establish (resumes stay staggered)
+    gap_end = time.time() + ETA
+    while time.time() < gap_end and not stop.is_set():
+        time.sleep(0.3)
+    to, co = ttft(vids, pid)                           # resume
+    with rlock:
+        resume_rows.append((to, co))
     if inject:
         ev("session_end", pid)
 
 
+def ticker():
+    """Dense event stream (as a real proxy posts per request) so the action-
+    timeline clock advances finely and the warm fires on time.  arm=ours only."""
+    k = 0
+    while not stop.is_set():
+        ev("llm_prefill", f"TICK{k % 3}")
+        k += 1
+        time.sleep(0.3)
+
+
 bg = [threading.Thread(target=background, args=(i,), daemon=True) for i in range(BG_THREADS)]
+if ARM in ("ours", "ta"):
+    bg.append(threading.Thread(target=ticker, daemon=True))
 vt = [threading.Thread(target=victim, args=(i,), daemon=True) for i in range(N_VICT)]
 for t in bg:
-    t.start()
-time.sleep(3.0)                                       # warm up background pressure
+    t.start()                                         # ticker (ours only; dense clock)
 for t in vt:
-    t.start()
-time.sleep(RUN_S)
-stop.set()
-time.sleep(3.0)
+    t.start()                                         # victims run ONE staggered round each
+for t in vt:
+    t.join()                                          # wait for all resumes to complete
+stop.set()                                            # stop the ticker
+time.sleep(2.0)
 
 rows = [r for r in resume_rows if r[0] is not None]
 ttfts = sorted(r[0] for r in rows)
