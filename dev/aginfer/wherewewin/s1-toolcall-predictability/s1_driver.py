@@ -142,6 +142,15 @@ def run_program(idx: int, args) -> Dict[str, Any]:
             else:
                 command, real_gap = "ls -la /tmp", max(0.3, args.gap_s * 0.04)
             if inject:
+                # #238: register the CURRENT prefix (the sequence the next turn
+                # will resume) so the daemon's action-timeline promote can warm it
+                # back to HBM during the gap (prefill-only) if it gets evicted.
+                try:
+                    requests.post(f"{daemon}/aginfer/session_prefix",
+                                  json={"program_id": pid, "input_ids": seq},
+                                  timeout=15)
+                except Exception:
+                    pass
                 post_event(daemon, "tool_call_start", pid, {
                     "tool_name": tool_name,
                     "tool_args": {"command": command},

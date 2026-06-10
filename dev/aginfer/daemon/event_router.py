@@ -91,6 +91,14 @@ class EventRouter:
         # event stream is the clock") — no wall-clock timer task.
         self.timeline = None            # action_timeline.ActionTimeline | None
         self.due_action_handler = None  # async (payload, router) -> None
+        # #238 predictive-promote warm: the proxy/driver registers each
+        # session's CURRENT prefix tokens here (POST /aginfer/session_prefix).
+        # At the action-timeline promote fire, ``warm_to_hbm`` re-prefills these
+        # (max_new_tokens=0, prefill-only) so a DISK/dropped prefix — which has
+        # left the radix tree and is unreachable by the node-based migrate plane —
+        # is staged back into HBM via sglang's native load path.  Bounded by the
+        # active-session count; entries dropped on SESSION_END.
+        self._session_prefix: Dict[str, list] = {}
         # Serialise handler execution.  paper §9: "no two handlers
         # run concurrently".
         self._dispatch_lock = asyncio.Lock()
@@ -251,6 +259,32 @@ class EventRouter:
         r = await self._client.get(f"{self.sglang_base_url}/aginfer/state")
         r.raise_for_status()
         return r.json()
+
+    async def warm_to_hbm(self, token_ids: list, program_id: str) -> bool:
+        """#238 predictive promote: re-prefill ``token_ids`` with
+        ``max_new_tokens=0`` (sglang ``is_prefill_only``) so the prefix's KV is
+        loaded back into HBM via the native prefix-match → storage-prefetch →
+        load_back path, with NO decode and the KV retained cached.  Uniform across
+        DRAM / DISK / dropped — and the only way to reach a prefix that has left
+        the radix tree (DISK-evicted), which the node-based migrate plane cannot.
+        Awaited by the fire callback but the prefill itself is bounded by the gap;
+        a failure is logged and swallowed (the resume just pays B's cost)."""
+        if self._client is None or not token_ids:
+            return False
+        try:
+            await self._client.post(
+                f"{self.sglang_base_url}/generate",
+                json={
+                    "input_ids": list(token_ids),
+                    "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+                    "program_id": program_id,
+                },
+                timeout=httpx.Timeout(120.0),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("warm_to_hbm failed for %s: %r", program_id, exc)
+            return False
 
     # ---- worker ----
 
@@ -590,6 +624,27 @@ def attach_event_routes(app: FastAPI, router: EventRouter) -> None:
         )
         await router.bus.emit(evt)
         return {"status": "queued"}
+
+    # ---- #238: per-session prefix registration (predictive-promote warm) ----
+    # The proxy/driver POSTs the session's CURRENT prefix tokens each turn; the
+    # action-timeline promote re-prefills them (max_new_tokens=0) to stage the
+    # prefix back into HBM.  Tokens live where they naturally are (the request
+    # side) — the daemon only caches the latest, dropped on SESSION_END.
+    @app.post("/aginfer/session_prefix")
+    async def aginfer_session_prefix(raw: Request) -> Any:
+        try:
+            body = await raw.json()
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"error": {"message": f"invalid JSON: {exc!s}"}},
+                                status_code=400)
+        pid = body.get("program_id") or body.get("session")
+        toks = body.get("input_ids")
+        if not pid or not isinstance(toks, list) or not toks:
+            return JSONResponse(
+                {"error": {"message": "need program_id + non-empty input_ids"}},
+                status_code=400)
+        router._session_prefix[str(pid)] = [int(t) for t in toks]
+        return {"status": "registered", "n_tokens": len(toks)}
 
     # ---- T22 (#155): canonical thresholds endpoint -----------------
     # DESIGN §6 / §10 "Threshold parity": the daemon is the source of

@@ -1251,6 +1251,9 @@ class KvScheduler:
                bootstrap=round(float(event.payload.get("tool_eta_s") or 0.0), 3))
         elif event.kind == EventKind.TOOL_CALL_END and event.session:
             self.eta_estimator.on_tool_call_end(event.session, event.enqueue_time)
+        elif event.kind == EventKind.SESSION_END and event.session:
+            # #238: drop the registered prefix so the warm cache stays bounded.
+            getattr(router, "_session_prefix", {}).pop(event.session, None)
         try:
             state_json = await router.fetch_state()
         except Exception as exc:  # noqa: BLE001
@@ -1723,28 +1726,49 @@ class KvScheduler:
             _m("promote_skipped", session=session, reason="state_fetch_failed")
             return
         assignments: List[Tuple[str, List[Tier], List[Tier]]] = []
+        all_hbm = True
         for uid in payload.unit_hashes:
             u = sched_state.units.get(uid)
             if u is None:
-                continue  # dropped / gone since schedule → no-op
+                # Gone from the tree → DISK-evicted / dropped.  Unreachable by the
+                # node-based migrate plane; needs the warm (#238).
+                all_hbm = False
+                continue
             res = set(u.residence)
             if Tier.HBM in res:
                 continue  # already HBM (never demoted / already promoted)
-            if not (res & {Tier.DRAM, Tier.DISK}):
-                continue  # resident nowhere ⇒ dropped → can't promote
-            # DESIGN §7 residence-transition table: ``[] → {HBM}`` = load_back /
-            # predictive promote — populate HBM and KEEP the lower-tier backup
-            # (remove nothing). Removing DRAM here would discard the backup the
-            # load_back reads from and break the very copy we are promoting.
-            assignments.append((uid, [Tier.HBM], []))
+            all_hbm = False
+            if res & {Tier.DRAM, Tier.DISK}:
+                # DESIGN §7 ``[] → {HBM}`` = load_back; KEEP the lower-tier backup.
+                assignments.append((uid, [Tier.HBM], []))
+        if all_hbm:
+            # Whole tail already HBM-resident (never demoted) → idempotent no-op.
+            self.promotes_skipped_stale += 1
+            _m("promote_skipped", session=session, reason="already_hbm")
+            return
+        # #238: PREFER the warm (prefill-only, max_new_tokens=0) when the session's
+        # prefix is registered — it uniformly stages DRAM/DISK/dropped back to HBM
+        # and is the ONLY mechanism that can reach a prefix that has LEFT the radix
+        # tree (DISK-evicted).  The per-unit migrate (DRAM load_back) is the
+        # fallback when no prefix is registered (e.g. tests, or DRAM-only tails).
+        prefix_tokens = getattr(router, "_session_prefix", {}).get(session)
+        if prefix_tokens:
+            ok = await router.warm_to_hbm(prefix_tokens, session)
+            if ok:
+                self.promotes += 1
+                _m("promote_dispatched", session=session, via="warm",
+                   n_tokens=len(prefix_tokens), eta_s=round(payload.eta_s, 3))
+                return
+            # warm dispatch failed → fall through to the migrate fallback
         if not assignments:
             self.promotes_skipped_stale += 1
-            _m("promote_skipped", session=session, reason="no_demoted_units")
+            _m("promote_skipped", session=session,
+               reason="no_prefix_and_no_dram_units")
             return
         await self._dispatch_migrate(assignments)
         self.promotes += len(assignments)
-        _m("promote_dispatched", session=session, n=len(assignments),
-           eta_s=round(payload.eta_s, 3))
+        _m("promote_dispatched", session=session, via="migrate",
+           n=len(assignments), eta_s=round(payload.eta_s, 3))
 
 
 # ----------------------------------------------------------------- attach
