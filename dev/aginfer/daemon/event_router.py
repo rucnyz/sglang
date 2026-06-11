@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional
 
@@ -269,6 +270,11 @@ class EventRouter:
         the radix tree (DISK-evicted), which the node-based migrate plane cannot.
         Awaited by the fire callback but the prefill itself is bounded by the gap;
         a failure is logged and swallowed (the resume just pays B's cost)."""
+        # S2 isolation: disable the S1 predictive-promote so the holder-count value
+        # eviction (S2's distinctive lever) can be measured alone, un-masked by the
+        # promote re-staging the same shared prefix.
+        if os.environ.get("AGINFER_DISABLE_PROMOTE"):
+            return False
         if self._client is None or not token_ids:
             return False
         try:

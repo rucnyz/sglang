@@ -1131,8 +1131,19 @@ def hints_from_state(sched_state) -> List[Dict[str, Any]]:  # noqa: ANN001
             "hash": uid,
             "p_hat": float(u.p_hat),
             "lambda": float(u.lambda_rate),
+            # DESIGN §2 fact 1 / S2: holder-count so the inline eviction scorer can
+            # value a fleet-shared prefix by N× saved-prefill (it builds units with
+            # empty `holders` and can't recover the count from the node alone).
+            "n_holders": len(u.holders),
             "stamp": stamp,
         })
+    # S2 diagnostic: confirm the daemon actually observes shared units (n_holders>1)
+    _mx = max((h["n_holders"] for h in hints), default=0)
+    if _mx > 1:
+        import logging as _lg
+        _lg.getLogger("aginfer.kv").info(
+            "[aginfer] S2 hint push: n=%d units, MAX n_holders=%d (shared prefix seen)",
+            len(hints), _mx)
     return hints
 
 

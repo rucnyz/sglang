@@ -64,6 +64,12 @@ class ReuseUnit:
 
     # Per-session holders (admission §8 uses this for 1/holders weighting)
     holders: List[str] = field(default_factory=list)
+    # DESIGN §2 fact 1 / S2: holder-count multiplier on the saved-prefill value —
+    # a unit shared by N programs is worth N× keeping (N reuses served from cache).
+    # The daemon sets this = len(holders) and pushes it in the hint so the inline
+    # eviction scorer (which builds units with empty `holders`) can value-by-share.
+    # 0 ⇒ "unknown" → _value falls back to max(1, len(holders)).
+    n_holders: int = 0
 
     # DESIGN §7/§9 (#210): the three structural leaf predicates sglang
     # checks before applying a remove (unified_radix_cache apply site

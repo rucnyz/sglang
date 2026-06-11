@@ -1,16 +1,45 @@
-# S1 — predictive promote across tool gaps: RESULTS
+# S1 — program-aware KV scheduling across tool gaps: RESULTS
 
-**Claim.** When an agent is parked in a tool call, its idle KV prefix is demoted
-(HBM→DRAM→DISK) under memory pressure. A reactive HiCache baseline (**B**) re-acquires
-that prefix on the next prefill — on the resume critical path. Aginfer (**ours**) has
-**program-aware foresight**: it knows the program will resume *this* prefix at ~`T+ETA`,
-so it predictively promotes it back into HBM *during the idle gap* — moving the
-re-acquisition off the critical path.
+> **CORRECTION (supersedes the old framing).** This file previously headlined a
+> predictive-promote *latency* win (91 %) from a hand-forced microbenchmark. Rigorous
+> realistic-trace replay showed that latency win does **not** reproduce — the promote is
+> not the active lever. The validated headline is now the **program-aware eviction
+> goodput win** below; the microbench is retained as "mechanism in isolation". Full
+> cross-regime investigation: [`../FLEET_FINDINGS.md`](../FLEET_FINDINGS.md).
 
-## Headline (end-to-end, measured)
+**Claim (corrected).** Ours has **program-aware foresight** from the tool-call event
+stream — it knows *which* parked program will resume *which* prefix. On realistic traces
+this manifests not as a faster resume (latency) but as **better eviction**: Ours keeps the
+reuse-imminent prefixes that LRU drops → fewer re-prefilled tokens (goodput).
+
+## Headline — realistic CC traces, N=3 rigorous (the validated result)
+
+`cc6_park` — 6 real Claude Code programs, parking gaps 10–30 s, 2.3× over-subscribed
+(moderate concurrency, real idle headroom). Teacher-forced replay, **N=3, mean ± std**:
+
+| arm | cache-hit | re-prefill |
+|---|---|---|
+| **Ours** (daemon hints + `hint_v_u` eviction) | **71.6 % ± 3.4** | **−42 %** |
+| **B** (HiCache + LRU) | 55.8 % ± 5.5 | — |
+| local value-eviction (`ours_greedy`, no daemon) | 50.8 % ± 2.2 | ≈ B |
+
+**+16 pt cache-hit, separable (gap ≫ std); 42 % fewer re-prefilled tokens.** Validated:
+(1) entirely the daemon's program-aware foresight — local value-eviction ≈ LRU, the +21 pt
+is the daemon's event-driven `p_hat`; (2) true eviction-keeping not promote-shifting — a
+0-promote trial had the same win; (3) **goodput, not latency** — resume-TTFT is
+queueing-bound, so latency/makespan are within noise (the win is 42 % less prefill
+*compute*, a capacity/throughput benefit). Regime-specific: at the heavy 90-program fleet
+Ours ≈ LRU (churn-dominated; V4 multi-tier store non-functional). See
+[`../FLEET_FINDINGS.md`](../FLEET_FINDINGS.md).
+
+---
+
+## Mechanism in isolation (microbenchmark — NOT the realistic-trace result)
 
 `s1_disk_microbench.py` — flood a 50K victim prefix out of HBM+DRAM, then time its
-resume TTFT (N=3, V4-Flash tp2, GPUs 5,6):
+resume TTFT (N=3, V4-Flash tp2, GPUs 5,6). **Hand-engineered conditions (isolated leaf
+prefix, forced eviction, guaranteed idle GPU) that do NOT occur in realistic serving** —
+this shows the predictive-warm path *works*, not that it wins on real traces:
 
 | config | B (reactive) | ours (pre-staged) | win |
 |---|---|---|---|

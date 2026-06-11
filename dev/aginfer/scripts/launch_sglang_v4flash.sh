@@ -98,6 +98,7 @@ fi
 # UnifiedRadixCache._load_eviction_scorer).  Unset / empty = stock LRU.
 # Run H sets SGLANG_KV_POLICY_MODULE=baselines.sglang_adapter:ours_greedy_score.
 SGLANG_KV_POLICY_MODULE="${SGLANG_KV_POLICY_MODULE:-}" \
+SGLANG_WRITE_THROUGH_MODULE="${SGLANG_WRITE_THROUGH_MODULE:-}" \
 PYTHONPATH="$AGINFER_ROOT:${PYTHONPATH:-}" \
 CUDA_VISIBLE_DEVICES="$AGINFER_GPUS" \
 python -m sglang.launch_server \
@@ -116,7 +117,7 @@ python -m sglang.launch_server \
     $EVICTION_POLICY_ARG \
     --enable-hierarchical-cache \
     --hicache-ratio "${HICACHE_RATIO:-1.5}" \
-    --hicache-write-policy write_through_selective \
+    --hicache-write-policy "${HICACHE_WRITE_POLICY:-write_through_selective}" \
     --hicache-storage-backend mooncake \
     --hicache-storage-prefetch-policy best_effort \
     --hicache-storage-backend-extra-config "$MOONCAKE_EXTRA" \

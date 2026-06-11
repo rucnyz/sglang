@@ -22,8 +22,9 @@ not the cache tier itself.
 
 | ID | Scenario | Distinctive driver | Status |
 |---|---|---|---|
-| **S1** | [Predictive promote across tool gaps](scenarios/s1-predictive-promote/) | a program parks in a tool call → its idle prefix is evicted → it resumes the *same* prefix | ✅ **measured (Ours vs B)**; TA ≈ B analytically (TA never promotes) — direct TA run needs a chat-interface driver ([THUNDERAGENT.md](scenarios/s1-predictive-promote/THUNDERAGENT.md)) |
-| S2… | (future scenarios) | — | planned |
+| **S1** | [Program-aware KV scheduling across tool gaps](scenarios/s1-predictive-promote/) | a program parks in a tool call → its idle prefix is evicted → it resumes the *same* prefix | ✅ **measured on real CC traces, N=3**: program-aware eviction = **71.6 % vs 55.8 % cache-hit (−42 % re-prefill)** at moderate concurrency — a **goodput** win (NOT the old predictive-promote *latency* claim, which is a microbench only); ≈ LRU at the heavy fleet. TA ≈ B (never promotes). See [README](scenarios/s1-predictive-promote/) + [FLEET_FINDINGS](scenarios/s1-predictive-promote/FLEET_FINDINGS.md) |
+| **S2** | [Shared-prefix retention under scratch churn](scenarios/s2-shared-prefix-retention/) | a fleet-shared system prefix LRU ages out by recency under scratch churn | ⚠️ **no clean win (design-revising)**: holder-count was completely broken — fixed 2 real bugs (`补齐design`: storage-layer `n_holders` drop + lambda-formulation backfire). Even fixed, N=3 shows only a small/narrow effect (strong pool: TIE 64/64; moderate: ~20% within noise). Blocked by active-set competition + the **dead V4 multi-tier store** (evicted = full recompute, not cheap DRAM reload). See [README](scenarios/s2-shared-prefix-retention/) |
+| S3… | (future scenarios) | — | planned |
 
 > RQ1 is structured to grow: each scenario is a self-contained sub-folder with its own
 > README + scripts + results. The 3-arm framing (B / TA / Ours) is shared.

@@ -338,6 +338,8 @@ async def _one_request(
     last_tok_t: Optional[float] = None
     n_out = 0           # SSE-delta count (timing / fallback)
     usage_out: Optional[int] = None  # authoritative server completion_tokens
+    prompt_tokens: Optional[int] = None
+    cached_tokens: Optional[int] = None
     carry = b""
     try:
         async with cli.stream("POST", url, json=payload) as resp:
@@ -361,8 +363,14 @@ async def _one_request(
                     except Exception:
                         continue
                     u = obj.get("usage")
-                    if isinstance(u, dict) and u.get("completion_tokens") is not None:
-                        usage_out = int(u["completion_tokens"])
+                    if isinstance(u, dict):
+                        if u.get("completion_tokens") is not None:
+                            usage_out = int(u["completion_tokens"])
+                        if u.get("prompt_tokens") is not None:
+                            prompt_tokens = int(u["prompt_tokens"])
+                        _d = u.get("prompt_tokens_details") or {}
+                        if _d.get("cached_tokens") is not None:
+                            cached_tokens = int(_d["cached_tokens"])
                     for ch in obj.get("choices") or ():
                         delta = ch.get("delta") or {}
                         # Count content AND reasoning_content (reasoning
@@ -409,6 +417,10 @@ async def _one_request(
         "n_out": usage_out if usage_out is not None else n_out,
         "n_out_streamed": n_out,
         "want_out": want_out,
+        # per-request opportunity fields (eviction-reuse analysis)
+        "program_id": record.get("program_id"),
+        "prompt_tokens": prompt_tokens,
+        "cached_tokens": cached_tokens,
     }
 
 

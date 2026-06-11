@@ -194,13 +194,24 @@ def value_residence(u: ReuseUnit, next_residence: List[Tier],
     # below still accrues at the candidate ``tier`` (where the unit sits during
     # the tool gap), which is the actual benefit of demoting.
     reuse_tier = Tier.HBM if getattr(u, "promote_pending", False) else tier
-    save_prefill = u.p_hat * (
+    # DESIGN §2 fact 1 / S2: a unit shared by N programs saves N prefills if kept
+    # (each holder reuses it), so the saved-prefill term scales by holder count.
+    # Single-holder units (n_hold==1) are unchanged; only genuinely-shared prefixes
+    # are boosted, so they outrank any single program's stale scratch under churn.
+    n_hold = max(1, len(u.holders), int(getattr(u, "n_holders", 0)))
+    save_prefill = n_hold * u.p_hat * (
         reload_cost(u, Tier.DROP, costs, pi_u)
         - reload_cost(u, reuse_tier, costs, pi_u)
     )
     occ = state.tier_usage.occupancy_ratio(tier) if tier != Tier.DROP else 0.0
     h = holding_unit_cost(tier, occ, costs)
-    hold_time = 1.0 / u.lambda_rate if u.lambda_rate > 0 else 1e6
+    # DESIGN §2 fact 1 / S2: holder count also raises the EFFECTIVE reuse rate — N
+    # programs reuse the shared unit, so the inter-reuse interval is ~1/(N·lambda),
+    # not 1/lambda. Without this, a big shared prefix's occupancy tax (∝ n_bytes)
+    # dominates its (N×) saved-prefill and the boost backfires (the prefix's V_u goes
+    # negative → it's evicted first). Single-holder units (n_hold==1) are unchanged.
+    eff_lambda = n_hold * u.lambda_rate
+    hold_time = 1.0 / eff_lambda if eff_lambda > 0 else 1e6
     return save_prefill - h * u.n_bytes * hold_time
 
 

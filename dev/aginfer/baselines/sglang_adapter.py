@@ -275,4 +275,7 @@ def hint_v_u(node: Any, layer: Any, hint: Any) -> float:
     if hint is not None:
         u.p_hat = float(hint["p_hat"])
         u.lambda_rate = float(hint["lambda"])
+        # DESIGN §2 fact 1 / S2: holder-count multiplier from the daemon hint so a
+        # fleet-shared prefix outranks single-program scratch under churn.
+        u.n_holders = int(hint.get("n_holders", 0) or 0)
     return _v_u_from_unit(u)

@@ -620,6 +620,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # through trigger (default = hit_count >= threshold, #178).
         self._init_aginfer_eviction_scoring()
         self._write_through_policy = _load_write_through_policy()
+        if os.environ.get("SGLANG_WRITE_THROUGH_MODULE", "").strip() == "aginfer:hint_write_through":
+            self._write_through_policy = self._aginfer_hint_should_write_through
+            logger.info("[aginfer] write_through_loaded=aginfer:hint_write_through")
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
@@ -3261,6 +3264,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stamp = int(h["stamp"])
                 p_hat = float(h["p_hat"])
                 lam = float(h["lambda"])
+                # S2 (holder-count): preserve the daemon's n_holders through the
+                # storage layer — without this it was dropped here, so hint_v_u
+                # never saw it and the holder-count boost was inert. Optional for
+                # back-compat (absent ⇒ 0 ⇒ _value falls back to max(1, ...)).
+                n_holders = int(h.get("n_holders", 0) or 0)
             except (KeyError, TypeError, ValueError) as exc:
                 return (False, f"hint {uhash!r}: bad numeric field ({exc})", 0)
             existing = self._aginfer_hints.get(uhash)
@@ -3269,6 +3277,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 continue
             self._aginfer_hints[uhash] = {
                 "p_hat": p_hat, "lambda": lam, "stamp": stamp,
+                "n_holders": n_holders,
             }
             applied += 1
         return (True, "ok", applied)
@@ -3339,6 +3348,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         lock (DESIGN §10 'Hint atomicity' satisfied by serialisation)."""
         hint = self._aginfer_hints.get(self._aginfer_unit_hash(node))
         return self._aginfer_hint_v_u_fn(node, layer, hint)
+
+    def _aginfer_hint_should_write_through(self, node, threshold) -> bool:
+        """Hint-aware WRITE-THROUGH (cache-bound, mirrors the hint_v_u eviction
+        scorer): write a unit through to the host/DRAM tier when the daemon's hint
+        marks it reuse-imminent (high p_hat), so an evicted-then-reused prefix is
+        RETAINED (cheap DRAM load-back) instead of dropped (recompute) — the S1
+        value-aware retention the hit-count default cannot do under churn (nodes
+        evict before any hit). Absent hint -> hit-count default (do-no-harm)."""
+        hint = self._aginfer_hints.get(self._aginfer_unit_hash(node))
+        if hint is not None:
+            try:
+                return float(hint.get("p_hat", 0.0)) >= 0.5
+            except Exception:  # noqa: BLE001
+                pass
+        return int(node.hit_count) >= int(threshold)
 
     def _aginfer_seed_birth(self, node) -> None:
         """T27 (#188, DESIGN §3 'Hint table covers every live unit'):
