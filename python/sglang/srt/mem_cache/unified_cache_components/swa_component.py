@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -391,30 +392,92 @@ class SWAComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
 
+    def _value_ordered(self) -> bool:
+        """True when a non-default (value-aware) eviction scorer is attached.
+
+        On the DEFAULT scorer (stock sglang / no aginfer daemon) SWA eviction
+        keeps the exact LRU-LIST-POSITION order.  A last_access_time heap would
+        DIVERGE from SWA list position — the SWA list is refreshed window-bounded
+        (reset_node_and_window_ancestors_mru) while last_access_time is stamped up
+        to the root — so value-heaping the default scorer would change the evicted
+        SET (a do-no-harm break on the no-daemon path, which is also the A/B's LRU
+        baseline).  FULL is immune (a leaf's list position == its last_access_time
+        order) for the default LRU policy, which is why FullComponent can heap —
+        though on the default path it now keys the heap on
+        ``eviction_strategy.get_priority`` so non-LRU policies are honored too
+        (#253); SWA must not heap, on the default path.
+        """
+        # #253: single source of truth, set by _init_aginfer_eviction_scoring.
+        return getattr(self.cache, "_aginfer_value_aware", False)
+
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.swa_num_tokens
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
-        x = lru.get_lru_no_lock()
-        while tracker[ct] < request and x is not None and lru.in_list(x):
+        if not self._value_ordered():
+            # DEFAULT scorer: preserve the exact LRU-list-position walk byte-for-
+            # byte — stock sglang behavior unchanged (do-no-harm), and this is the
+            # A/B's true LRU baseline.
+            x = lru.get_lru_no_lock()
+            while tracker[ct] < request and x is not None and lru.in_list(x):
+                assert x.component_data[ct].value is not None
+                if x in self.cache.evictable_device_leaves:
+                    x_next = lru.get_prev_no_lock(x)
+                    self.cache._evict_device_leaf(x, tracker)
+                    if not lru.in_list(x_next):
+                        x_next = lru.get_lru_no_lock()
+                    x = x_next
+                else:
+                    x_next = lru.get_prev_no_lock(x)
+                    self.cache._evict_component_and_detach_lru(
+                        x, self, target=EvictLayer.DEVICE, tracker=tracker
+                    )
+                    self.cache._cascade_evict(x, self, tracker)
+                    x = x_next
+            return
+        # Value-aware SWA device eviction (aginfer scorer attached).  Mirrors
+        # FullComponent.drive_eviction (heap keyed by the pluggable scorer; lower
+        # score = evict first) but over the FULL SWA LRU membership (internal
+        # tombstone-holders AND true device leaves), not the leaf set: high-V_u
+        # reusable SWA pages sit on INTERNAL nodes under shared prefixes, so a
+        # leaves-only policy would leave most freeable SWA bytes unreachable.
+        score_fn = self.cache._eviction_scorer
+        # Build ONCE from the complete in-list set (UnifiedLRUList has no
+        # __iter__; .cache.values() is the canonical O(1)-indexed enumeration).
+        # The n.id tiebreaker is load-bearing: it stops heapq from comparing two
+        # UnifiedTreeNodes on equal scores (const-V_u / V_u=0 ties).
+        heap = [
+            (score_fn(n, EvictLayer.DEVICE), n.id, n) for n in lru.cache.values()
+        ]
+        heapq.heapify(heap)
+        while tracker[ct] < request and heap:
+            _, _, x = heapq.heappop(heap)
+            # Staleness guard (load-bearing): a prior pop's _evict_device_leaf
+            # write-through path walks UP detaching ancestors, and the cascade
+            # detaches x itself — queued entries go stale DURING the loop.  in_list
+            # is the O(1) liveness oracle; acting on x removes x, so no node is
+            # processed twice.
+            if not lru.in_list(x):
+                continue
+            # Skip locked SWA nodes (matches the _cascade_evict lock assertion).
+            if x.component_data[ct].lock_ref > 0:
+                continue
             assert x.component_data[ct].value is not None
             if x in self.cache.evictable_device_leaves:
-                # D-leaf: atomic eviction of all components
-                x_next = lru.get_prev_no_lock(x)
+                # True device leaf: atomic eviction of the whole node.
                 self.cache._evict_device_leaf(x, tracker)
-                if not lru.in_list(x_next):
-                    x_next = lru.get_lru_no_lock()
-                x = x_next
             else:
-                # Internal: tombstone SWA + cascade
-                x_next = lru.get_prev_no_lock(x)
+                # Internal node: tombstone ONLY the SWA component + cascade to
+                # lower-priority Mamba; Full KV + node + children survive.
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
-                x = x_next
+            # No parent re-push: SWA ancestors are already in the once-built heap
+            # and reclaimed by the cascade (the leaf-set parent-push is a Full-only
+            # idiom because a Full leaf-eviction creates a NEW leaf).
 
     def acquire_component_lock(
         self,
@@ -820,15 +883,49 @@ class SWAComponent(TreeComponent):
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:
-        """Evict SWA host resources.
-        Internal nodes: private tombstone (free SWA host only).
-        Host leaves: atomic eviction via _evict_host_leaf."""
+        """Evict SWA host resources.  Default scorer: exact LRU-list-position walk
+        (do-no-harm; stock host eviction unchanged).  Aginfer value scorer:
+        value-heap over the full host SWA membership.  Internal nodes private-
+        tombstone the SWA host bytes; host leaves evict atomically via
+        _evict_host_leaf; lower score = evict first."""
         ct = self.component_type
         host_lru = self.cache.host_lru_lists[ct]
-        x = host_lru.get_lru_no_host_lock()
-        while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
-            x_next = host_lru.get_prev_no_host_lock(x)
+        if not self._value_ordered():
+            # DEFAULT scorer: preserve the exact LRU-list-position walk byte-for-byte.
+            x = host_lru.get_lru_no_host_lock()
+            while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
+                x_next = host_lru.get_prev_no_host_lock(x)
+                cd = x.component_data[ct]
+                if x in self.cache.evictable_host_leaves:
+                    self.cache._evict_host_leaf(x, tracker)
+                else:
+                    assert cd.host_value is not None
+                    self.cache._evict_component_and_detach_lru(
+                        x, self, target=EvictLayer.HOST, tracker=tracker
+                    )
+                    self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
+                x = x_next
+            return
+        # Value-aware host eviction (aginfer scorer): heap by V_u over the full
+        # host SWA membership; lower score = evict first.
+        score_fn = self.cache._eviction_scorer
+        heap = [
+            (score_fn(n, EvictLayer.HOST), n.id, n) for n in host_lru.cache.values()
+        ]
+        heapq.heapify(heap)
+        while tracker[ct] < num_tokens and heap:
+            _, _, x = heapq.heappop(heap)
+            # Staleness guard: _evict_host_leaf's tombstone-walk + the cascade
+            # detach ancestors/x from host_lru; in_list drops stale entries and
+            # acting on x removes x, so no node is processed twice.
+            if not host_lru.in_list(x):
+                continue
             cd = x.component_data[ct]
+            # Skip host-locked nodes (matches the host-target _cascade_evict /
+            # _evict_host_leaf host_lock_ref==0 assert — intentionally tighter than
+            # the old loop's device-lock filter, which was a no-op on host members).
+            if cd.host_lock_ref > 0:
+                continue
             if x in self.cache.evictable_host_leaves:
                 self.cache._evict_host_leaf(x, tracker)
             else:
@@ -837,4 +934,4 @@ class SWAComponent(TreeComponent):
                     x, self, target=EvictLayer.HOST, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
-            x = x_next
+            # No parent re-push (same reasoning as the device path).

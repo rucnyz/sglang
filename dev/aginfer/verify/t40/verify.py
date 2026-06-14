@@ -292,7 +292,9 @@ def stage_b0_emit_one_hint_per_dt_unit() -> None:
         tracker = ProgramTracker()
         tracker.observe_arrival("p0")  # REASONING, alive
         sj = _state_json(
-            units=[_unit(uhash="u0", residence=["HBM"], holders=["p0"])],
+            # hit_count=3 → reuse-based p_hat (#249: alive no longer forces 1.0);
+            # a reused unit gives a concrete non-zero anchor below.
+            units=[_unit(uhash="u0", residence=["HBM"], holders=["p0"], hit_count=3)],
             time_counter=100,
         )
         ev = Event(EventKind.TOOL_CALL_END, session="p0")
@@ -313,12 +315,16 @@ def stage_b0_emit_one_hint_per_dt_unit() -> None:
     exp = _expected_hints(sched_state)
     if set(got) != set(exp):
         raise StageFail(f"hint hashes: got {set(got)} exp {set(exp)}")
-    # Literal anchor (audit B0-tautology): the fixture is deterministic
-    # — an alive REASONING holder gives p_hat == 1.0 exactly.  Pin it
-    # so a regression that zeroes every hint can't pass by also
-    # zeroing the `exp` derived from the same build_paper_state.
-    if abs(float(got["u0"]["p_hat"]) - 1.0) > 1e-9:
-        raise StageFail(f"u0 p_hat must be exactly 1.0 (alive holder); got {got['u0']}")
+    # Literal anchor (audit B0-tautology): pin u0's p_hat to the INDEPENDENTLY
+    # computed reuse-based value (#249/#250: recency-decoupled 1-exp(-a*(hits-1)),
+    # NOT read back from build_paper_state) so a regression that zeroes every hint
+    # can't pass by also zeroing the `exp` derived from the same build_paper_state.
+    import math as _math
+    exp_u0 = 1.0 - _math.exp(-kvs._PHAT_REUSE_ALPHA * (3 - 1))  # u0 hit_count=3
+    if abs(float(got["u0"]["p_hat"]) - exp_u0) > 1e-9:
+        raise StageFail(
+            f"u0 p_hat must be the reuse-based {exp_u0:.6f} (alive, hits=3); "
+            f"got {got['u0']}")
     for uid, e in exp.items():
         g = got[uid]
         if g.get("stamp") != e["stamp"]:

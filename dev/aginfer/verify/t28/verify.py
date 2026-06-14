@@ -8,7 +8,7 @@ not the daemon is attached.  Two physical plugin points carry this:
 
   * **Eviction scorer** (`SGLANG_KV_POLICY_MODULE`) — already wired
     (T29).  #177 makes the in-process DEFAULT the LRU-equivalent V_u
-    (`last_access_time` + a `hit_count` tie-break), matching the
+    (bare `last_access_time`), matching the
     daemon-side `baselines.sglang_adapter:default_policy_score`, so
     "aginfer disabled" and "aginfer default policy" are literally the
     same function — one code path.
@@ -22,17 +22,17 @@ not the daemon is attached.  Two physical plugin points carry this:
 Stages:
 
   A. eviction default (#177)
-    A0 _default_eviction_score = last_access_time + hit_count·2^-50
-       (the LRU-equivalent V_u, not bare last_access_time)
-    A1 ablation / no-tie path: two DISTINCT last_access_time nodes are
-       ordered by AGE regardless of hit_count (the bonus < 1.0 never
-       flips a distinct-age pair → baseline behaviour unchanged)
-    A2 tie-break path: two SAME-age nodes order by hit_count (higher
-       hits kept longer) — the DESIGN §3 refinement
+    A0 _default_eviction_score = bare last_access_time (the LRU-
+       equivalent V_u; the earlier hit_count·2^-50 tie-break bonus was
+       removed — hit_count must NOT enter the eviction score)
+    A1 distinct-age path: two DISTINCT last_access_time nodes are
+       ordered by AGE regardless of hit_count (baseline LRU unchanged)
+    A2 no-tie-break: two SAME-age nodes do NOT order by hit_count
+       (bare last_access_time has no hit_count refinement)
     A3 cross-tree drift guard: sglang `_default_eviction_score` ==
        daemon `baselines.sglang_adapter.default_policy_score` for
-       sampled nodes (catches formula / 2^-50 constant drift between
-       the two trees — the #175 drift-guard pattern)
+       sampled nodes (catches formula drift between the two trees —
+       the #175 drift-guard pattern)
     A4 plugin override still resolves (T29 contract intact)
   B. write-through plugin (#178)
     B0 _default_should_write_through(node, threshold) == (hit_count

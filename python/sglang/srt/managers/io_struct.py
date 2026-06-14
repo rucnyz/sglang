@@ -1871,14 +1871,17 @@ class GetAginferStateReqOutput(BaseReq):
     described in dev/aginfer/DESIGN.md §sglang surface.
 
     Fast path: when the underlying tree cache supports it the scheduler
-    pre-serialises the snapshot to JSON bytes (``state_bytes``) inside its
-    own process, so the ZMQ pickle hop only carries a single bytes payload
-    and the HTTP layer can write it without re-encoding.  ``state`` stays
+    pre-serialises the snapshot to a JSON string (``state_bytes``) inside its
+    own process, so the ZMQ pickle hop only carries a single text payload
+    and the HTTP layer can write it without re-encoding.  It is a ``str``
+    (JSON text), not ``bytes``: a ``str`` traverses both the native HTTP
+    route AND Dynamo's ``call_tokenizer_manager`` passthrough (whose Rust
+    JSON serializer cannot carry a Python ``bytes`` value).  ``state`` stays
     populated only when the cache cannot pre-serialise (e.g. the
     "unsupported" placeholder)."""
 
     state: Optional[Dict[str, Any]] = None
-    state_bytes: Optional[bytes] = None
+    state_bytes: Optional[str] = None
 
 
 @dataclass

@@ -38,6 +38,7 @@ and the sensitivity sweep in verify/t7/verify.py [step_lambda_sweep].
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -101,6 +102,14 @@ _DEFAULT_LAMBDA_ACTING = _env_float("AGINFER_LAMBDA_ACTING", "0.2")
 # (p_hat / lambda → constant) in build_paper_state so the daemon's migrate /
 # admission ranking is reuse-blind.  Matches sglang_adapter._CONST_VU.
 _CONST_VU = bool(os.environ.get("AGINFER_CONST_VU"))
+# DESIGN §7: p_hat is the PROBABILITY a unit is reused before eviction.  It must
+# be estimated from DEMONSTRATED reuse (hit_count), not from holder liveness — a
+# live holder is not a reuse guarantee.  p_hat = 1 - exp(-alpha * reuses), where
+# reuses = hit_count - 1 (observed repeats): a never-reused one-shot (hits<=1) ->
+# 0 (its save term collapses, hold tax evicts it first); a heavily-reused prefix
+# -> ~1 (kept).  Monotone in reuse count, recency-decoupled (no /age), never
+# saturates for one-shot units.  (Reuse-interval IMMINENCE decay is T11 future.)
+_PHAT_REUSE_ALPHA = _env_float("AGINFER_PHAT_REUSE_ALPHA", "0.5")
 if _CONST_VU:
     logging.getLogger(__name__).warning(
         "AGINFER_CONST_VU active — daemon V_u reuse signal neutralised "
@@ -830,6 +839,7 @@ def build_paper_state(
         session_ids = raw["session_ids"]
         any_acting = False
         any_alive = False
+        any_ended = False
         for sid in session_ids:
             st = tracker.state(sid)
             # T187 (#187, DESIGN §4 SESSION_END / §7): an ENDED holder
@@ -842,6 +852,8 @@ def build_paper_state(
             # keeps p_hat high (the unit survives the ended program).
             if st is not None and st is not State.ENDED:
                 any_alive = True
+            if st is State.ENDED:
+                any_ended = True
             if sid not in program_lambda:
                 program_lambda[sid] = (
                     _clamp_lambda_acting(lambda_acting)
@@ -855,9 +867,32 @@ def build_paper_state(
                 next(sid for sid in session_ids if program_lambda[sid] > 0)
             ]
         if any_alive:
-            p_hat = 1.0
-        else:
+            # §7 FIX: a LIVE holder no longer forces p_hat=1.0 (that binary
+            # liveness flag threw away the reuse count, so a one-shot prefix held
+            # by a live session tied a heavily-reused one at 1.0 and V_u collapsed
+            # to size).  Estimate the reuse PROBABILITY from demonstrated reuse:
+            # one-shot (hits<=1) -> 0, reused -> ->1.  Monotone, recency-decoupled.
+            p_hat = 1.0 - math.exp(-_PHAT_REUSE_ALPHA * max(0, hits - 1))
+        elif any_ended:
+            # Held ONLY by genuinely-ENDED programs (#187 / DESIGN §4 SESSION_END):
+            # the program terminated, so its demonstrated reuse no longer predicts
+            # FUTURE reuse — a demote/drop candidate, keep the low recency-decayed
+            # workload-prior (unchanged).  The demote itself is the explicit
+            # SESSION_END migrate; this is just the eviction-scorer fallback value.
             p_hat = min(1.0, hits / age)
+        else:
+            # No tracked holder at all (raw inference / no aginfer TOOL_CALL
+            # program protocol in play): use the SAME recency-DECOUPLED reuse
+            # estimate as the any_alive arm and the engine-local scorer
+            # (sglang_adapter._node_to_unit).  Demonstrated reuse must NOT be
+            # recency-penalised just because no program events exist — else a
+            # flood-advanced time counter decays a reused prefix's p_hat below a
+            # one-shot flood, and the pushed hint nibbles it (the do-no-harm
+            # regression root-caused on the Dynamo baseline A/B, 2026-06-13;
+            # completes #249, which fixed only the any_alive arm).  This is the
+            # [[feedback-workload-agnostic-phat]] rule: session-state is a FEATURE
+            # (the any_alive / any_ended arms), the base estimator is uniform.
+            p_hat = 1.0 - math.exp(-_PHAT_REUSE_ALPHA * max(0, hits - 1))
         if _CONST_VU:
             # #208 const-V_u isolation arm: neutralise the reuse-prediction
             # signal on the daemon side too (matches the inline scorer's
@@ -1501,6 +1536,14 @@ class KvScheduler:
         migrates = [c for c in plan if isinstance(c, Migrate)]
         pauses = [c for c in plan if isinstance(c, Pause)]
         resumes = [c for c in plan if isinstance(c, Resume)]
+        # S2 isolation knob: suppress the migrate/demote dispatch while keeping the
+        # hint push (so the eviction scorer still gets n_holders) and pause/resume.
+        # Under heavy churn the pressure-relief demote is net-counterproductive for
+        # shared-prefix retention (it demotes into a full/flaky DRAM tier AND frees
+        # HBM the bg flood immediately reclaims), so this isolates the pure
+        # value-aware EVICTION lever from the relief lever. Off by default.
+        if migrates and os.environ.get("AGINFER_DISABLE_MIGRATE"):
+            migrates = []
         _m(
             "kv_decide",
             kind=sched_state.event_kind,

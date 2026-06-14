@@ -704,52 +704,79 @@ def stage_c1_paused_lambda_also_clamped() -> None:
 
 
 def stage_c2_p_hat_alive_vs_ended() -> None:
-    """Program-alive p_hat rule: alive holder → p_hat=1.0.  All
-    holders unknown to tracker (= ENDED / never-seen) → p_hat =
-    hits/age proxy.  Mixing one ALIVE holder dominates."""
+    """p_hat estimator (DESIGN §7 / #249 / #250) — a recency-DECOUPLED reuse base,
+    with session-state as a FEATURE (the holder arms), NOT a branch to a different
+    formula ([[feedback-workload-agnostic-phat]]):
+
+      * ALIVE holder (tracked, not ENDED)      -> reuse-based 1-exp(-a*(hits-1))
+        (#249: a live holder no longer forces p_hat=1.0 — that binary flag threw
+        away the reuse count).
+      * GENUINELY-ENDED holder (observe+end())  -> low hits/age demote-prior (#187:
+        the program terminated, its tail won't be reused; the demote itself is the
+        explicit SESSION_END migrate).
+      * NEVER-SEEN / untracked holder           -> reuse-based, NOT hits/age (#250
+        fix: raw inference / no TOOL_CALL protocol must NOT recency-penalise
+        demonstrated reuse, else a flood-advanced counter decays a reused prefix
+        below a one-shot flood and the pushed hint nibbles it — the Dynamo baseline
+        regression).  This is the arm #249 missed.
+      * MIXED alive+other                       -> alive dominates -> reuse-based.
+    """
+    import math as _math
+    A = kvs._PHAT_REUSE_ALPHA
+
+    def reuse(h: int) -> float:           # the recency-decoupled base estimator
+        return 1.0 - _math.exp(-A * max(0, h - 1))
+
     tracker = ProgramTracker()
-    tracker.observe_arrival("p_alive")  # REASONING (known to tracker)
+    tracker.observe_arrival("p_alive")                      # tracked, LIVE
+    tracker.observe_arrival("p_done"); tracker.end("p_done")  # tracked, genuinely ENDED
 
     units = [
-        _unit(uhash="u-alive-only", residence=["HBM"],
-              holders=["p_alive"], hit_count=2, last_access_time=99),
-        _unit(uhash="u-ended-only", residence=["HBM"],
-              holders=["p_ended"],  # never seen by tracker
-              hit_count=2, last_access_time=99),  # hits/age = 2/1 = 2
-        _unit(uhash="u-mixed",      residence=["HBM"],
-              holders=["p_alive", "p_ended"],
+        _unit(uhash="u-alive", residence=["HBM"], holders=["p_alive"],
+              hit_count=2, last_access_time=99),
+        _unit(uhash="u-ended", residence=["HBM"], holders=["p_done"],
+              hit_count=1, last_access_time=1),     # genuinely ENDED -> hits/age
+        _unit(uhash="u-untracked-oneshot", residence=["HBM"], holders=["p_never"],
+              hit_count=1, last_access_time=1),      # never-seen flood -> reuse(1)=0
+        _unit(uhash="u-untracked-reused", residence=["HBM"], holders=["p_never2"],
+              hit_count=5, last_access_time=1),       # never-seen REUSED + idle
+        _unit(uhash="u-mixed", residence=["HBM"], holders=["p_alive", "p_never"],
               hit_count=2, last_access_time=99),
     ]
-    sj = _state_json(units=units)
-    s = _build_state(sj, Event(EventKind.LLM_PREFILL, session=None), tracker)
-    # alive-only → p_hat == 1.0
-    if abs(s.units["u-alive-only"].p_hat - 1.0) > 1e-9:
+    s = _build_state(_state_json(units=units),
+                     Event(EventKind.LLM_PREFILL, session=None), tracker)
+
+    # alive -> reuse-based (#249)
+    got = s.units["u-alive"].p_hat
+    if abs(got - reuse(2)) > 1e-9:
+        raise StageFail(f"alive p_hat should be reuse-based {reuse(2):.4f}; got {got}")
+
+    # genuinely ENDED -> small hits/age demote-prior (#187). age=99, 1/99≈0.0101
+    got = s.units["u-ended"].p_hat
+    if not (0.0 < got < 0.1):
+        raise StageFail(f"genuinely-ENDED p_hat should be small hits/age (<0.1); got {got}")
+
+    # never-seen one-shot flood -> reuse(1)=0 (evict-first), NOT hits/age
+    got = s.units["u-untracked-oneshot"].p_hat
+    if abs(got - reuse(1)) > 1e-9:
+        raise StageFail(f"untracked one-shot p_hat should be reuse(1)={reuse(1)}; got {got}")
+
+    # #250 DO-NO-HARM GUARD: never-seen but REUSED (hits=5) + idle (last_access=1,
+    # age=99) MUST be recency-DECOUPLED reuse-based (~0.86), NOT recency-decayed
+    # hits/age (5/99≈0.05).  This is exactly the Dynamo regression: an untracked
+    # reused prefix P stays high so the pushed daemon hint cannot eviction-nibble it.
+    got = s.units["u-untracked-reused"].p_hat
+    if abs(got - reuse(5)) > 1e-9:
         raise StageFail(
-            f"alive-only p_hat should be 1.0; got "
-            f"{s.units['u-alive-only'].p_hat}"
-        )
-    # ended-only → p_hat = min(1.0, hits/age) = 1.0 (clamped)
-    # We use hit_count=2, last_access_time=99, time=100 → age=1,
-    # hits/age=2.0 → clamped to 1.0.  To distinguish, use a lower
-    # ratio.  Rebuild with hit=1, last=1 → age=99, ratio≈0.01.
-    units2 = [
-        _unit(uhash="u-ended-cold", residence=["HBM"],
-              holders=["p_ended"], hit_count=1, last_access_time=1),
-    ]
-    s2 = _build_state(_state_json(units=units2),
-                      Event(EventKind.LLM_PREFILL, session=None), tracker)
-    p_cold = s2.units["u-ended-cold"].p_hat
-    if not (0.0 < p_cold < 0.1):
-        raise StageFail(
-            f"ended-only with hits/age ≈ 1/99 should have small p_hat "
-            f"(< 0.1); got {p_cold}"
-        )
-    # mixed → alive wins → p_hat = 1.0
-    if abs(s.units["u-mixed"].p_hat - 1.0) > 1e-9:
-        raise StageFail(
-            f"mixed alive+ended → alive dominates; expected 1.0, got "
-            f"{s.units['u-mixed'].p_hat}"
-        )
+            f"untracked REUSED prefix must be reuse-based {reuse(5):.4f} "
+            f"(NOT hits/age {5/99:.4f}); got {got}")
+    if got < 0.8:
+        raise StageFail(f"untracked reused (hits=5) p_hat must be high (>0.8); got {got}")
+
+    # mixed alive+untracked -> alive dominates -> reuse-based
+    got = s.units["u-mixed"].p_hat
+    if abs(got - reuse(2)) > 1e-9:
+        raise StageFail(f"mixed alive+untracked should be reuse-based {reuse(2):.4f}; got {got}")
 
 
 # ============================================================ D. action / dispatch
@@ -1173,7 +1200,7 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                               stage_c0_acting_lambda_floor_clamp),
     ("C1 PAUSED program also gets ACTING-floor λ",
                               stage_c1_paused_lambda_also_clamped),
-    ("C2 p_hat: alive holder=1.0, all-ENDED=hits/age",
+    ("C2 p_hat: alive/untracked=reuse-based, genuinely-ENDED=hits/age (#249/#250)",
                               stage_c2_p_hat_alive_vs_ended),
     ("D0 Action.assignments is 3-tuple (uid, add, remove)",
                               stage_d0_action_assignments_3tuple_shape),

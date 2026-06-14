@@ -1113,11 +1113,23 @@ def _validate_hints_body(body):
             raise ValueError(f"hints[{i}].stamp must be an int")
         if stamp < 0:
             raise ValueError(f"hints[{i}].stamp must be >= 0; got {stamp}")
+        # S2 / DESIGN §2 fact 1: the holder count (a unit shared by N programs is
+        # worth N× keeping) MUST survive validation — dropping it here (the
+        # original bug) silently neutralised the whole holder-count lever, so a
+        # fleet-shared prefix scored identically to single-program scratch and S2
+        # could never win.  Optional for back-compat (absent ⇒ 0); a non-negative
+        # int when present.
+        n_holders = h.get("n_holders", 0)
+        if isinstance(n_holders, bool) or not isinstance(n_holders, int):
+            raise ValueError(f"hints[{i}].n_holders must be an int; got {n_holders!r}")
+        if n_holders < 0:
+            raise ValueError(f"hints[{i}].n_holders must be >= 0; got {n_holders}")
         out.append({
             "hash": uhash,
             "p_hat": float(p_hat),
             "lambda": float(lam),
             "stamp": int(stamp),
+            "n_holders": int(n_holders),
         })
     return out
 

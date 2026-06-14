@@ -217,6 +217,34 @@ def stage_a4_scorer_does_not_advance_counter() -> None:
         )
 
 
+def stage_a5_hint_only_raises_never_lowers() -> None:
+    """#250 do-no-harm: the daemon hint may only RAISE eviction keep-value ABOVE
+    the local demonstrated-reuse evidence (max-combine), NEVER push a locally-hot
+    prefix below it.  A low / stale / branch-inconsistent daemon p_hat (e.g. the
+    recency-coupled no-program-event path) must not eviction-nibble a reused
+    prefix — the Dynamo baseline regression (39/39 -> flaky tail-nibbled partials).
+    Demote of an idle/ended unit is a SEPARATE explicit daemon migrate, not an
+    eviction-scorer downgrade."""
+    # locally-HOT node (many hits → high local reuse-based p_hat) with a LOW hint:
+    # max-combine must keep the local value, i.e. == the no-hint score.
+    hot = _Node(last_access_time=0, hit_count=9, n_tokens=100)
+    local = hint_v_u(hot, _LAYER, None)
+    low = hint_v_u(hot, _LAYER, {"p_hat": 0.0, "lambda": 1e-3, "stamp": 1})
+    if abs(low - local) > 1e-9:
+        raise StageFail(
+            f"a LOW hint must NOT lower a locally-hot prefix below local "
+            f"(max-combine); local={local} low_hint={low}")
+    # locally-COLD node (one-shot → local p_hat≈0) with a HIGH hint: the daemon's
+    # foresight may still RAISE it (promote), so the score must exceed no-hint.
+    cold = _Node(last_access_time=0, hit_count=1, n_tokens=100)
+    local_cold = hint_v_u(cold, _LAYER, None)
+    high = hint_v_u(cold, _LAYER, {"p_hat": 1.0, "lambda": 0.5, "stamp": 1})
+    if not (high > local_cold):
+        raise StageFail(
+            f"a HIGH hint must still RAISE a locally-cold node (promote foresight); "
+            f"local_cold={local_cold} high_hint={high}")
+
+
 # ============================================================ B. selection + scorer
 
 
@@ -307,13 +335,23 @@ def stage_b3_real_producer_consumer_round_trip() -> None:
 
 
 def stage_c0_birth_seed_absent() -> None:
+    """#249/#250: a fresh leaf is seeded with a LOW floor p_hat, NOT 1.0.  Under
+    the max-combine eviction scorer (sglang_adapter.hint_v_u) a 1.0 seed would let
+    a brand-new one-shot flood tie a heavily-reused prefix — so the seed must be a
+    low floor and let demonstrated reuse (the local reuse-based p_hat) dominate."""
+    from sglang.srt.mem_cache import unified_radix_cache as _urc
+    seed = float(_urc._AGINFER_BIRTH_PHAT)
     c = _bare_cache()
     c._aginfer_hint_aware = True
     n = _Node(hash_value=["fresh"], last_access_time=5)
     c._aginfer_seed_birth(n)
     h = c._aginfer_hints.get("fresh")
-    if h is None or abs(h["p_hat"] - 1.0) > 1e-9:
-        raise StageFail(f"birth-seed must seed p_hat=1.0 for an absent unit; got {h!r}")
+    if h is None or abs(h["p_hat"] - seed) > 1e-9:
+        raise StageFail(f"birth-seed must seed p_hat={seed} (the low floor); got {h!r}")
+    if not (0.0 <= seed < 0.5):
+        raise StageFail(
+            f"birth-seed must be a LOW floor (<0.5) so a fresh flood can't tie a "
+            f"reused prefix under max-combine; got {seed}")
 
 
 def stage_c1_birth_seed_no_clobber() -> None:
@@ -426,11 +464,12 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A2 drift guard: hint_v_u(None) == ours_greedy",  stage_a2_drift_guard_vs_ours_greedy),
     ("A3 V_u monotonic in hint p_hat",                 stage_a3_monotonic_in_p_hat),
     ("A4 scorer does not advance the time counter (#193)", stage_a4_scorer_does_not_advance_counter),
+    ("A5 hint only RAISES, never lowers below local (#250)", stage_a5_hint_only_raises_never_lowers),
     ("B0 sentinel binds the hint-aware scorer",        stage_b0_sentinel_binds_hint_scorer),
     ("B1 scorer reads _aginfer_hints by node hash",    stage_b1_scorer_reads_hint_table),
     ("B2 default spec → not hint-aware",               stage_b2_normal_spec_not_hint_aware),
     ("B3 real producer→consumer round-trip (hash key)", stage_b3_real_producer_consumer_round_trip),
-    ("C0 birth-seed p_hat=1.0 for absent unit",        stage_c0_birth_seed_absent),
+    ("C0 birth-seed low-floor p_hat for absent unit (#249/#250)", stage_c0_birth_seed_absent),
     ("C1 birth-seed does not clobber daemon hint",     stage_c1_birth_seed_no_clobber),
     ("C2 birth-seed no-op when not hint-aware",        stage_c2_birth_seed_noop_when_not_aware),
     ("C3 daemon overwrites birth-seed (C7 stamp floor)", stage_c3_daemon_overwrites_birth_seed),

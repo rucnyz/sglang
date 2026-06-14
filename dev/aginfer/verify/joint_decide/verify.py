@@ -179,12 +179,15 @@ def stage_a_migrate_candidates() -> None:
     """§7 migrate_candidates: per-unit transitions → Migrate(cost, relief,
     acquired), with the relief>0 filter and the (uid, add, remove) id."""
     tracker = ProgramTracker()
-    tracker.observe_arrival("S")  # REASONING → p_hat=1 (alive holder)
+    tracker.observe_arrival("S")  # REASONING (alive holder)
     GB = 1024 ** 3
     nb = 2_000_000  # bytes per tier for the unit
+    # hit_count=5 → reuse-based p_hat≈0.86 (#249: alive no longer forces 1.0).
+    # A REUSED unit is what gives V({DRAM})>0, so DROP forgoing the retained
+    # saved-prefill is a real cost — the property this stage exercises.
     sj = _state_json(
         units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
-                     n_bytes_per_tier={"HBM": nb, "DRAM": nb})],
+                     hit_count=5, n_bytes_per_tier={"HBM": nb, "DRAM": nb})],
         hbm={"kv": _sp(5 * GB, 10 * GB)},
     )
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
@@ -518,9 +521,12 @@ def stage_c_program_candidates() -> None:
     }
     sj = _state_json(
         units=[
-            _unit(uhash="uA", residence=["DRAM"], holders=["A"]),
-            _unit(uhash="uB", residence=["DRAM"], holders=["B"]),
-            _unit(uhash="uP", residence=["DRAM"], holders=["P"]),
+            # hit_count=5 → reuse-based p_hat≈0.86 (#249: alive no longer forces
+            # 1.0).  A REUSED unit gives a non-degenerate V_u so the gain/cost ==
+            # V_u_program identities this stage pins are exercised meaningfully.
+            _unit(uhash="uA", residence=["DRAM"], holders=["A"], hit_count=5),
+            _unit(uhash="uB", residence=["DRAM"], holders=["B"], hit_count=5),
+            _unit(uhash="uP", residence=["DRAM"], holders=["P"], hit_count=5),
         ],
         programs=programs,
         hbm={"kv": _sp(2 * GB, 10 * GB)},
