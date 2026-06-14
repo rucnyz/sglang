@@ -993,31 +993,12 @@ async def aginfer_thresholds_put(raw_request: Request):
     return ORJSONResponse({"ok": True, "ranks": len(responses)})
 
 
-def _validate_program_paused_body(body):
-    """T21 (#181) + #186 audit: validate a PUT /aginfer/program_paused
-    body.  Returns ``(pid, state, pre_pause_state)`` or raises
-    ``ValueError`` with a 400-able message.
-
-    Pure function (no FastAPI deps) so verify/t21 can unit-test the
-    type checks directly.  Type-validate BEFORE coercion — a prior
-    ``str(body["pid"])`` silently turned JSON null/number into
-    "None"/"123", bypassing the setter's empty-pid guard.
-    """
-    if not isinstance(body, dict):
-        raise ValueError("body must be a JSON object")
-    for k in ("pid", "state"):
-        if k not in body:
-            raise ValueError(f"missing required field: {k!r}")
-    pid = body["pid"]
-    if not isinstance(pid, str) or not pid:
-        raise ValueError("pid must be a non-empty string")
-    state = body["state"]
-    if not isinstance(state, str) or not state:
-        raise ValueError("state must be a non-empty string")
-    pre = body.get("pre_pause_state")
-    if pre is not None and not isinstance(pre, str):
-        raise ValueError("pre_pause_state must be string or null")
-    return pid, state, pre
+# aginfer HTTP request validators live in the self-contained module; the
+# endpoints below call them as thin hooks (#251).
+from sglang.srt.mem_cache.aginfer.http_validators import (  # aginfer hook (#251)
+    validate_program_paused_body as _validate_program_paused_body,
+    validate_hints_body as _validate_hints_body,
+)
 
 
 # T21 (#181): daemon → sglang program-state broadcast.  Body is
@@ -1062,76 +1043,6 @@ async def aginfer_program_paused_put(raw_request: Request):
         "ranks": len(responses),
         "applied": sum(int(r.applied) for r in responses),
     })
-
-
-def _validate_hints_body(body):
-    """T40 (#184): validate a PUT /aginfer/hints body.  Returns the
-    normalized list of hint dicts (``[{hash, p_hat, lambda, stamp}]``)
-    or raises ``ValueError`` with a 400-able message.
-
-    Pure function (no FastAPI deps) so verify/t40 can unit-test the
-    type checks + round-trip the daemon's exact wire body.  Rejects
-    out-of-range V_u inputs here so a malformed daemon push fails at
-    the door rather than silently poisoning the inline scorer's
-    eviction order: ``p_hat`` ∈ [0, 1], ``lambda`` ≥ 0, ``stamp`` a
-    non-negative int.
-    """
-    import math
-    if not isinstance(body, dict):
-        raise ValueError("body must be a JSON object")
-    hints = body.get("hints")
-    if not isinstance(hints, list):
-        raise ValueError("'hints' must be a list")
-    out = []
-    for i, h in enumerate(hints):
-        if not isinstance(h, dict):
-            raise ValueError(f"hints[{i}] must be an object")
-        uhash = h.get("hash")
-        if not isinstance(uhash, str) or not uhash:
-            raise ValueError(f"hints[{i}].hash must be a non-empty string")
-        # bool is an int subclass — reject it explicitly for numerics.
-        # Reject non-finite (NaN/inf) at the door: the validator is the
-        # safety boundary for the inline scorer's eviction order; a
-        # NaN p_hat / inf lambda would silently corrupt comparisons
-        # downstream (audit A4).
-        p_hat = h.get("p_hat")
-        if isinstance(p_hat, bool) or not isinstance(p_hat, (int, float)):
-            raise ValueError(f"hints[{i}].p_hat must be a number")
-        if not math.isfinite(p_hat):
-            raise ValueError(f"hints[{i}].p_hat must be finite; got {p_hat}")
-        if not (0.0 <= float(p_hat) <= 1.0):
-            raise ValueError(f"hints[{i}].p_hat must be in [0, 1]; got {p_hat}")
-        lam = h.get("lambda")
-        if isinstance(lam, bool) or not isinstance(lam, (int, float)):
-            raise ValueError(f"hints[{i}].lambda must be a number")
-        if not math.isfinite(lam):
-            raise ValueError(f"hints[{i}].lambda must be finite; got {lam}")
-        if float(lam) < 0.0:
-            raise ValueError(f"hints[{i}].lambda must be >= 0; got {lam}")
-        stamp = h.get("stamp")
-        if isinstance(stamp, bool) or not isinstance(stamp, int):
-            raise ValueError(f"hints[{i}].stamp must be an int")
-        if stamp < 0:
-            raise ValueError(f"hints[{i}].stamp must be >= 0; got {stamp}")
-        # S2 / DESIGN §2 fact 1: the holder count (a unit shared by N programs is
-        # worth N× keeping) MUST survive validation — dropping it here (the
-        # original bug) silently neutralised the whole holder-count lever, so a
-        # fleet-shared prefix scored identically to single-program scratch and S2
-        # could never win.  Optional for back-compat (absent ⇒ 0); a non-negative
-        # int when present.
-        n_holders = h.get("n_holders", 0)
-        if isinstance(n_holders, bool) or not isinstance(n_holders, int):
-            raise ValueError(f"hints[{i}].n_holders must be an int; got {n_holders!r}")
-        if n_holders < 0:
-            raise ValueError(f"hints[{i}].n_holders must be >= 0; got {n_holders}")
-        out.append({
-            "hash": uhash,
-            "p_hat": float(p_hat),
-            "lambda": float(lam),
-            "stamp": int(stamp),
-            "n_holders": int(n_holders),
-        })
-    return out
 
 
 # T40 (#184, DESIGN §6 PUT /aginfer/hints): daemon → sglang push of
