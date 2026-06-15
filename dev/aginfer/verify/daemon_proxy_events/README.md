@@ -1,6 +1,6 @@
 # daemon proxy + paper §4 event emission (daemon I/O surface)
 
-> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> **Status: infrastructure regression-guard.**  Not a numbered Impl_PLAN.md
 > task.  Guards the daemon proxy's two jobs:
 >
 > 1. **Pass-through of `/v1/chat/completions`** to sglang (transparent

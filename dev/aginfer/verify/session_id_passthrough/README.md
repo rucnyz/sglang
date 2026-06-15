@@ -1,6 +1,6 @@
 # session_id passthrough → `UnifiedTreeNode.session_ids`
 
-> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> **Status: infrastructure regression-guard.**  Not a numbered Impl_PLAN.md
 > task.  Guards the wire path that POPULATES `unit.session_ids`, which
 > is read by T17's `/aginfer/state` schema and consumed by per-program
 > attribution.  The mechanism was implemented before the round-9

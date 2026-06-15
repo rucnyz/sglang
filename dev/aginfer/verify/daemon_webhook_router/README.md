@@ -1,6 +1,6 @@
 # sglang→daemon webhook + daemon event router
 
-> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> **Status: infrastructure regression-guard.**  Not a numbered Impl_PLAN.md
 > task.  Guards the webhook receiver + event dispatcher at the
 > daemon's `POST /aginfer/event` endpoint:
 >

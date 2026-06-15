@@ -1,6 +1,6 @@
 # T11 — Empirical p_hat estimator (PLAN §1)
 
-PLAN.md §1 calibration task.  Replace `OursGreedyPolicy._value`'s
+Impl_PLAN.md §1 calibration task.  Replace `OursGreedyPolicy._value`'s
 `p_hat = min(1, hits/age)` proxy with a workload-agnostic estimator
 (histogram / per-program-bucket / Hawkes fit) per the
 [todo-empirical-phat] memory entry.  Session state (REASONING /

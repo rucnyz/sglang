@@ -1,6 +1,6 @@
 # T17 — State-dump schema upgrade (DESIGN §5)
 
-PLAN.md §3 T17.  Replace the legacy state-dump schema with the
+Impl_PLAN.md §3 T17.  Replace the legacy state-dump schema with the
 residence-set, per-subpool, two-view schema specified in DESIGN §5.
 This is a hard replace — no add-alongside, no compatibility shim.
 
@@ -252,7 +252,7 @@ initial test, all fixed in this pass:
    impl's specific placeholder value (1e12 today).
 
 Coverage gaps that the audit flagged as out-of-scope for T17 (each
-is the target of another PLAN.md task):
+is the target of another Impl_PLAN.md task):
 
 - D4 chunked-prefill atomicity (mid-prefill chunks not in `units`):
   PLAN T19 (Atomic unit visibility).

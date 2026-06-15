@@ -1,6 +1,6 @@
 # T42 — Daemon-side observability logging (PLAN §4)
 
-PLAN.md §4 T42.  Companion to T14 (sglang side).  Four daemon metric
+Impl_PLAN.md §4 T42.  Companion to T14 (sglang side).  Four daemon metric
 streams the operator needs to spot daemon-side backpressure
 empirically before designing the F3 fix:
 

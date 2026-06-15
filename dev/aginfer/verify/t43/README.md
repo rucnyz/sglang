@@ -1,6 +1,6 @@
 # T43 — `fatal(reason, **context)` helper (DESIGN §10)
 
-PLAN.md §4 T43.  Shared entry point for every **deployment-bug-class
+Impl_PLAN.md §4 T43.  Shared entry point for every **deployment-bug-class
 halt** in the daemon.  Defines the two-fault-class split (DESIGN §10):
 
 * **deployment-bug** — schema mismatch, missing required state fields,

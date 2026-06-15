@@ -7,22 +7,25 @@ Workspace for the paper **"Multi-Agent KV Cache Scheduling as an MDP"**
 
 | Read this | When |
 |---|---|
-| [`DESIGN.md`](DESIGN.md)   | What aginfer is, the state surface, action surface, decision rule, joint MDP — **the spec, source of truth** |
-| [`PLAN.md`](PLAN.md)       | Open implementation work, ordered by dependency.  Each item points at the DESIGN section it implements |
-| [`RUNBOOK.md`](RUNBOOK.md) | One-shot reproducer: install → start services → run a benchmark → cleanup |
+| [`DESIGN.md`](DESIGN.md)   | What aginfer is, the state/action surface, decision rule, joint MDP — **the spec, source of truth** |
+| [`Impl_PLAN.md`](Impl_PLAN.md) | **Implementation** work (calibration, observability, sglang+daemon; layering §7, refactor §8), keyed to DESIGN |
+| [`EXP_PLAN.md`](EXP_PLAN.md) | **Experiment** roadmap: the 3-config scorer factorial + the `wherewewin/` scenarios; execution → `reproduce/RQ1/` |
+| [`RUNBOOK.md`](RUNBOOK.md) | **Dynamo** stack startup (worker + router + frontend + daemon + bridge) + the operational gotchas |
 
 ## What's in each subdir
 
 | Path | What | Read its own README for details |
 |---|---|---|
-| [`baselines/`](baselines)   | Paper §8 policy implementations (LRU / TA / InferCept / Continuum / KVFlow / Ours-greedy) + simulation harness | — |
+| [`wherewewin/`](wherewewin) | **Scenario catalogue** — the distinct agentic scenarios (S1–S8) where ours should beat B/TA, with each one's win + metric | [`wherewewin/README.md`](wherewewin/README.md) |
 | [`daemon/`](daemon)         | The aginfer daemon: proxy, event router, program tracker, admission controller, kv scheduler | — |
-| [`workload/`](workload)     | Agent-DAG data model used by baseline policies | — |
-| [`scripts/`](scripts)       | Launch + sanity scripts sourced by RUNBOOK | — |
-| [`verify/`](verify)         | Per-item correctness + performance tests, aligned with PLAN.md sections | [`verify/README.md`](verify/README.md) |
-| [`scenarios/`](scenarios)   | End-to-end workload × arm comparisons (e.g. swebench_default × {LRU, TA, ours_inline, ours_full}) | [`scenarios/README.md`](scenarios/README.md) |
-| [`results/`](results)       | Raw harbor / scenario output, one dir per labelled run | — |
-| [`logs/`](logs)             | Server / build stdout, rotated (`*.log.prev` = previous run) | — |
+| [`verify/`](verify)         | Per-item correctness + performance tests, aligned with `Impl_PLAN.md` sections | [`verify/README.md`](verify/README.md) |
+| [`baselines/`](baselines)   | **Live core policy library** (despite the name): shared data types (`Tier`/`Scope`/`ReuseUnit`/`Action`), cost model, the OursGreedy policy, the knapsack DP, the sglang adapter — imported by the daemon + verify. (paper §8 baseline policies also live here) | — |
+| [`scripts/`](scripts)       | Launch + sanity scripts | — |
+| [`results/`](results) / [`logs/`](logs) | Raw run output / server stdout (`*.log.prev` = previous run) | — |
+| [`archive/`](archive)       | Legacy, do-not-use: old **harbor** scenario tree + the §2.4 `workload/` Agent-DAG model — superseded by Dynamo (`../dynamo/`) + `reproduce/RQ1/` | [`archive/README.md`](archive/README.md) |
+
+> **Live experiments now run on Dynamo** — see [`../dynamo/`](../dynamo) (platform + S2),
+> [`EXP_PLAN.md`](EXP_PLAN.md) (what to run), and `../../reproduce/RQ1/` (paper packages).
 
 ## Conventions
 

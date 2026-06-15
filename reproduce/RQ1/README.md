@@ -23,7 +23,7 @@ not the cache tier itself.
 | ID | Scenario | Distinctive driver | Status |
 |---|---|---|---|
 | **S1** | [Program-aware KV scheduling across tool gaps](scenarios/s1-predictive-promote/) | a program parks in a tool call → its idle prefix is evicted → it resumes the *same* prefix | ✅ **measured on real CC traces, N=3**: program-aware eviction = **71.6 % vs 55.8 % cache-hit (−42 % re-prefill)** at moderate concurrency — a **goodput** win (NOT the old predictive-promote *latency* claim, which is a microbench only); ≈ LRU at the heavy fleet. TA ≈ B (never promotes). See [README](scenarios/s1-predictive-promote/) + [FLEET_FINDINGS](scenarios/s1-predictive-promote/FLEET_FINDINGS.md) |
-| **S2** | [Shared-prefix retention under scratch churn](scenarios/s2-shared-prefix-retention/) | a fleet-shared system prefix LRU ages out by recency under scratch churn | ⚠️ **no clean win (design-revising)**: holder-count was completely broken — fixed 2 real bugs (`补齐design`: storage-layer `n_holders` drop + lambda-formulation backfire). Even fixed, N=3 shows only a small/narrow effect (strong pool: TIE 64/64; moderate: ~20% within noise). Blocked by active-set competition + the **dead V4 multi-tier store** (evicted = full recompute, not cheap DRAM reload). See [README](scenarios/s2-shared-prefix-retention/) |
+| **S2** | [Shared-prefix retention under scratch churn](scenarios/s2-shared-prefix-retention/) | a fleet-shared system prefix LRU ages out by recency under scratch churn | 🔄 **moved to Dynamo + token-exact agentreplay (2026-06-15).** The "dead V4 multi-tier store" blocker was a config artifact (tier is live post-sync); holder-count had 4 stacked bugs, all fixed + the lever now fires (`n_holders=8`). Chat-harness clean re-run showed **ours −23% re-prefill vs LRU, do-no-harm strict (N=3)**; the token-exact agentreplay redo is in progress (open V4-Flash watchdog blocker). **Current state of record: `dev/dynamo/S2_RESULTS.md`** + `dev/aginfer/EXP_PLAN.md`. (The narrow/TIE finding in this folder's README is the SUPERSEDED earlier result.) |
 | S3… | (future scenarios) | — | planned |
 
 > RQ1 is structured to grow: each scenario is a self-contained sub-folder with its own
@@ -35,8 +35,9 @@ This package contains the **workload drivers + analysis**; the *system* (sglang 
 the aginfer daemon) is the dependency:
 
 - **Code**: the aginfer fork of sglang with the daemon under `dev/aginfer/`. Point
-  `AGINFER_ROOT` at that `dev/aginfer` directory. (At time of writing this lives on the
-  `aginfer-synced` branch / the `sglang-sync` worktree — see [`CONSOLIDATION.md`](CONSOLIDATION.md).)
+  `AGINFER_ROOT` at that `dev/aginfer` directory. (Canonical checkout: branch
+  `aginfer-synced` at `/scratch/yuzhou/projects/sglang` — the old `sglang-sync` worktree was
+  consolidated away.)
 - **Python env**: conda env `agsched-rebase` (torch 2.11+cu130, sglang dev, mooncake,
   sgl_kernel). Model: DeepSeek **V4-Flash**, TP=2.
 - **Hardware (as measured)**: 8× B300 (275 GB); GPUs **5,6** free. KV ≈ 1.17 KB/token.
@@ -51,7 +52,7 @@ the aginfer daemon) is the dependency:
 ## How to reproduce (S1)
 
 ```bash
-export AGINFER_ROOT=/path/to/sglang/dev/aginfer   # the aginfer code (see CONSOLIDATION.md)
+export AGINFER_ROOT=/path/to/sglang/dev/aginfer   # the aginfer code (branch aginfer-synced)
 conda activate agsched-rebase
 cd scenarios/s1-predictive-promote
 

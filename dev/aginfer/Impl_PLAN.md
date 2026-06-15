@@ -1,10 +1,11 @@
-# aginfer — implementation & verification plan
+# aginfer — implementation plan (`Impl_PLAN.md`)
 
-Companion document to `DESIGN.md`.  Captures the **forward-looking
-work** (empirical calibration, implementation gaps, scenario
-verification) that the design references but does not itself
-contain.  Each section is keyed back to the `DESIGN.md` section
-that motivates it.
+Companion to `DESIGN.md`, the **implementation** side: empirical calibration (§1),
+observability (§2), the sglang (§3) + daemon (§4) work, revisit triggers (§6), the
+Dynamo↔sglang layering decision (§7), and the in-engine-plugin refactor (§8). The
+**experiment** side — win scenarios, the value-aware-scorer factorial, and run
+methodology — lives in `EXP_PLAN.md` (§5 here is just a pointer). Each section keys
+back to the `DESIGN.md` section that motivates it.
 
 ## 1. Empirical calibration tasks
 
@@ -27,9 +28,10 @@ Goal: replace the rule with a **workload-agnostic estimator**:
 - Must be **session-state-aware** but not session-state-branched —
   the program state is a feature input, not a switch (per
   `feedback-workload-agnostic-phat.md`)
-- Evaluation: replay traces from existing `scenarios/` cycle runs
-  with each candidate estimator, score by `Σ |observed_access -
-  predicted_p_hat|` on held-out segments
+- Evaluation: replay traces (agentreplay token-exact, or archived
+  `archive/scenarios_harbor/` cycle runs) with each candidate
+  estimator, score by `Σ |observed_access - predicted_p_hat|` on
+  held-out segments
 
 When this lands, the T12 follow-on (collect `(tier, subpool, occ,
 marginal_V_u)` quadruples from the same scenario cycle runs +
@@ -718,115 +720,13 @@ generalization.
       / `throughput_ema` fields; cross-rank subpool-key disagreement;
       `peak_bw_bps ≤ 0`; daemon-attached mode losing daemon mid-run
 
-## 5. Scenario-specific verification
+## 5. Scenario verification & win experiments → see `EXP_PLAN.md`
 
-For each `DESIGN §12` scenario, a small verification run that
-confirms the named subpools actually appear in `/aginfer/state`
-and that the decision rule reacts as the scenario claims.
-
-### Methodology (applies to every scenario)
-
-- **N ≥ 3 cycles per arm**, B/O alternation order across cycles
-  (Ours/Baseline/Ours/Baseline/...) to neutralise GPU-thermal /
-  docker-cache / time-of-day drift.
-- **Each cycle from clean slate**: `pkill sglang daemon
-  mooncake_master` → drain zombies → fresh start.
-- **Fixed knobs** within a matrix: `--ak temperature=0.0` (greedy
-  decoding), `--random-seed 42` on sglang, identical
-  `harbor -l N -n N -k 1`, identical `sglang HEAD` (verify
-  `git rev-parse HEAD` matches at every cycle start).
-- **Headline metric**: per-trial wall (`finished_at − started_at`
-  from `harbor_jobs/<run_id>/instance_*/result.json`).  Aggregate:
-  mean ± std per cycle, then across-cycle mean ± std per arm.
-- **Fine metric**: per-turn TTFT from sglang `Prefill batch` log
-  line (prompt_tokens, cached_tokens, ttft_ms).
-- **Acceptance**: `ours_mean + ours_std < baseline_mean −
-  baseline_std` at N=3 → claim significant; if not, do N=6 before
-  abandoning.
-
-### T44 — Verify DESIGN §12 S1 (single-stack attention, current benchmark)
-
-Model: DeepSeek-V4-Flash (MLA).
-
-- 1 HBM subpool (`"attn"`) ✓ already running
-- 3-axis §9 DP ✓ baseline by construction
-- T12 / T13 calibration runs land on this scenario
-
-Open output: `verify/t44/README.md`.  Specifically verifies the
-named-subpool framework **correctly degenerates to a single
-subpool** (`pool_usage.HBM.subpools` has exactly one entry, no
-hardcoded single-subpool assumption survives in the daemon).
-T11 / T12 / T13 run on this scenario but do not check the
-degeneracy explicitly — T44 does.
-
-### T45 — Verify DESIGN §12 S2 (SWA-hybrid)
-
-Model: Mistral / Gemma (any sglang-supported SWA hybrid).
-
-- Verify `pool_usage.HBM.subpools` has `{"full", "swa"}`
-- Verify `units[i].n_bytes["HBM"].swa` transitions to 0 when the
-  unit's tokens age out of the sliding window
-- Verify pressure on SWA subpool fires `joint_decide` even when
-  full-attention subpool is at < theta_hi
-
-Open output: `verify/t45/README.md`.
-
-### T46 — Verify DESIGN §12 S3 (Mamba+attention hybrid)
-
-Model: Jamba / Zamba (any sglang-supported Mamba+attn hybrid).
-
-- Verify only leaf radix-tree nodes carry `n_bytes["HBM"].mamba > 0`
-- Verify Mamba snapshot Migrate transitions (DRAM archive, load_back)
-  follow the same residence-set semantics as attention units
-- Verify `forecast_inflight_demand["mamba"] == 0` between snapshot
-  boundaries
-
-Open output: `verify/t46/README.md`.
-
-### T47 — Verify DESIGN §12 S5 (speculative decoding)
-
-Model: Medusa / Eagle on any base model.
-
-- Verify `pool_usage.HBM.subpools` adds `"draft"`
-- Verify draft KV does NOT appear in `state.units`
-- Verify `per_program_usage[p].hbm.inflight["draft"]` tracks draft
-  buffer occupancy per program
-- Verify `pause_relief[draft]` for a spec-decoding program is the
-  full discarded draft buffer
-
-Open output: `verify/t47/README.md`.
-
-### Multi-LoRA (out of scope)
-
-No verification task in the current plan.  The §12 "Out of scope"
-note covers the framework's extensibility — instantiate an
-`"adapter"` subpool and route per-request adapter bytes through
-`per_program_usage[p].hbm.inflight["adapter"]` when a scenario
-lights this up.
-
-### Eviction & hint-latency characterization (#230)
-
-A cross-cutting characterization suite (not a single DESIGN §12
-scenario) that maps **where each eviction-related mechanism binds**
-across pressure regimes and the hint-freshness dimension, to
-*understand and document* the design-ideal system — NOT to cut
-features.  Lives in `scenarios/5_eviction_characterization/`:
-
-- **Tier-1** (`harness/`, deterministic CPU): a trace-replay
-  eviction simulator sweeping policy (LRU / hint-steered / const-V_u)
-  × pressure × hint-delay × reuse-pattern × migrate, counting
-  re-prefill tokens.  Self-test `harness/verify.py`; sweep
-  `harness/sweep.py`; findings in `RESULTS.md`.  Headline: steering
-  value is pressure-dependent (+49% under headroom → +3% saturated,
-  quantitatively explaining the A3 `ours ≈ baseline` / `migrate ≈ 6`
-  observation); the hint-latency budget ≈ the predictable-reuse lead
-  time.
-- **Tier-2** (`e2e/`): real-stack arms via `run_k.sh` with the
-  inline scorer + `AGINFER_HINT_DELAY_MS` knob (#230 daemon) swapped
-  per arm, sweeping `lru / ours-fresh / ours-d{250,1000}ms`.  Grounds
-  the Tier-1 trends in real TTFT / cache-hit; follows §5 methodology
-  (N ≥ 3, mean ± std).  Open output: `scenarios/5_eviction_
-  characterization/RESULTS.md` Tier-2 section.
+The per-scenario WIN experiments (S1 predictive-promote, S2 holder-count), the
+3-config factorial that proves the value-aware scorer, the per-architecture
+verification (DESIGN §12 S1/S2/S3/S5), and the #230 eviction characterization now
+live in **`EXP_PLAN.md`** (execution → `sglang/reproduce/RQ1/`). This file keeps only
+the implementation / calibration / observability / layering / refactor work.
 
 ## 6. Revisit triggers
 
@@ -844,3 +744,456 @@ Conditions that flip an out-of-scope item back into the work plan.
 - **Multi-LoRA scenario**: triggered when the workload mix
   includes per-request LoRA adapter activations occupying material
   HBM bytes
+
+
+---
+
+## 7. Layering decision: Dynamo (policy) ↔ sglang (mechanism)
+
+> Folded in from the former `LAYERING_dynamo_sglang.md` (decision record 2026-06-14).
+
+Decision record (2026-06-14). Captures *where aginfer's logic lives*, *why*, *what each
+PR target gets*, and the empirically-established fact that **no Dynamo Rust change is
+needed** — for the algorithm or for token-exact replay. Not yet PR'd (per request).
+
+### TL;DR
+
+- **aginfer is a SUPERSET of ThunderAgent**, not a same-layer peer. ThunderAgent is a
+  Dynamo **router** that is **KV-blind** — its only lever is pause/admit/route. aginfer
+  adds the layer ThunderAgent can't reach: **engine-level value-aware KV-tier control**
+  (HBM/DRAM/Disk/Drop migrate/evict/promote).
+- **Policy lives at the router layer (Dynamo)** — same layer as ThunderAgent, so the A/B
+  is apples-to-apples. **Mechanism lives in the engine (sglang)**: the KV-tier action API
+  + a hint-driven hot-path eviction.
+- **No Dynamo Rust change is required** — neither for the runtime algorithm nor for
+  token-exact replay. (Details below.)
+
+### Layering
+
+```
+┌─ Dynamo: aginfer_router  (Python component, peer of thunderagent_router) ─────────────┐
+│  POLICY (all event-scale, NOT hot-path):                                              │
+│   - value model / reuse prediction (p_hat), program lifecycle                          │
+│   - pause / admit decisions                                                            │
+│   - strategic migrate / promote / demote across tiers                                  │
+│   - pushes per-unit value as HINTS to the engine                                       │
+└───────────────┬───────────────────────────────────────────────────────────────────────┘
+                │  side-channel HTTP to the engine (NOT Dynamo's request path):
+                │   PUT /aginfer/hints      (value priorities)
+                │   POST /aginfer/migrate   (explicit tier actions)
+                ▼
+┌─ sglang engine ────────────────────────────────────────────────────────────────────────┐
+│  MECHANISM:                                                                              │
+│   (a) KV-tier action API: migrate / evict / promote primitives                          │
+│   (b) hint-driven LOCAL fast eviction on the hot path: read the pushed per-unit          │
+│       priority and evict lowest — a cheap local lookup, NO router round-trip             │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Decision vs execution — why network overhead does NOT push policy into the engine
+
+| operation | time-scale | home | hot-path? |
+|---|---|---|---|
+| value/p_hat compute, predictive promote/demote, pause/admit | program-event scale (per turn / tool-call / arrival), ~100ms–s | **Dynamo router** | no |
+| "which block to evict" when the pool is full | allocation loop, microseconds | **engine** | yes |
+
+The genuinely smart parts of aginfer are **event-scale, not hot-path** → they sit happily
+at the Dynamo router (ThunderAgent's pause runs at the same cadence). The only microsecond
+operation is *emergency eviction selection*, and that does **not** make a decision — it
+reads a **pre-pushed priority** (computed by the router's value model, pushed on program
+events) and evicts the lowest. Value changes at turn-scale, not microsecond-scale, so the
+hint is fresh enough; the residual staleness is bounded and managed (#227 freshness-bound,
+#228 decision→apply latency). So: **policy → router; engine just needs the action API +
+a hint-driven fast-evict.**
+
+### ThunderAgent comparison (the framing)
+
+Both are Dynamo routers → same layer → fair A/B (`aginfer_router` vs `thunderagent_router`,
+same workload, same end metrics: re-prefill / makespan / cache-hit). Our edge is explicitly
+the cross-layer reach ThunderAgent lacks: it can only pause; we additionally push value
+hints and issue KV-tier actions the engine executes. The paper's novelty is this
+**router-decides-KV / engine-executes-KV coordination**.
+
+### Does Dynamo need a Rust change? NO.
+
+1. **Runtime algorithm:** `aginfer_router` is a Python Dynamo component (like
+   `thunderagent_router`); hints/actions reach the engine via sglang's own HTTP side-channel
+   (`/aginfer/hints`, `/aginfer/migrate`), NOT through Dynamo's request schema. This is the
+   #246 result: **ZERO dynamo-core change**.
+2. **Token-exact replay (testing):** the OpenAI HTTP frontend 400-rejects `custom_params`
+   (that path *would* need Rust) — but we do **not** use it. The **native endpoint**
+   `dynamo.thunderagent_router.generate` (dynamo Python runtime client) carries `token_ids`
+   + `sampling_options.custom_params` unfiltered to the worker, **still through the router**,
+   **zero Rust** — proven live in `aginfer_dyn`. The only missing piece is that the
+   container's sglang fork lacks our `_aginfer_force_token` hook; porting that Python hook
+   (from `python/sglang/srt/managers/scheduler_components/batch_result_processor.py`) +
+   restarting the worker makes forcing fire. See `dynamo-frontend-blocks-custom-params`
+   memory for the full chain + payload schema.
+
+The only scenario that needs Rust is insisting on token-exact replay through the OpenAI
+HTTP frontend specifically — which we avoid via the native endpoint.
+
+### PR split (when we PR — not yet)
+
+- **Dynamo PR:** `aginfer_router` — the KV-aware agent scheduling policy (Python component,
+  peer of thunderagent_router). Optionally richer `agent_context` fields if the design needs
+  more than {trajectory_id, session_id, session_type_id} (+ priority hint).
+- **sglang PR:** the engine mechanism — KV-tier action API (migrate/evict/promote) + hint
+  consumption (`/aginfer/hints`) + value-aware local eviction. This is the layer ThunderAgent
+  lacks.
+
+### Experiment platforms
+
+| goal | platform | token-exact today? |
+|---|---|---|
+| aginfer vs default (value-eviction, S1, S2, RQ1) — core contribution | **sglang-direct** (agentreplay → `/generate`) | ✅ yes (proven: 112/112, len_match=1.0) |
+| aginfer vs ThunderAgent — SOTA baseline | **Dynamo** (native endpoint) | needs the forcing hook ported into the container sglang |
+
+Most of the work runs on sglang-direct, no Dynamo. Dynamo is only for the ThunderAgent
+comparison (its router lives there).
+
+### Open items
+
+- Container sglang (`/sgl-workspace/sglang`) is **stale** vs canonical `aginfer-synced` fork
+  (lacks `_aginfer_force_token`). Clean fix = sync the container's sglang to the canonical
+  fork (not cherry-pick one hook).
+- `agentreplay` `dynamo-native` backend = an **isolated, optional** adapter (lazy `dynamo`
+  import) so the reusable harness core stays HTTP/token-space pure.
+- Reconcile #251 (in-engine scheduler, delete daemon) vs #246 (router-layer policy): they
+  correspond to two deployment targets — in-engine for sglang-direct (no router), router-layer
+  for the Dynamo/ThunderAgent comparison. Same core algorithm, different integration per
+  platform.
+
+---
+
+## 8. Refactor: aginfer daemon → in-engine pluggable scheduler
+
+> Folded in from the former `REFACTOR_engine_plugin.md` (original plan 2026-06-13; task #251).
+
+**Status:** IN PROGRESS (2026-06-15). Stage A.2 landed — the engine policy is extracted into a
+self-contained in-engine package (`python/sglang/srt/mem_cache/aginfer/`): state-dump subsystem,
+HTTP validators, `/aginfer/state` response cache, teacher-forcing + program-id sanitize are all
+their own modules (see git log `aginfer #251: extract …`). Remaining: fully retire the external
+daemon/bridge/proxy once the in-engine scheduler reaches parity. The original plan + feasibility
+record follows verbatim.
+
+### 0. Principle (the standard this plan is held to)
+
+Per-unit KV tiering is an **engine** concern — the engine owns the KV bytes, the tiers
+(HBM/DRAM/DISK), the radix state, and the eviction callsite. Program-level pause/resume is an
+**orchestrator** concern. The external daemon reaching *into* the engine over a bridge was
+**wrong-layer coupling** (managing an engine concern from above its abstraction). This refactor
+puts each lever in its rightful layer, deletes the cross-process plumbing, and keeps the design's
+**one V_u** — realised as a *plugin* (mechanism/policy split), NOT a separate process. Design = ideal:
+we take the clean decomposition even though it's more work than keeping the bridge hack.
+
+### 1. Feasibility — FEASIBLE-WITH-WORK (clean)
+
+1. **The engine already owns the whole mechanism.** `dump_aginfer_state()` (unified_radix_cache.py
+   :3846) and `apply_aginfer_migrations()` (:2770) are direct in-process calls — no HTTP, no lock
+   (the scheduler thread serialises cache access). The entire daemon transport tier
+   (proxy/event_router/outbound/webhook) exists **only** to bridge a process boundary that disappears.
+2. **A zero-cost-when-busy hook already exists.** `on_idle()` (scheduler.py:3424) + the
+   `aginfer_webhook.maybe_fire(occ)` cadence in both event loops (:1526/:1601) — a prefill-safe place
+   to run the cadenced decision; pays only when the system is light/idle.
+3. **The engine self-derives every §4 event.** `Req.program_id` is already present; request
+   arrival/completion use the same `perf_counter` clock the proxy used. The proxy was never an
+   oracle — it re-observed boundaries the engine already sees. (Only SESSION_END is not
+   self-derivable — see §4.)
+4. **The policy core is pure stdlib Python** (`build_paper_state`, `joint_decide`,
+   `migrate_candidates`, `ETAEstimator`, `ProgramTracker`, the V_u/cost model) — it moves **verbatim**.
+
+### 2. The clean 3-component architecture
+
+| Component | Owns | Layer |
+|---|---|---|
+| **Engine plugin `AginferScheduler`** (new, in sglang) | §7 per-unit tiering (reactive scorer is already here; add the proactive migrate) | engine |
+| **`aginfer_router`** (exists, in dynamo fork) | §8 program pause/resume (fleet-wide view) + stamps `program_id` + forwards SESSION_END | orchestrator |
+| **DELETE**: daemon process + `aginfer_bridge.py` + proxy + outbound + event_router + webhook | — | (cross-process plumbing — gone) |
+
+**One V_u, two timescales, both in-engine, sharing one policy module:** the reactive eviction scorer
+(`SGLANG_KV_POLICY_MODULE`, already in-engine) and the proactive `AginferScheduler` plugin read the
+**same** V_u module — value-consistency (DESIGN §3) preserved, now without a process boundary.
+
+### 3. Migration map
+
+**MOVE → engine plugin** (pure policy, verbatim): `build_paper_state` + `_build_decision_set` +
+`_top_k_by_regret` (kv_scheduler.py); `joint_decide` (joint_decide.py); `migrate_candidates` /
+`value_residence` / cost fns (ours_greedy.py); `knapsack` (baselines/knapsack.py); `ETAEstimator`
+(eta_estimator.py); `ProgramTracker` sync core (program_tracker.py); `ActionTimeline` /
+`PromoteAction` (action_timeline.py); cost constants (costs.py); `Event`/`EventKind` as a thin
+internal struct.
+
+**STAYS in engine** (mechanism, now called directly not over HTTP): `dump_aginfer_state` (:3846),
+`apply_aginfer_migrations` (:2770), `_aginfer_eviction_score` + `set_aginfer_hints` (:3318/:3203),
+`set_aginfer_program_state` / `set_aginfer_runtime_metrics`, `node.session_ids` propagation, the
+`on_idle`/webhook cadence sites.
+
+**MOVES → Dynamo router**: `_extract_program_id` (proxy → router stamps it); `pause_candidates` /
+`resume_candidates` + the `wait_if_paused` gate (admission = the fleet-wide pause/resume decision).
+
+**DELETE** (transport plumbing that bridged a now-gone process boundary): `EventRouter.fetch_state`
++ HTTP GET `/aginfer/state`; `EventRouter._event_worker`; `OutboundQueue`/`OutboundWorker`; the
+proxy; the webhook handlers (APPLY_FAILED collapses to the in-process migrate return dict;
+SESSION_END → router signal); `main.py` process wiring; `aginfer_bridge.py` (Dynamo).
+
+### 4. Interfaces after the refactor (minimal, clean)
+
+- **Router → Engine**: (a) `program_id` stamped on each request (engine already reads it); (b) ONE
+  `SESSION_END` signal per ended program — rides the request channel (terminal flag on the last
+  request), NOT a new HTTP endpoint. **This is the only signal the engine cannot self-derive** (a
+  program going idle is indistinguishable from a long tool call without it).
+- **Engine internal**: plugin ↔ cache mechanism = in-process direct calls (no RPC).
+- **No new external API** on either side. The engine gains zero new HTTP surface; Dynamo needs no new
+  migrate/state API. This is the answer to "does Dynamo lack an API" — **after this refactor, no.**
+
+### 5. The two design decisions (both resolved BY the layering principle, not compromises)
+
+1. **Knapsack DP isolation.** The exact 0/1 knapsack (`joint_decide`) can take ~20s worst-case
+   (capped at 10⁶ cells, top-k 256). It must never block the loop thread → run it on a **worker
+   thread with a ~100ms timeout, pressure-gated** (only when `occ` crosses `theta_hi`); the common
+   path drains the action-timeline + applies the cached/incremental decision. Preserves the paper's
+   exact-optimality (§9) while guaranteeing zero TTFT cost. (Greedy-approx is the fallback if the
+   thread harness proves fragile.)
+2. **Admission (pause/resume) → router, NOT the engine plugin.** Pause/resume needs the **fleet-wide
+   / cross-rank inflight sum** — a property only the orchestrator has. The per-unit §7 migrate is
+   **per-rank-local** (a single worker decides if *this* unit leaves *its* HBM) → engine plugin.
+   This split **is** the clean layering we agreed: programs → router, KV bytes → engine.
+
+### 6. Risks / invariants to hold
+
+- **do-no-harm**: plugin fully inert when the flag is off; the default path stays the exact stock
+  LRU walk at zero plugin cost. (Below-baseline is a bug, not a tuning gap.)
+- **Crash isolation lost** (no separate process): wrap the entire plugin tick in try/except → on a
+  policy exception, log + disable aginfer for the session, never kill the engine.
+- **Event-clock staleness** under bursty arrival: action-timeline is designed for "past-due fires on
+  next drain"; use `perf_counter` as a floor, keep monotonic gating.
+- **n_holders correctness** on the single-rank path after dropping `_flatten_per_rank` (S2 boost).
+
+### 7. Staged implementation (each stage independently reviewable + testable)
+
+- **Stage A — lift policy core into sglang, no behaviour change.** Move the pure modules into
+  `python/sglang/srt/mem_cache/aginfer_policy/` (or similar). The existing `dev/aginfer/verify/`
+  suite must still pass against the moved code (import-path update only). *Review:* diff is a move +
+  import rewire; verify suite green.
+- **Stage B — wire `AginferScheduler` into the loop (in-process).** Cadence at `on_idle` +
+  pressure-gate; read state via direct `dump_aginfer_state`, apply via `apply_aginfer_migrations`,
+  hints in-process. *Review:* do-no-harm A/B (flag off == stock) + the eviction-value win
+  (ours-engine 39/39 reproduced WITHOUT the daemon).
+- **Stage C — knapsack isolation** (worker-thread+timeout, pressure-gated). *Review:* TTFT under
+  flood is flat with the plugin on.
+- **Stage D — delete daemon/bridge/proxy; move admission + program_id + SESSION_END to the router.**
+  *Review:* the router A/B (aginfer_router vs thunderagent_router) runs with NO daemon/bridge in the
+  picture; the only router→engine wires are program_id + SESSION_END.
+
+### 8. Review checklist (how to review this)
+
+1. **Layer ownership** — does each piece end up in the layer that *owns* its data? (engine = KV
+   bytes/tiers; router = programs.) No component reaches below its abstraction.
+2. **Interface minimality** — router→engine is exactly {program_id, SESSION_END}; no new API.
+3. **One V_u** — the reactive scorer and the proactive plugin share one policy module (not two
+   copies that can drift).
+4. **do-no-harm** — flag-off path is byte-identical stock; plugin pays zero when off / busy.
+5. **No hidden process** — after Stage D, `grep -r aginfer_bridge|daemon.main|OutboundQueue` is empty
+   on the Dynamo path.
+6. **Tests** — `dev/aginfer/verify/` green after the move; do-no-harm + eviction-win A/B reproduced
+   in-engine without the daemon.
+
+---
+
+### 9. Engine fork delta — KEEP / DELETE / EXTRACT / CLEAN (audited vs clean upstream `ca0b7ea4f6^2`)
+
+Our engine delta = **+4158 / −17 across 22 files** (purely additive — we touch ~0 upstream lines, low
+merge-conflict surface). But it's **buried**:
+
+| bucket | lines | % | |
+|---|---|---|---|
+| **NECESSARY-CORE** (real sglang PR) | ~900 | 22% | clean, well-formed; default path = byte-for-byte stock LRU when unset |
+| **DAEMON-PLUMBING** (deletes with refactor) | ~3180 | **76%** | pure HTTP/webhook/IPC transport to the external daemon — no hot path depends on it |
+| **CLEANLINESS-FIX** | ~80 | 2% | S2DBG hooks, dup docstring, mid-file imports, daemon flags in core args |
+
+#### 9a. DELETE — daemon transport (~3180 lines), in full with the refactor
+- `aginfer_webhook.py` (NEW +745) → DELETE ~675 (firing/threading/bootstrap/payloads); **extract ~70**
+  (`WatermarkState` + `classify()` hysteresis + `derive_kind()`) → `aginfer/occupancy_detector.py`.
+- `http_server.py` (+416) → DELETE all 5 `/aginfer/*` endpoints + 50ms refresh-cache; **extract ~75**
+  (`_validate_hints_body` NaN/inf/[0,1] bounds) → `aginfer/validation.py` *iff* external hints persist.
+- `unified_radix_cache.py` dump/serialization (~1265 of +1822) → DELETE: `dump_aginfer_state*`,
+  `_dump_aginfer_state_impl/_dict`, `_StateDumpMetrics`, `_aginfer_program_states`+`set_aginfer_program_state`
+  +overlay, `_aginfer_runtime_metrics` store, `_aginfer_pool_usage/link_stats/tier_holding_cost/
+  bytes_per_token/node_summary`, collision payloads. (All echo state back over HTTP; zero engine decisions —
+  the in-process plugin reads `_aginfer_hints` / `node.session_ids` / EMA dicts directly.)
+- `scheduler.py` HTTP handlers (~290 of +532) → DELETE: `get/migrate/update_*` handlers, webhook init/
+  cleanup/firing, `_fire_apply_failed/_fire_hash_collisions`, communicator registrations.
+- `io_struct.py` (+111 of +136) → DELETE 10 IPC dataclasses (`GetAginferState*/Migrate*/UpdateThresholds*/
+  UpdateProgramPaused*/UpdateHints*`).
+- `tokenizer_control_mixin.py` (+91) → DELETE (5 pure pass-through communicator methods).
+- `server_args.py` (~48 of +60) → DELETE daemon flags (`aginfer_notify_url/heartbeat_s/theta_*`,
+  `bootstrap_thresholds_into_server_args`) — daemon-owned policy, not sglang config.
+- `hybrid_cache_controller.py` `_last_load_decline` strings (~10) → DELETE (dump-only diagnostic).
+
+#### 9b. KEEP — the clean sglang PR (~900 lines), BUT extract inline → `aginfer/` module (thin-hook principle)
+- `full_component.py` (+13/−8) — **the model thin hook**: swaps `eviction_strategy.get_priority(n)` →
+  `self.cache._eviction_scorer(n, EvictLayer.*)`. Minimal, LRU-identical when unset. KEEP as-is.
+- `unified_radix_cache.py` (~520 necessary, currently INLINE) — the pluggable-policy framework
+  (`_load_eviction_scorer/_load_write_through_policy`), `_aginfer_hints` table + accessors, `_aginfer_
+  eviction_score` (V_u), `apply_aginfer_migrations`, birth-seed, `node.session_ids` propagation, clear-on-
+  evict. → **EXTRACT into `aginfer/` module; leave thin hooks** (a scorer-callsite call + the session_ids
+  tag on insert/split + a couple accessors). This is the bulk of the thin-hook work.
+- `scheduler.py` (~240 necessary, INLINE) — throughput/EMA state + `_aginfer_record_*`/`_update_*`/
+  `record_spec_decode`, `program_id` propagation, the on_idle/cadence site. → **EXTRACT the EMA/throughput
+  logic into `aginfer/metrics_hooks.py`; leave thin hooks** (pre/post-forward one-liners + the tick call).
+- `aginfer_metrics.py` (+144, whole file) — pure stateless utils → **move into `aginfer/` as-is**.
+- `batch_result_processor.py` (+40) — `_aginfer_force_token` teacher-forcing (replay) → KEEP, thin hook.
+- `schedule_batch.py` (+55) — `_sanitize_program_id` + `Req.program_id` → KEEP (minimal).
+- `swa_component.py` (+42) — host-lock pair + `load_back` race short-circuit → KEEP (**V4 correctness**).
+- `hybrid_cache_controller.py` `kv_buffer is None` anchor-skip → KEEP (**V4 correctness**).
+- `protocol.py` (+28, dedupe docstring), `io_struct.py` (+13: program_id), `base_prefix_cache.py` (+6),
+  `tree_component.py` (+11: `peek_time_counter`), `__init__.py` (+2), `session_controller.py` (+7),
+  `encode_receiver.py` (+5), serving/tokenizer (+1×3) — `program_id` threaded through every entrypoint/
+  disagg/session handoff. KEEP (minimal).
+
+#### 9c. CLEANLINESS-FIX (~80 lines, do anytime — independent of the refactor)
+1. DELETE 6 S2DBG debug lines: `unified_radix_cache.py:3252–3256, 3327–3330`.
+2. DRY the duplicated 20-line `program_id` docstring in `protocol.py` → one `_PROGRAM_ID_DOC` constant.
+3. Hoist mid-file `import os, threading` in `http_server.py:~687` to top (moot if file deleted).
+4. Consolidate scattered validators → one `aginfer/validation.py`.
+5. Isolate daemon flags out of core `server_args` (subsumed by 9a delete).
+
+#### 9d. Net result
+After delete + extract: the sglang PR = **~900 lines, ~13 files**, of which the upstream-file footprint
+is a **handful of thin `# aginfer hook` lines** + the self-contained `aginfer/` module + the 3 small
+retained kernels (`occupancy_detector.py` ~70, `validation.py` ~75, runtime-metrics push as a plugin hook).
+**Reviewable, minimal, do-no-harm at the code level.**
+
+---
+
+### 10. Progress log
+
+Canonical engine package: `python/sglang/srt/mem_cache/aginfer/`.
+
+- **Stage A — DONE + verified.** 14-file policy closure (base/costs/knapsack/ours_greedy/sglang_adapter/
+  events/program_tracker/eta_estimator/action_timeline/admission_controller/joint_decide/_metrics/
+  _admission_math/_fatal) moved `dev/aginfer/{baselines,daemon}/` → the engine package; old paths are
+  `sys.modules` alias-shims (value-model shims stay for dev research; pure-policy shims die in Stage D).
+  Verify suite green against the moved code.
+- **Stage A.2 increment 1 — DONE + verified.** Module-level plugin framework (154 lines: env-symbol
+  loaders, the LRU-equivalent `_default_eviction_score`, write-through trigger, birth-seed constants)
+  `unified_radix_cache.py:67–220` → `aginfer/cache_policy.py`; upstream = a 15-line re-import hook.
+  `_default_eviction_score` **identity preserved** (swa_component's `is not` check holds). t27 17/17, t38 7/7.
+- **Stage A.2 increment 2 — DONE + verified.** Contiguous hint-table + value-eviction scorer block
+  (157 lines: `set_aginfer_hints` / `get`/`clear_aginfer_hint` / `_aginfer_unit_hash` /
+  `_init_aginfer_eviction_scoring` / `_aginfer_eviction_score` / `_aginfer_hint_should_write_through` /
+  `_aginfer_seed_birth`) `unified_radix_cache.py:3064–3220` → `aginfer/cache_hooks.py` as free functions
+  over `cache`; upstream = 8 thin `(*a,**k)` delegators + 1 import. Folded-in cleanups: `hint_v_u` now
+  imported via the in-package path (`...aginfer.sglang_adapter`, no `sys.path` dependence) not
+  `baselines.*`; added missing `import os`. **Verify:** engine import OK · delegators wired ·
+  `_default_eviction_score` identity preserved · t27 17/17 · t38 7/7 · **s2_holder_scorer PASS** (hint→
+  `_v_u_from_unit`→scorer, "no drift") · kv_scheduler_value_rule/joint_decide/admission_controller/
+  program_tracker PASS. (`action_timeline` FAIL is a pre-existing daemon ETA `due_time` drift, #235 —
+  pulls **none** of the changed modules into its import graph, provably independent.)
+- **Stage A.2 increment 3 — DONE (code-move verified by construction; 39/39 full-stack DEFERRED).**
+  `apply_aginfer_migrations` (the §7 migrate EXECUTOR, 392 lines, `unified_radix_cache.py:2632–3023`) →
+  `aginfer/cache_hooks.py` as a free function over `cache`; upstream = a 2-line delegator. The move is
+  **behaviour-preserving by construction**: uniform de-indent + whole-word `self`→`cache` (28 subs, every
+  `self` token verified a code ref — def sig + 1 `getattr(self,…)` + all `self.X`; no string/comment
+  `self`). **Forward proof: 0 diffs** — every moved line equals `dedent(orig)`+`self→cache`. Tier names
+  HBM/DRAM/DISK/HOST are string literals (no import); the only runtime deps imported are `EvictLayer` +
+  `BASE_COMPONENT_TYPE` (circular-safe — `unified_cache_components` is already loaded before the
+  `cache_hooks` import; the swa→urc back-edge is a lazy in-method import). **Verify:** compile + import OK,
+  deps resolve, delegator present, t27/t38/s2_holder_scorer/kv_scheduler_value_rule(25/25)/joint_decide
+  all PASS. ⚠️ **DEFERRED gate (task #252):** `apply_aginfer_migrations` has no server-free unit test
+  (t20/t24 POST a live `:30001`), so the runtime migrate path is unconfirmed until the next
+  `dynamo.sglang` restart runs the daemon→engine round-trip + do-no-harm + 39/39-without-daemon.
+- **Stage A.2 increment 4 — DONE (code-move verified by construction + full-import; live EMA DEFERRED).**
+  The 8 scheduler EMA/throughput hooks (`_aginfer_record_throughput`(+`_inner`), `_aginfer_extend_token_count`
+  [@staticmethod], `_aginfer_update_prefill`/`_update_decode`, `_aginfer_record_spec_throughput`/`_spec_decode`,
+  `_aginfer_push_runtime_metrics`; `scheduler.py:3674–3895`, 222 ln) → NEW `aginfer/metrics_hooks.py` as free
+  functions over `sched`; upstream = 8 delegators (7 instance + 1 `@staticmethod`). The now-block-only
+  `aginfer_metrics` import was **relocated** out of `scheduler.py` (5 names had zero out-of-block refs).
+  Move = de-indent + strip the lone `@staticmethod` + whole-word `self`→`sched` (NOT `cache` — bodies use a
+  local `cache` var). Annotations made lazy via `from __future__ import annotations`; runtime deps imported
+  (`ForwardMode`, the 5 `aginfer_metrics` fns; `BASE_COMPONENT_TYPE` covered by the in-method import).
+  **Verify:** 0-diff forward proof (accounting for the stripped decorator) · py_compile · **FULL
+  `import scheduler` OK (no circular import)** · 8 delegators present + `_metrics_hooks` wired +
+  `aginfer_metrics` relocated + staticmethod preserved · t26/t27/t38/s2_holder_scorer green. ⚠️ DEFERRED
+  (task #252): the live decode/prefill EMA populate-under-load (#204) re-confirms on the next restart.
+
+- **Stage A.2 increment 5 — DONE.** The write-through policy RESOLUTION (4 inline lines in
+  `unified_radix_cache.__init__`) → `_init_aginfer_write_through(cache)` in `cache_hooks.py` + a thin
+  delegator + a one-line callsite — making it the symmetric twin of `_init_aginfer_eviction_scoring`. The
+  `_load_write_through_policy` re-import stays in urc only as a re-export for verify/t28. Verify: compile +
+  import + `_init_aginfer_write_through` wired + re-exports intact + t28/t38/t27/t21/s2/kv_scheduler/joint_decide green.
+
+**A.2 EXTRACTION COMPLETE.** All separable aginfer logic now lives in the self-contained package; the only
+aginfer code left inline in the two big upstream files is (a) thin hooks — ~10+8 delegators, the re-import
+block, ~8 callsites, 3 irreducible `node.session_ids` tags — and (b) the ~1265-line daemon dump/state plumbing
+that **DELETEs (not moves)** in Stage D when the daemon HTTP path is removed (`set_aginfer_program_state`,
+`_aginfer_program_states`, `_aginfer_node_summary`, `dump_aginfer_state*`, …; a few — `_aginfer_bytes_per_token`,
+`_aginfer_subpool_name`, `set_aginfer_runtime_metrics` — are cross-used by `metrics_hooks` and stay). The
+`node.session_ids` propagation is genuinely irreducible (1–2-line node tagging on tree split/insert) — a thin
+hook by nature, not an extraction target.
+
+#### A.2 final independent verification (3-lens) — completeness PASS, 1 fix, 1 pre-existing gap tasked
+
+A second adversarial pass on the COMPLETE state (inc1–5 + fixes): **Completeness = PASS** (every inline aginfer
+ref is a thin hook, a Stage-D-delete daemon-plumbing method, or one of the 3 cross-used keepers
+`_aginfer_bytes_per_token`/`_aginfer_subpool_name`/`set_aginfer_runtime_metrics`); **inc5 + all 3 prior fixes
+verified correct** (byte-identical move, `_AGINFER_VALID_STATES` is a class attr, re-exports load-bearing,
+future-annotations present); **do-no-harm intact for the default config** (env-unset => `_default_eviction_score`
+= `last_access_time` = stock LRU, identity preserved through the re-import chain). Findings:
+- **FIXED:** dead `import os` at urc:70 (inc5 orphaned it; stale comment) — removed.
+- **#253 (pre-existing, NOT A.2):** the aginfer eviction-scorer plugin replaced `eviction_strategy.get_priority(n)`
+  with `_eviction_scorer`, whose default hardwires LRU => `--radix-eviction-policy lfu/slru/priority` silently
+  diverges from stock even with env unset. Matches stock only for the default `lru` (what all experiments use).
+  A do-no-harm gap for a clean upstream PR; tasked, not folded into A.2.
+- **Stage-D note:** the duplicated T5 webhook-firing block in `scheduler.py` (event_loop_normal/overlap) is
+  pre-existing daemon-plane code; it deletes (or extracts) in Stage D.
+
+#### Round-3 review — #253 fix + dedup confirmed do-no-harm; 4 minor non-regressions
+
+After fixing the above: **#253 (FIXED)** — `full_component._evict_keyfn` now branches on a single
+`cache._aginfer_value_aware` flag (set in `_init_aginfer_eviction_scoring`): default path keys on
+`eviction_strategy.get_priority` (honors `--radix-eviction-policy`), value path on the scorer. swa's
+`_value_ordered()` reads the same flag. **Regression gate:** `verify/radix_eviction_policy` (12/12). The
+**dead `import os`** and the **duplicated webhook block** (→ `_aginfer_maybe_fire_webhook()`) are also fixed.
+Round-3 (3-lens) verdict: 2 PASS + 1 framing-only; do-no-harm proven at source + runtime —
+`LRUStrategy.get_priority == last_access_time == _default_eviction_score`, so lru + value paths are
+byte-identical no-ops; only non-LRU defaults change (the fix). 4 minor non-regressions, all dispositioned:
+(1) swa value-heap is #248's code (framing); (2) #253 boundary already documented; (3) **MambaComponent +
+SWA are LRU-list-only — STOCK behavior** (Mamba is byte-for-byte unchanged vs HEAD; honoring non-LRU there
+would be a feature *beyond* stock, not do-no-harm); (4) `full_component` heap tuple `(key, n)` matches
+**stock** `radix_cache.py` and is crash-safe via `UnifiedTreeNode.__lt__` — the swa `n.id` tiebreaker is
+#248's own choice, not required here.
+
+#### A.2 adversarial review (5-lens panel + per-finding verify) — 1 CRITICAL fixed, 2 cleanups, 1 mis-attribution
+
+Ran an adversarial review of inc1–4 (5 independent lenses → verify each finding). Lenses B (imports/
+circular), C (callsites), D (identity invariants) returned **CLEAN**. 5 findings, all triaged + resolved:
+
+- **CRITICAL (FIXED + gated):** inc3's block boundary swept the trailing CLASS attribute
+  `_AGINFER_VALID_STATES` into `cache_hooks.py` module scope while its consumer `set_aginfer_program_state`
+  stayed inline → `AttributeError` on the program-state path. The 0-diff forward-proof validated the
+  TRANSFORM but **not the BOUNDARY** (the swept line was a class attr, not part of `apply_aginfer_migrations`);
+  compile/import can't catch runtime attribute resolution. FIX: restored `_AGINFER_VALID_STATES` as a class
+  attribute (`unified_radix_cache.py:2635`), deleted the orphan. **Regression gate: t21** (exercises
+  `set_aginfer_program_state` 17×) green + now in the standing set. (Lesson: also run the test for the
+  methods left BEHIND adjacent to a cut, and grep the moved module for stray module-level `NAME =` — only
+  `logger` should remain. Verified: both new modules have only `logger` at module scope.)
+- **Minor (FIXED):** `cache_hooks.py` lacked `from __future__ import annotations` (bare `UnifiedTreeNode`
+  in a local annotation — safe per PEP 526 but inconsistent with `metrics_hooks`) → added. 3 dead re-imports
+  in the urc hook block (`_AGINFER_HINT_SCORER_SPEC`/`_AGINFER_BIRTH_LAMBDA`/`_AGINFER_BIRTH_STAMP` — no inline
+  use, no external consumer) → deleted; kept `_AGINFER_BIRTH_PHAT` (read by verify/t27 via `_urc.`).
+- **Mis-attribution (NO CHANGE):** the newborn birth-seed `p_hat` 1.0→`_AGINFER_BIRTH_PHAT`=0.1 is
+  **PRE-EXISTING WIP** — the reviewer diffed against HEAD, which predates it; the inc1/inc2 scripts did only
+  de-indent + self→X + byte-copy and so CANNOT have introduced it. do-no-harm floor intact (the seed fires
+  only on the opt-in `aginfer:hint_v_u` path; env-unset = stock LRU).
+
+Post-fix verify (all green): compile + full `import scheduler` + t21/t26/t27/t28/t38/s2_holder_scorer/
+kv_scheduler_value_rule(25)/joint_decide. The 925-line, 3-file extraction stands clean + reviewed.
+
+**Conclusion — re-sequence.** Because the remaining cache-method KEEP code is tangled with the
+DELETE-in-Stage-D plumbing AND has no unit-level gate, the clean order is **Stage B (in-engine
+`AginferScheduler` plugin) + Stage D (delete daemon transport) BEFORE the final cache-method extraction** —
+deleting the ~1265 interleaved dump/state lines de-tangles the region, and Stage B/D need the live stack
+anyway. All three remaining pieces share one gate: restart `dynamo.sglang` → do-no-harm (default == stock
+LRU) + ours-engine **39/39 reproduced without the daemon**. That is the next focused, live-stack effort.

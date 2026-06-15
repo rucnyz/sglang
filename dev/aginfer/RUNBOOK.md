@@ -1,236 +1,80 @@
-# aginfer reproduce runbook
+# aginfer runbook — Dynamo stack startup
 
-> One-shot reproducer for V4-Flash + 4-tier HiCache + concurrent harbor agent workload.
-> All paths are absolute on `di-bm-vykpmg-145`. Replace with your own when porting.
+> How to bring up the aginfer stack on **NVIDIA Dynamo + DeepSeek-V4-Flash** (the current
+> platform). Replaces the old harbor / standalone-sglang reproducer (archived). For the
+> platform internals see `../dynamo/README.md`; for the S2 experiment + the full operational
+> diagnosis see `../dynamo/S2_RESULTS.md`; for *what* to run see `EXP_PLAN.md`.
 
----
+## Topology
+- **Container** `aginfer_dyn` (GPUs 5,6). Mounts: host `sglang`→`/workspace/sglang`,
+  `dynamo`→`/workspace/dynamo`, HF cache, deep_gemm cache.
+- **Worker** — `python -m dynamo.sglang` (V4-Flash, our fork; launch script in `/tmp` or
+  the mounted `dev/dynamo/launch_v4_*.sh`). Exposes endpoint `dynamo.backend.generate`,
+  system port `:8081`.
+- **Bridge** `:9200` — `dev/dynamo/aginfer_bridge.py`: proxies the daemon's 4 `/aginfer/*`
+  calls into the worker's tokenizer_manager (no Dynamo Rust change).
+- **Router** — `dynamo.thunderagent_router` (the baseline; exposes
+  `dynamo.thunderagent_router.generate`, routes to `dynamo.backend.generate`).
+- **Frontend** `:8100` — `dynamo.frontend` (OpenAI HTTP; round-robin).
+- **Daemon** `:9100` — `dev/aginfer/daemon/main.py`: pulls `/aginfer/state`, computes `V_u`,
+  PUTs hints / migrates (ours arm only).
+- **Python**: dynamo venv `/opt/dynamo/venv/bin/python` (has dynamo.runtime + httpx + orjson).
+  agentreplay is docker-cp'd to `/tmp/agentreplay`.
 
-## 0. Prerequisites (one-time install)
+## Launch scripts (in `dev/dynamo/`, mounted)
+| script | eviction | tier | use |
+|---|---|---|---|
+| `launch_v4_fork_hbm.sh` | `priority` + `SGLANG_KV_POLICY_MODULE=aginfer:hint_v_u` | **HBM-only** | ours (S2: real re-prefill signal, deadlock-free) |
+| `launch_v4_lru_hbm.sh`  | `lru` (no scorer) | **HBM-only** | LRU baseline |
+| `launch_v4_fork.sh` / `launch_v4_lru.sh` | same, but `--enable-hierarchical-cache` (HiCache write_through) | 4-tier | the 4-tier story; **deadlock-prone under heavy oversubscription** (see S2_RESULTS) |
 
+## Cold bring-up (copy/paste)
 ```bash
-# Conda env with torch, sglang, mooncake, sgl_kernel, flash_mla
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
-conda activate agsched
+# 0) agentreplay into the container (only if /tmp/agentreplay is gone after a container restart)
+docker cp /scratch/yuzhou/projects/agentreplay/agentreplay aginfer_dyn:/tmp/agentreplay_pkg
+docker exec aginfer_dyn bash -lc 'mkdir -p /tmp/agentreplay && mv /tmp/agentreplay_pkg /tmp/agentreplay/agentreplay'
+
+# 1) WORKER — pick a launch script. HBM-only fork shown. (deep_gemm JIT cache persists
+#    in-container across reboots; first boot of a session pays the 10–20 min JIT.)
+docker exec aginfer_dyn bash -lc "pkill -9 -f 'dynamo.sglang|launch_v4|daemon.main|thunderagent_router|dynamo.frontend'; sleep 4"
+docker exec -d aginfer_dyn bash -lc "bash /workspace/sglang/dev/dynamo/launch_v4_fork_hbm.sh > /tmp/sglang_backend.log 2>&1"
+# wait until ready (bridge probes the worker):  curl -s :9200/health == '{"ok": true}'
+
+# 2) ROUTER + FRONTEND — MUST restart after EVERY worker reboot (else they stay pinned to the
+#    dead worker instance → requests never route → worker idle, client hangs).
+#    pause/soft = 1.0 DISABLES ThunderAgent pausing (needed for an engine-EVICTION experiment,
+#    else it soft-demotes the fleet at occ≥0.80 and the engine never reaches the eviction regime).
+docker exec -d aginfer_dyn bash -lc "python -m dynamo.thunderagent_router --endpoint dynamo.backend.generate --model-name deepseek-ai/DeepSeek-V4-Flash --router-block-size 64 --router-reset-states --pause-threshold 1.0 --soft-demote-threshold 1.0 > /tmp/router_ta.log 2>&1"
+docker exec -d aginfer_dyn bash -lc "python -m dynamo.frontend --http-port 8100 --router-mode round-robin --router-reset-states > /tmp/frontend.log 2>&1"
+sleep 30   # router discovery — DO NOT skip (a too-early request errors fast: n_error=1, ~0.2s)
+
+# 3) DAEMON (ours arm only; evict-only for S2). LRU arm: leave the daemon OFF.
+docker exec -d aginfer_dyn bash -lc 'cd /workspace/sglang/dev/aginfer && PYTHONPATH=/workspace/sglang/python:/workspace/sglang/dev/aginfer AGINFER_DISABLE_MIGRATE=1 AGINFER_DISABLE_PROMOTE=1 /opt/dynamo/venv/bin/python -m daemon.main --sglang-base-url=http://127.0.0.1:9200 --host=127.0.0.1 --port=9100 --kv-scheduler=enabled --admission-controller=disabled --theta-hi=0.85 --theta-lo=0.70 --theta-crit=0.90 --heartbeat-s=5.0 > /tmp/daemon.log 2>&1'
+
+# 4) SMOKE — confirm routing + token-exact before any real run:
+docker exec aginfer_dyn bash -lc "cd /tmp/agentreplay && PYTHONPATH=/tmp/agentreplay timeout 120 /opt/dynamo/venv/bin/python -m agentreplay replay-dynamo --trace /workspace/sglang/dev/dynamo/s2_block1.jsonl --model deepseek-ai/DeepSeek-V4-Flash --namespace dynamo --mode arrival --max-concurrency 1 --limit 1 --salt smk-\$(date +%s) --verify-exact"
+#   expect: "n_ok": 1, "force_exact_rate": 1.0, wall_s ~0.5s
 ```
 
-If `agsched` doesn't exist, see [[agsched-env]] notes (~2 hours to rebuild). The current install
-already has all five pieces below; the build steps are listed only for porting to another machine.
-
-### 0a. FlashMLA from source (sglang dsv4 backend hard-imports it)
-
-Use our patched fork — the upstream kernel crashes under tight KV pool + HiCache OFF.
-
+## Health checks
 ```bash
-# First-time only: clone the fork.
-git clone git@github.com:rucnyz/FlashMLA.git /scratch/yuzhou/projects/FlashMLA
-cd /scratch/yuzhou/projects/FlashMLA && git checkout aginfer
-
-# Build + install (rebuild after pulling new commits).
-bash /scratch/yuzhou/projects/sglang/dev/aginfer/scripts/build_flash_mla.sh
+docker exec aginfer_dyn bash -lc 'curl -s :9200/health'   # bridge→worker: {"ok": true, "ranks": 1}
+docker exec aginfer_dyn bash -lc 'curl -s :9100/health'   # daemon: {"status":"ok",...}
+docker exec aginfer_dyn bash -lc 'pgrep -c -f dynamo.sglang'  # worker alive = 1 (0 = crashed; check /tmp/sglang_backend.log for "watchdog timeout")
+docker exec aginfer_dyn bash -lc "grep -a state_fetched /tmp/daemon.log | tail -1"  # occ_hbm / n_holders
 ```
 
-`aginfer` branch carries one commit on top of upstream `main`:
+## Operational gotchas (all hit + fixed this session — the non-obvious ones)
+1. **Restart router + frontend after EVERY worker reboot** (stale instance pins).
+2. **Disable ThunderAgent pausing** (`--pause-threshold 1.0 --soft-demote-threshold 1.0`) for
+   an engine-eviction experiment, else it starves the fleet and the engine never evicts.
+3. **HBM-only for the re-prefill signal**: HiCache `write_through` mirrors HBM→DRAM, so HBM
+   can't be evicted without deadlocking DRAM, and a DRAM reload is ~free (no signal). HBM-only
+   ⇒ evict = DROP = recompute (the real saving) and drops are instant (no demote-stall).
+4. **Fresh `--salt` per worker boot** (routing freshness; tokens are salt-independent).
+5. **V4-Flash crashes under heavy oversubscription** (scheduler watchdog, occ≈0.98) — run a
+   **moderate** regime. Full diagnosis + tuning: `../dynamo/S2_RESULTS.md`.
 
-```
-487d509  fix(get_decoding_sched_meta): skip kernel when batch is 0
-```
-
-### 0b. Our patched sglang (rucnyz/sglang `aginfer`)
-
-`/scratch/yuzhou/projects/sglang` is already on `aginfer` (4 commits on top of upstream PR #26062).
-Editable install via the existing `pip install -e python/`.
-
-```
-ab4acdeda  fix(mooncake_store): skip anchor buffer registration when kv_buffer is None
-8ae7eb271  fix(swa_component): accept lock_host kwarg in acquire/release_component_lock
-c4bdf1ba1  feat(mooncake_store): generate per-pool keys for DeepSeek-V4 sidecar pools
-4138a93d8  fix(hybrid_cache_controller): skip anchor super() when kv_buffer is None
-```
-
-### 0c. Our patched Mooncake (rucnyz/Mooncake `aginfer`)
-
-Cherry-picks upstream PR #2174 (TCP UAF in `ClientSession::writeBody`). Rebuild:
-
-```bash
-cd /scratch/yuzhou/projects/Mooncake && git checkout aginfer
-mkdir -p build && cd build
-cmake -DPython3_EXECUTABLE=$(which python) -DPYTHON_EXECUTABLE=$(which python) ..
-make -j 16
-
-# Install client .so + master binary
-SITE=/scratch/yuzhou/miniconda3/envs/agsched/lib/python3.12/site-packages/mooncake
-cp mooncake-integration/engine.cpython-312-x86_64-linux-gnu.so $SITE/
-cp mooncake-integration/store.cpython-312-x86_64-linux-gnu.so  $SITE/
-cp mooncake-common/libasio.so $SITE/
-mkdir -p ~/.local/bin && cp mooncake-store/src/mooncake_master ~/.local/bin/
-```
-
-### 0d. V4-Flash weights (149 GB FP8)
-
-```bash
-hf download deepseek-ai/DeepSeek-V4-Flash --max-workers 8
-# Lands in ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash
-```
-
-### 0e. Harbor
-
-```bash
-cd /scratch/yuzhou/projects/harbor && pip install -e .
-```
-
----
-
-## 1. Start the serving stack
-
-Each step in its own shell. All scripts source `aginfer/scripts/env.sh` which loads `.env`
-and activates `agsched`.
-
-### 1a. Mooncake master (RPC 50051, metrics 9053)
-
-```bash
-bash /scratch/yuzhou/projects/sglang/dev/aginfer/scripts/start_mooncake_master.sh
-```
-
-Look for `Master service started on port 50051` in `logs/mooncake_master.log`. The binary used
-is `~/.local/bin/mooncake_master` (our patched version — `env.sh` prepends it to PATH).
-
-### 1b. SGLang V4-Flash (GPUs 5,6 — see [[gpu-layout]])
-
-```bash
-bash /scratch/yuzhou/projects/sglang/dev/aginfer/scripts/launch_sglang_v4flash.sh
-```
-
-Wait for `Uvicorn running on http://0.0.0.0:30000` in `logs/sglang_v4flash.log`. Total ~5 min
-(weight load 60s + cuda graph 90s + host pool alloc 200s + Mooncake warmup).
-
-### 1c. Sanity (optional)
-
-```bash
-bash /scratch/yuzhou/projects/sglang/dev/aginfer/scripts/sanity_request.sh
-# repeat the same call: second one should report #cached-token > 0 in server log
-```
-
----
-
-## 2. Run an agent benchmark
-
-### 2a. Generate the dataset
-
-```bash
-# AIME math (60 tasks, light)
-cd /scratch/yuzhou/projects/harbor/adapters/aime && uv run aime
-# datasets land at /scratch/yuzhou/projects/harbor/datasets/aime
-
-# SWE-bench Pro python subset (limit 32, much heavier)
-cd /scratch/yuzhou/projects/harbor/adapters/swebenchpro && uv run swebenchpro --language python --limit 32
-# datasets land at /scratch/yuzhou/projects/harbor/datasets/swebenchpro
-```
-
-### 2b. Run harbor with terminus-2 against V4-Flash
-
-The labelled runs reported in `results/SUMMARY.md` (A–G) all use
-`swebenchpro --limit 32 -n 32 --ak max_turns=200`. Pick a `--jobs-dir`
-under `results/run_X_…` so the SUMMARY columns stay consistent.
-
-```bash
-cd /scratch/yuzhou/projects/harbor
-
-OPENAI_API_KEY=sk-fake-do-not-check \
-  harbor run \
-    -p datasets/swebenchpro \
-    -a terminus-2 \
-    -m openai/deepseek-ai/DeepSeek-V4-Flash \
-    --ak api_base=http://172.17.0.1:30000/v1 \
-    --ak max_turns=200 \
-    -n 32 \
-    --jobs-dir /scratch/yuzhou/projects/sglang/dev/aginfer/results/run_<X>
-```
-
-`http://172.17.0.1:30000` is the docker bridge gateway IP — every harbor agent container can
-reach the host's `0.0.0.0:30000` through it. (V4-Flash must be launched with `HOST=0.0.0.0`,
-which `launch_sglang_v4flash.sh` already does.)
-
-### 2b'. Run G — through the ThunderAgent router
-
-Same harbor command as 2b, but point `api_base` at the router (port 9100
-on the host) instead of sglang directly. Requires
-[`rucnyz/ThunderAgent@aginfer`](https://github.com/rucnyz/ThunderAgent/tree/aginfer)
-installed in the `agsched` env and
-[`rucnyz/harbor@aginfer`](https://github.com/rucnyz/harbor/tree/aginfer)
-which mirrors `session_id` into `extra_body.program_id` (with UUID
-fallback).
-
-```bash
-# 1. backend (cap 512 K + HiCache ON, identical to Run F)
-MAX_TOTAL_TOKENS=524288 \
-  bash /scratch/yuzhou/projects/sglang/dev/aginfer/scripts/launch_sglang_v4flash.sh
-
-# 2. router (port 9100; host port 9000 is taken on di-bm-vykpmg-145)
-TA_PORT=9100 \
-  bash /scratch/yuzhou/projects/sglang/dev/aginfer/scripts/launch_thunderagent.sh
-
-# 3. harbor → router → sglang
-OPENAI_API_KEY=sk-fake-do-not-check \
-  harbor run \
-    -p datasets/swebenchpro \
-    -a terminus-2 \
-    -m openai/deepseek-ai/DeepSeek-V4-Flash \
-    --ak api_base=http://172.17.0.1:9100/v1 \
-    --ak max_turns=200 -n 32 \
-    --jobs-dir /scratch/yuzhou/projects/sglang/dev/aginfer/results/run_G_thunderagent
-```
-
-Verify routing is real (not pass-through): `curl http://127.0.0.1:9100/programs`
-should list N UUID program ids, not a single `"default"`.
-
-Result layout per job:
-```
-<jobs-dir>/<timestamp>/
-├── job_metadata.json
-├── trials/<trial_id>/{logs,traj,result}.json
-└── ...
-```
-
-### 2c. Watch what's happening
-
-```bash
-# Active harbor containers (each one = one trial)
-docker ps --format '{{.Names}}\t{{.Status}}' | grep -E 'aime|swebenchpro'
-
-# Server's prefill batches with cache-hit counters
-tail -F /scratch/yuzhou/projects/sglang/dev/aginfer/logs/sglang_v4flash.log | grep "Prefill batch"
-# look for #cached-token > 0  and input throughput numbers
-```
-
----
-
-## 3. Resume / cleanup
-
-```bash
-# Resume a job that got interrupted
-cd /scratch/yuzhou/projects/harbor
-harbor job resume -p /scratch/yuzhou/projects/sglang/dev/aginfer/results/run_<X>/<timestamp>
-
-# Kill all harbor docker leftovers
-docker ps --format '{{.Names}}' | grep -E 'instance_|swebenchpro' | xargs -r docker kill
-```
-
----
-
-## 4. Default knobs (changeable in `scripts/launch_sglang_v4flash.sh`)
-
-| Knob | Current | Rationale |
-|---|---|---|
-| `--tp 2 --ep 2` | 2 GPUs, TP + EP | Fits V4-Flash on GPUs 5,6 |
-| `--mem-fraction-static 0.85` | 85% HBM | Leaves room for DeepGEMM 6 GB activations; 0.95 OOMs |
-| `--hicache-ratio 1.5` | Host pool = 1.5× device pool | Auto-sized; do not write `--hicache-size N` |
-| `--hicache-write-policy write_through_selective` | Async backup of hot pages | `write_through` synchronous blocks prefill |
-| `--context-length 65536` | 64K | Plenty for AIME / SWE-bench Pro |
-| `--moe-a2a-backend none` | Triton fused MoE | `deepep` not installed, `mooncake` a2a slower for our load |
-
-Mooncake L3 config in `MOONCAKE_EXTRA` JSON inside the launch script:
-- `global_segment_size: 200gb` — DRAM each TP rank contributes
-- `protocol: tcp` + `metadata_server: P2PHANDSHAKE` — single-node, no RDMA
-- SSD spill currently **off** (4-tier reduced to tier 3 HBM + tier 2 DRAM + Mooncake DRAM
-  pool). To re-enable disk spill, add `enable_ssd_offload: true, ssd_offload_path:
-  /scratch/yuzhou/mooncake_ssd` and restart `mooncake_master` with `--enable_offload=true`.
+## Run an experiment
+Orchestrators + per-scenario packages: see **`EXP_PLAN.md`** (what) and
+**`../dynamo/s2_replay_ab.py`** / **`reproduce/RQ1/scenarios/`** (how).

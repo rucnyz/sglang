@@ -1,6 +1,6 @@
 # T14 — State-dump cost observability (PLAN §2, sglang side)
 
-PLAN.md §2 first item.  Per-call wall-clock for `dump_aginfer_state`,
+Impl_PLAN.md §2 first item.  Per-call wall-clock for `dump_aginfer_state`,
 emitted as a metric (histogram).  Sglang owns the metric (the
 tree-cache lives in the scheduler process); the daemon and any human
 monitor read it via `/aginfer/state`.
@@ -348,7 +348,7 @@ daemon doesn't observe it anymore.
 PLAN T14 should split its `p99 > 50 ms` clause into "daemon-
 facing HTTP latency" (the trigger F3 fixes; now under) AND
 "scheduler-internal compute" (still firing; #179 follow-on).
-PLAN.md updated accordingly.
+Impl_PLAN.md updated accordingly.
 
 * date: 2026-06-01
 * raw logs: `results/20260601_t160_n3_run2.log` (pre-fix N=3),

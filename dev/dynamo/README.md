@@ -1,5 +1,15 @@
 # aginfer on Dynamo — experiment platform & runbook
 
+> **UPDATE 2026-06-15 — read these first for current state:**
+> - **Stack startup** moved to the canonical Dynamo runbook: `../aginfer/RUNBOOK.md`.
+> - **What to run / experiment plan:** `../aginfer/EXP_PLAN.md` (the 3-config scorer factorial).
+> - **S2 holder-count A/B** is now driven by the **token-exact agentreplay** harness
+>   (`build_s2_trace.py` real-data trace + `s2_replay_ab.py`); current results, the open
+>   V4-Flash watchdog-crash blocker, and the exact RESUME procedure are in **`S2_RESULTS.md`**.
+> - For S2 the **eviction scorer (`hint_v_u`) IS the lever** and **HBM-only** is the measurement
+>   config; the §2/§5–7 daemon-migrate framing below is the 4-tier-migration story (still valid,
+>   but not what S2's re-prefill A/B isolates). §0 TL;DR below is the 2026-06-13 snapshot.
+
 Self-contained handover for running aginfer (our program-aware, value-driven KV scheduler)
 **on NVIDIA Dynamo**, against the native ThunderAgent baseline, with **DeepSeek-V4-Flash** +
 a full 4-tier KV cache (HBM / DRAM / mooncake-DISK / DROP). Mirrors `dev/aginfer/` but for
@@ -92,6 +102,56 @@ residence-set governor. (DISK/L3 explicit promote is still `disk_tier_not_yet_wi
 DRAM/DROP fully covered.) Also: the v0 V_u `token_total*(1+step_count)*n_holders` has a DEAD
 `n_holders` (never a Program field → always 1) and no reuse-imminence term — populate
 n_holders from KV-events + add an ETA/will-resume term for the S1 parked-gap regime.
+
+---
+
+## 2b. Positioning — action axes, ThunderAgent superset, do-no-harm (CANONICAL)
+
+> Canonical framing (2026-06-14 discussion). Aligns with paper `main.tex` §3 Technique.
+> **Supersedes** any "migrate is harmful / hints is the win, migrate is icing" framing
+> elsewhere in these docs.
+
+**Two action axes, not three.** The controller has exactly two: **(1) migration** — per-unit
+residence moves across HBM/DRAM/DISK/DROP (promote / demote / write-through / drop, all just
+edits to `res(u)`); **(2) admission** — per-program pause/resume. `pause ⊂ admission` (pause is
+one direction, resume the other). Pause is currently **dormant** (cost model incomplete; on
+Dynamo `--admission-controller=disabled`). So the **live levers = migration + in-engine
+value-eviction (hints)**; resume is active, pause is not.
+
+**ThunderAgent is a strict subspace, structurally.** TA = admission-only, migration frozen,
+pause-by-**size** on a watermark. Our action space ⊇ TA's. This is structural — the SAME space
+also subsumes LRU / InferCept / Continuum / KVFlow, each a different restriction; a space bent
+to fit TA would not also fit the other four. **Superset alone does NOT mean we beat TA**: it
+gives *our optimum ≥ their optimum* ("we can always at least match"). Actually beating them
+needs the value model to use the extra levers (surgical per-unit migration + **value**-based
+admission) better than blind-by-size pause.
+
+**Do-no-harm floor = the engine's own default (LRU), NOT ThunderAgent.** Held by value-gating
+(take only positive-net-value actions) + the empty action always being feasible. Any sub-LRU
+result is a **BUG**. In particular the extreme-flood `ours-full 40.5 > LRU 28.7` demote-harm is
+a **do-no-harm bug to root-cause** (demote into a full DRAM tier becomes a drop; value-inverted
+relief frees HBM that low-value churn then grabs; missing saturation-yield) — **NOT a
+fundamental limit of migration**. Re-classify any "migrate is fragile/harmful" claim accordingly.
+
+**migrate-only should be ≥ TA in every regime, and win at moderate pressure.** It wins NOT by
+pinning the shared (non-leaf) prefix — you cannot move a non-leaf — but by proactively dropping
+the **low-value bg-churn leaves** (reachable, ranked by reuse) to spare the high-value shared
+prefix from LRU eviction. TA's blind-by-size pause cannot target value. (The "non-leaf
+unreachable" fact only blocks *pinning the prefix directly*, not *clearing its low-value
+competitors*.)
+
+**hints / in-engine value-eviction = the SAME value direction, executed in-process at eviction
+frequency.** Its role is **stability** under high churn, where the daemon round-trip cannot
+match the eviction rate and migrate-only is race-limited (it then do-no-harm *ties* TA via the
+yield guard, and the in-engine scorer wins the regime). It is do-no-harm by construction
+(max-combine; never below LRU; absent hint → local reuse). It is **not** "the win while migrate
+is icing" — it is the reliable fast-path execution of the same policy.
+
+**Eval framing.** (a) full-system vs TA — fair (TA is the SOTA agent-aware router). (b) ablation:
+migrate-only vs full, each vs TA, to attribute. **Layer-1 target to prove:** migrate-only ≥ TA
+every regime, and > TA at moderate pressure (value-aware relief). The engine stays general — it
+exposes the interfaces (`/aginfer/migrate`, the hint table, the pluggable scorer) and applies an
+opaque per-unit value; it never decides on program identity.
 
 ---
 

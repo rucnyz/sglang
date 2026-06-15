@@ -1,6 +1,6 @@
 # e2e_smoke — end-to-end daemon ↔ sglang sanity checks
 
-> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> **Status: infrastructure regression-guard.**  Not a numbered Impl_PLAN.md
 > task.  Home for end-to-end smoke runs that exercise the FULL
 > chain (sglang webhook → daemon event router → policy decide →
 > daemon migrate POST → sglang apply_aginfer_migrations) and pin

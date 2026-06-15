@@ -1,6 +1,6 @@
 # T20 — `POST /aginfer/migrate` residence-set payload (DESIGN §6)
 
-PLAN.md §3 T20.  Replaces the legacy `{hash, target_tier}` action with
+Impl_PLAN.md §3 T20.  Replaces the legacy `{hash, target_tier}` action with
 the residence-set form `{hash, add_tiers, remove_tiers, action_id}` per
 DESIGN §6 + the 6 transitions in §7 transfer-window semantics.
 

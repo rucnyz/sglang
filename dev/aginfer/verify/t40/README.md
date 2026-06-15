@@ -175,7 +175,7 @@ five test-depth findings + one validator hardening, all closed:
   (TP>1-safe).
 * **A6** (unbounded `_aginfer_hints` growth) is an ACKNOWLEDGED
   deferral — eviction-time clear is T27; `clear_aginfer_hint` is the
-  primitive (tested in D5).  Tracked in PLAN.md.
+  primitive (tested in D5).  Tracked in Impl_PLAN.md.
 
 ## REGRESSION SANITY
 

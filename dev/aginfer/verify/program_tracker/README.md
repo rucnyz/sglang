@@ -1,6 +1,6 @@
 # program_tracker state machine (daemon infra)
 
-> **Status: infrastructure regression-guard.**  Not a numbered PLAN.md
+> **Status: infrastructure regression-guard.**  Not a numbered Impl_PLAN.md
 > task.  Guards `daemon/program_tracker.py` — the per-program FSM
 > consumed by the proxy gate + admission_controller + T33's
 > program-alive rule in `build_paper_state`.

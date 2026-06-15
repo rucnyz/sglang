@@ -13,7 +13,10 @@ def epoch(ts):
 
 logpath, start, end = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 rx = re.compile(
-    r"(\d{4}-\d{2}-\d{2}T[\d:.]+Z).*#new-token: (\d+), #cached-token: (\d+), token usage: ([\d.]+)")
+    r"(\d{4}-\d{2}-\d{2}T[\d:.]+Z).*#new-token: (\d+), #cached-token: (\d+)")
+# V4-Flash (hybrid) logs "full token usage" / "swa token usage", not a bare
+# "token usage" — grab whichever for peak_util (optional, not required to match).
+util_rx = re.compile(r"(?:full )?token usage: ([\d.]+)")
 new = cached = 0
 peak = 0.0
 for line in open(logpath, errors="ignore"):
@@ -24,7 +27,9 @@ for line in open(logpath, errors="ignore"):
     t = epoch(m.group(1))
     if start <= t <= end:
         new += int(m.group(2)); cached += int(m.group(3))
-        peak = max(peak, float(m.group(4)))
+        um = util_rx.search(line)
+        if um:
+            peak = max(peak, float(um.group(1)))
 tot = new + cached
 print(json.dumps({"new": new, "cached": cached, "total": tot,
                   "cache_hit_pct": round(cached / tot * 100, 2) if tot else 0.0,
