@@ -267,7 +267,7 @@ def joint_decide(
             # guard the c.id[2] unpack (consistency with scheduler_driver's id guards):
             # a live migrate_candidate's id is always (uid, add, remove); behaviour-identical
             # for valid 3-tuples, and a malformed/None id can never crash this filter.
-            and not (reuse_imminent and isinstance(c.id, tuple) and len(c.id) >= 3
+            and not (reuse_imminent and isinstance(c.id, tuple) and len(c.id) == 3
                      and Tier.HBM in c.id[2])
         ]
         # Pause lever — now LIVE (#260; was DORMANT).  Value each Pause's HBM

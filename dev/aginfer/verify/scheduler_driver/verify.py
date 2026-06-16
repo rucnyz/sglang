@@ -177,7 +177,11 @@ def stage_C_daemon_delegates():
     print("[C] daemon KvScheduler delegates to the in-engine driver")
     # the daemon's _filter_cooled_evicts must now be the driver's implementation
     import importlib
-    kvs = importlib.import_module("daemon.kv_scheduler")
+    try:
+        kvs = importlib.import_module("daemon.kv_scheduler")
+    except Exception as e:  # daemon may pull deps absent in a minimal env — SKIP like stage I
+        print("  SKIP (cannot import daemon.kv_scheduler: %s)" % str(e)[:80])
+        return
     now = 0.0
     cooled = _mig("x", [], [Tier.HBM])
     out = kvs._filter_cooled_evicts([cooled], {"x": now + 1.0}, now)
@@ -236,11 +240,12 @@ def stage_D_in_process_apply():
 
     # malformed-id Migrate is skipped, not crashed (the defensive guard, review #8/#9)
     bad = Migrate(cost=0.0, id=None)        # id None
-    bad2 = Migrate(cost=0.0, id=("only_two", [Tier.HBM]))  # 2-tuple, not 3
+    bad2 = Migrate(cost=0.0, id=("only_two", [Tier.HBM]))  # 2-tuple, too few
+    bad3 = Migrate(cost=0.0, id=("four", [Tier.HBM], [Tier.DRAM], "extra"))  # 4-tuple, too many
     good = _mig("ok", [Tier.DRAM], [])
     cache6 = _FakeCache()
-    out6 = d.apply_plan([bad, bad2, good], cache6)
-    _check("malformed-id migrates skipped (no crash), good one applied",
+    out6 = d.apply_plan([bad, bad2, bad3, good], cache6)
+    _check("malformed-id migrates (None/2-tuple/4-tuple) skipped (no crash), good one applied",
            len(cache6.migrate_calls) == 1 and len(cache6.migrate_calls[0]) == 1
            and cache6.migrate_calls[0][0]["hash"] == "ok")
 

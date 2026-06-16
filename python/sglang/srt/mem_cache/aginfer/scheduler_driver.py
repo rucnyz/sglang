@@ -82,7 +82,7 @@ def filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
         # guard the unpack so a malformed/None id can never crash the eviction path — such a
         # migrate just isn't a cooldown candidate and passes through (same as the live result).
         cid = getattr(c, "id", None)
-        if isinstance(c, Migrate) and isinstance(cid, tuple) and len(cid) >= 3:
+        if isinstance(c, Migrate) and isinstance(cid, tuple) and len(cid) == 3:
             uid, _add, remove = cid[0], cid[1], cid[2]
             if remove and cooldown.get(uid, 0.0) > now:
                 continue
@@ -211,8 +211,10 @@ class AginferDriver:
         # guard the id unpack: a live Migrate's id is always a 3-tuple (ours_greedy.py:355);
         # skip any malformed/None-id migrate rather than crash the apply path (it carries no
         # uid, so it could not be applied anyway). Same defensive contract as the eviction path.
+        # exact 3-tuple (uid, add, remove): a 4+ tuple would pass a >=3 guard then crash the
+        # 3-way unpack in assignments_to_wire — so require == 3 (the live contract is exactly 3).
         migrates = [c for c in plan if isinstance(c, Migrate)
-                    and isinstance(getattr(c, "id", None), tuple) and len(c.id) >= 3]
+                    and isinstance(getattr(c, "id", None), tuple) and len(c.id) == 3]
         pauses = [getattr(c, "pid", None) for c in plan if isinstance(c, Pause)]
         resumes = [getattr(c, "pid", None) for c in plan if isinstance(c, Resume)]
         migrate_result = None
@@ -273,12 +275,17 @@ class AginferDriver:
         # plan = self.decide(sched_state, event, ...); self.apply_plan(plan, cache);
         # self.apply_hints(hints_from_state(sched_state), cache).
         #
-        # ⚠ INCREMENT-4 REQUIREMENT (round-2 review #7): decide() forwards `event` to
-        # joint_decide, whose reuse-imminent tail-protection keys on event.kind ==
-        # TOOL_CALL_END (joint_decide.py ~246/267). The in-engine tick has NO natural
-        # event — it fires on a pressure cadence, not a tool-call. So increment 4 MUST
-        # pass a synthetic MEMORY_PRESSURE event (EventKind.MEMORY_PRESSURE, like the
-        # daemon's pressure decides) — NOT None and NOT a TOOL_CALL_END — or the
-        # reuse-imminent protection silently no-ops and a hot tail could be migrated out.
+        # ⚠ INCREMENT-4 REQUIREMENTS (must ALL hold when the body below is activated, so it
+        # replicates the daemon's handle() exactly — reviews r2#7 + r3):
+        #   (a) EVENT: decide() forwards `event` to joint_decide, whose reuse-imminent
+        #       tail-protection keys on event.kind == TOOL_CALL_END. The tick fires on a
+        #       pressure cadence, not a tool-call, so pass a synthetic EventKind.MEMORY_PRESSURE
+        #       event (like the daemon's pressure decides) — NOT None / NOT TOOL_CALL_END — or
+        #       the protection silently no-ops and a hot tail could be migrated out.
+        #   (b) EMA ORDER: call self.update_demote_apply_rate(sched_state.units) BEFORE decide()
+        #       (the daemon does this at handle() top, kv_scheduler.py:~1399) — else the
+        #       saturation-yield EMA never updates in-engine (stuck at 1.0, yield dead).
+        #   (c) BELIEF: drive the program_tracker / eta_estimator off the event first (the
+        #       daemon's _apply_belief_transition) so per_program state is fresh for decide().
         n_units = len(state_json.get("units", {})) if isinstance(state_json, dict) else 0
         return {"status": "dump_only_pending_build_state", "n_units": n_units}
