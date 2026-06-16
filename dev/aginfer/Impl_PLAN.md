@@ -919,6 +919,24 @@ admission RELOCATES to the router, it does not collapse into the engine.
    `build_paper_state` in-engine (it is still daemon-side, kv_scheduler.py:624) → increment 4; today
    tick() fires the trigger + the in-process dump only (value no-op, so flag-on is safe). Live A/B
    under load awaits the V4 stack fix (S2_RESULTS).)*
+1b. (high) **Increment 4 — move `build_paper_state` (dump→PaperState) in-engine**, then light up
+   `tick()`'s decide/apply. EXTRACTION MANIFEST (mapped + verified 2026-06-16, ready to execute
+   mechanically): move from `daemon/kv_scheduler.py` into a new `aginfer/state_builder.py` the
+   closure = 12 fns [`build_paper_state` 624-959, `_flatten_per_rank` 261-604, `_tier_from_string`
+   246-258, `_log_unknown_tier_once` 607-621, `_clamp_lambda_acting` 202-203, `_estimate_load_back_s`
+   206-230, `_units_for_session` 965-993, `_shared_prefix_units` 996-1001, `_top_k_by_regret`
+   1004-1045, `_build_decision_set` 1048-1093, `_env_float` 74-86, `_env_int` 89-96] + 10 consts
+   [`_LAMBDA_ACTING_FLOOR/CEIL` 70-71, `_DEFAULT_LAMBDA_ACTING` 99, `_CONST_VU` 104,
+   `_PHAT_REUSE_ALPHA` 112, `_DEFAULT_MEMORY_PRESSURE_TOPK` 121, `_PROMOTE_FALLBACK_BW_BPS` 172,
+   `LINK_IDLE_SECONDS` 189, `LINK_PAIRS` 194-199, `_TIER_LABEL_MAP` 236-243] + a FRESH module logger
+   (the `logger` straggler — do NOT carry the daemon's). All imported deps already resolve in-engine
+   (`baselines.*` + `.events`/`.program_tracker`/`._fatal` are alias-shims to `aginfer.*`). Daemon
+   RE-EXPORTS `build_paper_state` + `_flatten_per_rank` (reverse deps: verify/{t43,kv_scheduler_value_rule,
+   joint_decide,t187,admission_controller} import build_paper_state; verify/t20 + daemon import
+   _flatten_per_rank). Test: fixture `/aginfer/state` dict → assert SchedulerState units/pool_usage/
+   decision_set. THEN activate `tick()` with the 3 forward-reqs already recorded in scheduler_driver.tick()
+   (synthetic MEMORY_PRESSURE event; update_demote_apply_rate before decide; drive belief plane).
+   Run the 6 reverse-dep verify files + 3 review rounds (the bar set for Stage B).
 2. (med) Move occupancy/watermark detection in-process (port `AginferWebhookFirer.maybe_fire`).
 3. (med) Wrap the driver tick in try/except — crash isolation is lost without the separate process;
    a policy exception must disable aginfer for the session, never kill the scheduler loop.
