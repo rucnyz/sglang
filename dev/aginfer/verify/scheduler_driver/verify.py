@@ -32,7 +32,26 @@ from sglang.srt.mem_cache.aginfer.base import Tier  # noqa: E402
 from sglang.srt.mem_cache.aginfer.knapsack import Migrate  # noqa: E402
 from sglang.srt.mem_cache.aginfer.scheduler_driver import (  # noqa: E402
     AginferDriver, _DEMOTE_YIELD_EMA, filter_cooled_evicts,
+    assignments_to_wire, tier_to_wire,
 )
+
+
+class _FakeCache:
+    """Records the in-process apply calls the driver makes (stands in for the engine's
+    UnifiedRadixCache). The real methods live in cache_hooks.py; here we only assert the
+    driver CALLS them with the right wire — engine-side semantics are covered by verify/t20."""
+    def __init__(self):
+        self.migrate_calls = []
+        self.hint_calls = []
+
+    def apply_aginfer_migrations(self, actions):
+        self.migrate_calls.append(actions)
+        return {"applied": len(actions), "applied_hashes": [a["hash"] for a in actions],
+                "skipped": []}
+
+    def set_aginfer_hints(self, hints):
+        self.hint_calls.append(hints)
+        return (True, len(hints))
 
 
 class _Unit:
@@ -136,8 +155,51 @@ def stage_C_daemon_delegates():
     _check("daemon filter == driver filter", out == out2 == [])
 
 
+def stage_D_in_process_apply():
+    print("[D] in-process apply (the 'no HTTP' half): plan/hints → cache methods")
+    d = AginferDriver()
+    cache = _FakeCache()
+
+    # apply_hints → cache.set_aginfer_hints with the list; empty = no-op
+    _check("empty hints = no-op (no cache call)", d.apply_hints([], cache) is None and not cache.hint_calls)
+    hints = [{"hash": "h1", "p_hat": 0.9, "lambda": 1.0, "n_holders": 3, "stamp": 5}]
+    d.apply_hints(hints, cache)
+    _check("apply_hints calls set_aginfer_hints once with the hints",
+           len(cache.hint_calls) == 1 and cache.hint_calls[0] == hints)
+
+    # apply_plan: migrates → apply_aginfer_migrations with byte-identical wire; the
+    # remove-HBM one is recorded for the EMA; pauses/resumes surfaced (admission=router).
+    remove_hbm = _mig("u_demote", add=[], remove=[Tier.HBM])
+    promote = _mig("u_promote", add=[Tier.HBM], remove=[Tier.DRAM])
+    cache2 = _FakeCache()
+    out = d.apply_plan([remove_hbm, promote], cache2)
+    _check("apply_plan calls apply_aginfer_migrations once", len(cache2.migrate_calls) == 1)
+    wire = cache2.migrate_calls[0]
+    # wire must be byte-identical to assignments_to_wire([m.id ...]) (minus the random action_id)
+    want = assignments_to_wire([remove_hbm.id, promote.id])
+    _check("wire has both migrates", len(wire) == 2)
+    _check("wire hashes + tier strings match the translator",
+           [(w["hash"], w["add_tiers"], w["remove_tiers"]) for w in wire]
+           == [(w["hash"], w["add_tiers"], w["remove_tiers"]) for w in want])
+    _check("every wire item has an action_id correlator", all(w.get("action_id") for w in wire))
+    _check("remove-HBM demote recorded for the apply-rate EMA",
+           "u_demote" in d._pending_demote and "u_promote" not in d._pending_demote)
+
+    # empty plan = no apply call
+    cache3 = _FakeCache()
+    out3 = d.apply_plan([], cache3)
+    _check("empty plan = no migrate call", not cache3.migrate_calls and out3["migrate_result"] is None)
+
+    # pauses/resumes surfaced for the (router-side) admission caller, NOT applied here
+    pmig = _mig("u", [], [Tier.DRAM])
+    cache4 = _FakeCache()
+    out4 = d.apply_plan([pmig], cache4)
+    _check("apply_plan returns pauses/resumes keys", "pauses" in out4 and "resumes" in out4)
+
+
 if __name__ == "__main__":
     stage_A_apply_rate_ema()
     stage_B_postprocess_plan()
     stage_C_daemon_delegates()
+    stage_D_in_process_apply()
     print("verify/scheduler_driver: ALL STAGES PASSED")

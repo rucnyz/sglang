@@ -30,7 +30,30 @@ import os
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.mem_cache.aginfer.base import Tier
-from sglang.srt.mem_cache.aginfer.knapsack import Migrate
+from sglang.srt.mem_cache.aginfer.knapsack import Migrate, Pause, Resume
+
+
+def tier_to_wire(tier: Tier) -> str:
+    """Tier enum → the DESIGN §6 wire string. Single-sourced here (the daemon
+    re-exports as `_tier_to_wire`)."""
+    return {Tier.HBM: "HBM", Tier.DRAM: "DRAM", Tier.DISK: "DISK", Tier.DROP: "DROP"}[tier]
+
+
+def assignments_to_wire(assignments) -> List[Dict[str, Any]]:
+    """Translate ``[(unit_hash, add_tiers, remove_tiers), ...]`` → DESIGN §6
+    ``apply_aginfer_migrations`` action dicts. Each carries add/remove tier lists
+    plus an opaque ``action_id`` correlator (echoed back in APPLY_FAILED webhooks).
+    Moved verbatim from daemon/kv_scheduler.py (single source; daemon re-exports)."""
+    import uuid
+    return [
+        {
+            "hash": uhash,
+            "add_tiers": [tier_to_wire(t) for t in add],
+            "remove_tiers": [tier_to_wire(t) for t in remove],
+            "action_id": uuid.uuid4().hex,
+        }
+        for uhash, add, remove in assignments
+    ]
 
 
 def _env_float(name: str, default: str) -> float:
@@ -137,6 +160,41 @@ class AginferDriver:
                    ema=round(self._demote_apply_ema, 3),
                    stripped=_before - len(plan))
         return plan
+
+    # -- in-process apply (the "no HTTP" half of the #251 blocker) ---------------
+    # The daemon translates a plan into wire dicts and POSTs them over HTTP through the
+    # bridge to the engine's apply_aginfer_migrations / set_aginfer_hints. In-engine
+    # there is no process boundary: the driver calls those cache methods DIRECTLY. The
+    # wire dicts are byte-identical to the HTTP path's, so the engine side is unchanged.
+    def apply_hints(self, hints: List[Dict[str, Any]], cache) -> Any:
+        """Push the V_u hints in-process (was: outbound HTTP PUT /aginfer/hints →
+        bridge → set_aginfer_hints). Empty list = no-op. `cache` is the engine's
+        UnifiedRadixCache (exposes set_aginfer_hints)."""
+        if not hints:
+            return None
+        return cache.set_aginfer_hints(hints)
+
+    def apply_plan(self, plan: List[Any], cache) -> Dict[str, Any]:
+        """Apply a joint_decide mixed plan in-process. MIGRATIONS go straight to
+        `cache.apply_aginfer_migrations` (was: outbound HTTP POST /aginfer/migrate).
+        Remove-HBM migrates are recorded for the #240 apply-rate EMA. PAUSE/RESUME are
+        the ADMISSION axis — NOT enforced in-engine (the ingress gate lives at the
+        Dynamo router, #251 verified split); they are surfaced for the caller to route.
+        Returns {"migrate_result", "pauses": [pid...], "resumes": [pid...]}."""
+        migrates = [c for c in plan if isinstance(c, Migrate)]
+        pauses = [getattr(c, "pid", None) for c in plan if isinstance(c, Pause)]
+        resumes = [getattr(c, "pid", None) for c in plan if isinstance(c, Resume)]
+        migrate_result = None
+        if migrates:
+            assignments = [m.id for m in migrates]
+            wire = assignments_to_wire(assignments)
+            for uid, _add, remove in assignments:
+                if remove and Tier.HBM in remove:
+                    self.note_demote_dispatched(uid)
+            migrate_result = cache.apply_aginfer_migrations(wire)
+        return {"migrate_result": migrate_result,
+                "pauses": [p for p in pauses if p is not None],
+                "resumes": [p for p in resumes if p is not None]}
 
     def decide(self, sched_state, event, *, costs, pi_u, theta_hi: float,
                theta_lo: float, heartbeat_s: float, admission_enabled: bool,

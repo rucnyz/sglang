@@ -1096,35 +1096,14 @@ def _build_decision_set(
 # ----------------------------------------------------------------- dispatch
 
 
-def _tier_to_wire(tier: Tier) -> str:
-    return {
-        Tier.HBM: "HBM",
-        Tier.DRAM: "DRAM",
-        Tier.DISK: "DISK",
-        Tier.DROP: "DROP",
-    }[tier]
-
-
-def assignments_to_wire(
-    assignments: Iterable[Tuple[str, List[Tier], List[Tier]]],
-) -> List[Dict[str, Any]]:
-    """Translate ``[(unit_hash, add_tiers, remove_tiers), ...]`` →
-    DESIGN §6 ``POST /aginfer/migrate`` JSON body items.
-
-    Each item carries ``add_tiers`` + ``remove_tiers`` (residence-set
-    transitions per §7) plus an ``action_id`` opaque correlator that
-    the sglang side echoes back in APPLY_FAILED webhooks (T23).
-    """
-    import uuid
-    return [
-        {
-            "hash": uhash,
-            "add_tiers": [_tier_to_wire(t) for t in add],
-            "remove_tiers": [_tier_to_wire(t) for t in remove],
-            "action_id": uuid.uuid4().hex,
-        }
-        for uhash, add, remove in assignments
-    ]
+# #251 Stage B: the migrate wire translators are single-sourced in the in-engine
+# driver (so the in-process apply path and this daemon HTTP path emit byte-identical
+# wire). Re-exported here so existing `from daemon.kv_scheduler import assignments_to_wire`
+# callers (verify/kv_scheduler_value_rule, verify/t36, the legacy probe) keep working.
+from sglang.srt.mem_cache.aginfer.scheduler_driver import (  # noqa: E402
+    tier_to_wire as _tier_to_wire,
+    assignments_to_wire,
+)
 
 
 def hints_from_state(sched_state) -> List[Dict[str, Any]]:  # noqa: ANN001
