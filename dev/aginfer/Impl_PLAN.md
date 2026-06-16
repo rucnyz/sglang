@@ -937,6 +937,13 @@ admission RELOCATES to the router, it does not collapse into the engine.
    decision_set. THEN activate `tick()` with the 3 forward-reqs already recorded in scheduler_driver.tick()
    (synthetic MEMORY_PRESSURE event; update_demote_apply_rate before decide; drive belief plane).
    Run the 6 reverse-dep verify files + 3 review rounds (the bar set for Stage B).
+   *(LANDED 2026-06-16. 4a: build_paper_state + closure (12 fns/10 consts/logger, +hints_from_state)
+   moved to state_builder.py via AST source-segments; daemon re-exports (single source, identity-equal);
+   behaviour-equivalence PROVEN — reverse-dep verifies pass, t187 fails BYTE-IDENTICALLY pre/post.
+   4b: tick() activated — dump→build_paper_state(synthetic MEMORY_PRESSURE)→update_demote_apply_rate→
+   hints→apply_hints→decide(admission OFF)→apply_plan; driver owns a lazy tracker+policy; flag-gated
+   off + crash-isolated; mock-cache unit test. STILL DEFERRED: live under-load A/B (V4 stack fix);
+   belief-plane source (tracker driven off events) = the router half / admission relocation = step 5.)*
 2. (med) Move occupancy/watermark detection in-process (port `AginferWebhookFirer.maybe_fire`).
 3. (med) Wrap the driver tick in try/except — crash isolation is lost without the separate process;
    a policy exception must disable aginfer for the session, never kill the scheduler loop.
