@@ -113,12 +113,12 @@ def run_block(a, arm, b):
     trace = f"{BLOCKDIR}/s2_block{b}.jsonl"
     outj = f"{BLOCKDIR}/m_{arm}_b{b}.json"
     salt = f"{a.salt}-{arm}"                 # fresh per arm (routing); tokens are identical
-    # SESSION mode (closed-loop): each program's turns run sequentially, waiting for the
-    # response before the next — like the chat harness that worked. This bounds in-flight KV
-    # (≤ max_conc programs) so the scheduler always has evictable headroom and never enters
-    # the evict-storm that trips the 300s watchdog (open-loop `arrival` floods → worker crash).
+    # Faithful closed-loop replay: each program's turns run sequentially, waiting for the
+    # response before the next (parent blocks on subagents, real tool gaps). This bounds
+    # in-flight KV (≤ max_conc programs) so the scheduler always has evictable headroom and
+    # never enters the evict-storm that trips the 300s watchdog.
     cmd = (f"cd {AR} && PYTHONPATH={AR} timeout 900 {VENV} -m agentreplay replay-dynamo "
-           f"--trace {trace} --model {MODEL} --namespace dynamo --mode {a.mode} "
+           f"--trace {trace} --model {MODEL} --namespace dynamo "
            f"--stagger {a.stagger} --max-concurrency {a.max_conc} --salt {salt}-b{b} "
            f"--verify-exact --label {arm}_b{b} --out {outj}")
     t0 = time.time()
@@ -165,9 +165,7 @@ def main():
                     help="block run+DISCARDED first (DeepGEMM JIT + baseline pressure); -1 to skip")
     ap.add_argument("--max-conc", dest="max_conc", type=int, default=4,
                     help="closed-loop concurrency: ≤ this many programs in flight → bounded in-flight KV")
-    ap.add_argument("--mode", default="session", choices=["session", "arrival"],
-                    help="session = closed-loop (no evict-storm); arrival = open-loop (floods, crashes V4)")
-    ap.add_argument("--stagger", type=float, default=0.5, help="seconds between program starts (session)")
+    ap.add_argument("--stagger", type=float, default=0.5, help="seconds between program starts")
     ap.add_argument("--restart-router", action="store_true",
                     help="restart router+frontend first (REQUIRED once after a worker reboot)")
     ap.add_argument("--pad", type=float, default=4.0)
