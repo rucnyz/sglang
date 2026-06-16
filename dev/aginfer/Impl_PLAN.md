@@ -905,10 +905,20 @@ admission RELOCATES to the router, it does not collapse into the engine.
    via `apply_aginfer_migrations`/`set_aginfer_hints` in-process. Cadence: pressure-gated scheduler hook
    (occ>θ_lo + min-interval), NOT on_idle-only (on_idle only fires when idle = the LOW-pressure regime;
    the win is under flood). Gate the migrate arm behind a flag (off ⇒ stock LRU, do-no-harm).
-   *(increment 1 LANDED 2026-06-16: the post-`joint_decide` decision subsystem — saturation-yield EMA
-   #240 + cooldown filter #223 + `decide()` composition — extracted to `aginfer/scheduler_driver.py`;
-   daemon delegates; `verify/scheduler_driver` + the kv_scheduler_value_rule/joint_decide/admission/
-   s2_holder regression suites all green.)*
+   *(increment 1 LANDED: post-`joint_decide` decision subsystem — saturation-yield EMA #240 +
+   cooldown filter #223 + `decide()` — in `aginfer/scheduler_driver.py`; daemon delegates.
+   increment 2 LANDED: in-process apply — `apply_plan` (→ `cache.apply_aginfer_migrations`) +
+   `apply_hints` (→ `set_aginfer_hints`) + `assignments_to_wire`/`tier_to_wire` single-sourced
+   (daemon re-exports); the "no HTTP" half. increment 3 LANDED: the cadence gate `should_tick`
+   (pressure-gate occ≥θ_lo + interval-throttle — the #1 hard problem) + `tick()` + the engine hook
+   `Scheduler._aginfer_maybe_tick` wired into BOTH event loops next to the webhook fire,
+   gated on env `SGLANG_AGINFER_IN_ENGINE` (default OFF = byte-for-byte unchanged, do-no-harm by
+   construction) + try/except crash-isolation (a policy bug disables the feature, never kills the
+   loop). `verify/scheduler_driver` now A–F (cadence gate + flag-off inertness incl.); scheduler.py
+   imports clean; regression suites green. STILL OPEN in step 1: the tick body's decide/apply needs
+   `build_paper_state` in-engine (it is still daemon-side, kv_scheduler.py:624) → increment 4; today
+   tick() fires the trigger + the in-process dump only (value no-op, so flag-on is safe). Live A/B
+   under load awaits the V4 stack fix (S2_RESULTS).)*
 2. (med) Move occupancy/watermark detection in-process (port `AginferWebhookFirer.maybe_fire`).
 3. (med) Wrap the driver tick in try/except — crash isolation is lost without the separate process;
    a policy exception must disable aginfer for the session, never kill the scheduler loop.

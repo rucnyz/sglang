@@ -99,6 +99,25 @@ class AginferDriver:
         self._pending_demote: Dict[str, int] = {}
         self._demote_apply_ema: float = 1.0
         self._dump_gen: int = 0
+        # #251 Stage B increment 3: the in-engine trigger throttle (last tick wall-time).
+        self._last_tick_t: Optional[float] = None
+
+    # -- cadence gate (the #1 hard problem: trigger under never-idle high load) ----
+    # on_idle() only fires when the engine is FULLY idle — exactly the low-pressure
+    # regime where aginfer has nothing to do; under flood (where the win lives) the loop
+    # is never idle. So the driver rides the per-iteration hook (next to the webhook fire,
+    # which runs busy-OR-idle), but is PRESSURE-GATED (only when occ ≥ theta_lo — no
+    # pressure ⇒ nothing to migrate) and INTERVAL-THROTTLED (≥ min_interval since the last
+    # tick) so it never runs every step (the dump is 5-50ms, #160) nor competes with the
+    # hot path under headroom. Pure + deterministic ⇒ unit-tested.
+    def should_tick(self, occ: float, now: float, *, theta_lo: float,
+                    min_interval_s: float) -> bool:
+        if occ < theta_lo:
+            return False  # below the low watermark: no pressure, no work
+        if self._last_tick_t is not None and (now - self._last_tick_t) < min_interval_s:
+            return False  # throttle: too soon since the last tick
+        self._last_tick_t = now
+        return True
 
     # -- #240 saturation yield: measure whether dispatched demotes actually landed --
     def update_demote_apply_rate(self, units: Dict[str, Any]) -> None:
@@ -218,3 +237,28 @@ class AginferDriver:
             import time as _time
             now = _time.monotonic()
         return self.postprocess_plan(plan, evict_cooldown, now)
+
+    # -- the in-process tick (composes dump → build_paper_state → decide → apply) --
+    # Called from the engine scheduler loop's per-iteration hook when should_tick() is
+    # true. This is the in-process replacement for the daemon's event_router → handle()
+    # cycle. The DECIDE + APPLY pieces are already in-engine (decide / apply_plan /
+    # apply_hints above); the missing piece is build_paper_state (still daemon-side,
+    # kv_scheduler.py:624) — it relocates in the next increment, at which point the
+    # commented body below activates. Until then the tick exercises the in-process
+    # dump path (the engine producing its own s_t with no HTTP) and is a value no-op
+    # — so turning the flag on is safe (it cannot mis-decide without the builder).
+    def tick(self, scheduler) -> Dict[str, Any]:
+        """One in-process scheduling tick. Returns a small status dict (for the hook's
+        metric/log). MUST NOT raise into the scheduler loop — the caller wraps it, but
+        keep it defensive too."""
+        dump_fn = getattr(scheduler.tree_cache, "dump_aginfer_state", None)
+        if dump_fn is None:
+            return {"status": "no_dump"}  # non-Unified cache: in-engine aginfer N/A
+        state_json = dump_fn()  # the engine's own s_t, in-process (no /aginfer/state HTTP)
+        # build_paper_state is not yet in-engine (increment 4). Until then we do not
+        # decide/apply — fire the trigger + the in-process dump only. When the builder
+        # lands, this becomes: sched_state = build_paper_state(state_json, ...);
+        # plan = self.decide(sched_state, event, ...); self.apply_plan(plan, cache);
+        # self.apply_hints(hints_from_state(sched_state), cache).
+        n_units = len(state_json.get("units", {})) if isinstance(state_json, dict) else 0
+        return {"status": "dump_only_pending_build_state", "n_units": n_units}

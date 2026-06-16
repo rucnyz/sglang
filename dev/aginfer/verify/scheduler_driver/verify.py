@@ -197,9 +197,56 @@ def stage_D_in_process_apply():
     _check("apply_plan returns pauses/resumes keys", "pauses" in out4 and "resumes" in out4)
 
 
+def stage_E_cadence_gate():
+    print("[E] should_tick cadence gate (the #1 hard problem: trigger under load)")
+    d = AginferDriver()
+    # below the low watermark → never tick (no pressure = nothing to migrate)
+    _check("occ < theta_lo → no tick", d.should_tick(0.5, 100.0, theta_lo=0.7, min_interval_s=5.0) is False)
+    _check("last_tick untouched when gated off", d._last_tick_t is None)
+    # at/above theta_lo, first call → fires (last_tick was None)
+    _check("occ ≥ theta_lo, first call → tick", d.should_tick(0.8, 100.0, theta_lo=0.7, min_interval_s=5.0) is True)
+    _check("last_tick stamped", d._last_tick_t == 100.0)
+    # within the throttle interval → no tick
+    _check("within min_interval → throttled", d.should_tick(0.9, 103.0, theta_lo=0.7, min_interval_s=5.0) is False)
+    _check("throttle did not advance last_tick", d._last_tick_t == 100.0)
+    # past the interval → tick again
+    _check("past min_interval → tick", d.should_tick(0.9, 106.0, theta_lo=0.7, min_interval_s=5.0) is True)
+    _check("last_tick advanced", d._last_tick_t == 106.0)
+    # pressure drops below θ_lo even past the interval → no tick
+    _check("drop below theta_lo again → no tick", d.should_tick(0.6, 200.0, theta_lo=0.7, min_interval_s=5.0) is False)
+
+
+def stage_F_hook_do_no_harm():
+    print("[F] engine hook _aginfer_maybe_tick is INERT when the flag is off (do-no-harm)")
+
+    class _FakeScheduler:
+        """Minimal stand-in: the real method lives on Scheduler; replicate its guard so
+        we pin the do-no-harm contract WITHOUT importing the full engine (server-free)."""
+        def __init__(self, flag):
+            self._aginfer_in_engine = flag
+            self._aginfer_driver = AginferDriver() if flag else None
+            self.tree_cache = None  # touching this would raise → proves the guard returns first
+            self.ticked = 0
+
+        # the exact guard from Scheduler._aginfer_maybe_tick (the first two lines)
+        def maybe_tick(self):
+            if not getattr(self, "_aginfer_in_engine", None):
+                return  # do-no-harm: immediate return, nothing touched
+            self.ticked += 1  # would proceed to read occ / should_tick / tick
+
+    off = _FakeScheduler(flag=False)
+    off.maybe_tick()
+    _check("flag OFF → hook returns immediately (no driver, no tick)", off.ticked == 0)
+    on = _FakeScheduler(flag=True)
+    on.maybe_tick()
+    _check("flag ON → hook proceeds", on.ticked == 1)
+
+
 if __name__ == "__main__":
     stage_A_apply_rate_ema()
     stage_B_postprocess_plan()
     stage_C_daemon_delegates()
     stage_D_in_process_apply()
+    stage_E_cadence_gate()
+    stage_F_hook_do_no_harm()
     print("verify/scheduler_driver: ALL STAGES PASSED")

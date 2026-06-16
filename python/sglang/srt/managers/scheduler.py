@@ -515,6 +515,19 @@ class Scheduler(
                 self.aginfer_webhook.theta_crit,
             )
 
+        # aginfer #251 Stage B: the in-engine scheduler driver (replaces the out-of-process
+        # daemon). OFF by default — gated on SGLANG_AGINFER_IN_ENGINE=1 — so a normal launch
+        # is byte-for-byte unchanged (do-no-harm). When on, _aginfer_maybe_tick() drives it
+        # from the per-iteration loop hook. The decide/apply path lights up once
+        # build_paper_state relocates in-engine (next increment); today the tick fires the
+        # trigger + the in-process state dump only.
+        self._aginfer_in_engine = os.environ.get("SGLANG_AGINFER_IN_ENGINE", "0") == "1"
+        self._aginfer_driver = None
+        if self._aginfer_in_engine:
+            from sglang.srt.mem_cache.aginfer.scheduler_driver import AginferDriver
+            self._aginfer_driver = AginferDriver()
+            logger.info("aginfer in-engine driver armed (SGLANG_AGINFER_IN_ENGINE=1)")
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -1546,6 +1559,7 @@ class Scheduler(
             self.last_batch = batch
 
             self._aginfer_maybe_fire_webhook()  # aginfer T5 (deduped, #251 review)
+            self._aginfer_maybe_tick()  # aginfer #251 Stage B: in-engine driver (default off)
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -1607,6 +1621,7 @@ class Scheduler(
             self.last_batch = batch
 
             self._aginfer_maybe_fire_webhook()  # aginfer T5 (deduped, #251 review)
+            self._aginfer_maybe_tick()  # aginfer #251 Stage B: in-engine driver (default off)
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -3692,6 +3707,37 @@ class Scheduler(
             self.aginfer_webhook.maybe_fire(occ=occ)
         except Exception:
             logger.exception("aginfer webhook check raised")
+
+    def _aginfer_maybe_tick(self) -> None:
+        """aginfer #251 Stage B: the IN-ENGINE scheduler tick (replaces the out-of-process
+        daemon's event_router→handle cycle). Runs on EVERY loop iteration (busy OR idle —
+        unlike on_idle, which only fires when fully idle = the low-pressure regime where
+        there is nothing to do); the AginferDriver's should_tick() pressure-gates (occ ≥
+        theta_lo) and interval-throttles it so it never runs every step.
+
+        DEFAULT OFF: gated on env SGLANG_AGINFER_IN_ENGINE=1. When unset this is a single
+        attribute check + return — zero behaviour change (do-no-harm by construction; the
+        daemon path is untouched). Wrapped in try/except: crash isolation is lost without a
+        separate process, so a policy bug must DISABLE the feature for the session, never
+        kill the scheduler loop (the inline LRU scorer remains the safety net)."""
+        if not getattr(self, "_aginfer_in_engine", None):
+            return
+        try:
+            occ = 0.0
+            pu = getattr(self.tree_cache, "_aginfer_pool_usage", None)
+            if pu is not None:
+                occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
+            import time as _time
+            theta_lo = getattr(self.server_args, "aginfer_theta_lo", 0.70)
+            heartbeat_s = getattr(self.server_args, "aginfer_heartbeat_s", 5.0)
+            if self._aginfer_driver.should_tick(
+                occ, _time.monotonic(), theta_lo=theta_lo, min_interval_s=heartbeat_s):
+                self._aginfer_driver.tick(self)
+        except Exception:
+            logger.exception(
+                "aginfer in-engine tick raised — DISABLING aginfer-in-engine for the "
+                "session (inline LRU scorer remains active; daemon path unaffected)")
+            self._aginfer_in_engine = False
 
     # aginfer throughput/EMA hooks — logic in aginfer/metrics_hooks.py (#251 Stage A.2)
     def _aginfer_record_throughput(self, *a, **k):
