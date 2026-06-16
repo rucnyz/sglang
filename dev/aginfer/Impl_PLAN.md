@@ -870,12 +870,72 @@ comparison (its router lives there).
 
 > Folded in from the former `REFACTOR_engine_plugin.md` (original plan 2026-06-13; task #251).
 
-**Status:** IN PROGRESS (2026-06-15). Stage A.2 landed — the engine policy is extracted into a
-self-contained in-engine package (`python/sglang/srt/mem_cache/aginfer/`): state-dump subsystem,
-HTTP validators, `/aginfer/state` response cache, teacher-forcing + program-id sanitize are all
-their own modules (see git log `aginfer #251: extract …`). Remaining: fully retire the external
-daemon/bridge/proxy once the in-engine scheduler reaches parity. The original plan + feasibility
-record follows verbatim.
+**Status:** IN PROGRESS. Stage A (pure-policy extraction) DONE + verified; Stage B (the in-engine
+driver) STARTED. The original plan + feasibility record follows verbatim below §8.2.
+
+### 8.1 Verified state + plan (2026-06-16, adversarially verified, high confidence)
+
+**Already done (Stage A):** the value model + the cache MECHANISM are fully in-engine
+(`python/sglang/srt/mem_cache/aginfer/`): `base/ours_greedy/joint_decide/knapsack/admission_controller/
+program_tracker/action_timeline/costs/events/eta_estimator` + plugin hooks `cache_hooks/cache_policy/
+state_dump/http_*`. The engine can already STORE hints, APPLY migrations, SCORE eviction, DUMP state
+in-process. The daemon's `joint_decide.py`/`admission_controller.py`/etc. are now 6-line alias-shims
+to the in-engine modules — ONE canonical copy of the value math. #253 added `_aginfer_value_aware`
+so default LRU honours `--radix-eviction-policy` (do-no-harm).
+
+**THE BLOCKER (verified):** there is NO in-engine DRIVER LOOP. A grep for callers of
+`joint_decide`/`migrate_candidates` in `python/sglang/srt/` returns ZERO — the policy code is
+colocated in-engine but inert; the only consumer is the daemon's `kv_scheduler.handle()` over HTTP.
+`scheduler.on_idle()` is pure housekeeping. So the decision brain still runs out-of-process; every
+downstream deletion (proxy/outbound/event_router/daemon) is blocked until an in-engine driver exists.
+
+**ADMISSION SPLITS (verified, mandatory):** migration → engine plugin (delete that half of the
+daemon); ADMISSION (the `wait_if_paused` ingress gate + pause/resume decision) → the **Dynamo
+ROUTER**, NOT the engine. Two load-bearing reasons: (1) enforcement is a request-INGRESS blocking
+gate (`program_tracker.wait_if_paused`, an `await asyncio.Event`); the engine's
+`update_aginfer_program_paused` is a passthrough STORE that gates nothing, and `tokenizer_manager`
+has no admission gate — so a pause stored in-engine is a no-op. (2) the pause DECISION
+(`pause_relief` = shadow-price `bytes//n_holders`) needs the cross-rank fleet view a per-rank engine
+plugin structurally lacks. SESSION_END must ride a terminal flag on the final request from the router
+(idle is indistinguishable from a slow tool-call). Net: full daemon deletion is achievable but
+admission RELOCATES to the router, it does not collapse into the engine.
+
+**Ordered remaining work (9 steps, risk-tagged):**
+1. (high) **Stage B driver** — `AginferDriver` that builds D_t, calls in-engine `joint_decide`, applies
+   via `apply_aginfer_migrations`/`set_aginfer_hints` in-process. Cadence: pressure-gated scheduler hook
+   (occ>θ_lo + min-interval), NOT on_idle-only (on_idle only fires when idle = the LOW-pressure regime;
+   the win is under flood). Gate the migrate arm behind a flag (off ⇒ stock LRU, do-no-harm).
+   *(increment 1 LANDED 2026-06-16: the post-`joint_decide` decision subsystem — saturation-yield EMA
+   #240 + cooldown filter #223 + `decide()` composition — extracted to `aginfer/scheduler_driver.py`;
+   daemon delegates; `verify/scheduler_driver` + the kv_scheduler_value_rule/joint_decide/admission/
+   s2_holder regression suites all green.)*
+2. (med) Move occupancy/watermark detection in-process (port `AginferWebhookFirer.maybe_fire`).
+3. (med) Wrap the driver tick in try/except — crash isolation is lost without the separate process;
+   a policy exception must disable aginfer for the session, never kill the scheduler loop.
+4. (med) Replace outbound transport with direct calls (delete `outbound.py` + `aginfer_bridge.py`);
+   decide coalescing fate (#228 brought latency 1.8s→<1s — re-measure, don't naively drop).
+5. (high) **Admission → Dynamo router** — port `wait_if_paused` gate + pause/resume + the
+   REASONING/ACTING/PAUSED/ENDED machine + disconnect race (#183) + SESSION_END-while-gated (#185);
+   emit PAUSED in the engine dump; router-side pause decision reads it.
+6. (high) Move the action-timeline (predictive promote) in-process + resolve #235 ETA due_time drift.
+7. (high) **Stage D — delete the daemon** (`event_router/main/proxy/outbound/kv_scheduler` + shims +
+   bridge); demote the now-unneeded `/aginfer/*` HTTP endpoints; re-run aginfer-vs-thunderagent +
+   the S2 holder-count + S1 predictive-promote A/Bs on the live stack with NO daemon.
+8. (high) Knapsack DP isolation — worker thread + ~100ms timeout, pressure-gated; greedy fallback;
+   verify TTFT stays flat under flood with the plugin on.
+9. (med) Close deferred test gates (#252 server-free migrate test; single-rank n_holders; e2e A/Bs).
+
+**Hard / unsolved (the genuinely non-mechanical ones):** (a) driver cadence under never-idle high
+load — on_idle is the wrong hook; needs an event-driven trigger in the hot step with no per-step
+latency. (b) state freshness vs decision latency — in-process dump is a 5-50ms tree walk (#160)
+competing with the single-threaded step; #180 read-lock snapshot vs accept-stale both open. (c)
+admission cross-rank view (structural → router). (d) two state machines (belief vs residence)
+merging across the router↔engine boundary — no merge protocol designed; SESSION_END not
+self-derivable in-engine. (e) action-timeline belief coupling — ETA lives at proxy/router, the
+promote migrate at engine. (f) saturation-yield async feedback loop into a single-threaded step.
+(g) coalescing latency floor (#228/#230). (h) crash-isolation loss (#220/#221 still open).
+
+### 8.2 Original plan + feasibility record (verbatim, 2026-06-13)
 
 ### 0. Principle (the standard this plan is held to)
 

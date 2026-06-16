@@ -174,19 +174,11 @@ _PROMOTE_FALLBACK_BW_BPS = _env_float("AGINFER_PROMOTE_FALLBACK_BW_BPS", "5e9")
 
 def _filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
                           now: float) -> List[Any]:
-    """#223: drop any migrate that REMOVES a tier for a hash currently in the
-    TOCTOU evict cooldown.  Pure-add migrates (write-through) for a cooled
-    hash still pass — only the failing remove is backed off.  Expired entries
-    are ignored (and pruned by the caller)."""
-    from baselines.knapsack import Migrate
-    out: List[Any] = []
-    for c in plan:
-        if isinstance(c, Migrate):
-            uid, _add, remove = c.id
-            if remove and cooldown.get(uid, 0.0) > now:
-                continue
-        out.append(c)
-    return out
+    """#223 / #251 Stage B: the cooldown filter moved into the in-engine driver
+    (single implementation).  This thin delegator keeps the daemon's call path and
+    verify/kv_scheduler_value_rule working unchanged."""
+    from sglang.srt.mem_cache.aginfer.scheduler_driver import filter_cooled_evicts
+    return filter_cooled_evicts(plan, cooldown, now)
 
 
 # DESIGN §7 bw_free branch: link is "cold-idle" iff
@@ -1253,13 +1245,13 @@ class KvScheduler:
         self.last_action: Optional[Action] = None
         self.last_plan: Optional[List[Any]] = None
         self.last_decision_set_size: int = 0
-        # #240 saturation-yield self-measurement: hashes we dispatched a
-        # remove-HBM for, with the dump generation, + an EMA of whether they
-        # actually left HBM by a later dump.  Bounded by the in-flight demote
-        # count; pruned on check; reconstructed-from-scratch on restart.
-        self._pending_demote: Dict[str, int] = {}
-        self._demote_apply_ema: float = 1.0
-        self._dump_gen: int = 0
+        # #251 Stage B: the post-joint_decide decision subsystem (saturation-yield
+        # apply-rate EMA + #223 cooldown filter) lives in the IN-ENGINE driver now;
+        # the daemon delegates to it.  Behaviour-identical to the former inline
+        # _pending_demote/_demote_apply_ema/_dump_gen + handle() block — this is the
+        # first piece of the decision brain relocated in-process (the #251 blocker).
+        from sglang.srt.mem_cache.aginfer.scheduler_driver import AginferDriver
+        self.driver = AginferDriver()
         # Audit round-2 R2-N2: per-instance unknown-tier log set so
         # cross-test / cross-restart state doesn't leak.
         self._unknown_tier_log: set = set()
@@ -1428,8 +1420,12 @@ class KvScheduler:
         # greedy-decide-then-admission decompose.  Thresholds + horizon
         # come from the router (the single source of truth, T22/§10);
         # cost calibration from the shared policy instance.
-        from .joint_decide import joint_decide
-        plan = joint_decide(
+        # #251 Stage B: ONE in-engine call does joint_decide + the #223 evict-cooldown
+        # filter + the #240 saturation yield — the post-decision logic that used to be
+        # inline here.  Same call, same filters, no transport (the daemon still does the
+        # fetch above and the dispatch below).  `evict_cooldown` is mutated in place
+        # (expired-entry prune) exactly as before.
+        plan = self.driver.decide(
             sched_state, event,
             costs=self.policy.costs,
             pi_u=self.policy.pi_u,
@@ -1437,34 +1433,8 @@ class KvScheduler:
             theta_lo=router.theta_lo,
             heartbeat_s=router.heartbeat_s,
             admission_enabled=self.admission_enabled,
+            evict_cooldown=getattr(router, "evict_cooldown", None),
         )
-        # #223: back off remove migrates for hashes whose remove recently
-        # failed the dump-vs-apply leaf TOCTOU (cooldown populated by the
-        # APPLY_FAILED handler on the router).  Prunes expired entries.
-        _cd = getattr(router, "evict_cooldown", None)
-        if _cd:
-            import time as _time
-            _now = _time.monotonic()
-            for _h in [h for h, exp in _cd.items() if exp <= _now]:
-                _cd.pop(_h, None)
-            if _cd:
-                plan = _filter_cooled_evicts(plan, _cd, _now)
-        # #240 SATURATION YIELD: if our recent explicit demotes aren't landing
-        # (apply-rate EMA below threshold → racing sglang's own lock at apply),
-        # strip remove-HBM migrates from the plan.  sglang's V_u-guided reactive
-        # eviction frees the same idle tails anyway; the daemon keeps promotes /
-        # pauses / resumes.  Value-optimal do-no-harm (DESIGN §9 saturation yield).
-        if plan and self._demote_apply_ema < _DEMOTE_YIELD_EMA:
-            from baselines.knapsack import Migrate as _Migrate
-            _before = len(plan)
-            plan = [c for c in plan if not (
-                isinstance(c, _Migrate)
-                and isinstance(getattr(c, "id", None), tuple)
-                and len(c.id) >= 3 and Tier.HBM in c.id[2])]
-            if len(plan) < _before:
-                _m("demote_saturation_yield",
-                   ema=round(self._demote_apply_ema, 3),
-                   stripped=_before - len(plan))
         self.decisions += 1
         self.last_plan = plan
         # #215: reconcile in-flight resumes against the fresh dump — runs EVERY
@@ -1490,30 +1460,9 @@ class KvScheduler:
         await self._dispatch_plan(plan, sched_state)
 
     def _update_demote_apply_rate(self, units: Dict[str, Any]) -> None:
-        """#240: did our recently-dispatched remove-HBM demotes actually land?
-        A dispatched hash STILL HBM-resident a dump-generation later did not
-        apply (lock-race vs sglang's own eviction).  Update the apply-rate EMA
-        the saturation yield reads.  The EMA tolerates the dump's <1s eventual-
-        consistency lag.  Reconstructed from scratch on restart (no persistence)."""
-        self._dump_gen += 1
-        if not self._pending_demote:
-            # Recovery drift: with nothing pending, slowly relax the apply-rate
-            # EMA back toward 1.0 so a sustained yield re-probes demotes once
-            # pressure eases — otherwise the yield (which suppresses dispatch,
-            # hence new measurements) would lock in permanently.
-            if self._demote_apply_ema < 1.0:
-                self._demote_apply_ema = min(1.0, self._demote_apply_ema + 0.02)
-            return
-        for h, gen in list(self._pending_demote.items()):
-            if self._dump_gen - gen < 1:
-                continue  # give the apply at least one fresh dump to show up
-            u = units.get(h)
-            landed = (u is None) or (Tier.HBM not in u.residence)
-            self._demote_apply_ema = (
-                0.7 * self._demote_apply_ema + 0.3 * (1.0 if landed else 0.0))
-            del self._pending_demote[h]
-        if len(self._pending_demote) > 4096:   # safety: never grow unbounded
-            self._pending_demote.clear()
+        """#240 / #251 Stage B: delegate to the in-engine driver's apply-rate EMA
+        (the logic moved verbatim into AginferDriver.update_demote_apply_rate)."""
+        self.driver.update_demote_apply_rate(units)
 
     async def _dispatch_plan(self, plan: List[Any], sched_state) -> None:
         """Dispatch a §9 ``joint_decide`` mixed plan (#194).
@@ -1554,12 +1503,12 @@ class KvScheduler:
             outcome="dispatched",
         )
         if migrates:
-            # #240: remember remove-HBM hashes so the next fresh dump tells us
-            # whether they landed (feeds the saturation-yield apply-rate EMA).
+            # #240 / #251 Stage B: remember remove-HBM hashes so the next fresh dump
+            # tells us whether they landed (feeds the in-engine driver's apply-rate EMA).
             for m in migrates:
                 _mid = getattr(m, "id", None)
                 if isinstance(_mid, tuple) and len(_mid) >= 3 and Tier.HBM in _mid[2]:
-                    self._pending_demote[_mid[0]] = self._dump_gen
+                    self.driver.note_demote_dispatched(_mid[0])
             await self._dispatch_migrate([m.id for m in migrates])
         for c in pauses:
             await self._dispatch_pause(c.pid, sched_state)

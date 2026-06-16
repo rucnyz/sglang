@@ -1,0 +1,162 @@
+"""aginfer in-engine scheduler driver (refactor #251 Stage B, increment 1).
+
+THE entry point the daemon's out-of-process orchestrator is being dissolved into.
+Today the decision brain still runs in dev/aginfer/daemon/kv_scheduler.py over HTTP;
+this module begins relocating that brain in-process so the engine can eventually
+drive `joint_decide` itself with NO daemon (the #251 blocker = "no in-engine driver
+loop"; this is its first load-bearing piece).
+
+Increment 1 extracts the PURE post-`joint_decide` decision subsystem — the part that
+turns a fresh state + event into a final plan — with NO transport (no fetch, no
+outbound POST). It is byte-for-faithful with the inline logic it replaces in
+`KvScheduler.handle()` (lines ~1431-1467 + `_update_demote_apply_rate`); the daemon
+now delegates to it, so behaviour is unchanged and the existing verify suite is the
+regression gate. Later increments fold in the belief plane + the cadence hook + the
+in-process apply, then the daemon deletes.
+
+Responsibilities owned here (the saturation-yield / cooldown decision subsystem):
+  * `update_demote_apply_rate(units)` — the #240 apply-rate EMA (did our recent
+    remove-HBM demotes actually land?), driven once per fresh dump.
+  * `decide(sched_state, event, ...)` — run the in-engine `joint_decide`, then
+    apply the #223 evict-cooldown filter and the #240 saturation yield, returning
+    the final plan (may be empty = no-op, the do-no-harm floor).
+
+State is reconstructed-from-scratch on restart (no persistence), exactly as the
+daemon's was — see `_update_demote_apply_rate`'s original docstring.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+from sglang.srt.mem_cache.aginfer.base import Tier
+from sglang.srt.mem_cache.aginfer.knapsack import Migrate
+
+
+def _env_float(name: str, default: str) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+# #240 saturation yield: when the recent remove-HBM apply-rate EMA falls below this,
+# the engine is racing sglang's own eviction lock on apply, so strip explicit demotes
+# from the plan (sglang's V_u-guided reactive eviction frees the same idle tails). The
+# constant mirrors the daemon's AGINFER_DEMOTE_YIELD_EMA (kv_scheduler.py).
+_DEMOTE_YIELD_EMA = _env_float("AGINFER_DEMOTE_YIELD_EMA", "0.4")
+
+
+def filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
+                         now: float) -> List[Any]:
+    """#223: drop any migrate that REMOVES a tier for a hash currently in the TOCTOU
+    evict cooldown. Pure-add migrates (write-through) for a cooled hash still pass —
+    only the failing remove is backed off. Expired entries are ignored (pruned by the
+    caller). Moved verbatim from daemon/kv_scheduler.py:_filter_cooled_evicts."""
+    out: List[Any] = []
+    for c in plan:
+        if isinstance(c, Migrate):
+            uid, _add, remove = c.id
+            if remove and cooldown.get(uid, 0.0) > now:
+                continue
+        out.append(c)
+    return out
+
+
+class AginferDriver:
+    """In-engine decision driver. Owns the saturation-yield / cooldown subsystem and
+    composes `joint_decide` into a final plan. Stateful (the apply-rate EMA), single
+    instance per scheduler — NOT thread-safe (the engine scheduler loop is single
+    threaded; the daemon consumer is too)."""
+
+    def __init__(self) -> None:
+        # #240 apply-rate EMA state (was KvScheduler._pending_demote / _demote_apply_ema
+        # / _dump_gen). EMA starts optimistic (1.0 = "demotes land") so the first
+        # pressure event is free to demote; it decays only on observed futile demotes.
+        self._pending_demote: Dict[str, int] = {}
+        self._demote_apply_ema: float = 1.0
+        self._dump_gen: int = 0
+
+    # -- #240 saturation yield: measure whether dispatched demotes actually landed --
+    def update_demote_apply_rate(self, units: Dict[str, Any]) -> None:
+        """Did our recently-dispatched remove-HBM demotes actually land? A dispatched
+        hash STILL HBM-resident a dump-generation later did not apply (lock-race vs
+        sglang's own eviction). Update the apply-rate EMA the saturation yield reads.
+        The EMA tolerates the dump's <1s eventual-consistency lag. Reconstructed from
+        scratch on restart. Verbatim from daemon/kv_scheduler.py:_update_demote_apply_rate."""
+        self._dump_gen += 1
+        if not self._pending_demote:
+            # Recovery drift: with nothing pending, slowly relax the EMA back toward
+            # 1.0 so a sustained yield re-probes demotes once pressure eases — else the
+            # yield (which suppresses dispatch, hence new measurements) locks in forever.
+            if self._demote_apply_ema < 1.0:
+                self._demote_apply_ema = min(1.0, self._demote_apply_ema + 0.02)
+            return
+        for h, gen in list(self._pending_demote.items()):
+            if self._dump_gen - gen < 1:
+                continue  # give the apply at least one fresh dump to show up
+            u = units.get(h)
+            landed = (u is None) or (Tier.HBM not in u.residence)
+            self._demote_apply_ema = (
+                0.7 * self._demote_apply_ema + 0.3 * (1.0 if landed else 0.0))
+            del self._pending_demote[h]
+        if len(self._pending_demote) > 4096:  # safety: never grow unbounded
+            self._pending_demote.clear()
+
+    def note_demote_dispatched(self, uid: str) -> None:
+        """Record a remove-HBM migrate we just dispatched, tagged with the current dump
+        generation, so a later `update_demote_apply_rate` can check if it landed. (The
+        daemon does this in `_dispatch_plan`; exposed here so the apply-rate state lives
+        with the EMA that consumes it.)"""
+        self._pending_demote[uid] = self._dump_gen
+
+    def postprocess_plan(self, plan: List[Any], evict_cooldown: Optional[Dict[str, float]],
+                         now: float) -> List[Any]:
+        """The pure plan post-processing the daemon ran inline after joint_decide:
+        (1) #223 evict-cooldown filter, (2) #240 saturation yield. Returns the final
+        plan (possibly empty). `evict_cooldown` may be None/empty (no cooldown)."""
+        if evict_cooldown:
+            # prune expired entries in place, then filter
+            for _h in [h for h, exp in evict_cooldown.items() if exp <= now]:
+                evict_cooldown.pop(_h, None)
+            if evict_cooldown:
+                plan = filter_cooled_evicts(plan, evict_cooldown, now)
+        # #240 SATURATION YIELD: if recent explicit demotes aren't landing (EMA below
+        # threshold → racing sglang's lock at apply), strip remove-HBM migrates. sglang's
+        # V_u-guided reactive eviction frees the same idle tails; keep promotes/pauses/
+        # resumes. Value-optimal do-no-harm (DESIGN §9 saturation yield).
+        if plan and self._demote_apply_ema < _DEMOTE_YIELD_EMA:
+            from sglang.srt.mem_cache.aginfer._metrics import m as _m
+            _before = len(plan)
+            plan = [c for c in plan if not (
+                isinstance(c, Migrate)
+                and isinstance(getattr(c, "id", None), tuple)
+                and len(c.id) >= 3 and Tier.HBM in c.id[2])]
+            if len(plan) < _before:
+                _m("demote_saturation_yield",
+                   ema=round(self._demote_apply_ema, 3),
+                   stripped=_before - len(plan))
+        return plan
+
+    def decide(self, sched_state, event, *, costs, pi_u, theta_hi: float,
+               theta_lo: float, heartbeat_s: float, admission_enabled: bool,
+               evict_cooldown: Optional[Dict[str, float]] = None,
+               now: Optional[float] = None) -> List[Any]:
+        """Run the in-engine `joint_decide` over the union action space, then
+        post-process (cooldown + saturation yield). Returns the final mixed plan.
+        This is the in-process equivalent of the daemon's handle() decision body
+        (kv_scheduler.py:1431-1467) — same call, same filters, no transport."""
+        from sglang.srt.mem_cache.aginfer.joint_decide import joint_decide
+        plan = joint_decide(
+            sched_state, event,
+            costs=costs,
+            pi_u=pi_u,
+            theta_hi=theta_hi,
+            theta_lo=theta_lo,
+            heartbeat_s=heartbeat_s,
+            admission_enabled=admission_enabled,
+        )
+        if now is None:
+            import time as _time
+            now = _time.monotonic()
+        return self.postprocess_plan(plan, evict_cooldown, now)
