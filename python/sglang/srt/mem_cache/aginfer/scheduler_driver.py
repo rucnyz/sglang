@@ -268,11 +268,16 @@ class AginferDriver:
     #   (b) update_demote_apply_rate(units) runs BEFORE decide (the daemon's handle() order)
     #       so the saturation-yield EMA actually updates in-engine;
     #   (c) admission (pause/resume) is OFF here — it is the Dynamo-ROUTER half (#251 verified
-    #       split), so decide runs with admission_enabled=False. The belief plane (driving the
-    #       tracker off the proxy/router event stream) is the router-half work; in-engine the
-    #       tick uses a driver-owned tracker (empty ⇒ programs fall to the dump's authoritative
-    #       per_program state + workload-prior p_hat). The S2/holder-count hint lever is FULL
-    #       (n_holders comes from the dump's session_ids, not the tracker).
+    #       split), so decide runs with admission_enabled=False.
+    # KNOWN DEGRADATION (honest): build_paper_state's per-holder p_hat keys on tracker.state(sid)
+    # (state_builder.py:~737), NOT the dump's per_program_usage. The driver's tracker is EMPTY
+    # in-engine (nothing drives its lifecycle yet), so EVERY program reads as "never-seen" →
+    # workload-prior p_hat (LIFECYCLE-BLIND). That is SAFE (no crash) but DEGRADES migrate-decision
+    # quality vs the daemon (which drives the tracker off the proxy event stream). The S2/holder-
+    # count HINT lever is UNAFFECTED (n_holders comes from the dump's session_ids, tracker-free).
+    # Driving the belief plane (the tracker, off events) is the ROUTER-half work (#251 step 5);
+    # until then the migrate-decision arm is first-cut quality — which is exactly why the whole
+    # in-engine path stays flag-default-OFF and the daemon remains the production decision-maker.
     # Still flag-gated (SGLANG_AGINFER_IN_ENGINE) + wrapped by the hook's try/except; the live
     # under-load A/B awaits the V4 stack fix (S2_RESULTS) — the flag stays off by default.
     def tick(self, scheduler, *, theta_hi: float = 0.85, theta_lo: float = 0.70,

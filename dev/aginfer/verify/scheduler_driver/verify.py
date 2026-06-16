@@ -383,7 +383,10 @@ def stage_H_tick_activated():
     try:
         _sb.build_paper_state = fake_bps
         _sb.hints_from_state = fake_hints
-        _jd.joint_decide = lambda ss, ev, **kw: [_mig("u_demote", [], [Tier.HBM])]
+        def fake_jd(ss, ev, **kw):
+            captured["admission_enabled"] = kw.get("admission_enabled")
+            return [_mig("u_demote", [], [Tier.HBM])]
+        _jd.joint_decide = fake_jd
 
         cache = _FakeCache()
         cache.dump_aginfer_state = lambda: {"units": {"u_demote": 1}, "time_counter": 0}  # build_paper_state is faked
@@ -403,8 +406,29 @@ def stage_H_tick_activated():
         _check("tick returns 'ticked' with unit/hint counts", r["status"] == "ticked" and r["n_hints"] == 1)
         _check("driver built a tracker + policy lazily on first tick",
                d._tracker is not None and d._policy is not None)
+        # (c) the tick must run decide with admission OFF (admission = router half, #251 split)
+        _check("(c) tick decides with admission_enabled=False (pause/resume = router half)",
+               captured.get("admission_enabled") is False)
     finally:
         _sb.build_paper_state, _sb.hints_from_state, _jd.joint_decide = o_bps, o_hints, o_jd
+
+
+def stage_J_single_source_invariant():
+    print("[J] single-source invariant: daemon re-exports ARE the in-engine state_builder objects")
+    try:
+        import importlib
+        kvs = importlib.import_module("daemon.kv_scheduler")
+    except Exception as e:
+        print("  SKIP (cannot import daemon.kv_scheduler: %s)" % str(e)[:80])
+        return
+    import sglang.srt.mem_cache.aginfer.state_builder as sb
+    # every moved name the daemon re-exports must be the SAME object as state_builder's
+    # (catches a future edit that re-adds a local def and silently shadows the canonical one).
+    for n in ["build_paper_state", "_flatten_per_rank", "hints_from_state", "_build_decision_set",
+              "_top_k_by_regret", "_units_for_session", "_tier_from_string", "_TIER_LABEL_MAP",
+              "_DEFAULT_LAMBDA_ACTING", "_PHAT_REUSE_ALPHA"]:
+        _check("daemon.%s IS state_builder.%s (single source)" % (n, n),
+               getattr(kvs, n) is getattr(sb, n))
 
 
 def stage_I_engine_hook_real_body():
@@ -478,4 +502,5 @@ if __name__ == "__main__":
     stage_G_decide_composition()
     stage_H_tick_activated()
     stage_I_engine_hook_real_body()
+    stage_J_single_source_invariant()
     print("verify/scheduler_driver: ALL STAGES PASSED")

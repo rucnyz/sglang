@@ -170,8 +170,8 @@ def _log_unknown_tier_once(label: str, seen: set) -> None:
         return
     seen.add(label)
     logger.warning(
-        "kv_scheduler: unknown tier label %r in /aginfer/state; "
-        "unit skipped.  Add to daemon/kv_scheduler.py _TIER_LABEL_MAP.",
+        "aginfer.state_builder: unknown tier label %r in /aginfer/state; "
+        "unit skipped.  Add to state_builder.py _TIER_LABEL_MAP.",
         label,
     )
 
