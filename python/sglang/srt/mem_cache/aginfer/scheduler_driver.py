@@ -78,8 +78,12 @@ def filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
     caller). Moved verbatim from daemon/kv_scheduler.py:_filter_cooled_evicts."""
     out: List[Any] = []
     for c in plan:
-        if isinstance(c, Migrate):
-            uid, _add, remove = c.id
+        # a live Migrate's id is always (uid, add_tiers, remove_tiers) (ours_greedy.py:355);
+        # guard the unpack so a malformed/None id can never crash the eviction path — such a
+        # migrate just isn't a cooldown candidate and passes through (same as the live result).
+        cid = getattr(c, "id", None)
+        if isinstance(c, Migrate) and isinstance(cid, tuple) and len(cid) >= 3:
+            uid, _add, remove = cid[0], cid[1], cid[2]
             if remove and cooldown.get(uid, 0.0) > now:
                 continue
         out.append(c)
@@ -200,7 +204,11 @@ class AginferDriver:
         the ADMISSION axis — NOT enforced in-engine (the ingress gate lives at the
         Dynamo router, #251 verified split); they are surfaced for the caller to route.
         Returns {"migrate_result", "pauses": [pid...], "resumes": [pid...]}."""
-        migrates = [c for c in plan if isinstance(c, Migrate)]
+        # guard the id unpack: a live Migrate's id is always a 3-tuple (ours_greedy.py:355);
+        # skip any malformed/None-id migrate rather than crash the apply path (it carries no
+        # uid, so it could not be applied anyway). Same defensive contract as the eviction path.
+        migrates = [c for c in plan if isinstance(c, Migrate)
+                    and isinstance(getattr(c, "id", None), tuple) and len(c.id) >= 3]
         pauses = [getattr(c, "pid", None) for c in plan if isinstance(c, Pause)]
         resumes = [getattr(c, "pid", None) for c in plan if isinstance(c, Resume)]
         migrate_result = None

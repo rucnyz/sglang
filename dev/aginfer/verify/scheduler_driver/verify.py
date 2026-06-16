@@ -106,6 +106,30 @@ def stage_A_apply_rate_ema():
     _check("a hash noted one gen before the check IS evaluated",
            "h_fresh" not in d3._pending_demote)
 
+    # u=None path: a dispatched hash absent from the fresh dump => DROPPED (landed=True).
+    d4 = AginferDriver()
+    d4._demote_apply_ema = 0.5
+    d4.note_demote_dispatched("h_gone")
+    d4.update_demote_apply_rate({})  # h_gone not in units => u=None => landed=True
+    _check("u=None (hash gone from dump) counts as landed (EMA rises 0.7*0.5+0.3=0.65)",
+           abs(d4._demote_apply_ema - 0.65) < 1e-9 and "h_gone" not in d4._pending_demote)
+
+    # 4096 safety clear: to keep entries pending past the loop they must hit the grace branch
+    # (`_dump_gen - gen < 1`), i.e. their gen must be ≥ the post-increment _dump_gen. Seed 4097
+    # entries one gen AHEAD of the counter; the next update increments into them (diff==0 → grace
+    # → all kept) → len > 4096 → the guard clears the whole map (unbounded-growth backstop).
+    d5 = AginferDriver()
+    d5._dump_gen = 5
+    d5._pending_demote = {"k%d" % i: 6 for i in range(4097)}  # gen=6, ahead of _dump_gen=5
+    d5.update_demote_apply_rate({})  # _dump_gen -> 6; every entry diff (6-6)=0 <1 -> grace kept -> 4097 > 4096
+    _check("4096 safety-clear fires (pending > cap -> cleared)", len(d5._pending_demote) == 0)
+    # one-below-cap stays in grace, NOT cleared (boundary)
+    d6 = AginferDriver()
+    d6._dump_gen = 5
+    d6._pending_demote = {"k%d" % i: 6 for i in range(4096)}  # exactly the cap
+    d6.update_demote_apply_rate({})
+    _check("at the cap (4096) the guard does NOT clear (still in grace)", len(d6._pending_demote) == 4096)
+
 
 def stage_B_postprocess_plan():
     print("[B] postprocess_plan: #223 cooldown filter + #240 saturation yield")
@@ -122,6 +146,14 @@ def stage_B_postprocess_plan():
     _check("cooled remove dropped", cooled not in out)
     _check("pure-add for cooled hash survives", pure_add in out)
     _check("non-cooled remove survives", other in out)
+
+    # cooldown dict with ONLY expired entries: pruned to empty → inner filter skipped (no drop)
+    d_exp = AginferDriver()
+    remove_mig = _mig("h_x", add=[], remove=[Tier.HBM])
+    cd_expired = {"h_x": now - 1.0}  # already expired at `now`
+    out_exp = d_exp.postprocess_plan([remove_mig], cd_expired, now)
+    _check("all-expired cooldown pruned → migrate NOT dropped", remove_mig in out_exp)
+    _check("expired entry pruned from the dict in place", "h_x" not in cd_expired)
 
     # #240 saturation yield NO-OP when EMA healthy (do-no-harm)
     d_hi = AginferDriver()  # EMA 1.0 > threshold
@@ -191,10 +223,26 @@ def stage_D_in_process_apply():
     _check("empty plan = no migrate call", not cache3.migrate_calls and out3["migrate_result"] is None)
 
     # pauses/resumes surfaced for the (router-side) admission caller, NOT applied here
-    pmig = _mig("u", [], [Tier.DRAM])
-    cache4 = _FakeCache()
-    out4 = d.apply_plan([pmig], cache4)
-    _check("apply_plan returns pauses/resumes keys", "pauses" in out4 and "resumes" in out4)
+    from sglang.srt.mem_cache.aginfer.knapsack import Pause, Resume
+    pause_obj = Pause(cost=1.0, pid="prog_1")
+    resume_obj = Resume(gain=1.0, pid="prog_2")
+    mig = _mig("u", [Tier.DRAM], [])
+    cache5 = _FakeCache()
+    out5 = d.apply_plan([pause_obj, resume_obj, mig], cache5)
+    _check("apply_plan extracts real Pause pids", out5["pauses"] == ["prog_1"])
+    _check("apply_plan extracts real Resume pids", out5["resumes"] == ["prog_2"])
+    _check("pauses/resumes are NOT applied in-engine (admission = router half)",
+           len(cache5.migrate_calls) == 1 and not cache5.hint_calls)  # only the migrate applied
+
+    # malformed-id Migrate is skipped, not crashed (the defensive guard, review #8/#9)
+    bad = Migrate(cost=0.0, id=None)        # id None
+    bad2 = Migrate(cost=0.0, id=("only_two", [Tier.HBM]))  # 2-tuple, not 3
+    good = _mig("ok", [Tier.DRAM], [])
+    cache6 = _FakeCache()
+    out6 = d.apply_plan([bad, bad2, good], cache6)
+    _check("malformed-id migrates skipped (no crash), good one applied",
+           len(cache6.migrate_calls) == 1 and len(cache6.migrate_calls[0]) == 1
+           and cache6.migrate_calls[0][0]["hash"] == "ok")
 
 
 def stage_E_cadence_gate():
@@ -242,6 +290,126 @@ def stage_F_hook_do_no_harm():
     _check("flag ON → hook proceeds", on.ticked == 1)
 
 
+def stage_G_decide_composition():
+    print("[G] decide() = joint_decide ∘ postprocess (composition; joint_decide monkeypatched)")
+    import sglang.srt.mem_cache.aginfer.joint_decide as _jd
+    orig = _jd.joint_decide
+    try:
+        # stub joint_decide to return a known plan; decide() must then apply the post-filters.
+        remove_hbm = _mig("z", add=[], remove=[Tier.HBM])
+        keep = _mig("y", add=[Tier.DRAM], remove=[])
+        captured = {}
+
+        def fake_joint_decide(sched_state, event, **kw):
+            captured.update(kw)
+            return [remove_hbm, keep]
+        _jd.joint_decide = fake_joint_decide
+
+        # EMA healthy → saturation yield is a no-op → both survive
+        d = AginferDriver()
+        plan = d.decide(object(), object(), costs="C", pi_u="P", theta_hi=0.9,
+                        theta_lo=0.7, heartbeat_s=5.0, admission_enabled=True, now=100.0)
+        _check("decide forwards params to joint_decide",
+               captured.get("theta_hi") == 0.9 and captured.get("admission_enabled") is True)
+        _check("decide returns joint_decide's plan unfiltered when EMA healthy", len(plan) == 2)
+
+        # EMA low → decide must strip the remove-HBM (postprocess applied inside decide)
+        d2 = AginferDriver()
+        d2._demote_apply_ema = _DEMOTE_YIELD_EMA - 0.05
+        plan2 = d2.decide(object(), object(), costs="C", pi_u="P", theta_hi=0.9,
+                          theta_lo=0.7, heartbeat_s=5.0, admission_enabled=True, now=100.0)
+        _check("decide applies saturation yield (remove-HBM stripped)",
+               remove_hbm not in plan2 and keep in plan2)
+
+        # default now (None) → uses monotonic, must not crash + still composes
+        d3 = AginferDriver()
+        plan3 = d3.decide(object(), object(), costs="C", pi_u="P", theta_hi=0.9,
+                          theta_lo=0.7, heartbeat_s=5.0, admission_enabled=False)
+        _check("decide with default now= (monotonic) works", len(plan3) == 2)
+    finally:
+        _jd.joint_decide = orig
+
+
+def stage_H_tick_paths():
+    print("[H] tick(): in-process dump path + no_dump + non-dict guard")
+    d = AginferDriver()
+
+    class _CacheWithDump:
+        def dump_aginfer_state(self):
+            return {"units": {"a": 1, "b": 2, "c": 3}, "time_counter": 7}
+
+    class _SchedDump:
+        tree_cache = _CacheWithDump()
+    r = d.tick(_SchedDump())
+    _check("tick dump path returns dump_only status", r["status"] == "dump_only_pending_build_state")
+    _check("tick counts units from the in-process dump", r["n_units"] == 3)
+
+    class _CacheNoDump:
+        pass  # no dump_aginfer_state attr
+
+    class _SchedNoDump:
+        tree_cache = _CacheNoDump()
+    r2 = d.tick(_SchedNoDump())
+    _check("tick no_dump path when cache lacks dump_aginfer_state", r2["status"] == "no_dump")
+
+    class _CacheListDump:
+        def dump_aginfer_state(self):
+            return ["not", "a", "dict"]  # malformed
+
+    class _SchedList:
+        tree_cache = _CacheListDump()
+    r3 = d.tick(_SchedList())
+    _check("tick non-dict dump → n_units 0 (isinstance guard, no crash)", r3["n_units"] == 0)
+
+
+def stage_I_engine_hook_real_body():
+    print("[I] Scheduler._aginfer_maybe_tick REAL body (flag on/off + exception-disable)")
+    try:
+        from sglang.srt.managers.scheduler import Scheduler
+    except Exception as e:  # heavy import (torch); skip gracefully if unavailable
+        print("  SKIP (cannot import Scheduler: %s)" % str(e)[:80])
+        return
+    import types
+
+    def _fake(occ_fn, flag=True):
+        ns = types.SimpleNamespace()
+        ns._aginfer_in_engine = flag
+        ns._aginfer_driver = AginferDriver() if flag else None
+        ns.server_args = types.SimpleNamespace(aginfer_theta_lo=0.7, aginfer_heartbeat_s=5.0)
+
+        class _TC:
+            def _aginfer_pool_usage(self_inner):
+                return {"HBM": {"token_usage": occ_fn()}}
+        ns.tree_cache = _TC()
+        return ns
+
+    # flag OFF → immediate return, driver untouched (do-no-harm), no exception
+    off = _fake(lambda: 0.9, flag=False)
+    Scheduler._aginfer_maybe_tick(off)
+    _check("real hook flag-off → no-op (driver stays None)", off._aginfer_driver is None)
+
+    # flag ON, high occ → should_tick True (first call) → tick runs (no_dump, no crash);
+    # driver._last_tick_t gets stamped (proves should_tick fired through the real body)
+    on = _fake(lambda: 0.9, flag=True)
+    Scheduler._aginfer_maybe_tick(on)
+    _check("real hook flag-on, high occ → ticked (last_tick stamped)",
+           on._aginfer_driver._last_tick_t is not None)
+
+    # flag ON, low occ → should_tick False → no tick (last_tick stays None)
+    lo = _fake(lambda: 0.5, flag=True)
+    Scheduler._aginfer_maybe_tick(lo)
+    _check("real hook flag-on, low occ → not ticked (below theta_lo)",
+           lo._aginfer_driver._last_tick_t is None)
+
+    # exception in occ read → except disables the feature for the session (never raises)
+    def _boom():
+        raise RuntimeError("occ read failed")
+    bad = _fake(_boom, flag=True)
+    Scheduler._aginfer_maybe_tick(bad)  # must NOT raise
+    _check("real hook exception → feature DISABLED for session (crash isolation)",
+           bad._aginfer_in_engine is False)
+
+
 if __name__ == "__main__":
     stage_A_apply_rate_ema()
     stage_B_postprocess_plan()
@@ -249,4 +417,7 @@ if __name__ == "__main__":
     stage_D_in_process_apply()
     stage_E_cadence_gate()
     stage_F_hook_do_no_harm()
+    stage_G_decide_composition()
+    stage_H_tick_paths()
+    stage_I_engine_hook_real_body()
     print("verify/scheduler_driver: ALL STAGES PASSED")
