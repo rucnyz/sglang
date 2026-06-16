@@ -18,13 +18,14 @@ phases are NOT mutually exclusive — resume runs every event alongside
 relief; resuming a starved-out program is itself a net-positive action.
 
   * **Relief** (any HBM subpool's ``forecast`` > ``theta_hi × cap``):
-    take net-positive Migrate actions that RELIEVE A PRESSURED subpool,
-    maximising total −cost within each destination subpool's free room
-    — ``knapsack_max_value_multi``.  A hot unit (cost > 0) or a migrate
-    that would relieve a healthy subpool is excluded.  The **Pause
-    lever is DORMANT** (not generated): its cost misses the paused
-    agent's forgone progress and its OOM-benefit is unmodelled, so it
-    cannot yet be valued (§8).
+    take net-positive Migrate AND Pause actions that RELIEVE A PRESSURED
+    subpool, maximising total value within each destination subpool's free
+    room — ``knapsack_max_value_multi``.  A hot unit (cost > 0) or a migrate
+    that would relieve a healthy subpool is excluded.  The **Pause lever is
+    LIVE** (#260): a Pause's HBM relief is valued at the pressured subpool's
+    shadow price (the eviction it averts), net of its cost — now including the
+    forgone-progress term (§8) that makes pausing an actively-decoding agent
+    net-negative, so only a parked low-value agent is ever paused (do-no-harm).
   * **Resume** (runs every event): take net-positive Resume actions
     that fit per-subpool at ``theta_lo`` headroom — same
     ``knapsack_max_value_multi``.  A zero-re_use resume (un-starve of a
@@ -137,6 +138,34 @@ def _budget_and_buckets(state, base_budget, items):
     return budget, bucket
 
 
+def _shadow_prices(state, pressured_sps, costs, pi_u) -> Dict[str, float]:
+    """#260 — marginal value (inference-time per byte) of freeing one HBM byte
+    in each pressured subpool: the V_u-DENSITY of the lowest-V_u HBM-resident
+    unit in that subpool — the next eviction victim that freed room spares.
+    Clamped >= 0 (a marginal resident with net-negative V_u should be evicted
+    anyway, so making room to keep it has no relief value).
+
+    This is the ``OOM averted`` benefit (DESIGN §8) that lets a Pause's HBM
+    relief be VALUED against Migrate in the SAME value-knapsack — the term whose
+    absence (relief measured in bytes, never converted to time) was half of why
+    Pause stayed dormant."""
+    best: Dict[str, Any] = {}   # sp -> (lowest V_u, that unit's bytes in sp)
+    for u in state.units.values():
+        if Tier.HBM not in u.residence:
+            continue
+        hb = u.n_bytes_by_tier.get(Tier.HBM, {})
+        v = None
+        for sp, b in hb.items():
+            if sp not in pressured_sps or int(b) <= 0:
+                continue
+            if v is None:
+                v = adm._value_at_current_tier(u, state, costs, pi_u)
+            cur = best.get(sp)
+            if cur is None or v < cur[0]:
+                best[sp] = (v, int(b))
+    return {sp: max(0.0, vb[0] / vb[1]) for sp, vb in best.items()}
+
+
 def joint_decide(
     state: SchedulerState,
     event: Any,
@@ -169,14 +198,16 @@ def joint_decide(
     the per-unit decision, and the pressured-subpool filter carries the
     targeting.
 
-    The **Pause lever is NOT generated** here — it is DORMANT.  A Pause's
-    cost (``V_u_program + marginal_pause_cost``) misses the paused agent's
-    forgone PROGRESS, and its benefit (the OOM it averts) is unmodelled, so
-    a Pause cannot yet be correctly valued — and an under-costed Pause whose
-    ``V_u_program`` goes negative under the holding tax would wrongly fire
-    and stall an active agent (the A3 regression).  Until both the
-    progress-cost and the OOM-benefit are modelled (§8), the daemon never
-    pauses.  Migrate is the working relief lever.
+    The **Pause lever is LIVE** (#260).  A Pause's HBM relief is valued at the
+    pressured subpool's shadow price (``_shadow_prices`` — the V_u-density of
+    the unit eviction would next claim, the ``OOM averted`` benefit), net of
+    its cost = ``V_u_program + marginal_pause_cost + forgone_progress``.  The
+    forgone-progress term (``admission_controller``, §8) costs the wall-time the
+    held agent makes no progress — a full horizon for a REASONING agent — so a
+    Pause that would stall an actively-decoding agent is net-negative and never
+    chosen (the A3 regression is closed by the cost MODEL, not a state filter).
+    Only net-positive pauses enter the knapsack; with no pressure or no
+    low-value parked agent, none do (do-no-harm).  Gated on ``admission_enabled``.
 
     Resume (runs EVERY event, independent of relief — not mutually
     exclusive): take net-positive Resume actions that fit per-subpool at
@@ -233,8 +264,45 @@ def joint_decide(
             for c in cands
             if float(c.cost) < 0.0
             and any(sp in pressured_sps for sp in c.relief.get("HBM", {}))
-            and not (reuse_imminent and Tier.HBM in c.id[2])
+            # guard the c.id[2] unpack (consistency with scheduler_driver's id guards):
+            # a live migrate_candidate's id is always (uid, add, remove); behaviour-identical
+            # for valid 3-tuples, and a malformed/None id can never crash this filter.
+            and not (reuse_imminent and isinstance(c.id, tuple) and len(c.id) >= 3
+                     and Tier.HBM in c.id[2])
         ]
+        # Pause lever — now LIVE (#260; was DORMANT).  Value each Pause's HBM
+        # relief at the pressured-subpool shadow price (the eviction it averts),
+        # NET of the pause cost (V_u_program + marginal re-prefill + forgone
+        # progress).  do-no-harm: only NET-POSITIVE pauses enter; a REASONING
+        # agent's forgone-progress term makes its pause net-negative, so it is
+        # never chosen — the A3 regression is closed by the cost MODEL, not a
+        # state filter.  re_use={} — a pause consumes no destination capacity
+        # (it frees HBM), so it always fits; group=("pause", pid) keeps a
+        # program's pause one item, independent of every unit's migrate group
+        # (the radix-vs-inflight byte overlap is already removed in
+        # pause_relief via ``_committed_in_dt``).  Gated on admission_enabled
+        # (the Run-K kv-only ablation suppresses it).
+        if admission_enabled:
+            shadow = _shadow_prices(state, pressured_sps, costs, pi_u)
+            for pc in adm.pause_candidates(state, heartbeat_s=heartbeat_s):
+                # The relief from pausing p PERSISTS only while p stays paused —
+                # the every-event Resume lever pulls it back the moment p is
+                # ready.  A REASONING agent resumes at once (τ_idle=0) → its
+                # relief does not persist → hold_frac 0 → gain = −cost ≤ 0
+                # ROBUSTLY, independent of the relief magnitude: the benefit-side
+                # half of the A3 do-no-harm guarantee (the cost-side half is
+                # forgone_progress).  A parked ACTING agent persists for its tool
+                # gap → hold_frac 1 (cold; a per-program ETA tightens it to
+                # min(1, τ_idle / W)).
+                pstate = (state.per_program_usage.get(pc.pid, {}) or {}).get("state")
+                hold_frac = 0.0 if pstate == "REASONING" else 1.0
+                relief_value = hold_frac * sum(
+                    float(pc.relief.get(sp, 0)) * shadow.get(sp, 0.0)
+                    for sp in pressured_sps)
+                gain = relief_value - float(pc.cost)
+                if gain > 0.0:
+                    items.append(_ValueItem(
+                        gain=gain, re_use={}, group=("pause", pc.pid), src=pc))
         if items:
             # Only constraint: do not overflow any destination (DRAM|DISK,
             # subpool) cap.  Clamp to >= 0 (an over-subscribed destination

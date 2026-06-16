@@ -117,9 +117,13 @@ class AginferDriver:
     def should_tick(self, occ: float, now: float, *, theta_lo: float,
                     min_interval_s: float) -> bool:
         if occ < theta_lo:
+            # pressure resolved: RE-ARM the throttle so the NEXT pressure onset ticks
+            # promptly (react fast to a new spike) rather than waiting out the interval
+            # left over from the last tick during the previous pressure episode.
+            self._last_tick_t = None
             return False  # below the low watermark: no pressure, no work
         if self._last_tick_t is not None and (now - self._last_tick_t) < min_interval_s:
-            return False  # throttle: too soon since the last tick
+            return False  # throttle: too soon since the last tick (sustained pressure)
         self._last_tick_t = now
         return True
 
@@ -268,5 +272,13 @@ class AginferDriver:
         # lands, this becomes: sched_state = build_paper_state(state_json, ...);
         # plan = self.decide(sched_state, event, ...); self.apply_plan(plan, cache);
         # self.apply_hints(hints_from_state(sched_state), cache).
+        #
+        # ⚠ INCREMENT-4 REQUIREMENT (round-2 review #7): decide() forwards `event` to
+        # joint_decide, whose reuse-imminent tail-protection keys on event.kind ==
+        # TOOL_CALL_END (joint_decide.py ~246/267). The in-engine tick has NO natural
+        # event — it fires on a pressure cadence, not a tool-call. So increment 4 MUST
+        # pass a synthetic MEMORY_PRESSURE event (EventKind.MEMORY_PRESSURE, like the
+        # daemon's pressure decides) — NOT None and NOT a TOOL_CALL_END — or the
+        # reuse-imminent protection silently no-ops and a hot tail could be migrated out.
         n_units = len(state_json.get("units", {})) if isinstance(state_json, dict) else 0
         return {"status": "dump_only_pending_build_state", "n_units": n_units}

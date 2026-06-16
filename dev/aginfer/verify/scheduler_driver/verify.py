@@ -260,8 +260,14 @@ def stage_E_cadence_gate():
     # past the interval → tick again
     _check("past min_interval → tick", d.should_tick(0.9, 106.0, theta_lo=0.7, min_interval_s=5.0) is True)
     _check("last_tick advanced", d._last_tick_t == 106.0)
-    # pressure drops below θ_lo even past the interval → no tick
-    _check("drop below theta_lo again → no tick", d.should_tick(0.6, 200.0, theta_lo=0.7, min_interval_s=5.0) is False)
+    # pressure drops below θ_lo → no tick AND the throttle re-arms (last_tick → None) so the
+    # next onset ticks promptly even if within the old interval (round-2 review #6).
+    _check("drop below theta_lo → no tick", d.should_tick(0.6, 107.0, theta_lo=0.7, min_interval_s=5.0) is False)
+    _check("below theta_lo re-arms the throttle (last_tick reset to None)", d._last_tick_t is None)
+    _check("pressure ONSET after a resolve ticks immediately (within old interval)",
+           d.should_tick(0.9, 108.0, theta_lo=0.7, min_interval_s=5.0) is True)
+    _check("sustained pressure then throttles again",
+           d.should_tick(0.9, 109.0, theta_lo=0.7, min_interval_s=5.0) is False)
 
 
 def stage_F_hook_do_no_harm():
@@ -406,8 +412,21 @@ def stage_I_engine_hook_real_body():
         raise RuntimeError("occ read failed")
     bad = _fake(_boom, flag=True)
     Scheduler._aginfer_maybe_tick(bad)  # must NOT raise
-    _check("real hook exception → feature DISABLED for session (crash isolation)",
+    _check("real hook exception (occ read) → feature DISABLED (crash isolation)",
            bad._aginfer_in_engine is False)
+
+    # exception INSIDE tick (dump raises) → same crash-isolation (round-2 review #3)
+    bad2 = _fake(lambda: 0.9, flag=True)
+
+    class _BoomDump:
+        def _aginfer_pool_usage(self_inner):
+            return {"HBM": {"token_usage": 0.9}}
+        def dump_aginfer_state(self_inner):
+            raise RuntimeError("dump exploded")
+    bad2.tree_cache = _BoomDump()
+    Scheduler._aginfer_maybe_tick(bad2)  # must NOT raise
+    _check("real hook exception (tick dump) → feature DISABLED (crash isolation)",
+           bad2._aginfer_in_engine is False)
 
 
 if __name__ == "__main__":
