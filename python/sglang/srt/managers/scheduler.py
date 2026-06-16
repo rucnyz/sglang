@@ -3728,11 +3728,13 @@ class Scheduler(
             if pu is not None:
                 occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
             import time as _time
+            theta_hi = getattr(self.server_args, "aginfer_theta_hi", 0.85)
             theta_lo = getattr(self.server_args, "aginfer_theta_lo", 0.70)
             heartbeat_s = getattr(self.server_args, "aginfer_heartbeat_s", 5.0)
             if self._aginfer_driver.should_tick(
                 occ, _time.monotonic(), theta_lo=theta_lo, min_interval_s=heartbeat_s):
-                self._aginfer_driver.tick(self)
+                self._aginfer_driver.tick(self, theta_hi=theta_hi, theta_lo=theta_lo,
+                                          heartbeat_s=heartbeat_s)
         except Exception:
             logger.exception(
                 "aginfer in-engine tick raised — DISABLING aginfer-in-engine for the "

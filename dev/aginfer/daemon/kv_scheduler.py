@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.aginfer.state_builder import (  # noqa: E402,F401
     _shared_prefix_units,
     _top_k_by_regret,
     _build_decision_set,
+    hints_from_state,
     _env_float,
     _env_int,
     _LAMBDA_ACTING_FLOOR,
@@ -234,51 +235,6 @@ from sglang.srt.mem_cache.aginfer.scheduler_driver import (  # noqa: E402
 )
 
 
-def hints_from_state(sched_state) -> List[Dict[str, Any]]:  # noqa: ANN001
-    """T40 (#184, DESIGN §6 ``PUT /aginfer/hints``): one hint per unit
-    in ``D_t``, carrying the V_u inputs the scorer just computed.
-
-    Wire shape per hint: ``{"hash", "p_hat", "lambda", "stamp"}``.
-    ``stamp`` is sglang's own ``time_counter`` (``sched_state.t``) —
-    a monotonic, daemon-restart-surviving ordering token that makes
-    sglang's overwrite-by-stamp table deterministic WITHOUT any
-    wall-clock call in the daemon's policy path (the §10 "no time.*
-    in the transition path" invariant).
-
-    This is the WHOLE D_t, pushed unconditionally — no shadow
-    ``{hash: last_pushed}`` map, no "value changed beyond threshold"
-    filter (DESIGN §10 "No daemon-side hint cache").  Redundant
-    re-pushes of unchanged values are absorbed by sglang's
-    overwrite-by-stamp dedupe (an equal stamp is an idempotent
-    no-op).
-    """
-    stamp = int(sched_state.t)
-    hints: List[Dict[str, Any]] = []
-    for uid in sched_state.decision_set:
-        u = sched_state.units.get(uid)
-        if u is None:
-            # D_t is derived from units, so this should not happen;
-            # skip defensively rather than push a hint for a hash
-            # sglang has no unit for.
-            continue
-        hints.append({
-            "hash": uid,
-            "p_hat": float(u.p_hat),
-            "lambda": float(u.lambda_rate),
-            # DESIGN §2 fact 1 / S2: holder-count so the inline eviction scorer can
-            # value a fleet-shared prefix by N× saved-prefill (it builds units with
-            # empty `holders` and can't recover the count from the node alone).
-            "n_holders": len(u.holders),
-            "stamp": stamp,
-        })
-    # S2 diagnostic: confirm the daemon actually observes shared units (n_holders>1)
-    _mx = max((h["n_holders"] for h in hints), default=0)
-    if _mx > 1:
-        import logging as _lg
-        _lg.getLogger("aginfer.kv").info(
-            "[aginfer] S2 hint push: n=%d units, MAX n_holders=%d (shared prefix seen)",
-            len(hints), _mx)
-    return hints
 
 
 # ----------------------------------------------------------------- handler

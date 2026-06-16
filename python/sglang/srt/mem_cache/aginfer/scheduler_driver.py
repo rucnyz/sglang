@@ -105,6 +105,11 @@ class AginferDriver:
         self._dump_gen: int = 0
         # #251 Stage B increment 3: the in-engine trigger throttle (last tick wall-time).
         self._last_tick_t: Optional[float] = None
+        # increment 4: belief + policy for the activated tick(), built lazily on first tick
+        # (only when SGLANG_AGINFER_IN_ENGINE is on) so constructing a driver stays trivial.
+        self._tracker = None              # ProgramTracker
+        self._policy = None               # OursGreedyPolicy (supplies decide's costs + pi_u)
+        self._unknown_tier_log: set = set()
 
     # -- cadence gate (the #1 hard problem: trigger under never-idle high load) ----
     # on_idle() only fires when the engine is FULLY idle — exactly the low-pressure
@@ -255,37 +260,51 @@ class AginferDriver:
     # -- the in-process tick (composes dump → build_paper_state → decide → apply) --
     # Called from the engine scheduler loop's per-iteration hook when should_tick() is
     # true. This is the in-process replacement for the daemon's event_router → handle()
-    # cycle. The DECIDE + APPLY pieces are already in-engine (decide / apply_plan /
-    # apply_hints above); the missing piece is build_paper_state (still daemon-side,
-    # kv_scheduler.py:624) — it relocates in the next increment, at which point the
-    # commented body below activates. Until then the tick exercises the in-process
-    # dump path (the engine producing its own s_t with no HTTP) and is a value no-op
-    # — so turning the flag on is safe (it cannot mis-decide without the builder).
-    def tick(self, scheduler) -> Dict[str, Any]:
-        """One in-process scheduling tick. Returns a small status dict (for the hook's
-        metric/log). MUST NOT raise into the scheduler loop — the caller wraps it, but
-        keep it defensive too."""
+    # cycle. ACTIVATED in increment 4 (build_paper_state is now in-engine, state_builder.py):
+    # dump → build_paper_state(synthetic MEMORY_PRESSURE event) → update_demote_apply_rate →
+    # hints → apply_hints → decide → apply_plan. The 3 forward-reqs (r2#7 + r3) are honoured:
+    #   (a) a synthetic EventKind.MEMORY_PRESSURE event (NOT None / NOT TOOL_CALL_END) so
+    #       joint_decide's reuse-imminent tail-protection is applied;
+    #   (b) update_demote_apply_rate(units) runs BEFORE decide (the daemon's handle() order)
+    #       so the saturation-yield EMA actually updates in-engine;
+    #   (c) admission (pause/resume) is OFF here — it is the Dynamo-ROUTER half (#251 verified
+    #       split), so decide runs with admission_enabled=False. The belief plane (driving the
+    #       tracker off the proxy/router event stream) is the router-half work; in-engine the
+    #       tick uses a driver-owned tracker (empty ⇒ programs fall to the dump's authoritative
+    #       per_program state + workload-prior p_hat). The S2/holder-count hint lever is FULL
+    #       (n_holders comes from the dump's session_ids, not the tracker).
+    # Still flag-gated (SGLANG_AGINFER_IN_ENGINE) + wrapped by the hook's try/except; the live
+    # under-load A/B awaits the V4 stack fix (S2_RESULTS) — the flag stays off by default.
+    def tick(self, scheduler, *, theta_hi: float = 0.85, theta_lo: float = 0.70,
+             heartbeat_s: float = 5.0) -> Dict[str, Any]:
+        """One in-process scheduling tick (the daemon handle() equivalent, no transport).
+        Returns a small status dict. MUST NOT raise into the scheduler loop — the hook wraps
+        it, but it stays defensive."""
         dump_fn = getattr(scheduler.tree_cache, "dump_aginfer_state", None)
         if dump_fn is None:
             return {"status": "no_dump"}  # non-Unified cache: in-engine aginfer N/A
         state_json = dump_fn()  # the engine's own s_t, in-process (no /aginfer/state HTTP)
-        # build_paper_state is not yet in-engine (increment 4). Until then we do not
-        # decide/apply — fire the trigger + the in-process dump only. When the builder
-        # lands, this becomes: sched_state = build_paper_state(state_json, ...);
-        # plan = self.decide(sched_state, event, ...); self.apply_plan(plan, cache);
-        # self.apply_hints(hints_from_state(sched_state), cache).
-        #
-        # ⚠ INCREMENT-4 REQUIREMENTS (must ALL hold when the body below is activated, so it
-        # replicates the daemon's handle() exactly — reviews r2#7 + r3):
-        #   (a) EVENT: decide() forwards `event` to joint_decide, whose reuse-imminent
-        #       tail-protection keys on event.kind == TOOL_CALL_END. The tick fires on a
-        #       pressure cadence, not a tool-call, so pass a synthetic EventKind.MEMORY_PRESSURE
-        #       event (like the daemon's pressure decides) — NOT None / NOT TOOL_CALL_END — or
-        #       the protection silently no-ops and a hot tail could be migrated out.
-        #   (b) EMA ORDER: call self.update_demote_apply_rate(sched_state.units) BEFORE decide()
-        #       (the daemon does this at handle() top, kv_scheduler.py:~1399) — else the
-        #       saturation-yield EMA never updates in-engine (stuck at 1.0, yield dead).
-        #   (c) BELIEF: drive the program_tracker / eta_estimator off the event first (the
-        #       daemon's _apply_belief_transition) so per_program state is fresh for decide().
-        n_units = len(state_json.get("units", {})) if isinstance(state_json, dict) else 0
-        return {"status": "dump_only_pending_build_state", "n_units": n_units}
+        if not isinstance(state_json, dict) or "unsupported_tree_cache" in state_json:
+            return {"status": "unsupported"}
+        # lazy belief + policy (built once, only when the flag is on and a tick actually fires)
+        if self._tracker is None:
+            from sglang.srt.mem_cache.aginfer.program_tracker import ProgramTracker
+            from sglang.srt.mem_cache.aginfer.ours_greedy import OursGreedyPolicy
+            from sglang.srt.mem_cache.aginfer.costs import default_costs
+            self._tracker = ProgramTracker()
+            self._policy = OursGreedyPolicy(default_costs())
+        from sglang.srt.mem_cache.aginfer.state_builder import build_paper_state, hints_from_state
+        from sglang.srt.mem_cache.aginfer.events import Event, EventKind
+        evt = Event(kind=EventKind.MEMORY_PRESSURE)                                   # (a)
+        sched_state = build_paper_state(state_json, event=evt, tracker=self._tracker,
+                                        unknown_tier_log=self._unknown_tier_log)
+        self.update_demote_apply_rate(sched_state.units)                              # (b) before decide
+        cache = scheduler.tree_cache
+        hints = hints_from_state(sched_state)
+        self.apply_hints(hints, cache)              # the S2/value hint lever (full, n_holders-driven)
+        plan = self.decide(sched_state, evt, costs=self._policy.costs, pi_u=self._policy.pi_u,
+                           theta_hi=theta_hi, theta_lo=theta_lo, heartbeat_s=heartbeat_s,
+                           admission_enabled=False)                                   # (c) migration only
+        result = self.apply_plan(plan, cache)
+        return {"status": "ticked", "n_units": len(sched_state.units),
+                "n_hints": len(hints), "migrate_result": result.get("migrate_result")}

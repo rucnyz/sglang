@@ -341,36 +341,70 @@ def stage_G_decide_composition():
         _jd.joint_decide = orig
 
 
-def stage_H_tick_paths():
-    print("[H] tick(): in-process dump path + no_dump + non-dict guard")
-    d = AginferDriver()
+def stage_H_tick_activated():
+    print("[H] tick() ACTIVATED: dump → build_paper_state(MP event) → EMA → hints → decide → apply")
+    import sglang.srt.mem_cache.aginfer.state_builder as _sb
+    from sglang.srt.mem_cache.aginfer.events import EventKind
 
-    class _CacheWithDump:
-        def dump_aginfer_state(self):
-            return {"units": {"a": 1, "b": 2, "c": 3}, "time_counter": 7}
+    # no_dump / unsupported guards first (no monkeypatch needed)
+    d0 = AginferDriver()
 
-    class _SchedDump:
-        tree_cache = _CacheWithDump()
-    r = d.tick(_SchedDump())
-    _check("tick dump path returns dump_only status", r["status"] == "dump_only_pending_build_state")
-    _check("tick counts units from the in-process dump", r["n_units"] == 3)
+    class _NoDump:
+        tree_cache = type("C", (), {})()
+    _check("tick no_dump when cache lacks dump_aginfer_state", d0.tick(_NoDump())["status"] == "no_dump")
 
-    class _CacheNoDump:
-        pass  # no dump_aginfer_state attr
+    class _Unsup:
+        tree_cache = type("C", (), {"dump_aginfer_state": lambda self: {"unsupported_tree_cache": "X"}})()
+    _check("tick unsupported when dump marks unsupported cache", d0.tick(_Unsup())["status"] == "unsupported")
 
-    class _SchedNoDump:
-        tree_cache = _CacheNoDump()
-    r2 = d.tick(_SchedNoDump())
-    _check("tick no_dump path when cache lacks dump_aginfer_state", r2["status"] == "no_dump")
+    # activated path: monkeypatch build_paper_state + hints_from_state to capture args + return
+    # canned values (real build_paper_state is covered by the 6 reverse-dep verifies). We assert
+    # the tick ORCHESTRATION + the 3 forward-reqs, with a fake cache recording apply calls.
+    captured = {}
 
-    class _CacheListDump:
-        def dump_aginfer_state(self):
-            return ["not", "a", "dict"]  # malformed
+    class _CannedState:
+        def __init__(self):
+            # remove-HBM migrate present so we can confirm decide()'s plan is applied
+            self.units = {"u_demote": _Unit({Tier.HBM})}
+            self.decision_set = ["u_demote"]
+            self.t = 0
 
-    class _SchedList:
-        tree_cache = _CacheListDump()
-    r3 = d.tick(_SchedList())
-    _check("tick non-dict dump → n_units 0 (isinstance guard, no crash)", r3["n_units"] == 0)
+    def fake_bps(state_json, *, event, tracker, unknown_tier_log, **kw):
+        captured["event_kind"] = event.kind
+        captured["bps_called"] = True
+        return _CannedState()
+
+    def fake_hints(sched_state):
+        captured["hints_called"] = True
+        return [{"hash": "u_demote", "p_hat": 0.9, "lambda": 1.0, "n_holders": 4, "stamp": 0}]
+
+    import sglang.srt.mem_cache.aginfer.joint_decide as _jd
+    o_bps, o_hints, o_jd = _sb.build_paper_state, _sb.hints_from_state, _jd.joint_decide
+    try:
+        _sb.build_paper_state = fake_bps
+        _sb.hints_from_state = fake_hints
+        _jd.joint_decide = lambda ss, ev, **kw: [_mig("u_demote", [], [Tier.HBM])]
+
+        cache = _FakeCache()
+        cache.dump_aginfer_state = lambda: {"units": {"u_demote": 1}, "time_counter": 0}  # build_paper_state is faked
+        d = AginferDriver()
+        sched = type("S", (), {"tree_cache": cache})()
+        gen0 = d._dump_gen
+        r = d.tick(sched, theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
+        _check("(a) tick passes a synthetic MEMORY_PRESSURE event to build_paper_state",
+               captured.get("event_kind") == EventKind.MEMORY_PRESSURE)
+        _check("(b) update_demote_apply_rate ran before decide (dump_gen advanced)",
+               d._dump_gen == gen0 + 1)
+        _check("hints_from_state called + apply_hints pushed them to the cache",
+               captured.get("hints_called") and len(cache.hint_calls) == 1
+               and cache.hint_calls[0][0]["n_holders"] == 4)
+        _check("decide's plan applied via apply_aginfer_migrations", len(cache.migrate_calls) == 1)
+        _check("tick returns 'ticked' with unit/hint counts", r["status"] == "ticked" and r["n_hints"] == 1)
+        _check("driver built a tracker + policy lazily on first tick",
+               d._tracker is not None and d._policy is not None)
+    finally:
+        _sb.build_paper_state, _sb.hints_from_state, _jd.joint_decide = o_bps, o_hints, o_jd
 
 
 def stage_I_engine_hook_real_body():
@@ -442,6 +476,6 @@ if __name__ == "__main__":
     stage_E_cadence_gate()
     stage_F_hook_do_no_harm()
     stage_G_decide_composition()
-    stage_H_tick_paths()
+    stage_H_tick_activated()
     stage_I_engine_hook_real_body()
     print("verify/scheduler_driver: ALL STAGES PASSED")
