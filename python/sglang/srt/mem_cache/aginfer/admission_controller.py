@@ -296,6 +296,51 @@ def marginal_pause_cost(pu: Dict[str, Any], prefill_bps: float) -> float:
     return inflight_bytes / prefill_bps
 
 
+def forgone_progress(
+    pu: Dict[str, Any],
+    state: SchedulerState,
+    heartbeat_s: float,
+    tool_eta_remaining: Optional[float] = None,
+) -> float:
+    """DESIGN §8 forgone-progress cost of pausing p (#260) — the work-loss
+    ``marginal_pause_cost`` MISSES: the wall-time p makes no progress while
+    held paused, in inference-time units (seconds).  This is the term whose
+    absence kept the Pause lever DORMANT and caused the A3 regression (an
+    under-costed Pause whose ``V_u_program`` went negative under the holding
+    tax wrongly fired and stalled an active agent).
+
+    First principles: ``forgone_progress = max(0, W − τ_idle)``.
+      W      = the pause window = ``forecast_horizon`` (expected seconds to the
+               next event), the horizon over which the held program is delayed.
+      τ_idle = p's natural remaining idle time — wall-time p would NOT have been
+               making GPU progress anyway.
+      * REASONING (mid-decode, on-GPU): τ_idle = 0 → forgone = W.  Pausing an
+        actively-decoding agent forgoes a full horizon of progress, so its Pause
+        is heavily penalised and never net-positive — the A3 do-no-harm property
+        is DERIVED here, not hard-coded.
+      * ACTING (off-GPU in a tool call): τ_idle = the tool's learned remaining
+        ETA (#239); pausing forgoes progress only for the window held PAST the
+        tool's return.  ``tool_eta_remaining=None`` (cold start / ETA not yet
+        plumbed into the decision path) assumes the tool wait ≥ W → forgone 0:
+        a parked agent is free to pause, and the every-event Resume lever bounds
+        any held-past-return.  Wiring the per-program ETA tightens this so a
+        SHORT-tool ACTING agent (about to return) is also protected.
+    """
+    W = forecast_horizon(state, heartbeat_s)
+    if pu.get("state") == "REASONING":
+        return float(W)
+    # ACTING (the only other _ACTIVE_STATE that reaches here).
+    if tool_eta_remaining is None:
+        return 0.0
+    try:
+        tau = float(tool_eta_remaining)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(tau) or tau < 0.0:
+        return 0.0
+    return max(0.0, float(W) - tau)
+
+
 def _committed_in_dt(
     pu: Dict[str, Any], state: SchedulerState
 ) -> Dict[str, int]:
@@ -374,12 +419,26 @@ def pause_candidates(
     state: SchedulerState,
     prefill_bps: Optional[float] = None,
     heartbeat_s: float = 5.0,
+    tool_eta_remaining: Optional[Dict[str, float]] = None,
 ) -> List[Any]:
     """DESIGN §8 ``pause_candidates`` — one ``Pause`` per REASONING /
     ACTING program (ENDED + PAUSED skipped).
 
-      cost   = V_u_program(p) + marginal_pause_cost(p)     # work-loss (s)
+      cost   = marginal_pause_cost(p) + forgone_progress(p)   # work-loss (s)
       relief = snapshot_relief(p) + future_inflight_savings(p)   # HBM bytes
+
+    The cost is pure WORK-LOSS (#260): the re-prefill p pays on resume
+    (``marginal_pause_cost``) plus the wall-time it is held without progress
+    (``forgone_progress``).  ``V_u_program`` is deliberately NOT a cost term —
+    pausing p frees its bytes and p re-prefills them on resume, which IS
+    ``marginal_pause_cost``; adding p's hold-value on top double-counts, and it
+    was exactly the term that "goes negative under the holding tax and wrongly
+    fires" (the dormancy note).  The benefit — others' value of the freed bytes —
+    is the shadow-price relief valued in ``joint_decide``, gated by how long the
+    relief persists (0 for a REASONING agent that resumes at once → robust A3
+    do-no-harm).  ``forgone_progress`` is a full horizon for a REASONING agent,
+    ~0 for a parked ACTING one; ``tool_eta_remaining`` (the learned tool ETA,
+    #239) tightens the ACTING term, absent ⇒ a parked agent's forgone 0.
 
     ``relief`` is the flat ``{sp: bytes}`` shape; ``joint_decide``
     normalises it to ``{"HBM": {...}}`` before the DP (DESIGN §9).
@@ -397,7 +456,6 @@ def pause_candidates(
     horizon = forecast_horizon(state, heartbeat_s)
     decode = state.throughput_ema.get("decode_per_program", {}) or {}
     dbpt = state.tier_usage.decode_bytes_per_token.get(Tier.HBM, {})
-    vprog = shared_aware_prog_scores(state)
     out: List[Any] = []
     for pid, pu in state.per_program_usage.items():
         if pu.get("state") not in _ACTIVE_STATES:
@@ -409,7 +467,13 @@ def pause_candidates(
         # count the same radix bytes.
         excl = _committed_in_dt(pu, state)
         relief = pause_relief(pu, fut, excl)
-        cost = vprog.get(pid, 0.0) + marginal_pause_cost(pu, prefill_bps)
+        eta_p = (tool_eta_remaining or {}).get(pid)
+        # Pure work-loss cost (#260): re-prefill on resume + forgone progress.
+        # NO V_u_program term — pausing p frees its bytes and p re-prefills them
+        # on resume, which IS marginal_pause_cost; the program's hold-value would
+        # double-count it, and was the term that "goes negative → wrongly fires".
+        cost = (marginal_pause_cost(pu, prefill_bps)
+                + forgone_progress(pu, state, heartbeat_s, eta_p))
         out.append(Pause(cost=cost, relief=relief, pid=pid))
     return out
 

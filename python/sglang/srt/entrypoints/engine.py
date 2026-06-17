@@ -352,6 +352,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        program_id: Optional[Any] = None,  # aginfer hook (#251): see async_generate.
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -389,6 +390,7 @@ class Engine(EngineScoreMixin, EngineBase):
             rid=rid,
             session_params=session_params,
             priority=priority,
+            program_id=program_id,  # aginfer hook (#251)
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -454,6 +456,7 @@ class Engine(EngineScoreMixin, EngineBase):
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
+        program_id: Optional[Any] = None,  # aginfer hook (#251): program identity -> KV-unit session_ids (holder-count / per-program value). The OpenAI serving layer sets GenerateReqInput.program_id directly; this exposes it on the programmatic door used by external orchestrators (Dynamo).
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -491,6 +494,7 @@ class Engine(EngineScoreMixin, EngineBase):
             rid=rid,
             session_params=session_params,
             priority=priority,
+            program_id=program_id,  # aginfer hook (#251)
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 

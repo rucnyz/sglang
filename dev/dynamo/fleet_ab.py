@@ -75,7 +75,7 @@ async def stream_request(session, base, model, traj_id, session_id, messages, ma
         nvext["agent_hints"] = {"priority": int(priority)}
     body = {
         "model": model, "messages": messages, "max_tokens": max_tokens,
-        "stream": True, "temperature": 0.0,
+        "stream": True, "temperature": 0.0, "seed": 0,
         "stream_options": {"include_usage": True},
         "nvext": nvext,
     }
@@ -124,7 +124,12 @@ async def run_trajectory(session, args, traj_id, prefix, turns, stats, priority=
             args.max_tokens, args.req_timeout, priority=priority)
         stats.inflight -= 1
         stats.add(ttft, ok, t, err=err, timed_out=to)
-        history.append({"role": "assistant", "content": (text or "ok")[:200]})
+        # FIXED reply (NOT the real decode) so the conversation history — and thus every
+        # turn's prefill prompt — is byte-identical across arms regardless of decode
+        # non-determinism (batch composition). The S2 metric is prefill; decode output is
+        # irrelevant to it. This is the token-identity guarantee for the fair A/B.
+        history.append({"role": "assistant",
+                        "content": "Acknowledged. Continuing the task as instructed."})
         if t < turns - 1 and args.gap > 0:
             await asyncio.sleep(args.gap)
     # close-ping: release the program from the router accounting (frees its util).

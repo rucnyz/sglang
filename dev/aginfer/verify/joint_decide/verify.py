@@ -548,11 +548,15 @@ def stage_c_program_candidates() -> None:
     if pb.relief != {"kv": 3 * MB}:
         raise StageFail(f"C: B pause_relief (committed 3MB) should be 3MB, "
                         f"got {pb.relief}")
-    # prefill_bps=0 placeholder → marginal_pause_cost 0 → cost = V_u_program.
+    # #260: pause cost = marginal_pause_cost (0 here, prefill_bps=0) +
+    # forgone_progress — pure WORK-LOSS, NO V_u_program.  A is REASONING →
+    # forgone = the horizon W; the V_u_program term was dropped (it double-counted
+    # marginal_pause_cost and was what "went negative → wrongly fired").
     vprog = adm.shared_aware_prog_scores(st)
-    if abs(pa.cost - vprog["A"]) > 1e-12:
-        raise StageFail(f"C: A pause cost should equal V_u_program "
-                        f"(marginal=0 pre-T26): {pa.cost} vs {vprog['A']}")
+    W = adm.forecast_horizon(st, 5.0)
+    if abs(pa.cost - W) > 1e-9:
+        raise StageFail(f"C: REASONING A pause cost = forgone-progress horizon "
+                        f"(work-loss #260): {pa.cost} vs {W}")
 
     # ---- resume_candidates ----
     rcs = adm.resume_candidates(st, heartbeat_s=5.0, theta_hi=0.85)
@@ -818,8 +822,13 @@ def stage_d_resume_under_pressure() -> None:
         raise StageFail(
             "D-press-resume: the net-positive relief migrate must be taken "
             f"under pressure; got {[type(c).__name__ for c in plan]}")
+    # #260: Pause is LIVE, but the only active program here (S) is REASONING —
+    # hold_frac=0 (its relief does not persist; it resumes at once) so its pause
+    # gain ≤ 0 and it is NEVER paused.  do-no-harm: an actively-decoding agent is
+    # never stalled (the A3 regression is closed by the cost model, robustly).
     if any(isinstance(c, Pause) for c in plan):
-        raise StageFail("D-press-resume: Pause lever is dormant — none allowed")
+        raise StageFail("D-press-resume: a REASONING agent must NEVER be paused "
+                        "(do-no-harm #260); got a Pause in the plan")
     # ...AND the un-starve resume of P COEXISTS with the relief in one plan
     #    (relief and resume are NOT mutually exclusive — the #213 fix).
     resumed = {c.pid for c in plan if isinstance(c, Resume)}

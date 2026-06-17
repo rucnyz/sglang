@@ -233,10 +233,18 @@ def stage_pause_candidates() -> None:
     if {p.pid for p in pcs} != {"A", "B"}:
         raise StageFail(f"pause_candidates must be REASONING+ACTING only "
                         f"(PAUSED/ENDED skipped); got {[p.pid for p in pcs]}")
-    vprog = adm.shared_aware_prog_scores(st)
-    pa = next(p for p in pcs if p.pid == "A")
-    if abs(pa.cost - vprog["A"]) > 1e-12:
-        raise StageFail("pause cost must equal V_u_program (marginal=0)")
+    pa = next(p for p in pcs if p.pid == "A")  # REASONING
+    pb = next(p for p in pcs if p.pid == "B")  # ACTING
+    W = adm.forecast_horizon(st, 5.0)  # forgone-progress horizon (= heartbeat_s)
+    # #260: cost = marginal_pause_cost (0 here, prefill_bps=0) + forgone_progress.
+    # Pure work-loss, NO V_u_program.  A REASONING agent pays a full horizon of
+    # forgone progress (pausing an actively-decoding agent is heavily penalised);
+    # a parked ACTING agent pays ~0 — the do-no-harm asymmetry.
+    if abs(pa.cost - W) > 1e-9:
+        raise StageFail(f"REASONING pause cost = forgone-progress horizon "
+                        f"(work-loss, #260): {pa.cost} vs {W}")
+    if abs(pb.cost) > 1e-9:
+        raise StageFail(f"ACTING pause cost = 0 (forgone 0, marginal 0): {pb.cost}")
     # A's committed 4MB minus uA's D_t-excluded share (uA ∈ MEMORY_PRESSURE
     # D_t) — exact relief math is pinned by stage_disjoint/stage_overlap;
     # here just confirm a positive committed-based relief.
