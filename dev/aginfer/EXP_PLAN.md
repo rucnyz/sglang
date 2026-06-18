@@ -82,7 +82,7 @@ Recommended order: **E1 → E2 → E3**.
 
 | # | What | Prerequisite | Why |
 |---|---|---|---|
-| **F1** | **KVBM on vLLM** (Dynamo-native KV manager, no engine fork) | vLLM backend + KVBM eviction policy plugin (Dynamo PR only, zero vLLM change) | KVBM supports vLLM/TRT-LLM (sglang ❌). Our value-aware eviction replaces KVBM's frequency-based policy at the Dynamo layer. SSD lifespan filter (freq≥2, default ON) modeled in our cost function (DISK cost = DROP cost when freq<2) — no need to disable it. |
+| **F1** | **KVBM + vLLM** (same 5 arms as E1) | vLLM aginfer branch (block_pool eviction hook) + KVBM eviction policy plugin (Dynamo PR) | Value eviction at both layers: KVBM offload tier (Dynamo PR) + vLLM HBM block_pool (small hook). SSD lifespan filter modeled in cost function. Proves engine-agnostic: same policy, different engine + tier backend. |
 | **F2** | **KVBM + PD disaggregation** | F1 + multi-GPU (≥4), NIXL KV transfer | KVBM on prefill worker + disagg decode. KV lifetime changes: prefill produces, NIXL transfers, decode consumes. NCCL replicated mode (`DYN_KVBM_NCCL_MLA_MODE`) for MLA models (DeepSeek) — only rank 0 loads back, broadcast to others. |
 | **F3** | **KV-aware routing** (`--router-mode kv` + agent hints) | Multi-worker setup (≥2 workers) | Router steers requests to workers with cached prefixes; agentreplay emits `nvext.session_metadata` (session_id/trajectory_id) for session pinning. Proves our intra-worker eviction composes with inter-worker routing. |
 
