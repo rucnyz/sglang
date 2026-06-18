@@ -66,8 +66,6 @@ def _launch_sglang(log_path: Path) -> subprocess.Popen:
         "--trust-remote-code",
         "--attention-backend", "flashinfer",
         "--enable-hierarchical-cache",
-        "--hicache-ratio", "1.5",
-        "--hicache-write-policy", "write_through",
     ]
     f = open(log_path, "w")
     return subprocess.Popen(

@@ -43,9 +43,8 @@ CUDA_VISIBLE_DEVICES=$GPU nohup $PY -m sglang.launch_server \
   --model-path Qwen/Qwen3-0.6B \
   --host 127.0.0.1 --port $SGLANG_PORT --tp 1 \
   --mem-fraction-static 0.10 \
-  --enable-hierarchical-cache --hicache-ratio 1.2 \
-  --hicache-write-policy write_through_selective \
-  --max-running-requests 32 --trust-remote-code \
+  --enable-hierarchical-cache \
+  --trust-remote-code \
   --enable-metrics --enable-cache-report \
   --aginfer-notify-url http://127.0.0.1:$DAEMON_PORT/aginfer/event \
   >"$SGL_LOG" 2>&1 &

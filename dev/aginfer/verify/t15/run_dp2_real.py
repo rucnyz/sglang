@@ -81,10 +81,6 @@ def _launch_sglang(log_path: Path) -> subprocess.Popen:
         # request volume — we want churn, not endurance.
         "--mem-fraction-static", "0.10",
         "--enable-hierarchical-cache",
-        # Small DRAM mirror for fast startup; HBM eviction still works.
-        "--hicache-ratio", "1.2",
-        "--hicache-write-policy", "write_through_selective",
-        "--max-running-requests", "32",
         "--trust-remote-code",
     ]
     f = open(log_path, "w")

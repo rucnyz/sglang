@@ -65,9 +65,6 @@ def _launch_sglang(
         "--tp", str(tp),
         "--mem-fraction-static", "0.10",
         "--enable-hierarchical-cache",
-        "--hicache-ratio", "1.2",
-        "--hicache-write-policy", "write_through_selective",
-        "--max-running-requests", "32",
         "--trust-remote-code",
         # T22 (#155): sglang's AginferWebhookFirer is only constructed
         # when this flag is set; without it the scheduler's

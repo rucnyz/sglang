@@ -11,8 +11,7 @@ nohup $PY -m sglang.launch_server \
   --model-path Qwen/Qwen3-0.6B --host 127.0.0.1 --port 30000 \
   --tp 1 --mem-fraction-static 0.15 --max-total-tokens 65536 \
   --trust-remote-code --attention-backend flashinfer \
-  --enable-hierarchical-cache --hicache-ratio 1.5 \
-  --hicache-write-policy write_through \
+  --enable-hierarchical-cache \
   ${CHUNKED:+--chunked-prefill-size $CHUNKED} \
   --enable-cache-report \
   > /tmp/qwen_t17profile.log 2>&1 &
