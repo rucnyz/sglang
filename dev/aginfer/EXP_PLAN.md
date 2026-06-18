@@ -50,16 +50,27 @@ No other flags. Dynamo router + frontend use defaults.
 | **default router** | Dynamo default (round-robin / KV-aware) | Pure isolation of our eviction scorer |
 | **ThunderAgent** | `dynamo.thunderagent_router` | Our scorer + TA admission; proves orthogonality |
 
+### Arms (same 4 arms in every E)
+
+| Arm | Router | Engine eviction | What it is |
+|---|---|---|---|
+| **B** | default | LRU | Pure baseline |
+| **TA** | ThunderAgent | LRU | Dynamo's existing best (cache-blind admission) |
+| **Ours-evict** | default | value (in-engine) | Our eviction only, no admission |
+| **Ours-full** | our router | value (in-engine) | Full system (admission + eviction, superset of TA) |
+
+Key comparisons: Ours-full vs TA (headline), Ours-evict vs B (eviction value),
+Ours-full vs Ours-evict (admission marginal value), TA vs B (TA value).
+
 ### Full matrix
 
-| # | Tiers | Router | Arms | What we show |
-|---|---|---|---|---|
-| **E1** | 4-tier nixl | default | B, **TA**, Ours | **Headline win** (all three compared on full tier stack) |
-| **E2** | 4-tier nixl | ThunderAgent | B(=TA+LRU), Ours(=TA+value) | Orthogonality (ours helps even under TA admission) |
-| **E3** | 2-tier (no SSD) | default | B, **TA**, Ours | No-regression with fewer tiers |
-| **E4** | mooncake | default | B, **TA**, Ours | Extensibility to different transport backend |
+| # | Tiers | Arms | What we show |
+|---|---|---|---|
+| **E1** | 4-tier nixl | B, TA, Ours-evict, Ours-full | **Headline**: full system on full tier stack |
+| **E2** | 2-tier (no SSD) | B, TA, Ours-evict, Ours-full | No-regression with fewer tiers |
+| **E3** | mooncake | B, TA, Ours-evict, Ours-full | Extensibility to different transport backend |
 
-Recommended order: **E1 → E3 → E2 → E4**.
+Recommended order: **E1 → E2 → E3**.
 
 ## Methodology
 
