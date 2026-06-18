@@ -57,14 +57,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# aginfer teacher-forcing lives in the self-contained module; this file carries
-# only thin hooks that call it (#251).
-from sglang.srt.mem_cache.aginfer.teacher_forcing import (  # aginfer hook (#251)
-    force_token as _aginfer_force_token,
-    validate_no_forced_output_with_spec as _aginfer_validate_no_spec,
-)
-
-
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -231,7 +223,6 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
-                    next_token_id = _aginfer_force_token(req, next_token_id)
                     req.output_ids.append(next_token_id)
 
                     self._maybe_update_reasoning_tokens(req, next_token_id)
@@ -653,10 +644,8 @@ class SchedulerBatchResultProcessor:
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
-                next_token_id = _aginfer_force_token(req, next_token_id)
                 req.output_ids.append(next_token_id)
             else:
-                _aginfer_validate_no_spec(req)  # aginfer hook (#251): reject forced+spec
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 

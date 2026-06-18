@@ -203,6 +203,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.managers.forced_tokens import forced_override_positions
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
@@ -3198,6 +3199,7 @@ class Scheduler(
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
+                        self._apply_forced_tokens(batch, batch_result.next_token_ids)
                         if batch_result.delay_sample_func is None:
                             stash_payload = (
                                 batch_result.next_draft_input
@@ -3258,6 +3260,7 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                self._apply_forced_tokens(batch, batch_result.next_token_ids)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
                     # Non-spec: relay via future_map, gathered next iter.
                     self.future_map.stash(
@@ -3707,6 +3710,29 @@ class Scheduler(
             self.aginfer_webhook.maybe_fire(occ=occ)
         except Exception:
             logger.exception("aginfer webhook check raised")
+
+    def _apply_forced_tokens(self, batch: ScheduleBatch, next_token_ids) -> None:
+        """Override sampled tokens with teacher-forced values on the GPU.
+
+        Overlap-compatible: the bookkeeping in ``forced_override_positions``
+        tracks a dispatch counter (not ``len(output_ids)``), so the 1-step
+        commit lag under ``--enable-overlap`` is handled correctly.  A no-op
+        when no request in the batch carries ``forced_output_ids``.
+        """
+        if next_token_ids is None:
+            return
+        overrides = forced_override_positions(batch.reqs)
+        if not overrides:
+            return
+        idx = torch.tensor(
+            [o[0] for o in overrides], device=next_token_ids.device, dtype=torch.long
+        )
+        val = torch.tensor(
+            [o[1] for o in overrides],
+            device=next_token_ids.device,
+            dtype=next_token_ids.dtype,
+        )
+        next_token_ids[idx] = val
 
     def _aginfer_maybe_tick(self) -> None:
         """aginfer #251 Stage B: the IN-ENGINE scheduler tick (replaces the out-of-process

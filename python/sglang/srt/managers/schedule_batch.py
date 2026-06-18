@@ -726,6 +726,7 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        self.forced_dispatched = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
         # never mutates this array's length.
@@ -1486,6 +1487,7 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+        self.forced_dispatched = len(self.output_ids)
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
