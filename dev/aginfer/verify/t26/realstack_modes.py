@@ -23,7 +23,7 @@ of the blanket-except swallowing an AttributeError on a real Req/batch
 "metrics populate AND no suppressed warning" is the real liveness gate.
 
 Usage:
-    source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+    source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
     cd /scratch/yuzhou/projects/sglang
     python dev/aginfer/verify/t26/realstack_modes.py
 """

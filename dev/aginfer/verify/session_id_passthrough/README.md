@@ -160,7 +160,7 @@ PID so the tear-down is precise.
 
 ```bash
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
-conda activate agsched
+conda activate agsched-rebase
 
 # openai package is required for the OpenAI-client extra_body test
 # (step [3] of verify.py).  Force-use the conda-env python so a stray

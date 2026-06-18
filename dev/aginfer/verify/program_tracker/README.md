@@ -101,7 +101,7 @@ in-process (no sglang launch needed, no GPU).
 
 ```bash
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
-conda activate agsched
+conda activate agsched-rebase
 
 cd /scratch/yuzhou/projects/sglang/dev/aginfer
 python verify/t6/verify.py
@@ -114,7 +114,7 @@ Daemon code lives at `dev/aginfer/daemon/program_tracker.py` —
 ## RESULTS
 
 **PASSED** — all 10 steps (post audit round-1 + audit-of-tests
-round-2) in ~60 ms on the agsched env.
+round-2) in ~60 ms on the agsched-rebase env.
 
 ### Audit round-2 "audit of tests"
 

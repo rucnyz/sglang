@@ -99,7 +99,7 @@ Caught during T15 wire-up — **NEEDED FOR ANY FUTURE AGINFER RUN**:
 ## REPRODUCING
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 
 # Synthetic verify (1s, no GPU)

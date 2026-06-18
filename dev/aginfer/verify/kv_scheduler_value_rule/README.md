@@ -78,12 +78,12 @@ F.  Idempotence + latency
 ## REPRODUCING
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/kv_scheduler_value_rule/verify.py
 ```
 
-Runs in ~10 s on the agsched env (A3/A4 each spawn a subprocess to
+Runs in ~10 s on the agsched-rebase env (A3/A4 each spawn a subprocess to
 exercise `fatal()` → `os._exit(1)`).
 
 ## RESULTS

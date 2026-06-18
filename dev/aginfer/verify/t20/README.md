@@ -149,7 +149,7 @@ Stage 9  action_id echo
 ## REPRODUCING
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 
 SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 CUDA_VISIBLE_DEVICES=5 \

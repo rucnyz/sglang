@@ -119,7 +119,7 @@ bootstrap (the §8 over-pause anti-pattern).
 ## REPRODUCING
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t26/verify.py                       # pure helpers
 python dev/aginfer/verify/integration_stress/verify.py        # stage T26 (pure-mode real stack)

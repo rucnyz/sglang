@@ -109,7 +109,7 @@ here — it lands when the sglang launch path is wired to call
 ## REPRODUCING
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t22/verify.py
 ```

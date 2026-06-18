@@ -128,7 +128,7 @@ F. e2e (env-gated AGINFER_VERIFY_BASE)
 Pure-Python stages A–E (no GPU, ~1 s):
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t40/verify.py        # F0 SKIPs without a server
 ```

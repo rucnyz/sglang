@@ -120,7 +120,7 @@ just confirms the instrumentation reads numbers.
 Phase A only (no sglang):
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t14/verify.py
 ```
@@ -128,7 +128,7 @@ python dev/aginfer/verify/t14/verify.py
 Phase A + B (live sglang):
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 
 # 1. sglang

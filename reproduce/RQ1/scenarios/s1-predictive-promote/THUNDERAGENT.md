@@ -3,7 +3,7 @@
 ## Status: TA stack works; a direct token-space TA measurement is blocked by an interface mismatch.
 
 ## What was set up
-- TA is installed in both conda envs (`agsched`, `agsched-rebase`); repo at
+- TA is installed in both conda envs (`agsched-rebase`, `agsched-rebase`); repo at
   `/scratch/yuzhou/projects/ThunderAgent` (pip-installable).
 - Launch: `dev/aginfer/scripts/launch_thunderagent.sh` → TR-mode proxy on **:9000**,
   `--backends http://127.0.0.1:30000 --backend-type sglang --router tr --metrics`. It comes

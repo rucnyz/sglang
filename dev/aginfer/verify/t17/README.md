@@ -152,7 +152,7 @@ Stage 8 — Link stats / tier holding cost / throughput EMA shape
 ```bash
 # 1. Activate env.
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
-conda activate agsched
+conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang/dev/aginfer
 
 # 2. Pick a free GPU (typically 5 or 6 — see [[gpu-layout]]).

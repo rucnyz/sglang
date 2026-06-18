@@ -30,7 +30,7 @@ Workspace for the paper **"Multi-Agent KV Cache Scheduling as an MDP"**
 ## Conventions
 
 - **GPUs**: default 5, 6 (`AGINFER_GPUS` in `.env`)
-- **Conda env**: `agsched` at `~/miniconda3/envs/agsched`
+- **Conda env**: `agsched-rebase` at `~/miniconda3/envs/agsched-rebase`
 - **CUDA**: 13.2 at `/usr/local/cuda-13.2`
 - **HF cache**: default `~/.cache/huggingface` (do NOT override)
 - **Logs**: `logs/*.log`, previous run preserved as `*.log.prev`

@@ -112,7 +112,7 @@ GPU, no real sglang launch.
 
 ```bash
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
-conda activate agsched
+conda activate agsched-rebase
 
 cd /scratch/yuzhou/projects/sglang/dev/aginfer
 python verify/t4/verify.py

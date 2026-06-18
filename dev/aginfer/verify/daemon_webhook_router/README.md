@@ -123,7 +123,7 @@ Layer B exercises the full sglang→daemon webhook path on real GPU.
 
 ```bash
 source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh
-conda activate agsched
+conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang/dev/aginfer
 
 # Layer A only (~5 s, no GPU):

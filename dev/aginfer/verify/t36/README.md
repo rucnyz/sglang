@@ -91,7 +91,7 @@ B0  (opt-in) live daemon + sglang: time_in_queue_p99 < 100 ms PLAN
 Phase A only:
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t36/verify.py
 ```

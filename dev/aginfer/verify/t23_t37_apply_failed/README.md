@@ -104,7 +104,7 @@ B1  (opt-in via AGINFER_VERIFY_DAEMON_LOG): wait up to 5 s, grep
 Phase A only (no GPU):
 
 ```bash
-source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched
+source /scratch/yuzhou/miniconda3/etc/profile.d/conda.sh && conda activate agsched-rebase
 cd /scratch/yuzhou/projects/sglang
 python dev/aginfer/verify/t23_t37_apply_failed/verify.py
 ```
