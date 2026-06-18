@@ -342,6 +342,31 @@ class LRUList:
 
 class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
+        # Recovery-length EWMAs (paper sec:design-formalism-offline): written by
+        # record_recovery_len_{kv,rec,retract} on eviction/retraction; the planner
+        # c_sigma(L) and pressure adapter read them via the Budgeter snapshot.
+        self._slow_recovery_len_kv_ewma = 0.0
+        self._slow_recovery_len_rec_ewma = 0.0
+        self._slow_recovery_len_retract_ewma = 0.0
+        # Cumulative KV tokens reclaimed by admission-pressure eviction
+        # (check_decode_mem); read via the Budgeter snapshot as the
+        # deferred re-prefill cost the admission gate consults.
+        self._admission_cumulative_evicted_tokens = 0
+        # SWARadixCache uses its own TreeNode (no `_hit_times` /
+        # `record_hit` / LPBStrategy plumbing), so LPB eviction is not
+        # yet wired here. Fail loud rather than
+        # silently running LRU when the operator asked for LPB —
+        # silent degradation is the exact bug the LPB audit closed on the other
+        # cache variants.
+        if params.eviction_policy == "lpb":
+            raise NotImplementedError(
+                "--radix-eviction-policy lpb is not supported on "
+                "SWARadixCache (sliding-window attention models). LPB "
+                "is wired for the plain / hybrid-mamba / hierarchical "
+                "caches only; SWA support is not yet implemented. Use "
+                "--radix-eviction-policy lru (or lfu / slru / "
+                "priority) for SWA models."
+            )
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator

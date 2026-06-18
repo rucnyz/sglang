@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -35,6 +36,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPoolFP4,
     NoOpMHATokenToKVPool,
     ReqToTokenPool,
+    kv_live_migration_enabled,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
@@ -75,6 +77,11 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
         f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
     )
 
+
+def _resolve_max_admission_size(max_num_reqs: int, mamba_ratio: float) -> int:
+    if mamba_ratio <= 0:
+        return max_num_reqs
+    return max(max_num_reqs, int(max_num_reqs * (1 + mamba_ratio) / mamba_ratio))
 
 _is_npu = is_npu()
 _is_hip = is_hip()
@@ -387,6 +394,9 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
+                    max_size=_resolve_max_admission_size(
+                        max_num_reqs, self.server_args.mamba_full_memory_ratio,
+                    ),
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
@@ -694,6 +704,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
+                        or kv_live_migration_enabled()
                     ),
                     use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
@@ -718,6 +729,7 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            or kv_live_migration_enabled()
                         ),
                     )
                 else:
@@ -743,11 +755,24 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            or kv_live_migration_enabled()
                         ),
                     )
 
         # Initialize token_to_kv_pool_allocator
-        need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
+        # T2 (paper §3.2.2): SGLANG_ALLOCATOR_PLACEMENT_BIAS=1 forces
+        # need_sort=True so allocator picks the smallest free indices first
+        # (lowest-address placement). Live blocks cluster at pool head, free
+        # accumulates at tail — required for T3's smart over-cap selection.
+        need_sort = (
+            self.server_args.disaggregation_mode in ("decode", "prefill")
+            or os.environ.get("SGLANG_ALLOCATOR_PLACEMENT_BIAS", "0") == "1"
+        )
+        if need_sort:
+            logger.info(
+                "T2 placement bias active (need_sort=True): allocator picks "
+                "smallest free indices first; live blocks cluster at pool head."
+            )
         if self.token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
@@ -816,12 +841,50 @@ class ModelRunnerKVCacheMixin:
                             )
                         )
                     elif self.page_size == 1:
+                        # When the KV pool is arena-backed (cross-fire), give
+                        # the allocator dynamic-cap headroom so a m2k fire can
+                        # durably GROW KV (mirror of the MambaPool cap).
+                        # Ceiling = boot × SGLANG_XPOOL_KV_MAX_FACTOR (default
+                        # 2.0), NOT the arena's full VA max_tokens — the latter
+                        # (~tens of millions of tokens) would size free_pages /
+                        # masks to hundreds of MB. The bounded factor is well
+                        # above the realizable growth (gated downstream by
+                        # mamba's donatable physical handles), and clamped to
+                        # the arena VA ceiling. `_kv_arena` is exposed by every
+                        # KVCache (None when not arena-backed → max_size=None →
+                        # boot-only, back-compat); the hybrid wrapper forwards
+                        # it to its inner full-attention pool, so a direct read
+                        # works whether the KV cache is plain or hybrid.
+                        _kv_arena = self.token_to_kv_pool._kv_arena
+                        _kv_max_size = None
+                        _kv_need_sort = need_sort
+                        if _kv_arena is not None:
+                            _factor = max(1.0, float(
+                                os.environ.get("SGLANG_XPOOL_KV_MAX_FACTOR", "2.0")
+                            ))
+                            _kv_max_size = min(
+                                int(self.max_total_num_tokens * _factor),
+                                int(_kv_arena.max_tokens),
+                            )
+                            # Arena dynamic-cap keeps the free list SORTED
+                            # (need_sort=True), independent of the global flag, so
+                            # allocation is low-id-first. The cross-pool drain
+                            # donates the HIGHEST free pages, so low-first alloc
+                            # keeps the drained (high) ids out of alloc's head —
+                            # CappedFreeList.alloc then skips them with a tiny
+                            # `marks` check and never scans the ~max_size-cap
+                            # reserved headroom tail (which the design keeps
+                            # implicit, never materialized — the arena
+                            # decode-overhead fix; see
+                            # dev/interlayer/4_e2e/cc_zero_downside).
+                            _kv_need_sort = True
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
+                            need_sort=_kv_need_sort,
+                            max_size=_kv_max_size,
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(

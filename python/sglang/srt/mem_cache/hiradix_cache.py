@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import collections
 import heapq
 import json
 import logging
@@ -47,6 +48,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     get_mha_host_pool_cls,
 )
+from sglang.srt.mem_cache.evict_policy import LPBStrategy
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -1572,12 +1574,21 @@ class HiRadixCache(RadixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
+        # LPB needs per-node hit counting (paper §sec:design-l1
+        # eq:lpb-lru `n_b`); skip the deque append in other modes
+        # to keep LRU/LFU/SLRU paths zero-overhead. Mirrors the gate
+        # in `RadixCache._match_prefix_helper` — without it,
+        # hierarchical-cache deployments would never record hits and
+        # LPB would silently degrade to LRU.
+        lpb_active = isinstance(self.eviction_strategy, LPBStrategy)
         child_key = key.child_key(self.page_size)
         value = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+            if lpb_active:
+                child.record_hit()
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -1604,6 +1615,14 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        # LPB sliding-window hit signal belongs to the shared-prefix
+        # segment (`new_node`); the divergent tail (`child`) starts
+        # fresh. Mirrors `RadixCache._split_node` (paper §sec:design-l1
+        # eq:lpb-lru `n_b` is per-block).
+        new_node._hit_times = child._hit_times
+        child._hit_times = collections.deque(
+            maxlen=TreeNode.lpb_hit_deque_maxlen
+        )
 
         # split value and host value if exists
         if child.evicted:

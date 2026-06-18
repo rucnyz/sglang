@@ -274,6 +274,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_evictable_size(self):
         return 0
 
+    def mamba_evictable_size(self):
+        return 0
+
     def swa_evictable_size(self):
         return 0
 

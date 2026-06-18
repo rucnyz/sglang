@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import collections
 import heapq
 import json
 import logging
@@ -957,6 +958,12 @@ class HiMambaRadixCache(MambaRadixCache):
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
+        # Paper §sec:design-l1: record a hit on every visited child so
+        # eviction_priority() reflects recent value to the workload.
+        # Mirrors `MambaRadixCache._match_prefix_helper` — without it,
+        # hierarchical hybrid deployments never increment hit_count and
+        # LPB silently degrades to LRU.
+        hit_path: List[TreeNode] = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
@@ -974,11 +981,13 @@ class HiMambaRadixCache(MambaRadixCache):
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
+                hit_path.append(new_node)
                 break
             else:
                 if not child.evicted:
                     value.append(child.value)
                 node = child
+                hit_path.append(child)
                 key = key[prefix_len:]
                 if len(key):
                     child_key = key.child_key(self.page_size)
@@ -986,6 +995,12 @@ class HiMambaRadixCache(MambaRadixCache):
         if node.mamba_value is not None or node.mamba_backuped:
             best_value_len = len(value)
             best_last_node = node
+
+        # Record hits for every node we visited in the matching walk,
+        # only when there was at least some prefix match.
+        if best_value_len > 0:
+            for n in hit_path:
+                n.record_hit()
 
         return value, best_last_node, best_value_len
 
@@ -1103,6 +1118,15 @@ class HiMambaRadixCache(MambaRadixCache):
         new_node.full_lock_ref = child.full_lock_ref
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
+        # LPB hit signal belongs to the shared-prefix segment; the
+        # tail starts fresh. Mirrors `MambaRadixCache._split_node`
+        # (paper §sec:design-l1 eq:lpb-lru `n_b` is per-block).
+        new_node.hit_count = child.hit_count
+        new_node._hit_times = child._hit_times
+        child.hit_count = 0
+        child._hit_times = collections.deque(
+            maxlen=TreeNode.lpb_hit_deque_maxlen
+        )
 
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()

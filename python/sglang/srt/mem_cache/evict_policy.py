@@ -63,3 +63,17 @@ class SLRUStrategy(EvictionStrategy):
 
         is_protected = 1 if node.hit_count >= self.protected_threshold else 0
         return (is_protected, node.last_access_time)
+
+
+class LPBStrategy(EvictionStrategy):
+    """Loss-per-byte eviction (paper §sec:design-l1 eq:lpb-lru).
+
+    Per-node loss `ℓ(b) = n_b · c_kv(s_b) / B_b` (computed lazily on
+    the TreeNode via `lpb_priority()`). Lower loss = evicted first.
+    Falls back to `last_access_time` as a tiebreaker so that
+    never-hit zero-loss nodes still get a deterministic LRU-like
+    order among themselves.
+    """
+
+    def get_priority(self, node: "TreeNode") -> Tuple[float, float]:
+        return (node.lpb_priority(), node.last_access_time)

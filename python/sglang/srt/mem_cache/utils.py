@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.evict_policy import (
     FIFOStrategy,
     FILOStrategy,
     LFUStrategy,
+    LPBStrategy,
     LRUStrategy,
     MRUStrategy,
     PriorityStrategy,
@@ -60,6 +61,7 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
     "filo": FILOStrategy,
     "priority": PriorityStrategy,
     "slru": SLRUStrategy,
+    "lpb": LPBStrategy,
 }
 
 
