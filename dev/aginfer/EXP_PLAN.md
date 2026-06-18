@@ -50,25 +50,31 @@ No other flags. Dynamo router + frontend use defaults.
 | **default router** | Dynamo default (round-robin / KV-aware) | Pure isolation of our eviction scorer |
 | **ThunderAgent** | `dynamo.thunderagent_router` | Our scorer + TA admission; proves orthogonality |
 
-### Arms (same 4 arms in every E)
+### Arms (same 5 arms in every E)
 
 | Arm | Router | Engine eviction | What it is |
 |---|---|---|---|
 | **B** | default | LRU | Pure baseline |
 | **TA** | ThunderAgent | LRU | Dynamo's existing best (cache-blind admission) |
 | **Ours-evict** | default | value (in-engine) | Our eviction only, no admission |
+| **TA+Ours-evict** | ThunderAgent | value (in-engine) | TA admission + our eviction (orthogonality) |
 | **Ours-full** | our router | value (in-engine) | Full system (admission + eviction, superset of TA) |
 
-Key comparisons: Ours-full vs TA (headline), Ours-evict vs B (eviction value),
-Ours-full vs Ours-evict (admission marginal value), TA vs B (TA value).
+Key comparisons:
+- Ours-full vs TA (headline: full system vs Dynamo's best)
+- Ours-evict vs B (eviction value in isolation)
+- TA+Ours-evict vs TA (our eviction adds value even under TA's admission)
+- Ours-full vs TA+Ours-evict (our admission vs TA's admission, both with our eviction)
+- Ours-full vs Ours-evict (admission marginal value)
+- TA vs B (TA admission value alone)
 
 ### Full matrix
 
 | # | Tiers | Arms | What we show |
 |---|---|---|---|
-| **E1** | 4-tier nixl | B, TA, Ours-evict, Ours-full | **Headline**: full system on full tier stack |
-| **E2** | 2-tier (no SSD) | B, TA, Ours-evict, Ours-full | No-regression with fewer tiers |
-| **E3** | mooncake | B, TA, Ours-evict, Ours-full | Extensibility to different transport backend |
+| **E1** | 4-tier nixl | B, TA, Ours-evict, TA+Ours-evict, Ours-full | **Headline**: full system on full tier stack |
+| **E2** | 2-tier (no SSD) | B, TA, Ours-evict, TA+Ours-evict, Ours-full | No-regression with fewer tiers |
+| **E3** | mooncake | B, TA, Ours-evict, TA+Ours-evict, Ours-full | Extensibility to different transport backend |
 
 Recommended order: **E1 → E2 → E3**.
 
