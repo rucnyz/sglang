@@ -1,87 +1,60 @@
-# aginfer — experiment plan (`EXP_PLAN.md`)
+# aginfer — experiment plan
 
-The **experiment** side (the implementation side is `Impl_PLAN.md`). This is the thin
-roadmap that ties together: *which* scenarios we win on, *how* we prove the value-aware
-scorer, *how* we measure, and *where* the runnable packages live. It **references**
-the detailed scenario catalogue in `wherewewin/` rather than duplicating it.
+## Architecture (post-cleanup 2026-06-18)
 
-## The claim + the three competitors
+- **Platform**: NVIDIA Dynamo (container `aginfer_dyn`, GPUs 5,6)
+- **Engine backend**: sglang fork (branch `aginfer-synced` on latest upstream)
+- **Replay harness**: agentreplay (`convert` real CC traces → `replay`/`replay-dynamo`)
+- **In-engine scheduler**: `SGLANG_AGINFER_IN_ENGINE=1` (no external daemon)
+- **Teacher-forcing**: overlap-compatible GPU scatter (`forced_tokens.py`)
+- **Traces**: real Claude-Code trajectories via `agentreplay convert` (no synthetic workloads)
+
+## The claim + competitors
+
 **Thesis:** *proactive + value-aware + program-aware* KV scheduling beats *reactive +
-recency + program-blind*. The two baselines we measure against:
-- **B** = vanilla sglang + HiCache + **LRU** (recency, program-blind). The do-no-harm floor.
-- **TA** = **ThunderAgent** router — cache-blind, router-side admission (pause/admit) only;
-  never migrates/promotes/evicts.
-- **Ours** = event-driven per-unit value `V_u` (tier + holder-count + reuse-prob), 4-tier
-  residence-set migration `{HBM,DRAM,DISK,DROP}`, value-gated pause/resume, predictive promote.
+recency + program-blind*.
 
-Full competitor analysis + measurement discipline: **`wherewewin/README.md`** (the source).
+| Arm | What | How enabled |
+|---|---|---|
+| **B (baseline)** | Dynamo default (LRU eviction, program-blind) | default sglang, no aginfer env |
+| **TA** | ThunderAgent router (cache-blind admission only) | Dynamo ThunderAgent router |
+| **Ours** | value-aware eviction + program-aware scheduling | `SGLANG_AGINFER_IN_ENGINE=1` |
 
-## The scenario set → see `wherewewin/`
-`wherewewin/` is the **catalogue of all scenarios** (one driver each; S8 = capstone).
-Do not re-derive them here — this is the index + current home/status:
+The ONLY difference between B and Ours at the sglang level = one env var.
+Dynamo/router configuration is identical across arms.
 
-| # | Scenario (driver) | Lever | Canonical package | Status |
-|---|---|---|---|---|
-| **S1** | tool-call predictability | demote + **predictive promote** | `reproduce/RQ1/scenarios/s1-predictive-promote/` | **DONE** (paper artifact #242); redo on Dynamo #245 |
-| **S2** | fleet-shared prefix vs churn | **value eviction** (holder-count) | `dev/dynamo/` (agentreplay) → fold into `reproduce/RQ1/scenarios/s2-*` | **IN PROGRESS** (#243; blocker below) |
-| **S3** | drop-on-death (compaction/end) | drop-on-death | `wherewewin/s3-drop-on-death/` | planned |
-| **S5** | value-gated pause under overload | admission pause | `wherewewin/s5-overload-pause/` | planned (needs live overload) |
-| **S6** | blocking sub-agent | reuses S1 + drop | `wherewewin/s6-blocking-subagent/` | planned |
-| **S7** | background fan-out | proactive demote/pause | `wherewewin/s7-background-fanout/` | planned |
-| **S8** | comprehensive (all at once) | full joint_decide | `wherewewin/s8-comprehensive/` | capstone, run last |
+## Methodology
 
-(Numbering keeps the wherewewin convention; there is no standalone S4.)
+- **Token-exact replay** via agentreplay: `/generate` + `forced_output_ids` (overlap-compatible),
+  real CC traces, byte-identical prompts across arms.
+- **Metrics**: re-prefill (`#new-token` = tokens NOT cached), TTFT, makespan, per-program e2e,
+  `cached_tokens` (from `meta_info`). agentreplay `report` computes mean±std per arm.
+- **N ≥ 3**, paired measurements; do-no-harm = ours ≤ B in every metric.
+- **Traces**: `agentreplay convert --tokenizer <target-model> --max-turns N --max-prompt-tokens M`
+  from real `~/.claude/projects/` data. No synthetic workloads, no gap-scale manipulation.
 
-## How we PROVE the scorer — the 3-config factorial (the new core)
-For the **eviction/migration axis** (the `V_u` scorer), prove usefulness in three settings
-of increasing strength. This is a `{router} × {eviction: LRU, ours}` factorial, applied
-first to **S2** (holder-count, the cleanest eviction case) and reusable for S1/S3:
+## Scenario set (from `wherewewin/`)
 
-- **① default Dynamo path (no ThunderAgent) + ours-scorer vs LRU.** Cleanest isolation of
-  the scorer — no admission interference. *Closest to done; ≈ current setup (TA pausing
-  disabled = a plain router). Gate: the moderate-pressure regime (see blocker).*
-- **② ThunderAgent ON (pausing enabled) + ours-scorer vs LRU.** Proves the scorer is
-  **orthogonal / additive** — it helps even under someone else's admission control →
-  universality. *Risk: TA pausing can remove the very pressure the scorer needs → may come
-  back inconclusive (which is NOT "scorer useless"). Design the regime so pressure survives.*
-- **③ our router + ours-scorer (full aginfer) vs the full baseline (TA + LRU).** The
-  complete system (value-aware admission + value-aware eviction) — the headline. *Biggest
-  lift: our admission (pause/resume) on Dynamo is unit-tested but not yet live-A/B'd (#247).
-  If our pause works it may also relieve pressure and dodge the crash below.*
+| # | Scenario | Lever | Status |
+|---|---|---|---|
+| **S1** | tool-call predictability | predictive promote | needs Dynamo redo |
+| **S2** | shared-prefix retention under churn | value eviction (holder-count) | needs clean run |
+| **S3** | drop-on-death (session end) | session-scoped eviction | planned |
+| **S5** | overload pause | admission control | planned |
+| **S6** | blocking sub-agent | S1 + drop | planned |
+| **S7** | background fan-out | proactive demote | planned |
+| **S8** | comprehensive | full joint_decide | capstone, last |
 
-Recommended order: **① → ③ → ②** (prove the scorer clean; then the full stack; then the
-trickiest universality claim last).
+## Execution
 
-Honesty: ③ "should be best" is a hypothesis — it only wins if our admission actually adds
-value beyond the scorer in this workload; it may merely tie ①.
+1. `agentreplay convert` to produce a trace for the target model (matching vocab)
+2. Start Dynamo with sglang backend (our fork)
+3. For each arm: set env (ours: `SGLANG_AGINFER_IN_ENGINE=1`), restart worker, run
+   `agentreplay replay-dynamo --trace <trace.jsonl> --label <arm>`
+4. `agentreplay report --ours ours.json --base base.json` for the verdict
 
-## Methodology (the short version; full discipline in `wherewewin/README.md`)
-- **Token-exact replay** via **agentreplay** (`/generate` + `forced_output_ids`), real CC
-  traces, byte-identical prompts across arms → do-no-harm is meaningful. NOT a live agent.
-- **Metric ≠ cache-hit** (HiCache makes DRAM-hit == HBM-hit). Measure re-prefill
-  (`#new-token`), TTFT, load_back bytes, makespan/goodput, p99.
-- **Genuine 4-tier pressure** so DROP actually occurs (where value-aware vs recency diverge).
-  Gate first on **baseline B's logs** that DROP/recompute is really happening.
-- **N ≥ 3**, report mean ± std; do-no-harm = ours ≤ B in every paired unit.
+## Open blocker
 
-## OPEN BLOCKER (gates ①/②/③ on Dynamo right now)
-The V4-Flash worker **crashes under heavy oversubscription** — `Scheduler watchdog timeout
-(300s) → SIGQUIT` (eviction retry-storm at occ≈0.98). Both open-loop and closed-loop replay
-trip it. **Plan A (recommended): moderate-pressure regime** (tune churn so occ peaks ≈0.90).
-**Plan B: root-cause the evict-storm.** Full diagnosis + the exact Dynamo bring-up + tuning
-knobs are in **`dev/dynamo/S2_RESULTS.md`** ("RESUME HERE").
-
-## Execution — where to run
-- **Canonical paper packages:** `sglang/reproduce/RQ1/scenarios/sN-*/` (scripts + results;
-  S1 lives here today).
-- **Current Dynamo working dir (S2):** `dev/dynamo/` — `build_s2_trace.py` (real-data trace),
-  `s2_replay_ab.py` (agentreplay orchestrator), `S2_RESULTS.md` (results + RESUME procedure).
-  Fold into `reproduce/RQ1/scenarios/s2-*` once it produces a number.
-- **Stack startup:** `RUNBOOK.md` (Dynamo bring-up).
-
-## Secondary: per-architecture mechanism coverage (was Impl PLAN §5 T44–T47)
-Confirm the state surface + decision rule bind correctly per attention architecture
-(DESIGN §12): **S1** single-stack (done, V4-Flash MLA), **S2-arch** SWA-hybrid, **S3-arch**
-Mamba+attn, **S5-arch** speculative decode. Low priority vs the win experiments; verify
-opportunistically when a matching model is up. (Distinct from the win scenarios S1–S8 above
-— this is correctness-across-architectures, not a benchmark.)
+V4-Flash worker crashes under extreme oversubscription (scheduler watchdog timeout at
+occ≈0.98). Moderate-pressure traces (occ peaks ~0.90) work. Use `--max-turns` /
+`--max-prompt-tokens` in convert to control trace intensity.
