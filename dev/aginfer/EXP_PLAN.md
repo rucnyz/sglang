@@ -76,9 +76,11 @@ Recommended order: **E1 → E2 → E3**.
 
 | # | What | Prerequisite | Why |
 |---|---|---|---|
-| **F1** | **KVBM** (Dynamo-native KV manager) | Write sglang KVBM connector OR port to vLLM backend | KVBM currently supports vLLM/TRT-LLM only (sglang ❌ in support matrix). Proves our policy works on Dynamo-native tier management without sglang HiCache. |
-| **F2** | **PD disaggregation** (separate prefill/decode workers) | Multi-GPU setup (≥4 GPU), NIXL KV transfer | KV lifetime changes fundamentally: prefill worker produces KV, transfers to decode worker. Our scheduling must handle cross-worker tier decisions. |
-| **F3** | **KV-aware routing** (`--router-mode kv` + agent hints) | Multi-worker setup (≥2 sglang workers) | Router steers requests to workers with cached prefixes; agentreplay emits `nvext.session_metadata` (session_id/trajectory_id) so Dynamo can pin agent sessions. Proves our intra-worker eviction composes with inter-worker routing. |
+| **F1** | **KVBM on vLLM** (Dynamo-native KV manager, no engine fork) | vLLM backend + KVBM eviction policy plugin (Dynamo PR only, zero vLLM change) | KVBM supports vLLM/TRT-LLM (sglang ❌). Our value-aware eviction replaces KVBM's frequency-based policy at the Dynamo layer. SSD lifespan filter (freq≥2, default ON) modeled in our cost function (DISK cost = DROP cost when freq<2) — no need to disable it. |
+| **F2** | **KVBM + PD disaggregation** | F1 + multi-GPU (≥4), NIXL KV transfer | KVBM on prefill worker + disagg decode. KV lifetime changes: prefill produces, NIXL transfers, decode consumes. NCCL replicated mode (`DYN_KVBM_NCCL_MLA_MODE`) for MLA models (DeepSeek) — only rank 0 loads back, broadcast to others. |
+| **F3** | **KV-aware routing** (`--router-mode kv` + agent hints) | Multi-worker setup (≥2 workers) | Router steers requests to workers with cached prefixes; agentreplay emits `nvext.session_metadata` (session_id/trajectory_id) for session pinning. Proves our intra-worker eviction composes with inter-worker routing. |
+
+E1 ablation: **NCCL MLA mode** on/off (single data point in the primary 4-tier experiment, measures load-back cost difference).
 
 ## Methodology
 
