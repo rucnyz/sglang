@@ -78,8 +78,7 @@ Recommended order: **E1 → E2 → E3**.
 |---|---|---|---|
 | **F1** | **KVBM** (Dynamo-native KV manager) | Write sglang KVBM connector OR port to vLLM backend | KVBM currently supports vLLM/TRT-LLM only (sglang ❌ in support matrix). Proves our policy works on Dynamo-native tier management without sglang HiCache. |
 | **F2** | **PD disaggregation** (separate prefill/decode workers) | Multi-GPU setup (≥4 GPU), NIXL KV transfer | KV lifetime changes fundamentally: prefill worker produces KV, transfers to decode worker. Our scheduling must handle cross-worker tier decisions. |
-| **F3** | **KV-aware routing** (`--router-mode kv`) | Multi-worker setup (≥2 sglang workers) | Router steers requests to workers with cached prefixes. Orthogonal to our intra-worker eviction; proves they compose. |
-| **F4** | **Agent hints** (`nvext.agent_hints` in requests) | Modify agentreplay to emit session_id/trajectory_id/priority | Tests Dynamo's program-aware routing signal channel. |
+| **F3** | **KV-aware routing** (`--router-mode kv` + agent hints) | Multi-worker setup (≥2 sglang workers) | Router steers requests to workers with cached prefixes; agentreplay emits `nvext.session_metadata` (session_id/trajectory_id) so Dynamo can pin agent sessions. Proves our intra-worker eviction composes with inter-worker routing. |
 
 ## Methodology
 
