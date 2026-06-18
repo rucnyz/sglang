@@ -660,6 +660,12 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+# aginfer program-id sanitization lives in the self-contained module (#251).
+from sglang.srt.mem_cache.aginfer.program_id import (  # aginfer hook (#251)
+    sanitize_program_id as _sanitize_program_id,
+)
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -697,6 +703,7 @@ class Req(ReqDllmMixin):
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        program_id: Optional[Any] = None,
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
@@ -719,6 +726,7 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        self.forced_dispatched = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
         # never mutates this array's length.
@@ -779,6 +787,11 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+
+        # aginfer: program-level identity, sanitized once at Req construction.
+        # Stored as a short string (≤64 chars) or None.  Untagged requests
+        # leave this as None; every node they touch gets session_ids = ∅.
+        self.program_id = _sanitize_program_id(program_id)
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -1474,6 +1487,7 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+        self.forced_dispatched = len(self.output_ids)
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[

@@ -742,6 +742,239 @@ async def server_info():
     }
 
 
+# ---- aginfer external scheduler API ----
+# Read-only snapshot of the radix cache + per-tier occupancy that the
+# aginfer daemon (see dev/aginfer/DESIGN.md) consumes on every event.
+# Single-DP deployments get a flat dict; multi-DP deployments get
+# {"per_rank": [...]} so the daemon can still address each rank.
+#
+# #160 / F3-revisit (2026-06-01): direct synchronous dump under load
+# hits scheduler-loop tick variance (p99 ~340 ms when scheduler is
+# busy with prefill/decode batches).  Fix: HTTP-layer cache + a
+# background refresh task that absorbs the variance.  Daemon sees
+# bounded staleness (~refresh-interval) instead of unbounded latency.
+#
+# Cache invariants:
+#  * Bytes payload (or per_rank dict) cached in a single module-
+#    level slot, guarded by a lock.
+#  * Background task refreshes at AGINFER_STATE_REFRESH_MS cadence
+#    (default 50 ms).  Refresh blocks on the scheduler the same way
+#    the old synchronous path did; the variance lives in the
+#    background task's own loop, not the user-facing handler.
+#  * First-ever request: if cache is empty, do a synchronous fetch
+#    (one-time cold start; subsequent requests see the cache).
+#  * Refresh task auto-stops if the response shape regresses to
+#    `unsupported_tree_cache` (e.g. CLI launch without
+#    SGLANG_ENABLE_UNIFIED_RADIX_TREE=1) — no point repeatedly
+#    fetching a static error envelope.
+import os
+import threading
+
+_AGINFER_REFRESH_MS = float(
+    os.environ.get("AGINFER_STATE_REFRESH_MS", "50.0")
+)
+# Per #160 closure: a 50ms refresh cadence at ~5ms dump cost is <1%
+# scheduler overhead.  Operators can tune via the env var.
+
+# aginfer GET /aginfer/state response cache lives in the self-contained module;
+# the endpoint below is a thin hook (#251).
+from sglang.srt.mem_cache.aginfer.http_cache import (  # aginfer hook (#251)
+    AginferStateCache,
+)
+
+_aginfer_state_cache = AginferStateCache(_AGINFER_REFRESH_MS)
+
+
+@app.get("/aginfer/state")
+async def aginfer_state():
+    body, media = await _aginfer_state_cache.get(
+        _global_state.tokenizer_manager
+    )
+    return Response(content=body, media_type=media)
+
+
+# POST /aginfer/migrate -- apply paper §6 residence-set transitions.
+# Body: {"actions": [{"hash": str,
+#                     "add_tiers":    ["HBM"|"DRAM"|"DISK", ...],
+#                     "remove_tiers": ["HBM"|"DRAM"|"DISK", ...],
+#                     "action_id":    "<opaque correlator>"}, ...]}
+# Response: {"applied": int, "applied_hashes": [...],
+#            "skipped": [{"hash":..., "action_id":..., "reason":...}, ...]}
+# Skip reasons per DESIGN §6 + verify/t20/README.md table.
+# Unresolved actions are listed in `skipped` rather than raised, so the
+# daemon's idempotent re-issue loop stays simple.
+@app.post("/aginfer/migrate")
+async def aginfer_migrate(raw_request: Request):
+    try:
+        payload = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    actions = payload.get("actions") if isinstance(payload, dict) else None
+    if not isinstance(actions, list):
+        raise HTTPException(
+            status_code=400, detail="missing or non-list 'actions' field"
+        )
+    # Caps protect the scheduler against adversarial payloads: a 1MB hash
+    # string would consume O(len) on every dict-lookup, and a 1M-action
+    # batch would block the scheduler event loop for seconds.  Real daemon
+    # batches are ~hundreds of actions with hex-SHA256 or "node-N" hashes.
+    AGINFER_MAX_ACTIONS_PER_BATCH = 100_000
+    AGINFER_MAX_HASH_LEN = 1024
+    if len(actions) > AGINFER_MAX_ACTIONS_PER_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"too many actions in one batch ({len(actions)} > "
+                f"{AGINFER_MAX_ACTIONS_PER_BATCH})"
+            ),
+        )
+    # DESIGN §6 wire payload: each action MUST carry these four
+    # fields.  Validate at the HTTP boundary (where "fail loud" means
+    # 400, not "scheduler subprocess KeyError + crash") so a malformed
+    # daemon POST surfaces to ops without taking sglang down.
+    _AGINFER_REQUIRED_ACTION_FIELDS = (
+        "hash", "add_tiers", "remove_tiers", "action_id",
+    )
+    for _i, _a in enumerate(actions):
+        if not isinstance(_a, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"actions[{_i}] must be a dict, got "
+                       f"{type(_a).__name__}",
+            )
+        _missing = [f for f in _AGINFER_REQUIRED_ACTION_FIELDS
+                    if f not in _a]
+        if _missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"actions[{_i}] missing required field(s): "
+                       f"{_missing!r}",
+            )
+        _h = _a["hash"]
+        if isinstance(_h, str) and len(_h) > AGINFER_MAX_HASH_LEN:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"hash too long ({len(_h)} > {AGINFER_MAX_HASH_LEN})"
+                ),
+            )
+    from sglang.srt.managers.io_struct import MigrateAginferReq
+
+    responses = await _global_state.tokenizer_manager.migrate_aginfer(
+        MigrateAginferReq(actions=actions)
+    )
+    if len(responses) == 1:
+        out = responses[0]
+        return ORJSONResponse(
+            {
+                "applied": out.applied,
+                "applied_hashes": out.applied_hashes,
+                "skipped": out.skipped,
+            }
+        )
+    return ORJSONResponse(
+        {
+            "per_rank": [
+                {
+                    "applied": r.applied,
+                    "applied_hashes": r.applied_hashes,
+                    "skipped": r.skipped,
+                }
+                for r in responses
+            ]
+        }
+    )
+
+
+
+# aginfer HTTP request validators live in the self-contained module; the
+# endpoints below call them as thin hooks (#251).
+from sglang.srt.mem_cache.aginfer.http_validators import (  # aginfer hook (#251)
+    validate_program_paused_body as _validate_program_paused_body,
+    validate_hints_body as _validate_hints_body,
+)
+
+
+# T21 (#181): daemon → sglang program-state broadcast.  Body is
+# {pid, state, pre_pause_state?}.  Sglang stores per-pid on each
+# rank's tree cache (set_aginfer_program_state); the next
+# /aginfer/state dump echoes the state back in
+# per_program_usage[pid].  Idempotent: applied=0 if already at
+# requested state (DESIGN §10 R2).
+@app.put("/aginfer/program_paused")
+async def aginfer_program_paused_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    from sglang.srt.managers.io_struct import (
+        UpdateAginferProgramPausedReq,
+    )
+    try:
+        pid, state, pre = _validate_program_paused_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    req = UpdateAginferProgramPausedReq(
+        pid=pid,
+        state=state,
+        pre_pause_state=pre,
+    )
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_program_paused(req)
+    )
+    all_ok = all(r.ok for r in responses)
+    if not all_ok:
+        first_fail = next(r for r in responses if not r.ok)
+        raise HTTPException(
+            status_code=400,
+            detail=f"validation: {first_fail.reason}",
+        )
+    # Sum applied across ranks (typically 1 OR len(responses); they
+    # share the same daemon view so all flip in unison).  Caller
+    # treats >0 as "state changed", 0 as "idempotent no-op".
+    return ORJSONResponse({
+        "ok": True,
+        "ranks": len(responses),
+        "applied": sum(int(r.applied) for r in responses),
+    })
+
+
+# T40 (#184, DESIGN §6 PUT /aginfer/hints): daemon → sglang push of
+# V_u inputs (p_hat / lambda) for the inline scorer.  Body is
+# {hints: [{hash, p_hat, lambda, stamp}]}.  Each rank's tree cache
+# applies overwrite-by-stamp (set_aginfer_hints); the daemon keeps no
+# shadow cache and re-pushes D_t every event (DESIGN §10).
+@app.put("/aginfer/hints")
+async def aginfer_hints_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    from sglang.srt.managers.io_struct import UpdateAginferHintsReq
+    try:
+        hints = _validate_hints_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    req = UpdateAginferHintsReq(hints=hints)
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_hints(req)
+    )
+    all_ok = all(r.ok for r in responses)
+    if not all_ok:
+        first_fail = next(r for r in responses if not r.ok)
+        raise HTTPException(
+            status_code=400,
+            detail=f"validation: {first_fail.reason}",
+        )
+    # Sum applied across ranks; ranks share the daemon's hash space so
+    # they advance in unison.  Caller treats 0 as idempotent no-op.
+    return ORJSONResponse({
+        "ok": True,
+        "ranks": len(responses),
+        "applied": sum(int(r.applied) for r in responses),
+    })
+
+
 @app.get("/get_load")
 async def get_load():
     """Get load metrics (deprecated - use /v1/loads instead).

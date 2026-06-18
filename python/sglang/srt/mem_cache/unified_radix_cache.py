@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 import time
@@ -50,6 +51,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
+    peek_time_counter,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
@@ -62,6 +64,20 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.session.streaming_session import StreamingSession
+
+# --- aginfer: pluggable eviction scorer + write-through (framework extracted) ---
+# Framework (loaders, default LRU scorer, birth-seed constants) lives in the
+# self-contained aginfer module; this file carries only thin hooks that call it.
+from sglang.srt.mem_cache.aginfer.cache_policy import (  # aginfer hook (#251)
+    _default_eviction_score,
+    _default_should_write_through,
+    _load_eviction_scorer,
+    _load_write_through_policy,
+    _AGINFER_BIRTH_PHAT,  # re-exported: read by verify/t27 via _urc._AGINFER_BIRTH_PHAT
+)
+from sglang.srt.mem_cache.aginfer import cache_hooks as _cache_hooks  # aginfer hook (#251)
+from sglang.srt.mem_cache.aginfer import state_dump as _state_dump  # aginfer hook (#251)
+# ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -101,6 +117,11 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+
+        # aginfer §3 state: set of program_ids that touched this node.
+        # Populated on insert/cache_finished_req from req.program_id; read
+        # by dump_aginfer_state.  Empty for untagged requests.
+        self.session_ids: set[str] = set()
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -302,6 +323,12 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+# aginfer state-dump subsystem moved to aginfer/state_dump.py (#251).
+# ``_StateDumpMetrics`` is instantiated in reset() from the module; the dump
+# methods below are thin delegators into _state_dump.
+_StateDumpMetrics = _state_dump._StateDumpMetrics
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -375,6 +402,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
+        # aginfer: pluggable eviction scorer (default = LRU-equivalent
+        # V_u, #177; aginfer:hint_v_u = hint-aware, T27 #188) + write-
+        # through trigger (default = hit_count >= threshold, #178).
+        self._init_aginfer_eviction_scoring()  # aginfer hook (#251)
+        self._init_aginfer_write_through()  # aginfer hook (#251)
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
@@ -466,6 +498,48 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         }
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        # T24 — set of (id_a, id_b) hash-collision pairs already logged.
+        # Cached on the instance so a persistent collision doesn't spam
+        # the warning log every batch.  Populated by
+        # apply_aginfer_migrations.
+        self._aginfer_collision_seen: set[tuple[int, int]] = set()
+        # T14 — per-call state-dump latency + emitted bytes.  Piggybacked
+        # into /aginfer/state under the ``state_dump_metrics`` top-level
+        # key.  Capacity 1024 ≈ 5 minutes at the daemon's typical 3.4 Hz
+        # poll rate; deep enough for a meaningful p99 over recent window
+        # but bounded so it doesn't blow up memory under year-long uptime.
+        self._aginfer_state_dump_metrics = _StateDumpMetrics(capacity=1024)
+        # T21 (#181, DESIGN §6 round-6 H2): daemon-pushed program state.
+        # The daemon owns the (REASONING / ACTING / PAUSED / ENDED)
+        # state transition; sglang stores the daemon's view as a
+        # passthrough and echoes it back in the next /aginfer/state
+        # dump.  Set via PUT /aginfer/program_paused → scheduler →
+        # set_aginfer_program_state.  Empty cold-start: dumps default
+        # state="REASONING", pre_pause_state=None for every pid that
+        # has live units cited in session_ids.
+        self._aginfer_program_states: dict[str, dict] = {}
+        # T26 (#200): scheduler-pushed throughput / in-flight measurement
+        # (the scheduler owns the running batch + forward timing; the
+        # cache only stores + serialises).  ``decode_per_program`` =
+        # {pid: tokens/sec EMA}; ``prefill_bps`` = bytes/sec EMA;
+        # ``inflight`` = {pid: {subpool: HBM bytes}}.  Empty cold-start →
+        # the dump emits the same placeholders as before until the
+        # scheduler pushes real numbers (set_aginfer_runtime_metrics).
+        self._aginfer_runtime_metrics: dict = {
+            "decode_per_program": {},
+            "prefill_bps": 0.0,
+            "inflight": {},
+        }
+        # T40 (#184, DESIGN §6 PUT /aginfer/hints + §10 overwrite-by-
+        # stamp): daemon-pushed V_u inputs for the inline scorer,
+        # keyed by unit hash → {"p_hat", "lambda", "stamp"}.  The
+        # daemon re-scores D_t every event and pushes unconditionally
+        # (no daemon-side shadow cache); this table dedupes by keeping
+        # only the newest-stamp entry per hash.  The inline scorer's
+        # CONSUMPTION of this table (eviction order) is wired
+        # separately (T27 / T28 / #177); this is the storage + the
+        # overwrite-by-stamp contract only.
+        self._aginfer_hints: dict[str, dict] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -541,7 +615,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 10
+        self.load_back_threshold = 256
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         if storage_backend is not None:
@@ -702,6 +776,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params = InsertParams(
                 prev_prefix_len=req.cache_protected_len,
                 priority=getattr(req, "priority", 0) or 0,
+                program_id=req.program_id,
             )
 
             # components prepare insert data + return effective cache_len
@@ -771,6 +846,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
             priority=getattr(req, "priority", 0) or 0,
+            program_id=req.program_id,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -1000,6 +1076,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        # aginfer: the new internal node inherits every program_id that
+        # touched the original (longer) prefix.  Without this the radix
+        # split loses session_ids on the ancestor path and admission_
+        # controller under-counts ownership.
+        new_node.session_ids |= child.session_ids
 
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
@@ -1015,6 +1096,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             child, UnifiedLRUList.insert_mru, skip_existing=True
         )
         child.last_access_time = get_and_increase_time_counter()
+
+        # T27 (#188, DESIGN §3 "covers every live unit"): the split's
+        # new INTERNAL node is a newly-live unit (the shared prefix);
+        # birth-seed it too.  The child keeps its hint — split moves the
+        # prefix hashes to new_node but the child's last hash
+        # (get_last_hash_value) is unchanged, so its key is stable.
+        self._aginfer_seed_birth(new_node)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
@@ -1043,6 +1131,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+
+        # T27 (#188, DESIGN §3): a unit is born here (post-commit leaf).
+        # Seed its hint (p_hat≈1) so the hint-aware scorer never sees an
+        # absent entry and the table covers every live unit.  No-op
+        # unless hint-aware; never clobbers a daemon hint.  Seed AFTER
+        # hash_value is set so the key matches the daemon's view.
+        self._aginfer_seed_birth(new_node)
 
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
@@ -1077,6 +1172,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             priority = 0
         self._touch_node(node)
         node.priority = max(node.priority, priority)
+        # aginfer: tag root + every node we visit with the program_id.
+        # ``params.program_id`` is sanitized at Req construction so it is
+        # safe to insert into a set; None skips silently for untagged
+        # requests (the worst-case "no program_id" row).
+        pid = params.program_id
         if len(key) == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
@@ -1085,6 +1185,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
+            if pid is not None:
+                node.session_ids.add(pid)
             prefix_len = node.key.match(key, page_size=self.page_size)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
@@ -1151,6 +1253,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             is_new_leaf = True
         else:
             target_node = node
+        if pid is not None:
+            target_node.session_ids.add(pid)
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
@@ -1271,6 +1375,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
+        # T27 (#188, DESIGN §10 'Hint clear ordering'): this is the one
+        # death/commit chokepoint (device-evict-death / host-evict /
+        # tombstone cascade / migrate-DROP all funnel here).  Clear the
+        # unit's hint AFTER the detach above — scorer-read (heap build)
+        # happens-before evict-commit (this pop) happens-before clear.
+        # Guarded on a non-empty table so non-aginfer mode pays nothing.
+        if getattr(self, "_aginfer_hints", None):
+            self.clear_aginfer_hint(self._aginfer_unit_hash(node))
 
     def _evict_component_and_detach_lru(
         self,
@@ -1625,7 +1737,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req=None,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
+        self._last_load_back_decline = None
         if self.cache_controller is None:
+            self._last_load_back_decline = "no_cache_controller"
             return False
 
         start_time = time.perf_counter()
@@ -1657,9 +1771,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
-            mem_quota is not None and kv_tokens > mem_quota + result.delta
-        ):
+        if kv_tokens < self.load_back_threshold and not comp_xfers:
+            self._last_load_back_decline = (
+                f"below_threshold:kv_tokens={kv_tokens}<thr={self.load_back_threshold}"
+            )
+            self.dec_lock_ref(best_match_node, ancestor_lock_params)
+            return False
+        if mem_quota is not None and kv_tokens > mem_quota + result.delta:
+            self._last_load_back_decline = (
+                f"exceeds_mem_quota:kv_tokens={kv_tokens}>quota={mem_quota}+delta={result.delta}"
+            )
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
@@ -1672,6 +1793,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
+                self._last_load_back_decline = (
+                    f"evict_short:needed={needed}>evicted={result.num_tokens_evicted}"
+                )
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
@@ -1688,6 +1812,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
+            sub = (
+                getattr(self.cache_controller, "_last_load_decline", None)
+                or "unknown"
+            )
+            self._last_load_back_decline = (
+                f"controller_load_returned_none:{sub}"
+            )
             return False
 
         # Commit: each component gets only its own transfers
@@ -1778,10 +1909,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             return
         node.hit_count += 1
-        if (
-            self.cache_controller is not None
-            and not node.backuped
-            and node.hit_count >= self.write_through_threshold
+        # #178 (DESIGN §3): pluggable write-through trigger.  Default
+        # is the historical hit_count >= threshold; aginfer can
+        # register a V_u-aware version.  `not node.backuped` stays a
+        # hard precondition (no point re-backing-up an existing copy).
+        # SCOPE (#192, resolved out-of-scope): only THIS cache
+        # (UnifiedRadixCache) routes the trigger through the hook.  The
+        # sibling HiRadixCache / HiMambaRadixCache `_inc_hit_count` keep
+        # the hardcoded `hit_count >= threshold` BY DESIGN — they carry
+        # ZERO aginfer surface (no _aginfer_hints, no eviction scorer,
+        # no /aginfer/state schema) and aginfer CANNOT run on them:
+        # every aginfer endpoint returns `unsupported_tree_cache` unless
+        # SGLANG_ENABLE_UNIFIED_RADIX_TREE=1.  So the aginfer plugins
+        # live only where aginfer runs; the siblings stay stock-sglang.
+        # The default here is byte-identical to their hardcoded check
+        # (verify/t28 B4), so the no-daemon baseline is unchanged.
+        if not node.backuped and self._write_through_policy(
+            node, self.write_through_threshold
         ):
             self.write_backup(node)
 
@@ -2436,6 +2580,68 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
         self.writing_check()
+
+    # ---- aginfer daemon migrate (paper §4 action a_t) ----
+    def apply_aginfer_migrations(self, *a, **k):
+        return _cache_hooks.apply_aginfer_migrations(self, *a, **k)
+
+    # ---- aginfer eviction-scoring + hints — logic in aginfer/cache_hooks.py (#251) ----
+    def set_aginfer_hints(self, *a, **k):
+        return _cache_hooks.set_aginfer_hints(self, *a, **k)
+
+    def get_aginfer_hint(self, *a, **k):
+        return _cache_hooks.get_aginfer_hint(self, *a, **k)
+
+    def clear_aginfer_hint(self, *a, **k):
+        return _cache_hooks.clear_aginfer_hint(self, *a, **k)
+
+    def _aginfer_unit_hash(self, *a, **k):
+        return _cache_hooks._aginfer_unit_hash(self, *a, **k)
+
+    def _init_aginfer_eviction_scoring(self, *a, **k):
+        return _cache_hooks._init_aginfer_eviction_scoring(self, *a, **k)
+
+    def _aginfer_eviction_score(self, *a, **k):
+        return _cache_hooks._aginfer_eviction_score(self, *a, **k)
+
+    def _aginfer_hint_should_write_through(self, *a, **k):
+        return _cache_hooks._aginfer_hint_should_write_through(self, *a, **k)
+
+    def _init_aginfer_write_through(self, *a, **k):
+        return _cache_hooks._init_aginfer_write_through(self, *a, **k)
+
+    def _aginfer_seed_birth(self, *a, **k):
+        return _cache_hooks._aginfer_seed_birth(self, *a, **k)
+
+    # ---- aginfer state-dump subsystem — logic in aginfer/state_dump.py (#251) ----
+    # The DESIGN §5 snapshot serializer + program-state / runtime-metrics
+    # storage live as free functions over the cache in aginfer/state_dump.py.
+    # The cache keeps thin delegators (external callers + internal hot paths
+    # reach them as bound methods) + the instance fields they read/write
+    # (initialised in __init__/reset, NOT here).  Default/LRU path unaffected.
+    def set_aginfer_program_state(self, *a, **k):
+        return _state_dump.set_aginfer_program_state(self, *a, **k)
+
+    def set_aginfer_runtime_metrics(self, *a, **k):
+        return _state_dump.set_aginfer_runtime_metrics(self, *a, **k)
+
+    def _aginfer_node_summary(self, *a, **k):
+        return _state_dump._aginfer_node_summary(self, *a, **k)
+
+    def _aginfer_bytes_per_token(self, *a, **k):
+        return _state_dump._aginfer_bytes_per_token(self, *a, **k)
+
+    def _aginfer_subpool_name(self, *a, **k):
+        return _state_dump._aginfer_subpool_name(self, *a, **k)
+
+    def _aginfer_pool_usage(self, *a, **k):
+        return _state_dump._aginfer_pool_usage(self, *a, **k)
+
+    def dump_aginfer_state(self, *a, **k):
+        return _state_dump.dump_aginfer_state(self, *a, **k)
+
+    def dump_aginfer_state_bytes(self, *a, **k):
+        return _state_dump.dump_aginfer_state_bytes(self, *a, **k)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

@@ -1,0 +1,503 @@
+"""T27 — hint-table CONSUMER: hint-aware eviction scorer + birth-seed
++ eviction-clear ordering (#188, DESIGN §3/§10).
+
+The PRODUCER (#184) pushes `PUT /aginfer/hints` into
+`UnifiedRadixCache._aginfer_hints` (overwrite-by-stamp).  This task is
+the consumer — the three coupled pieces that make daemon hints
+actually drive sglang's eviction order:
+
+  1. **Hint-aware scorer** — when launched with
+     `SGLANG_KV_POLICY_MODULE=aginfer:hint_v_u`, the eviction heap key
+     is `_aginfer_eviction_score(node, layer)`: it looks up the node's
+     hint in `_aginfer_hints` and computes the paper-§7 V_u from the
+     daemon's `p_hat` / `lambda` (via the adapter's `hint_v_u`, the
+     SAME V_u math as `ours_greedy_score` — no reimplementation/drift).
+     Absent hint → graceful fallback to the local hits/age derivation
+     (never bare LRU).
+  2. **Unit-birth seeding** — a new leaf gets a `p_hat = 1.0` seed in
+     `_aginfer_hints` (if absent), so the table "covers every live
+     unit" (DESIGN §3) and the scorer never sees an absent hint for a
+     newborn.
+  3. **Eviction-clear ordering** — a unit's hint is cleared at the
+     true death/commit boundary (`_remove_leaf_from_parent`, the one
+     chokepoint for device-evict-death / host-evict / tombstone /
+     migrate-DROP), AFTER the evict commits — DESIGN §10 "scorer-read
+     happens-before evict-commit happens-before hint-clear".
+
+Atomicity (DESIGN §10 "per-key seqlock/CAS"): satisfied trivially —
+sglang's scheduler serialises the `/aginfer/hints` PUT handler and the
+eviction path on ONE event loop, so the dict is never truly concurrent
+(no CAS needed; see README DESIGN-vs-CODE note).
+
+Stages:
+
+  A. adapter hint_v_u (the V_u math)
+    A0 hint drives the score: high-p_hat hint → higher (keep-longer)
+       V_u than a low-p_hat hint, same node
+    A1 no hint → falls back to local derivation, returns a float
+    A2 drift guard: hint_v_u(hint=None) == ours_greedy_score for the
+       same node (shared _v_u_from_unit, no reimplementation)
+    A3 monotonic in p_hat: higher hint p_hat → higher score
+  B. sglang scorer selection + bound method
+    B0 SGLANG_KV_POLICY_MODULE=aginfer:hint_v_u → _eviction_scorer is
+       the bound _aginfer_eviction_score, _aginfer_hint_aware True,
+       kv_policy_loaded line emitted
+    B1 _aginfer_eviction_score reads _aginfer_hints by node hash:
+       a node with a high-p_hat hint scores higher than the same node
+       with a low-p_hat hint
+    B2 a normal module spec → _load_eviction_scorer path,
+       _aginfer_hint_aware False (no hint lookup)
+  C. birth-seed
+    C0 hint-aware: _aginfer_seed_birth seeds p_hat=1.0 for an absent
+       unit
+    C1 birth-seed does NOT clobber an existing (daemon) hint
+    C2 non-hint-aware: _aginfer_seed_birth is a no-op
+  D. eviction-clear ordering
+    D0 _remove_leaf_from_parent clears the node's hint (table non-empty)
+    D1 the clear happens AFTER the node is detached from its parent
+       (the §10 ordering: commit before clear)
+    D2 clear is a no-op when the hint table is empty (non-aginfer mode
+       pays nothing)
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+from typing import Any, Callable, List, Tuple
+
+
+_HERE = Path(__file__).resolve().parent
+_AGINFER_ROOT = _HERE.parent.parent
+if str(_AGINFER_ROOT) not in sys.path:
+    sys.path.insert(0, str(_AGINFER_ROOT))
+_SGLANG_PY = "/scratch/yuzhou/projects/sglang/python"
+if _SGLANG_PY not in sys.path:
+    sys.path.insert(0, _SGLANG_PY)
+
+from baselines.sglang_adapter import (  # noqa: E402
+    hint_v_u,
+    ours_greedy_score,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
+
+
+def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
+def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+
+
+class StageFail(AssertionError):
+    pass
+
+
+# ============================================================ stubs
+
+
+class _CompData:
+    def __init__(self, n_tokens: int):
+        self.value = list(range(n_tokens))   # device tokens
+        self.host_value = None
+
+
+class _Node:
+    """Duck-typed UnifiedTreeNode for the scorers + cache methods."""
+    _counter = 10000
+
+    def __init__(self, *, last_access_time: int = 0, hit_count: int = 0,
+                 n_tokens: int = 100, hash_value=None, parent=None):
+        self.last_access_time = last_access_time
+        self.hit_count = hit_count
+        self.component_data = [_CompData(n_tokens)]
+        self.hash_value = hash_value          # list or None
+        self.parent = parent
+        self.key = _Key()
+        _Node._counter += 1
+        self.id = _Node._counter
+
+    def get_last_hash_value(self):
+        if self.hash_value is None or len(self.hash_value) == 0:
+            return None
+        return self.hash_value[-1]
+
+
+class _Key:
+    def child_key(self, page_size):
+        return "k"
+
+
+class _Layer:
+    name = "DEVICE"
+
+
+_LAYER = _Layer()
+
+
+def _bare_cache():
+    """A UnifiedRadixCache with just the aginfer-scoring attrs set, via
+    __new__ (bypasses the heavy GPU __init__)."""
+    c = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    c._aginfer_hints = {}
+    return c
+
+
+# ============================================================ A. hint_v_u
+
+
+def stage_a0_hint_drives_score() -> None:
+    """Same node, different hint p_hat → the high-p_hat hint scores
+    higher (more valuable to keep)."""
+    n = _Node(last_access_time=0, hit_count=1, n_tokens=100)
+    hi = hint_v_u(n, _LAYER, {"p_hat": 1.0, "lambda": 0.2, "stamp": 1})
+    lo = hint_v_u(n, _LAYER, {"p_hat": 0.01, "lambda": 0.2, "stamp": 1})
+    if not (hi > lo):
+        raise StageFail(f"high-p_hat hint must score higher; hi={hi} lo={lo}")
+
+
+def stage_a1_no_hint_fallback() -> None:
+    n = _Node(last_access_time=0, hit_count=3, n_tokens=100)
+    v = hint_v_u(n, _LAYER, None)
+    if not isinstance(v, float):
+        raise StageFail(f"no-hint hint_v_u must return float; got {type(v)}")
+
+
+def stage_a2_drift_guard_vs_ours_greedy() -> None:
+    """hint_v_u(hint=None) MUST equal ours_greedy_score for the same
+    node — they share the §7 V_u math (no reimplementation/drift).
+
+    No counter freeze needed (#193): the scorers PEEK the time counter
+    (non-mutating), so two back-to-back calls see the same `now` and
+    the side-by-side compare is naturally fair.  (Pre-#193 this freeze
+    was required because the scorers advanced the counter per call.)"""
+    for la, hc, nt in [(0, 1, 100), (50, 7, 400), (0, 0, 10)]:
+        n = _Node(last_access_time=la, hit_count=hc, n_tokens=nt)
+        a = hint_v_u(n, _LAYER, None)
+        b = ours_greedy_score(n, _LAYER)
+        if a != b:
+            raise StageFail(
+                f"hint_v_u(None) must == ours_greedy_score (no drift); "
+                f"at (la={la},hc={hc},nt={nt}) got {a} vs {b}"
+            )
+
+
+def stage_a3_monotonic_in_p_hat() -> None:
+    n = _Node(last_access_time=0, hit_count=1, n_tokens=100)
+    prev = None
+    for p in (0.0, 0.25, 0.5, 0.75, 1.0):
+        v = hint_v_u(n, _LAYER, {"p_hat": p, "lambda": 0.2, "stamp": 1})
+        if prev is not None and not (v >= prev):
+            raise StageFail(f"V_u must be monotonic in p_hat; p={p} v={v} < prev={prev}")
+        prev = v
+
+
+def stage_a4_scorer_does_not_advance_counter() -> None:
+    """#193: the eviction scorer is a READ — it must NOT advance the
+    global time counter.  Scoring K leaves in one heap build with a
+    mutating clock makes node[i]'s `now` = base+i, so the heap key is
+    ORDER-DEPENDENT (two same-(last_access,hits) nodes score
+    differently by iteration position) AND scoring pollutes the access
+    clock published as `time_counter`.  With `peek_time_counter` both
+    go away: scoring the same node twice is deterministic and the
+    counter is unchanged."""
+    from sglang.srt.mem_cache.unified_cache_components import peek_time_counter
+    n = _Node(last_access_time=0, hit_count=3, n_tokens=100)
+    before = int(peek_time_counter())
+    s1 = hint_v_u(n, _LAYER, None)
+    s2 = hint_v_u(n, _LAYER, None)
+    after = int(peek_time_counter())
+    if after != before:
+        raise StageFail(
+            f"scoring must NOT advance the global time counter (#193); "
+            f"{before} → {after} (a mutating clock makes the heap key "
+            f"order-dependent + pollutes time_counter)"
+        )
+    if s1 != s2:
+        raise StageFail(
+            f"scoring the same node twice must be deterministic; "
+            f"{s1} != {s2} (the clock advanced between calls)"
+        )
+
+
+def stage_a5_hint_only_raises_never_lowers() -> None:
+    """#250 do-no-harm: the daemon hint may only RAISE eviction keep-value ABOVE
+    the local demonstrated-reuse evidence (max-combine), NEVER push a locally-hot
+    prefix below it.  A low / stale / branch-inconsistent daemon p_hat (e.g. the
+    recency-coupled no-program-event path) must not eviction-nibble a reused
+    prefix — the Dynamo baseline regression (39/39 -> flaky tail-nibbled partials).
+    Demote of an idle/ended unit is a SEPARATE explicit daemon migrate, not an
+    eviction-scorer downgrade."""
+    # locally-HOT node (many hits → high local reuse-based p_hat) with a LOW hint:
+    # max-combine must keep the local value, i.e. == the no-hint score.
+    hot = _Node(last_access_time=0, hit_count=9, n_tokens=100)
+    local = hint_v_u(hot, _LAYER, None)
+    low = hint_v_u(hot, _LAYER, {"p_hat": 0.0, "lambda": 1e-3, "stamp": 1})
+    if abs(low - local) > 1e-9:
+        raise StageFail(
+            f"a LOW hint must NOT lower a locally-hot prefix below local "
+            f"(max-combine); local={local} low_hint={low}")
+    # locally-COLD node (one-shot → local p_hat≈0) with a HIGH hint: the daemon's
+    # foresight may still RAISE it (promote), so the score must exceed no-hint.
+    cold = _Node(last_access_time=0, hit_count=1, n_tokens=100)
+    local_cold = hint_v_u(cold, _LAYER, None)
+    high = hint_v_u(cold, _LAYER, {"p_hat": 1.0, "lambda": 0.5, "stamp": 1})
+    if not (high > local_cold):
+        raise StageFail(
+            f"a HIGH hint must still RAISE a locally-cold node (promote foresight); "
+            f"local_cold={local_cold} high_hint={high}")
+
+
+# ============================================================ B. selection + scorer
+
+
+def stage_b0_sentinel_binds_hint_scorer() -> None:
+    c = _bare_cache()
+    old = os.environ.get("SGLANG_KV_POLICY_MODULE")
+    os.environ["SGLANG_KV_POLICY_MODULE"] = "aginfer:hint_v_u"
+    try:
+        c._init_aginfer_eviction_scoring()
+    finally:
+        if old is None:
+            os.environ.pop("SGLANG_KV_POLICY_MODULE", None)
+        else:
+            os.environ["SGLANG_KV_POLICY_MODULE"] = old
+    if not c._aginfer_hint_aware:
+        raise StageFail("sentinel spec must set _aginfer_hint_aware=True")
+    # the scorer is the bound method
+    if c._eviction_scorer != c._aginfer_eviction_score:
+        raise StageFail("sentinel must bind _eviction_scorer to _aginfer_eviction_score")
+
+
+def stage_b1_scorer_reads_hint_table() -> None:
+    c = _bare_cache()
+    os.environ["SGLANG_KV_POLICY_MODULE"] = "aginfer:hint_v_u"
+    try:
+        c._init_aginfer_eviction_scoring()
+    finally:
+        os.environ.pop("SGLANG_KV_POLICY_MODULE", None)
+    n = _Node(last_access_time=0, hit_count=1, n_tokens=100, hash_value=["u0"])
+    c._aginfer_hints = {"u0": {"p_hat": 1.0, "lambda": 0.2, "stamp": 1}}
+    hi = c._eviction_scorer(n, _LAYER)
+    c._aginfer_hints = {"u0": {"p_hat": 0.01, "lambda": 0.2, "stamp": 1}}
+    lo = c._eviction_scorer(n, _LAYER)
+    if not (hi > lo):
+        raise StageFail(
+            f"hint-aware scorer must read _aginfer_hints by node hash and "
+            f"score the high-p_hat unit higher; hi={hi} lo={lo}"
+        )
+
+
+def stage_b2_normal_spec_not_hint_aware() -> None:
+    c = _bare_cache()
+    old = os.environ.get("SGLANG_KV_POLICY_MODULE")
+    os.environ.pop("SGLANG_KV_POLICY_MODULE", None)  # default LRU
+    try:
+        c._init_aginfer_eviction_scoring()
+    finally:
+        if old is not None:
+            os.environ["SGLANG_KV_POLICY_MODULE"] = old
+    if c._aginfer_hint_aware:
+        raise StageFail("default spec must NOT be hint-aware")
+    # a normal scorer ignores the hint table
+    n = _Node(last_access_time=42, hit_count=0, n_tokens=100, hash_value=["u0"])
+    if c._eviction_scorer(n, _LAYER) != float(42):
+        raise StageFail("default scorer should be bare last_access_time")
+
+
+def stage_b3_real_producer_consumer_round_trip() -> None:
+    """audit E12: drive the REAL producer (set_aginfer_hints) → the
+    REAL key (_aginfer_unit_hash) → the REAL consumer
+    (_aginfer_eviction_score), not a hand-set dict.  Proves the daemon's
+    PUT key and the scorer's lookup key are the same in code, not just
+    by inspection."""
+    c = _bare_cache()
+    os.environ["SGLANG_KV_POLICY_MODULE"] = "aginfer:hint_v_u"
+    try:
+        c._init_aginfer_eviction_scoring()
+    finally:
+        os.environ.pop("SGLANG_KV_POLICY_MODULE", None)
+    n = _Node(last_access_time=0, hit_count=1, n_tokens=100, hash_value=["realhash"])
+    key = c._aginfer_unit_hash(n)
+    ok, reason, applied = c.set_aginfer_hints(
+        [{"hash": key, "p_hat": 0.95, "lambda": 0.5, "stamp": 100}]
+    )
+    if not (ok and applied == 1):
+        raise StageFail(f"producer set_aginfer_hints failed: {reason!r}")
+    score_high = c._eviction_scorer(n, _LAYER)
+    c.set_aginfer_hints([{"hash": key, "p_hat": 0.01, "lambda": 0.5, "stamp": 200}])
+    score_low = c._eviction_scorer(n, _LAYER)
+    if not (score_high > score_low):
+        raise StageFail(
+            "the consumer must read the hint the REAL producer wrote "
+            f"under _aginfer_unit_hash(node); high={score_high} low={score_low}"
+        )
+
+
+# ============================================================ C. birth-seed
+
+
+def stage_c0_birth_seed_absent() -> None:
+    """#249/#250: a fresh leaf is seeded with a LOW floor p_hat, NOT 1.0.  Under
+    the max-combine eviction scorer (sglang_adapter.hint_v_u) a 1.0 seed would let
+    a brand-new one-shot flood tie a heavily-reused prefix — so the seed must be a
+    low floor and let demonstrated reuse (the local reuse-based p_hat) dominate."""
+    from sglang.srt.mem_cache import unified_radix_cache as _urc
+    seed = float(_urc._AGINFER_BIRTH_PHAT)
+    c = _bare_cache()
+    c._aginfer_hint_aware = True
+    n = _Node(hash_value=["fresh"], last_access_time=5)
+    c._aginfer_seed_birth(n)
+    h = c._aginfer_hints.get("fresh")
+    if h is None or abs(h["p_hat"] - seed) > 1e-9:
+        raise StageFail(f"birth-seed must seed p_hat={seed} (the low floor); got {h!r}")
+    if not (0.0 <= seed < 0.5):
+        raise StageFail(
+            f"birth-seed must be a LOW floor (<0.5) so a fresh flood can't tie a "
+            f"reused prefix under max-combine; got {seed}")
+
+
+def stage_c1_birth_seed_no_clobber() -> None:
+    c = _bare_cache()
+    c._aginfer_hint_aware = True
+    c._aginfer_hints = {"u": {"p_hat": 0.3, "lambda": 0.5, "stamp": 99}}
+    n = _Node(hash_value=["u"], last_access_time=5)
+    c._aginfer_seed_birth(n)
+    h = c._aginfer_hints["u"]
+    if abs(h["p_hat"] - 0.3) > 1e-9 or h["stamp"] != 99:
+        raise StageFail(f"birth-seed must NOT clobber an existing (daemon) hint; got {h!r}")
+
+
+def stage_c2_birth_seed_noop_when_not_aware() -> None:
+    c = _bare_cache()
+    c._aginfer_hint_aware = False
+    n = _Node(hash_value=["fresh"], last_access_time=5)
+    c._aginfer_seed_birth(n)
+    if c._aginfer_hints:
+        raise StageFail(f"non-hint-aware mode must not birth-seed; got {c._aginfer_hints!r}")
+
+
+def stage_c3_daemon_overwrites_birth_seed() -> None:
+    """audit C7: a birth-seed is a FLOOR — the daemon's FIRST refinement
+    must always win, even in the worst case where the global counter did
+    not advance between the unit's birth and the dump that first scores
+    it (so the daemon's stamp == int(node.last_access_time)).  The seed
+    must therefore carry a stamp strictly below any real daemon stamp;
+    set_aginfer_hints skips on `stamp <= existing`, so an equal-stamp
+    daemon push would otherwise be DROPPED and p_hat=1.0 would shadow
+    the daemon."""
+    c = _bare_cache()
+    c._aginfer_hint_aware = True
+    n = _Node(hash_value=["u"], last_access_time=500)
+    c._aginfer_seed_birth(n)
+    key = c._aginfer_unit_hash(n)
+    # daemon refines with stamp == int(last_access_time) — the no-advance
+    # worst case.  Must overwrite the seed.
+    ok, reason, applied = c.set_aginfer_hints(
+        [{"hash": key, "p_hat": 0.2, "lambda": 0.5, "stamp": 500}]
+    )
+    if applied != 1:
+        raise StageFail(
+            "the daemon's first refinement must overwrite the birth-seed "
+            f"even at stamp == int(last_access_time); applied={applied} "
+            "(birth-seed shadowed the daemon — C7)"
+        )
+    if abs(c._aginfer_hints[key]["p_hat"] - 0.2) > 1e-9:
+        raise StageFail(f"daemon p_hat must win; got {c._aginfer_hints[key]!r}")
+
+
+# ============================================================ D. eviction-clear
+
+
+def _parented_node(uhash: str):
+    parent = _Node(hash_value=["p"])
+    parent.children = {"k": None}
+    child = _Node(hash_value=[uhash], parent=parent)
+    parent.children["k"] = child
+    return parent, child
+
+
+def stage_d0_remove_clears_hint() -> None:
+    c = _bare_cache()
+    c.page_size = 1
+    _, child = _parented_node("dead")
+    c._aginfer_hints = {"dead": {"p_hat": 0.5, "lambda": 0.2, "stamp": 1},
+                        "live": {"p_hat": 0.9, "lambda": 0.2, "stamp": 1}}
+    c._remove_leaf_from_parent(child)
+    if "dead" in c._aginfer_hints:
+        raise StageFail("evicting (removing) a node must clear its hint")
+    if "live" not in c._aginfer_hints:
+        raise StageFail("removing one node must not clear OTHER nodes' hints")
+
+
+def stage_d1_clear_after_detach() -> None:
+    """§10 ordering: the node is detached from its parent BEFORE the
+    hint is cleared (commit happens-before clear).  We assert the node
+    is gone from parent.children AND the hint is gone — both, after the
+    single call."""
+    c = _bare_cache()
+    c.page_size = 1
+    parent, child = _parented_node("dead")
+    c._aginfer_hints = {"dead": {"p_hat": 0.5, "lambda": 0.2, "stamp": 1}}
+    c._remove_leaf_from_parent(child)
+    if parent.children.get("k") is not None:
+        raise StageFail("node must be detached from parent (evict commit)")
+    if "dead" in c._aginfer_hints:
+        raise StageFail("hint must be cleared after the detach")
+
+
+def stage_d2_clear_noop_empty_table() -> None:
+    """Non-aginfer mode (empty table): _remove_leaf_from_parent must
+    not crash and pays nothing."""
+    c = _bare_cache()
+    c.page_size = 1
+    parent, child = _parented_node("whatever")
+    c._aginfer_hints = {}
+    c._remove_leaf_from_parent(child)   # must not raise
+    if parent.children.get("k") is not None:
+        raise StageFail("node should still be detached even with empty table")
+
+
+# ============================================================ run
+
+
+_STAGES: List[Tuple[str, Callable[[], None]]] = [
+    ("A0 hint p_hat drives the eviction V_u",         stage_a0_hint_drives_score),
+    ("A1 no hint → local fallback (float)",            stage_a1_no_hint_fallback),
+    ("A2 drift guard: hint_v_u(None) == ours_greedy",  stage_a2_drift_guard_vs_ours_greedy),
+    ("A3 V_u monotonic in hint p_hat",                 stage_a3_monotonic_in_p_hat),
+    ("A4 scorer does not advance the time counter (#193)", stage_a4_scorer_does_not_advance_counter),
+    ("A5 hint only RAISES, never lowers below local (#250)", stage_a5_hint_only_raises_never_lowers),
+    ("B0 sentinel binds the hint-aware scorer",        stage_b0_sentinel_binds_hint_scorer),
+    ("B1 scorer reads _aginfer_hints by node hash",    stage_b1_scorer_reads_hint_table),
+    ("B2 default spec → not hint-aware",               stage_b2_normal_spec_not_hint_aware),
+    ("B3 real producer→consumer round-trip (hash key)", stage_b3_real_producer_consumer_round_trip),
+    ("C0 birth-seed low-floor p_hat for absent unit (#249/#250)", stage_c0_birth_seed_absent),
+    ("C1 birth-seed does not clobber daemon hint",     stage_c1_birth_seed_no_clobber),
+    ("C2 birth-seed no-op when not hint-aware",        stage_c2_birth_seed_noop_when_not_aware),
+    ("C3 daemon overwrites birth-seed (C7 stamp floor)", stage_c3_daemon_overwrites_birth_seed),
+    ("D0 remove_leaf_from_parent clears the hint",     stage_d0_remove_clears_hint),
+    ("D1 clear after detach (§10 ordering)",           stage_d1_clear_after_detach),
+    ("D2 clear no-op on empty table",                  stage_d2_clear_noop_empty_table),
+]
+
+
+def main() -> int:
+    failures: List[str] = []
+    for label, fn in _STAGES:
+        try:
+            fn()
+            print(f"  {_green('PASS')}  Stage {label}")
+        except StageFail as exc:
+            failures.append(label)
+            print(f"  {_red('FAIL')}  Stage {label}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            failures.append(label)
+            print(f"  {_red('FAIL')}  Stage {label}: "
+                  f"unexpected {type(exc).__name__}: {exc}")
+    if failures:
+        print(_red(f"\nT27 FAILED ({len(failures)}): {failures}"))
+        return 1
+    print(_green(f"\nT27 PASS — all {len(_STAGES)} stages green"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

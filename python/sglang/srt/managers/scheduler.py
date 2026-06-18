@@ -108,8 +108,16 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetAginferStateReq,
+    GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    MigrateAginferReq,
+    MigrateAginferReqOutput,
+    UpdateAginferProgramPausedReq,
+    UpdateAginferProgramPausedReqOutput,
+    UpdateAginferHintsReq,
+    UpdateAginferHintsReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -193,6 +201,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
+from sglang.srt.managers.forced_tokens import forced_override_positions
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
@@ -218,6 +227,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.aginfer import metrics_hooks as _metrics_hooks  # aginfer EMA hooks (#251)
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -314,6 +324,20 @@ class Scheduler(
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
         self.cur_batch: Optional[ScheduleBatch] = None
+
+        # T26 (#200): aginfer throughput / in-flight measurement.  Per-
+        # program decode tokens/sec EMA + prefill bytes/sec EMA, sampled
+        # once per forward in ``process_batch_result``; pushed onto the
+        # radix cache before each ``/aginfer/state`` dump so the daemon's
+        # §8 admission math (marginal_pause_cost, pause_relief snapshot,
+        # and — once T11 lands E[remaining] — the forecast trajectory)
+        # reads real numbers instead of the 0.0 / {} placeholders.  Gated
+        # on the cache exposing the aginfer schema, so non-aginfer
+        # deployments pay nothing.
+        self._aginfer_decode_ema: Dict[str, float] = {}
+        self._aginfer_prefill_bps_ema: Optional[float] = None
+        self._aginfer_last_decode_t: Optional[float] = None
+        self._aginfer_last_prefill_t: Optional[float] = None
         self.init_soft_watchdog(server_args)
 
         # Parse args
@@ -467,6 +491,18 @@ class Scheduler(
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
+
+        # aginfer #251 Stage B: the in-engine scheduler driver. OFF by default — gated on SGLANG_AGINFER_IN_ENGINE=1 — so a normal launch
+        # is byte-for-byte unchanged (do-no-harm). When on, _aginfer_maybe_tick() drives it
+        # from the per-iteration loop hook. The decide/apply path lights up once
+        # build_paper_state relocates in-engine (next increment); today the tick fires the
+        # trigger + the in-process state dump only.
+        self._aginfer_in_engine = os.environ.get("SGLANG_AGINFER_IN_ENGINE", "0") == "1"
+        self._aginfer_driver = None
+        if self._aginfer_in_engine:
+            from sglang.srt.mem_cache.aginfer.scheduler_driver import AginferDriver
+            self._aginfer_driver = AginferDriver()
+            logger.info("aginfer in-engine driver armed (SGLANG_AGINFER_IN_ENGINE=1)")
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
@@ -1389,6 +1425,10 @@ class Scheduler(
                 ),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
+                (GetAginferStateReq, self.get_aginfer_state),
+                (MigrateAginferReq, self.migrate_aginfer),
+                (UpdateAginferProgramPausedReq, self.update_aginfer_program_paused),
+                (UpdateAginferHintsReq, self.update_aginfer_hints),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -1492,6 +1532,9 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            self._aginfer_maybe_tick()  # aginfer #251 Stage B: in-engine driver (default off)
+
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
@@ -1550,6 +1593,8 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
+
+            self._aginfer_maybe_tick()  # aginfer #251 Stage B: in-engine driver (default off)
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
@@ -2013,6 +2058,7 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                program_id=recv_req.program_id,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -3063,6 +3109,11 @@ class Scheduler(
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
+        # T26 (#200): sample aginfer decode/prefill throughput EMAs from the
+        # FRESH batch (pre-forward) — extend_num_tokens / input_ids are
+        # consumed by the forward and gone by process_batch_result time
+        # under overlap scheduling.  Cheap; no-op on non-aginfer caches.
+        self._aginfer_record_throughput(batch)
 
         # Whether to run the profiler
         self.profiler_manager._profile_batch_predicate(batch)
@@ -3120,6 +3171,7 @@ class Scheduler(
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
+                        self._apply_forced_tokens(batch, batch_result.next_token_ids)
                         if batch_result.delay_sample_func is None:
                             stash_payload = (
                                 batch_result.next_draft_input
@@ -3180,6 +3232,7 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                self._apply_forced_tokens(batch, batch_result.next_token_ids)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
                     # Non-spec: relay via future_map, gathered next iter.
                     self.future_map.stash(
@@ -3283,6 +3336,11 @@ class Scheduler(
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
+            # T26 (#206): spec-v2 (overlap) resolves the real accepted-token
+            # count (accept_lens) during the call above — record it now.  v1
+            # spec doesn't expose it and is counted 1/req pre-forward instead.
+            if getattr(batch, "is_spec_v2", False):
+                self._aginfer_record_spec_throughput(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
@@ -3606,6 +3664,216 @@ class Scheduler(
         ret.pop("model_config", None)
 
         return GetInternalStateReqOutput(internal_state=ret)
+
+    def _apply_forced_tokens(self, batch: ScheduleBatch, next_token_ids) -> None:
+        """Override sampled tokens with teacher-forced values on the GPU.
+
+        Overlap-compatible: the bookkeeping in ``forced_override_positions``
+        tracks a dispatch counter (not ``len(output_ids)``), so the 1-step
+        commit lag under ``--enable-overlap`` is handled correctly.  A no-op
+        when no request in the batch carries ``forced_output_ids``.
+        """
+        if next_token_ids is None:
+            return
+        overrides = forced_override_positions(batch.reqs)
+        if not overrides:
+            return
+        idx = torch.tensor(
+            [o[0] for o in overrides], device=next_token_ids.device, dtype=torch.long
+        )
+        val = torch.tensor(
+            [o[1] for o in overrides],
+            device=next_token_ids.device,
+            dtype=next_token_ids.dtype,
+        )
+        next_token_ids[idx] = val
+
+    def _aginfer_maybe_tick(self) -> None:
+        """aginfer #251 Stage B: the IN-ENGINE scheduler tick (replaces the out-of-process
+        daemon's event_router→handle cycle). Runs on EVERY loop iteration (busy OR idle —
+        unlike on_idle, which only fires when fully idle = the low-pressure regime where
+        there is nothing to do); the AginferDriver's should_tick() pressure-gates (occ ≥
+        theta_lo) and interval-throttles it so it never runs every step.
+
+        DEFAULT OFF: gated on env SGLANG_AGINFER_IN_ENGINE=1. When unset this is a single
+        attribute check + return — zero behaviour change (do-no-harm by construction; the
+        daemon path is untouched). Wrapped in try/except: crash isolation is lost without a
+        separate process, so a policy bug must DISABLE the feature for the session, never
+        kill the scheduler loop (the inline LRU scorer remains the safety net)."""
+        if not getattr(self, "_aginfer_in_engine", None):
+            return
+        try:
+            occ = 0.0
+            pu = getattr(self.tree_cache, "_aginfer_pool_usage", None)
+            if pu is not None:
+                occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
+            import time as _time
+            theta_hi = getattr(self.server_args, "aginfer_theta_hi", 0.85)
+            theta_lo = getattr(self.server_args, "aginfer_theta_lo", 0.70)
+            heartbeat_s = getattr(self.server_args, "aginfer_heartbeat_s", 5.0)
+            if self._aginfer_driver.should_tick(
+                occ, _time.monotonic(), theta_lo=theta_lo, min_interval_s=heartbeat_s):
+                self._aginfer_driver.tick(self, theta_hi=theta_hi, theta_lo=theta_lo,
+                                          heartbeat_s=heartbeat_s)
+        except Exception:
+            logger.exception(
+                "aginfer in-engine tick raised — DISABLING aginfer-in-engine for the "
+                "session (inline LRU scorer remains active; daemon path unaffected)")
+            self._aginfer_in_engine = False
+
+    # aginfer throughput/EMA hooks — logic in aginfer/metrics_hooks.py (#251 Stage A.2)
+    def _aginfer_record_throughput(self, *a, **k):
+        return _metrics_hooks._aginfer_record_throughput(self, *a, **k)
+
+    def _aginfer_record_throughput_inner(self, *a, **k):
+        return _metrics_hooks._aginfer_record_throughput_inner(self, *a, **k)
+
+    def _aginfer_update_prefill(self, *a, **k):
+        return _metrics_hooks._aginfer_update_prefill(self, *a, **k)
+
+    def _aginfer_update_decode(self, *a, **k):
+        return _metrics_hooks._aginfer_update_decode(self, *a, **k)
+
+    def _aginfer_record_spec_throughput(self, *a, **k):
+        return _metrics_hooks._aginfer_record_spec_throughput(self, *a, **k)
+
+    def _aginfer_record_spec_decode(self, *a, **k):
+        return _metrics_hooks._aginfer_record_spec_decode(self, *a, **k)
+
+    def _aginfer_push_runtime_metrics(self, *a, **k):
+        return _metrics_hooks._aginfer_push_runtime_metrics(self, *a, **k)
+
+    @staticmethod
+    def _aginfer_extend_token_count(*a, **k):
+        return _metrics_hooks._aginfer_extend_token_count(*a, **k)
+
+    def get_aginfer_state(self, recv_req: GetAginferStateReq) -> GetAginferStateReqOutput:
+        """Snapshot the radix cache for the aginfer daemon (paper §3 s_t).
+
+        Only UnifiedRadixCache supports this; for other cache implementations
+        the daemon receives an explicit "unsupported" marker.
+
+        Fast path: when the cache exposes ``dump_aginfer_state_bytes`` we
+        serialise to JSON bytes inside this process so the ZMQ pickle hop
+        carries a single ``bytes`` payload (much cheaper than pickling a
+        10k-element list-of-dicts) and the HTTP layer can stream the bytes
+        without re-encoding.
+        """
+        # T26 (#200): refresh the cache's measured throughput / in-flight
+        # snapshot before EITHER dump path serialises it.
+        self._aginfer_push_runtime_metrics()
+        dump_bytes = getattr(self.tree_cache, "dump_aginfer_state_bytes", None)
+        if dump_bytes is not None:
+            return GetAginferStateReqOutput(state_bytes=dump_bytes())
+        dump = getattr(self.tree_cache, "dump_aginfer_state", None)
+        if dump is None:
+            # Tree cache doesn't expose the aginfer state schema (e.g.,
+            # non-Unified tree).  DESIGN §5: "Daemon halts loudly on this
+            # — running aginfer against an incompatible cache is a
+            # deployment bug."  We return only the marker; the daemon
+            # is supposed to fatal() on receipt rather than continue
+            # with a synthesised empty snapshot.
+            return GetAginferStateReqOutput(
+                state={
+                    "unsupported_tree_cache": type(self.tree_cache).__name__,
+                }
+            )
+        return GetAginferStateReqOutput(state=dump())
+
+    def migrate_aginfer(self, recv_req: MigrateAginferReq) -> MigrateAginferReqOutput:
+        """Apply paper §4 (u, τ_target) migrations dispatched by the daemon.
+
+        T23: every skipped action ALSO fires an `APPLY_FAILED` webhook
+        back to the daemon's `/aginfer/event` (DESIGN §4 round-9 B4 /
+        §6 L506 fire-and-forget).  The synchronous response.skipped[]
+        is preserved for the cold-start / debug code paths that still
+        read it; the webhook is the authoritative source the daemon's
+        observability counter listens to.
+        """
+        apply = getattr(self.tree_cache, "apply_aginfer_migrations", None)
+        if apply is None:
+            skipped = [
+                {
+                    "hash": a.get("hash"),
+                    "reason": f"unsupported_tree_cache:{type(self.tree_cache).__name__}",
+                    "action_id": a.get("action_id"),
+                }
+                for a in (recv_req.actions or [])
+            ]
+            return MigrateAginferReqOutput(
+                applied=0,
+                applied_hashes=[],
+                skipped=skipped,
+            )
+        result = apply(recv_req.actions or [])
+        skipped_list = list(result.get("skipped", []))
+        return MigrateAginferReqOutput(
+            applied=int(result.get("applied", 0)),
+            applied_hashes=list(result.get("applied_hashes", [])),
+            skipped=skipped_list,
+        )
+
+    def update_aginfer_program_paused(
+        self, recv_req: UpdateAginferProgramPausedReq,
+    ) -> UpdateAginferProgramPausedReqOutput:
+        """T21 (#181): daemon → sglang PUT /aginfer/program_paused.
+
+        DESIGN §6 round-6 H2: daemon owns the program-state
+        transition (REASONING / ACTING / PAUSED / ENDED); sglang
+        stores it as a passthrough and echoes it back in the next
+        /aginfer/state dump's per_program_usage[pid] entry.
+        Idempotent re-apply returns applied=0 (DESIGN §10 R2).
+
+        Storage lives on the radix cache so the dump-path can read
+        it without a scheduler round-trip.  Tree caches without
+        the setter (legacy HiRadixCache) reject the PUT.
+        """
+        setter = getattr(
+            self.tree_cache, "set_aginfer_program_state", None,
+        )
+        if setter is None:
+            return UpdateAginferProgramPausedReqOutput(
+                ok=False,
+                reason=(
+                    f"tree cache {type(self.tree_cache).__name__} "
+                    f"does not support set_aginfer_program_state; "
+                    f"set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1"
+                ),
+                applied=0,
+            )
+        ok, reason, applied = setter(
+            pid=recv_req.pid,
+            state=recv_req.state,
+            pre_pause_state=recv_req.pre_pause_state,
+        )
+        return UpdateAginferProgramPausedReqOutput(
+            ok=ok, reason=reason, applied=applied,
+        )
+
+    def update_aginfer_hints(
+        self, recv_req: UpdateAginferHintsReq,
+    ) -> UpdateAginferHintsReqOutput:
+        """T40 (#184): daemon → sglang PUT /aginfer/hints handler.
+
+        DESIGN §6: the daemon re-scores D_t every event and pushes the
+        V_u inputs unconditionally; sglang's hint table dedupes by
+        overwrite-by-stamp.  Storage lives on the radix cache (the
+        inline scorer reads it at its allocation callsite without a
+        scheduler round-trip).  Tree caches without the setter reject
+        the PUT (same contract as program_paused)."""
+        setter = getattr(self.tree_cache, "set_aginfer_hints", None)
+        if setter is None:
+            return UpdateAginferHintsReqOutput(
+                ok=False,
+                reason=(
+                    f"tree cache {type(self.tree_cache).__name__} "
+                    f"does not support set_aginfer_hints; "
+                    f"set SGLANG_ENABLE_UNIFIED_RADIX_TREE=1"
+                ),
+                applied=0,
+            )
+        ok, reason, applied = setter(recv_req.hints)
+        return UpdateAginferHintsReqOutput(ok=ok, reason=reason, applied=applied)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args
@@ -4143,3 +4411,4 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+

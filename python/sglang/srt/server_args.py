@@ -435,6 +435,12 @@ class ServerArgs:
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
+    # aginfer T5: outbound webhook to the daemon's /aginfer/event endpoint.
+    # When set, sglang's scheduler fires a fire-and-forget POST on HBM
+    # aginfer in-engine driver pressure-gate thresholds (§251).
+    aginfer_heartbeat_s: float = 5.0
+    aginfer_theta_hi: float = 0.7
+    aginfer_theta_lo: float = 0.55
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
@@ -5048,6 +5054,25 @@ class ServerArgs:
             "This option is typically used for development and debugging purposes."
             + f"\n\n{human_readable_int.__doc__}",
         )
+        # aginfer T5: webhook to daemon's /aginfer/event.
+        parser.add_argument(
+            "--aginfer-heartbeat-s",
+            type=float,
+            default=ServerArgs.aginfer_heartbeat_s,
+            help="aginfer: minimum seconds between in-engine scheduler ticks (default 5.0).",
+        )
+        parser.add_argument(
+            "--aginfer-theta-hi",
+            type=float,
+            default=ServerArgs.aginfer_theta_hi,
+            help="aginfer: HBM occupancy threshold for triggering scheduling decisions (default 0.7).",
+        )
+        parser.add_argument(
+            "--aginfer-theta-lo",
+            type=float,
+            default=ServerArgs.aginfer_theta_lo,
+            help="aginfer: HBM occupancy threshold for pressure relief (default 0.55).",
+        )
         parser.add_argument(
             "--chunked-prefill-size",
             type=int,
@@ -8370,7 +8395,9 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         force=True,
     )
 
-    return ServerArgs.from_cli_args(raw_args)
+    server_args = ServerArgs.from_cli_args(raw_args)
+
+    return server_args
 
 
 ZMQ_TCP_PORT_DELTA = 233

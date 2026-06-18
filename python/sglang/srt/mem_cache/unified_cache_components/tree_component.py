@@ -97,6 +97,16 @@ def get_and_increase_time_counter() -> float64:
     return ret
 
 
+def peek_time_counter() -> float64:
+    """Read the current counter without incrementing.  Used by
+    ``dump_aginfer_state*`` to publish ``time_counter`` in the state
+    payload — the daemon computes unit age as ``time_counter -
+    last_access_time``, so emitter must use the same scale as the
+    counter that stamps each node's ``last_access_time``.
+    """
+    return _LAST_ACCESS_TIME_COUNTER_FLOAT
+
+
 def next_component_uuid() -> int:
     global _COMPONENT_UUID_COUNTER
     _COMPONENT_UUID_COUNTER += 1
@@ -409,6 +419,7 @@ class TreeComponent(ABC):
         *,
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
+        **kw,
     ) -> None:
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass

@@ -31,8 +31,17 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetAginferStateReq,
+    GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    MigrateAginferReq,
+    MigrateAginferReqOutput,
+    UpdateAginferProgramPausedReq,
+    UpdateAginferProgramPausedReqOutput,
+    UpdateAginferHintsReq,
+    UpdateAginferHintsReqOutput,
+    GetLoadsReqInput,
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -110,6 +119,10 @@ _COMMUNICATOR_SPECS = [
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
+    ("get_aginfer_state", GetAginferStateReqOutput),
+    ("migrate_aginfer", MigrateAginferReqOutput),
+    ("update_aginfer_program_paused", UpdateAginferProgramPausedReqOutput),
+    ("update_aginfer_hints", UpdateAginferHintsReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
@@ -793,6 +806,66 @@ class TokenizerControlMixin:
         )
         # Many DP ranks
         return [res.internal_state for res in responses]
+
+    async def get_aginfer_state(
+        self: TokenizerManager,
+    ) -> List[GetAginferStateReqOutput]:
+        """aginfer daemon snapshot.  Returns one ``GetAginferStateReqOutput``
+        per DP rank; callers choose between the pre-serialised bytes fast
+        path (``state_bytes``) and the dict form (``state``)."""
+        self.auto_create_handle_loop()
+        req = GetAginferStateReq()
+        responses: List[GetAginferStateReqOutput] = (
+            await self.get_aginfer_state_communicator(req)
+        )
+        return responses
+
+    async def migrate_aginfer(
+        self: TokenizerManager, obj: MigrateAginferReq
+    ) -> List[MigrateAginferReqOutput]:
+        """Apply a batch of paper §4 (u, τ_target) actions across all DP ranks.
+
+        Each rank reports its own ``applied`` count + ``skipped`` list — the
+        daemon owns the same hash space across replicas in our deployment, so
+        the same action is sent to every rank and either applied or skipped
+        with a reason consistent with that rank's local cache state.
+        """
+        self.auto_create_handle_loop()
+        responses: List[MigrateAginferReqOutput] = (
+            await self.migrate_aginfer_communicator(obj)
+        )
+        return responses
+
+    async def update_aginfer_program_paused(
+        self: TokenizerManager, obj: UpdateAginferProgramPausedReq,
+    ) -> List[UpdateAginferProgramPausedReqOutput]:
+        """T21 (#181): daemon → sglang PUT /aginfer/program_paused.
+
+        Per DESIGN §6 round-6 H2, the daemon owns the program-state
+        transition.  Fans out to every rank's scheduler (the cache
+        is per-rank).  Caller aggregates: success only if all ranks
+        ok; partial ok = race with another in-flight PUT."""
+        self.auto_create_handle_loop()
+        responses: List[UpdateAginferProgramPausedReqOutput] = (
+            await self.update_aginfer_program_paused_communicator(obj)
+        )
+        return responses
+
+    async def update_aginfer_hints(
+        self: TokenizerManager, obj: UpdateAginferHintsReq,
+    ) -> List[UpdateAginferHintsReqOutput]:
+        """T40 (#184): daemon → sglang PUT /aginfer/hints.
+
+        Fans the V_u-hint batch out to every rank's scheduler (the
+        hint table is per-rank).  Each rank applies overwrite-by-stamp
+        independently; the caller aggregates ``applied`` across ranks.
+        Per-rank atomicity is the §10 hint invariant; cross-rank
+        divergence is bounded + benign (probed in T15)."""
+        self.auto_create_handle_loop()
+        responses: List[UpdateAginferHintsReqOutput] = (
+            await self.update_aginfer_hints_communicator(obj)
+        )
+        return responses
 
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
