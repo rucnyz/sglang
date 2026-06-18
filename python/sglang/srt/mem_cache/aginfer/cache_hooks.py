@@ -248,12 +248,8 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
     # size aginfer encounters, but the check is amortised free
     # (one extra dict-membership test per node).
     #
-    # #182 closure (2026-06-01): the caller (scheduler.migrate_
-    # aginfer) reads ``result["hash_collisions"]`` and fires the
-    # HASH_COLLISION webhook per pair via aginfer_webhook.fire_
-    # hash_collision().  Detection here is dedupe-guarded by the
-    # instance-level ``_aginfer_collision_seen`` set so a
-    # persistent collision doesn't spam ~36k webhook fires/hour.
+    # Detection is dedupe-guarded by the instance-level
+    # ``_aginfer_collision_seen`` set.
     hash_to_node: dict[str, UnifiedTreeNode] = {}
     hash_collisions: list[dict] = []
     stack = [cache.root_node]

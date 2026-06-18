@@ -118,8 +118,6 @@ from sglang.srt.managers.io_struct import (
     UpdateAginferProgramPausedReqOutput,
     UpdateAginferHintsReq,
     UpdateAginferHintsReqOutput,
-    UpdateAginferThresholdsReq,
-    UpdateAginferThresholdsReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -494,30 +492,7 @@ class Scheduler(
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
-        # aginfer T5: outbound webhook to daemon's /aginfer/event.  No-op
-        # when --aginfer-notify-url is unset.
-        self.aginfer_webhook = None
-        if getattr(server_args, "aginfer_notify_url", None):
-            from sglang.srt.managers.aginfer_webhook import AginferWebhookFirer
-
-            self.aginfer_webhook = AginferWebhookFirer(
-                notify_url=server_args.aginfer_notify_url,
-                heartbeat_s=getattr(server_args, "aginfer_heartbeat_s", 5.0),
-                theta_hi=getattr(server_args, "aginfer_theta_hi", 0.7),
-                theta_lo=getattr(server_args, "aginfer_theta_lo", 0.55),
-                theta_crit=getattr(server_args, "aginfer_theta_crit", 0.9),
-            )
-            logger.info(
-                "aginfer webhook armed: url=%s heartbeat_s=%.1f theta_hi=%.2f theta_lo=%.2f theta_crit=%.2f",
-                server_args.aginfer_notify_url,
-                self.aginfer_webhook.heartbeat_s,
-                self.aginfer_webhook.theta_hi,
-                self.aginfer_webhook.theta_lo,
-                self.aginfer_webhook.theta_crit,
-            )
-
-        # aginfer #251 Stage B: the in-engine scheduler driver (replaces the out-of-process
-        # daemon). OFF by default — gated on SGLANG_AGINFER_IN_ENGINE=1 — so a normal launch
+        # aginfer #251 Stage B: the in-engine scheduler driver. OFF by default — gated on SGLANG_AGINFER_IN_ENGINE=1 — so a normal launch
         # is byte-for-byte unchanged (do-no-harm). When on, _aginfer_maybe_tick() drives it
         # from the per-iteration loop hook. The decide/apply path lights up once
         # build_paper_state relocates in-engine (next increment); today the tick fires the
@@ -1452,7 +1427,6 @@ class Scheduler(
                 (GetInternalStateReq, self.get_internal_state),
                 (GetAginferStateReq, self.get_aginfer_state),
                 (MigrateAginferReq, self.migrate_aginfer),
-                (UpdateAginferThresholdsReq, self.update_aginfer_thresholds),
                 (UpdateAginferProgramPausedReq, self.update_aginfer_program_paused),
                 (UpdateAginferHintsReq, self.update_aginfer_hints),
                 (SetInternalStateReq, self.set_internal_state),
@@ -1559,7 +1533,6 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
 
-            self._aginfer_maybe_fire_webhook()  # aginfer T5 (deduped, #251 review)
             self._aginfer_maybe_tick()  # aginfer #251 Stage B: in-engine driver (default off)
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -1621,7 +1594,6 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
 
-            self._aginfer_maybe_fire_webhook()  # aginfer T5 (deduped, #251 review)
             self._aginfer_maybe_tick()  # aginfer #251 Stage B: in-engine driver (default off)
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -3693,24 +3665,6 @@ class Scheduler(
 
         return GetInternalStateReqOutput(internal_state=ret)
 
-    def _aginfer_maybe_fire_webhook(self) -> None:
-        """aginfer T5: fire the daemon webhook on watermark transition / heartbeat.
-        Uses the SAME occupancy view the daemon reads
-        (/aginfer/state.pool_usage.HBM.token_usage) so sglang and daemon never
-        disagree about pressure — the old `pool.size_full - pool.available_size()`
-        formula inflated "used" under SWA (available_size() = min(full,swa)).
-        No-op when no daemon is wired. (Deduped from both event loops, #251 review.)"""
-        if self.aginfer_webhook is None:
-            return
-        try:
-            occ = 0.0
-            pu = getattr(self.tree_cache, "_aginfer_pool_usage", None)
-            if pu is not None:
-                occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
-            self.aginfer_webhook.maybe_fire(occ=occ)
-        except Exception:
-            logger.exception("aginfer webhook check raised")
-
     def _apply_forced_tokens(self, batch: ScheduleBatch, next_token_ids) -> None:
         """Override sampled tokens with teacher-forced values on the GPU.
 
@@ -3846,7 +3800,6 @@ class Scheduler(
                 }
                 for a in (recv_req.actions or [])
             ]
-            self._fire_apply_failed_for_skipped(skipped)
             return MigrateAginferReqOutput(
                 applied=0,
                 applied_hashes=[],
@@ -3854,81 +3807,11 @@ class Scheduler(
             )
         result = apply(recv_req.actions or [])
         skipped_list = list(result.get("skipped", []))
-        self._fire_apply_failed_for_skipped(skipped_list)
-        # T24 (#182): fire one HASH_COLLISION webhook per pair the
-        # cache's DFS surfaced.  Detection is dedupe-guarded inside
-        # the cache (_aginfer_collision_seen set), so a persistent
-        # collision fires the daemon's fatal exactly once.
-        self._fire_hash_collisions(result.get("hash_collisions") or [])
         return MigrateAginferReqOutput(
             applied=int(result.get("applied", 0)),
             applied_hashes=list(result.get("applied_hashes", [])),
             skipped=skipped_list,
         )
-
-    def _fire_apply_failed_for_skipped(self, skipped_list) -> None:
-        """T23: one APPLY_FAILED webhook per skipped/failed action."""
-        if self.aginfer_webhook is None:
-            return
-        for entry in skipped_list:
-            reason = entry.get("reason")
-            if not isinstance(reason, str) or not reason:
-                continue
-            self.aginfer_webhook.fire_apply_failed(
-                endpoint="migrate",
-                action_id=str(entry.get("action_id") or ""),
-                reason=reason,
-                hash_=entry.get("hash"),
-            )
-
-    def _fire_hash_collisions(self, collisions) -> None:
-        """T24 (#182): one HASH_COLLISION webhook per (node_a,
-        node_b) pair the cache's DFS surfaced.  Cache's
-        ``_aginfer_collision_seen`` set dedupes pair-by-pair, so
-        a persistent collision triggers exactly one daemon fatal.
-        """
-        if self.aginfer_webhook is None:
-            return
-        for entry in collisions:
-            key = entry.get("key")
-            if not isinstance(key, str) or not key:
-                continue
-            self.aginfer_webhook.fire_hash_collision(
-                key=key,
-                node_a_summary=entry.get("node_a_summary") or {},
-                node_b_summary=entry.get("node_b_summary") or {},
-            )
-
-    def update_aginfer_thresholds(
-        self, recv_req: UpdateAginferThresholdsReq,
-    ) -> UpdateAginferThresholdsReqOutput:
-        """T22 (#155): daemon → sglang PUT /aginfer/thresholds handler.
-
-        DESIGN §6 round-6 H3 / §10 'Threshold parity': daemon is the
-        canonical source, sglang applies atomically.  Validation
-        lives in ``apply_thresholds_payload``; on success the
-        scheduler's AginferWebhookFirer instance has the new values
-        by next ``maybe_fire``.
-        """
-        if self.aginfer_webhook is None:
-            return UpdateAginferThresholdsReqOutput(
-                ok=False,
-                reason=(
-                    "sglang launched without --aginfer-notify-url; "
-                    "no webhook firer to update"
-                ),
-            )
-        from sglang.srt.managers.aginfer_webhook import (
-            apply_thresholds_payload,
-        )
-        body = {
-            "theta_hi":    recv_req.theta_hi,
-            "theta_lo":    recv_req.theta_lo,
-            "theta_crit":  recv_req.theta_crit,
-            "heartbeat_s": recv_req.heartbeat_s,
-        }
-        ok, reason = apply_thresholds_payload(self.aginfer_webhook, body)
-        return UpdateAginferThresholdsReqOutput(ok=ok, reason=reason)
 
     def update_aginfer_program_paused(
         self, recv_req: UpdateAginferProgramPausedReq,
@@ -4528,12 +4411,4 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
-            # aginfer T5: tear down the webhook firer's background asyncio
-            # loop + httpx client.  Without this, the daemon thread + open
-            # connections leak across scheduler restarts (audit-round-1
-            # BLOCKER 2).
-            if getattr(scheduler, "aginfer_webhook", None) is not None:
-                try:
-                    scheduler.aginfer_webhook.close()
-                except Exception:
-                    logger.exception("aginfer_webhook.close() failed")
+
