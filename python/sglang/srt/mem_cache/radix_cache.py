@@ -21,8 +21,10 @@ limitations under the License.
 The radix tree data structure for managing the KV cache.
 """
 
+import collections
 import heapq
 import logging
+import os
 import sys
 import time
 from array import array
@@ -217,6 +219,13 @@ class RadixKey:
 class TreeNode:
 
     counter = 0
+    # LPB eviction policy config (paper §sec:design-l1 eq:lpb-lru,
+    # design.md §"Shared cost model" `c^evict_i`). Mirrors the
+    # mamba-side knobs in `mamba_radix_cache.TreeNode`.
+    lpb_window_s = float(os.environ.get("SGLANG_LPB_WINDOW_S", "60.0"))
+    lpb_hit_deque_maxlen = int(
+        os.environ.get("SGLANG_LPB_HIT_DEQUE_MAXLEN", "4096")
+    )
 
     def __init__(self, id: Optional[int] = None, priority: int = 0):
         self.children = defaultdict(TreeNode)
@@ -239,8 +248,71 @@ class TreeNode:
         # priority for priority-aware eviction
         self.priority = priority
 
+        # LPB eviction signal — windowed hit timestamps. Only
+        # populated when `eviction_policy == "lpb"`; otherwise
+        # unused. `record_hit` appends; `hits_in_window` lazy-prunes.
+        self._hit_times: collections.deque = collections.deque(
+            maxlen=TreeNode.lpb_hit_deque_maxlen
+        )
+
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
+
+    # ---- LPB eviction signal (paper §sec:design-l1 eq:lpb-lru) ----
+
+    def record_hit(self) -> None:
+        """Append a hit timestamp + bump cumulative `hit_count`.
+        Called from `RadixCache._match_prefix_helper` on every node
+        visited during a successful prefix match (when policy=lpb)."""
+        self._hit_times.append(time.monotonic())
+        self.hit_count += 1
+
+    def hits_in_window(self) -> int:
+        """Sliding-window hit count over `TreeNode.lpb_window_s`
+        seconds. Lazy-prunes old entries on read."""
+        if not self._hit_times:
+            return 0
+        cutoff = time.monotonic() - TreeNode.lpb_window_s
+        while self._hit_times and self._hit_times[0] < cutoff:
+            self._hit_times.popleft()
+        return len(self._hit_times)
+
+    def lpb_priority(self) -> float:
+        """LPB loss-per-byte: `ℓ(b) = n_b · c_kv(s_b) / B_b`.
+        Higher loss = worse to evict; eviction picks the LOWEST.
+        Matches design.md §"Shared cost model" `c^evict_i` formula
+        and the mamba-side counterpart in `mamba_radix_cache`.
+
+        Factor decomposition (KV-only — this is the plain RadixCache):
+          - `n_b` = `self.hits_in_window()` — sliding-window hit count.
+          - `c_kv(s_b)` = recompute cost to re-prefill this block
+            (`CostCurves.c_kv_ms(len(self.key))` — block-local token
+            count). Quadratic in `s_b` per the paper.
+          - `B_b` = `value.numel()` — bytes the eviction would free.
+            For ratio ordering across nodes the int64-per-page
+            constant cancels, so we leave numel as-is.
+
+        Returns `+inf` for hit-but-zero-byte (guards div/0) and `0`
+        for never-hit zero-byte (degenerate; safe to evict first).
+
+        No memoization: a prior implementation cached the priority
+        on the node, but the cache went stale silently when
+        `hits_in_window` pruned an expired entry without a
+        `record_hit` in between (cache invalidation only fired on
+        record_hit). Recompute on every call — cost is one cost-curve
+        lookup + a divide, dominated by the deque walk in
+        `hits_in_window` even in the cached case.
+        """
+        size_bytes = 0
+        if self.value is not None:
+            size_bytes = int(self.value.numel())
+        n_hits = self.hits_in_window()
+        if size_bytes == 0:
+            return float("inf") if n_hits > 0 else 0.0
+        from sglang.srt.budgeter.cost_model import get_cost_curves
+        s_b = len(self.key) if self.key is not None else 0
+        c_kv_ms = get_cost_curves().c_kv_ms(s_b)
+        return n_hits * c_kv_ms / size_bytes
 
     @property
     def evicted(self):
@@ -279,6 +351,16 @@ class TreeNode:
 
 class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
+        # Recovery-length EWMAs (paper sec:design-formalism-offline): written by
+        # record_recovery_len_{kv,rec,retract} on eviction/retraction; the planner
+        # c_sigma(L) and pressure adapter read them via the Budgeter snapshot.
+        self._slow_recovery_len_kv_ewma = 0.0
+        self._slow_recovery_len_rec_ewma = 0.0
+        self._slow_recovery_len_retract_ewma = 0.0
+        # Cumulative KV tokens reclaimed by admission-pressure eviction
+        # (check_decode_mem); read via the Budgeter snapshot as the
+        # deferred re-prefill cost the admission gate consults.
+        self._admission_cumulative_evicted_tokens = 0
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
@@ -568,18 +650,139 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def total_size(self):
         return self._total_size_helper()
 
+    def _iter_evict_victims(self, num_tokens: int):
+        """Single source of truth for eviction victim selection
+        (design.md §"Why exact c^evict"). Pure-read generator yielding
+        the exact `TreeNode`s — in order — that would be popped to free
+        `num_tokens` tokens under the active `eviction_strategy`.
+
+        BOTH `evict()` (which then frees them) and
+        `predict_evict_cost_us` (which sums their recompute cost)
+        consume this generator, so the predicted set is byte-identical
+        to the evicted set *by construction* — they cannot drift.
+
+        Does NOT mutate tree / pool state. Parent-promotion is
+        simulated via a per-parent child countdown (`effective_children`)
+        that mirrors `_delete_leaf` emptying `parent.children`: after
+        the last evictable child of an unlocked internal node is
+        yielded, the parent is pushed into the heap exactly as the real
+        eviction would promote it.
+
+        IMPORTANT: callers that mutate (evict()) must materialise the
+        full sequence FIRST (`list(...)`) before freeing — the
+        generator reads live `len(parent.children)` to seed the
+        countdown, so interleaving it with `_delete_leaf` would seed
+        from already-mutated counts.
+
+        Skip contract (intentional, safer than the pre-refactor inline
+        loop): a popped node with `value is None` (already evicted) or
+        a zero-length `value` is skipped — it frees no tokens and is
+        left in the tree. The old inline `evict()` loop would have
+        crashed on `value is None` (`len(None)`) and pruned a
+        zero-length node; neither arises for a healthy evictable leaf.
+        """
+        if num_tokens <= 0:
+            return
+        leaves = list(self.evictable_leaves)
+        if not leaves:
+            return
+        eviction_heap = [
+            (self.eviction_strategy.get_priority(node), node)
+            for node in leaves
+        ]
+        heapq.heapify(eviction_heap)
+        effective_children: dict[int, int] = {}
+        num_evicted = 0
+        while eviction_heap and num_evicted < num_tokens:
+            _priority, x = heapq.heappop(eviction_heap)
+            if x.value is None:
+                continue
+            L_evicted = len(x.value)
+            if L_evicted == 0:
+                continue
+            yield x
+            num_evicted += L_evicted
+
+            parent = x.parent
+            if parent is None or parent is self.root_node:
+                continue
+            if parent.lock_ref != 0:
+                continue
+            key = id(parent)
+            if key not in effective_children:
+                effective_children[key] = len(parent.children)
+            effective_children[key] -= 1
+            if effective_children[key] == 0:
+                heapq.heappush(
+                    eviction_heap,
+                    (self.eviction_strategy.get_priority(parent), parent),
+                )
+
+    def predict_evict_cost_us(self, num_tokens: int, pool: str = "kv") -> float:
+        """Exact c^evict_i(X) predictor (design.md §"Shared cost model"
+        "Why exact c^evict"). Sums `Σ n_b · c_kv(s_b)` over the
+        exact set of blocks `evict()` would pick to free `num_tokens`
+        tokens — obtained from the shared `_iter_evict_victims`
+        generator, so the priced set IS the evicted set. Returns µs.
+
+        n_b semantics (design.md §"LPB and the Admitter"):
+          - LPB: `node.hits_in_window()` (path-counted by LPB anyway).
+          - non-LPB: `n_b ≡ 1` (sglang doesn't path-count under LRU /
+            LFU / FIFO / etc., so the predictor falls back to a
+            uniform per-block hit count).
+
+        Returns `+inf` when the cache cannot satisfy `num_tokens`
+        (evictable supply too small) so the Admitter treats own-evict
+        as infeasible — fail-closed.
+
+        Caller is expected to hold the allocator's `_alloc_lock`
+        across prediction → cap-barrier → execute (the Admitter wraps
+        `Admitter.decide_for_req`). This method does NOT acquire the
+        lock itself; called without the lock, the walk can race a
+        concurrent `evict()` and produce stale costs.
+        """
+        if pool != "kv":
+            # Plain RadixCache is a KV-only tree — it has no mamba
+            # side. `CostModel.c_evict_us("mamba", ...)` should never
+            # route here (it only does on hybrid models whose tree is
+            # a MambaRadixCache). Crash loudly on misrouting.
+            raise ValueError(
+                f"RadixCache.predict_evict_cost_us: unsupported pool "
+                f"{pool!r} (KV-only cache supports pool='kv' only)"
+            )
+        if num_tokens <= 0:
+            return 0.0
+        if self.disable:
+            return float("inf")
+
+        from sglang.srt.budgeter.cost_model import get_cost_curves
+        curves = get_cost_curves()
+        lpb_active = isinstance(self.eviction_strategy, LPBStrategy)
+
+        num_evicted = 0
+        total_cost_ms = 0.0
+        for x in self._iter_evict_victims(num_tokens):
+            s_b = len(x.key) if x.key is not None else 0
+            n_b = x.hits_in_window() if lpb_active else 1
+            total_cost_ms += n_b * curves.c_kv_ms(s_b)
+            num_evicted += len(x.value)
+
+        if num_evicted < num_tokens:
+            return float("inf")
+        return total_cost_ms * 1000.0
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
 
         start_time = time.perf_counter()
-        num_tokens = params.num_tokens
-        leaves = list(self.evictable_leaves)
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
-        heapq.heapify(eviction_heap)
+        from sglang.srt.mem_cache.common import record_recovery_len_kv
 
+        # Materialise the full victim list BEFORE freeing — the shared
+        # generator reads live `len(parent.children)` to simulate
+        # promotion; interleaving with `_delete_leaf` below would feed
+        # it mutated counts (see `_iter_evict_victims` docstring).
+        victims = list(self._iter_evict_victims(params.num_tokens))
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
@@ -587,12 +790,9 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
+            # HiMA: feed the slow-timescale KV recovery-length EWMA (\bar L_kv).
+            record_recovery_len_kv(self, len(x.value))
             self._delete_leaf(x)
-
-            if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
-
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
@@ -657,6 +857,10 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
         node.last_access_time = access_time
+        # LPB needs per-node hit counting (paper §sec:design-l1
+        # eq:lpb-lru `n_b`); skip the deque append in other modes
+        # to keep LRU/LFU/SLRU paths zero-overhead.
+        lpb_active = isinstance(self.eviction_strategy, LPBStrategy)
 
         child_key = key.child_key(self.page_size)
 
@@ -664,6 +868,8 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
+            if lpb_active:
+                child.record_hit()
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -685,6 +891,16 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
         new_node.hit_count = child.hit_count
+        # LPB sliding-window hit signal lives on the shared-prefix
+        # segment, which `new_node` now represents — every match that
+        # credited `child` passed through this prefix. Move the deque
+        # to `new_node`; the divergent tail (`child`) starts fresh
+        # since it is now distinct, narrower content (paper
+        # §sec:design-l1 eq:lpb-lru `n_b` is per-block).
+        new_node._hit_times = child._hit_times
+        child._hit_times = collections.deque(
+            maxlen=TreeNode.lpb_hit_deque_maxlen
+        )
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref

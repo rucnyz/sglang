@@ -917,6 +917,128 @@ class ModelRunner:
         self.prefill_cuda_graph_runner = capture.prefill_runner
         self.decode_cuda_graph_runner = capture.decode.runner
         self.graph_mem_usage = capture.decode.graph_mem_usage
+        self.maybe_warmup_arena_tlb()
+
+    def maybe_warmup_arena_tlb(self) -> None:
+        # Arena KV-pool TLB warmup:
+        #   Walk every page of the cuMemMap'd KV/mamba arena via a
+        #   streaming-read kernel to populate per-SM L1 TLBs before the
+        #   first real request arrives. Without this, the first batches
+        #   pay GPU page-table-walk cost (4096 PTEs vs ~1-2 GiB per-SM TLB
+        #   coverage) that shows up as a +4% mean-TTFT cold-TLB transient
+        #   (see dev/eval/RESULTS.md "Arena structural cost"). Boot-time
+        #   `tensor.zero_()` in MultiTensorArena.__init__ helps but evicts
+        #   before serving (~30 s gap, intervening cuda-graph capture +
+        #   autotune touches other pages); doing the walk HERE — as the
+        #   last step before serving — keeps TLB warm at first-request
+        #   time. Default off; gate via SGLANG_ARENA_WARMUP=1.
+        if (
+            self.device == "cuda"
+            and os.environ.get("SGLANG_ARENA_WARMUP", "0") == "1"
+        ):
+            self._arena_tlb_warmup()
+
+    def _arena_tlb_warmup(self) -> None:
+        """Two-stage GPU TLB warmup for arena-backed KV/mamba pools.
+
+        Stage 1 (broad): streaming read over every arena tensor to walk
+        every 2 MiB cuMemMap'd page once. Uses fill-kernel SM grid;
+        guarantees coverage of the full mapped range.
+
+        Stage 2 (attention-shape): dispatch real model forward passes
+        via `_dummy_run` so the attention kernel runs on its actual SM
+        grid against arena-resident KV. The cuMemMap'd KV pages that
+        attention specifically reads/writes get their per-SM L1 TLB
+        entries populated by the same kernel that will use them at
+        serving time. Without this, the bench-side first batches still
+        pay cold-TLB cost (attention's SM distribution differs from the
+        fill kernel used in stage 1).
+        """
+        pool = getattr(self, "token_to_kv_pool", None)
+        if pool is None:
+            return
+        # Hybrid models route through HybridLinearKVPool (.full_kv_pool) +
+        # MambaPool (.mamba_pool); single-pool models put _kv_arena directly
+        # on the pool.
+        arenas = []
+        if hasattr(pool, "_kv_arena") and pool._kv_arena is not None:
+            arenas.append(("kv", pool._kv_arena))
+        full = getattr(pool, "full_kv_pool", None)
+        if full is not None and getattr(full, "_kv_arena", None) is not None:
+            arenas.append(("kv-full", full._kv_arena))
+        mamba = getattr(pool, "mamba_pool", None)
+        if mamba is not None and getattr(
+            mamba, "_mamba_temporal_arena", None
+        ) is not None:
+            arenas.append(("mamba", mamba._mamba_temporal_arena))
+        if not arenas:
+            return
+
+        import time as _time
+        t0 = _time.time()
+
+        # Stage 1: broad fill-kernel walk of every page.
+        n_tensors = 0
+        for name, arena in arenas:
+            # CRITICAL: arena tensor.shape[0] == max_tokens, but only
+            # `static_min_chunks_per_pool * tokens_per_chunk` worth of
+            # pages are physically cuMemMap'd at boot. Reading past
+            # static_min raises cudaErrorIllegalAddress.
+            live_tokens = (
+                arena.static_min_chunks_per_pool * arena.tokens_per_chunk
+            )
+            if live_tokens <= 0:
+                continue
+            for t in arena._tensors:
+                t[:live_tokens].sum()
+                n_tensors += 1
+        torch.cuda.synchronize()
+        t_stage1 = (_time.time() - t0) * 1000
+
+        # Stage 2: attention-shape forward passes via _dummy_run. This
+        # uses the real model.forward() path and dispatches the actual
+        # attention kernel on its real SM grid. Each call touches a
+        # distinct stripe of the KV pool because cuda-graph buffer
+        # `out_cache_loc` is filled with shifting positions across calls.
+        n_dummy = 0
+        if hasattr(self, "_dummy_run"):
+            t1 = _time.time()
+            try:
+                # Cycle the bench's expected concurrency so attention
+                # touches a representative slice of cache positions. Most
+                # of the warm-state cost comes from the FIRST few real
+                # batches paying cold-TLB; replicating that grid pattern
+                # 4-8 times is enough to populate the per-SM TLBs the
+                # attention kernel actually uses.
+                bsz_candidates = [
+                    self.max_running_requests,
+                    max(1, self.max_running_requests // 2),
+                    max(1, self.max_running_requests // 4),
+                    8,  # match bench harness's default RPS bucket
+                ]
+                # De-duplicate while preserving order
+                seen = set()
+                bsz_list = []
+                for b in bsz_candidates:
+                    if b not in seen and b >= 1:
+                        bsz_list.append(b); seen.add(b)
+                for bsz in bsz_list:
+                    self._dummy_run(batch_size=bsz)
+                    n_dummy += 1
+                torch.cuda.synchronize()
+            except Exception as e:  # pragma: no cover - never block boot
+                logger.warning("Arena TLB warmup stage 2 (_dummy_run) "
+                               "failed: %r — stage 1 still applied", e)
+            t_stage2 = (_time.time() - t1) * 1000
+        else:
+            t_stage2 = 0.0
+
+        logger.info(
+            "Arena TLB warmup: stage1 fill-walk %d tensors / %d arena(s) "
+            "in %.1f ms; stage2 attention dummy_run %d batches in %.1f ms",
+            n_tensors, len(arenas), t_stage1, n_dummy, t_stage2,
+        )
+
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:

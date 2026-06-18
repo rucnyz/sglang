@@ -261,14 +261,19 @@ class SchedulerPoolStatsObserver:
             if (is_mamba_radix_cache and not has_int8_ckpt)
             else 0
         )
-        full_num_used = self.token_to_kv_pool_allocator.size - (
-            full_available_size + full_evictable_size
-        )
-        mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
-            mamba_available_size + mamba_evictable_size
-        )
-        full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
-        mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
+        # Use the LIVE capacity, not the raw page-id ceiling. The cross-pool
+        # cap-barrier (mark_pages_capped) moves free pages out of circulation
+        # to lower `live_size` without lowering `.size`, so dividing usage by
+        # `.size` would report a phantom usage floor (e.g. 0.5 at boot idle)
+        # and distort PrefillDelayer / Prometheus / the Budgeter occupancy
+        # signal. Mirror `live_size` on both the KV and mamba sides, matching
+        # `SchedulerInvariantChecker._check_full_pool` / `_check_mamba_pool`.
+        full_live = self.token_to_kv_pool_allocator.live_size
+        full_num_used = full_live - (full_available_size + full_evictable_size)
+        mamba_live = self.req_to_token_pool.mamba_allocator.live_size
+        mamba_num_used = mamba_live - (mamba_available_size + mamba_evictable_size)
+        full_token_usage = full_num_used / full_live if full_live else 0.0
+        mamba_usage = mamba_num_used / mamba_live if mamba_live else 0.0
 
         return PoolStats(
             is_hybrid_ssm=True,

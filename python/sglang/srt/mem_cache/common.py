@@ -102,6 +102,54 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
+# Slow-timescale recovery-length signal (paper §sec:design-formalism-offline,
+# the \bar L_i input to (P)'s slow-timescale water-filling). EWMA written
+# event-by-event from the actual evict / retract sites; consumed at
+# budgeter-tick granularity by the cross-pool planner. KV side is fed by
+# leaf evictions; rec side by mamba snapshot evictions; retract side by
+# req kicks. Cold-start (no events yet): EWMA stays at 0; snapshot falls
+# back to SGLANG_XPOOL_DEFAULT_L.
+_RECOVERY_LEN_EWMA_ALPHA = 0.05  # ~14-event half-life
+
+
+def record_recovery_len_kv(tree_cache, L: int) -> None:
+    if tree_cache is None or L <= 0:
+        return
+    prev = tree_cache._slow_recovery_len_kv_ewma
+    tree_cache._slow_recovery_len_kv_ewma = (
+        float(L)
+        if prev <= 0
+        else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev
+    )
+
+
+def record_recovery_len_rec(tree_cache, L: int) -> None:
+    """Recurrent-pool recovery length: chunked-scan distance to rebuild
+    a mamba snapshot when it gets evicted from the prefix tree."""
+    if tree_cache is None or L <= 0:
+        return
+    prev = tree_cache._slow_recovery_len_rec_ewma
+    tree_cache._slow_recovery_len_rec_ewma = (
+        float(L)
+        if prev <= 0
+        else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev
+    )
+
+
+def record_recovery_len_retract(tree_cache, L: int) -> None:
+    """Retract pressure signal: full seq_len of a req kicked out of the
+    decode batch under KV pressure. Conceptually distinct from c_i(\bar L_i):
+    feeds the SGLang adapter's `retract_us` admission-pressure term."""
+    if tree_cache is None or L <= 0:
+        return
+    prev = tree_cache._slow_recovery_len_retract_ewma
+    tree_cache._slow_recovery_len_retract_ewma = (
+        float(L)
+        if prev <= 0
+        else _RECOVERY_LEN_EWMA_ALPHA * L + (1 - _RECOVERY_LEN_EWMA_ALPHA) * prev
+    )
+
+
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return

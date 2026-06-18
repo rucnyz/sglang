@@ -19,7 +19,10 @@ limitations under the License.
 The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
+import collections
+import heapq
 import os
+import time
 from array import array
 from collections import defaultdict
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -73,6 +76,31 @@ class TreeNode:
 
     counter = 0
     last_access_time_counter_float = float64(1.0)
+    # Paper §sec:design-l1 (eq:lpb-lru): sliding-window in seconds for
+    # hits-per-byte eviction signal. Configurable via SGLANG_LPB_WINDOW_S;
+    # default 60s matches the paper's narrative.
+    lpb_window_s = float(os.environ.get("SGLANG_LPB_WINDOW_S", "60.0"))
+    # Cap on per-node _hit_times deque to keep memory bounded under
+    # long-running deployments with very hot nodes. With maxlen, the
+    # deque becomes circular and silently drops the oldest entries on
+    # append past the cap; hits_in_window() saturates at the cap value.
+    # That's fine for LPB ordering: super-hot blocks still all score
+    # above warm blocks, and ties break on last_access_time. Override
+    # with SGLANG_LPB_HIT_DEQUE_MAXLEN; default 4096 is generous for
+    # 60s windows at typical agent QPS.
+    lpb_hit_deque_maxlen = int(
+        os.environ.get("SGLANG_LPB_HIT_DEQUE_MAXLEN", "4096")
+    )
+    # Per-mamba-slot byte cost (B_b) used in eviction_priority()'s
+    # denominator. MambaRadixCache.__init__ unconditionally overwrites
+    # this with the actual pool byte/slot ratio
+    # (`mamba_pool.mamba_cache.mem_usage_bytes() // (max_size + 1)`,
+    # dividing by the physical allocated slot count per design.md
+    # "Allocator padding") so LPB's KV-vs-mamba weighting reflects
+    # reality, and fails loudly if the pool can't supply it. This 1024
+    # class default applies only to test fixtures that build the cache
+    # via `__new__` and bypass `__init__`.
+    lpb_bytes_per_mamba_slot = 1024
 
     def __init__(self, id: Optional[int] = None):
         self.children = defaultdict(TreeNode)
@@ -95,7 +123,15 @@ class TreeNode:
         self.last_access_time = get_last_access_time()
         self.mamba_last_access_time = self.last_access_time
 
+        # Paper §sec:design-l1 (eq:lpb-lru): hits-per-byte eviction.
+        # `hit_count` is the cumulative count (defined by upstream but
+        # never incremented). `_hit_times` is the windowed deque of
+        # timestamps used for the actual signal — `hits_in_window()`
+        # lazily prunes old entries.
         self.hit_count = 0
+        self._hit_times: collections.deque = collections.deque(
+            maxlen=TreeNode.lpb_hit_deque_maxlen
+        )
         self.host_ref_counter = 0
         self.host_mamba_ref_counter = 0
         # store the host indices of KV cache
@@ -167,6 +203,93 @@ class TreeNode:
 
     def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
+
+    # ---- LPB eviction signal (paper §sec:design-l1, eq:lpb-lru) ------
+
+    def record_hit(self) -> None:
+        """Append a hit timestamp to the windowed deque.
+
+        Called from `_match_prefix_helper` for every node visited during
+        a successful prefix match. The deque is pruned lazily in
+        `hits_in_window()`; we intentionally don't prune on insertion
+        since the window cutoff floats with wall time.
+        """
+        self._hit_times.append(time.monotonic())
+        self.hit_count += 1
+
+    def hits_in_window(self) -> int:
+        """Number of recorded hits within `TreeNode.lpb_window_s`."""
+        if not self._hit_times:
+            return 0
+        cutoff = time.monotonic() - TreeNode.lpb_window_s
+        # Lazy left-prune.
+        while self._hit_times and self._hit_times[0] < cutoff:
+            self._hit_times.popleft()
+        return len(self._hit_times)
+
+    def eviction_priority(self) -> float:
+        """LPB loss-per-byte: `ℓ(b) = n_b · c_i(s_b) / B_b`.
+
+        Higher loss = worse to evict; eviction picks the LOWEST.
+        Matches design.md §"Shared cost model" `c^evict_i` formula and
+        paper §sec:design-l1 eq:lpb-lru.
+
+        Factor decomposition:
+          - `n_b` = `self.hits_in_window()` — sliding-window hit
+            count (see `record_hit` / `hits_in_window`).
+          - `c_i(s_b)` = recompute cost to regenerate this block.
+            `s_b = len(self.key)` (block-local token count). For a
+            hybrid (KV + mamba) node, `c_i` is the SUM of `c_kv_ms(s_b)`
+            and `c_m_ms(s_b)` — both costs would be paid on miss. For
+            a KV-only or mamba-only node, only the matching curve
+            contributes. Curves come from `get_cost_curves()` (boot-
+            probed / built-in default).
+          - `B_b` = bytes the eviction would actually free:
+              * KV bytes (≈ `value.numel()`; the int64-per-page
+                constant cancels for ratio ordering).
+              * mamba snapshot bytes (`mamba_value.numel() ×
+                lpb_bytes_per_mamba_slot`; the latter is the real
+                per-slot byte cost from the mamba pool — its
+                `mem_usage_bytes()` divided by the physical allocated
+                slot count `max_size+1` (design.md "Padded slot 0"),
+                set unconditionally in `MambaRadixCache.__init__`. The
+                1024 class default applies only to `__new__` test
+                fixtures that bypass `__init__`).
+
+        Returns `+inf` for nodes that hit but free zero bytes
+        (shouldn't happen but guards against div-by-zero) and `0` for
+        never-hit zero-byte nodes (degenerate; safe to evict first).
+
+        No memoization: a prior implementation cached the priority,
+        but the cache went stale silently when `hits_in_window`
+        pruned an expired entry without a `record_hit` in between
+        (cache invalidation only fired on record_hit). Recompute on
+        every call.
+        """
+        n_hits = self.hits_in_window()
+        size_bytes = 0
+        if self.value is not None:
+            size_bytes += int(self.value.numel())
+        if self.mamba_value is not None:
+            size_bytes += (
+                int(self.mamba_value.numel())
+                * TreeNode.lpb_bytes_per_mamba_slot
+            )
+        if size_bytes == 0:
+            return float("inf") if n_hits > 0 else 0.0
+
+        # `c_i(s_b)` — recompute cost. Block-local token count is
+        # the sgl `RadixKey` length.
+        from sglang.srt.budgeter.cost_model import get_cost_curves
+        curves = get_cost_curves()
+        s_b = len(self.key) if self.key is not None else 0
+        c_i_ms = 0.0
+        if self.value is not None:
+            c_i_ms += curves.c_kv_ms(s_b)
+        if self.mamba_value is not None:
+            c_i_ms += curves.c_m_ms(s_b)
+
+        return n_hits * c_i_ms / size_bytes
 
 
 def get_last_access_time() -> float64:
@@ -439,6 +562,24 @@ class LRUList:
 
 class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
+        # Recovery-length EWMAs (paper sec:design-formalism-offline): written by
+        # record_recovery_len_{kv,rec,retract} on eviction/retraction; the planner
+        # c_sigma(L) and pressure adapter read them via the Budgeter snapshot.
+        self._slow_recovery_len_kv_ewma = 0.0
+        self._slow_recovery_len_rec_ewma = 0.0
+        self._slow_recovery_len_retract_ewma = 0.0
+        # Cumulative KV tokens reclaimed by admission-pressure eviction
+        # (check_decode_mem); read via the Budgeter snapshot as the
+        # deferred re-prefill cost the admission gate consults.
+        self._admission_cumulative_evicted_tokens = 0
+        # Cumulative cache-eviction counters: the Budgeter's grow-side
+        # eviction-rate signals (symmetric to the reuse-aware drain cost).
+        # A pool actively shedding (hot) entries should be GROWN. KV's
+        # admission-path tally misses cache eviction on a cache-bound
+        # workload, so these count the actual radix-cache evictions;
+        # BudgetAgent deltas them per tick.
+        self._cumulative_evicted_mamba_slots = 0
+        self._cumulative_evicted_kv_tokens = 0
         assert (
             isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
             or isinstance(
@@ -452,12 +593,27 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
 
+        # Optional cross-pool grow hook: a callable `(n_slots) -> bool`
+        # the Budgeter injects once its actuator chain is built. When a caching
+        # fork can't get a mamba slot and `evict_mamba` finds no unlocked cold
+        # cache to reclaim, this synchronously grows mamba from KV (k2m) and
+        # the fork is retried — instead of asserting "Can not alloc mamba
+        # cache". None on stock sglang / Budgeter off, so the
+        # fork-failure path stays the original evict→assert (fail-loud).
+        self._mamba_grow_hook = None
+
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = params.enable_mamba_extra_buffer_lazy
         self.kv_event_queue = []
+        # LPB vs LRU eviction is a boot-time config, same as plain
+        # `RadixCache` (paper §sec:design-l1). `evict_full` /
+        # `evict_mamba` consult `_should_use_lpb()` rather than an env
+        # var so a server launched with `--eviction-policy lpb` gets
+        # LPB on hybrid models too.
+        self.eviction_policy = params.eviction_policy
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -471,6 +627,45 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if params.enable_metrics:
             self.init_metrics_collector()
+
+        # Set the real per-mamba-slot byte cost on TreeNode so
+        # eviction_priority() weights mamba vs KV by ground-truth
+        # bytes (B_b) instead of an estimate. (Paper §sec:design-l1 —
+        # accurate hits-per-byte denominator.) Access the pool APIs
+        # directly: a missing/zero byte denominator must fail loudly
+        # rather than silently shipping a placeholder that corrupts the
+        # LPB ordering undetectably.
+        mp = self.req_to_token_pool.mamba_pool
+        assert mp.size > 0, (
+            f"mamba_pool.size must be positive to compute B_b, got {mp.size}"
+        )
+        assert mp.max_size >= mp.size, (
+            f"mamba_pool.max_size must be >= size to compute B_b, got "
+            f"max_size={mp.max_size}, size={mp.size}"
+        )
+        # B_b denominator is the PHYSICAL allocated slot count = max_size+1
+        # (design.md "Padded slot 0": the mamba State tensors are
+        # allocated at max_size+1 rows, which equals size+1 when not in
+        # dynamic-cap mode). mem_usage_bytes() sums those tensors, so
+        # dividing by max_size+1 yields the true per-slot byte cost.
+        # Dividing by size would over-estimate B_b by (size+1)/size and
+        # skew LPB's KV-vs-mamba weighting.
+        bytes_per_slot = int(mp.mamba_cache.mem_usage_bytes()) // (mp.max_size + 1)
+        assert bytes_per_slot > 0, (
+            f"mamba per-slot byte denominator (B_b) must be positive, got "
+            f"{bytes_per_slot} from mem_usage_bytes={mp.mamba_cache.mem_usage_bytes()} "
+            f"/ (max_size+1)={mp.max_size + 1}"
+        )
+        TreeNode.lpb_bytes_per_mamba_slot = bytes_per_slot
+        # Use print so it shows up regardless of sglang's configured log
+        # level — this is a one-time init line and useful for verifying
+        # LPB's denominator uses ground-truth bytes.
+        print(
+            f"[LPB] bytes_per_mamba_slot = {bytes_per_slot} "
+            f"(real, from mamba_pool: mem_usage_bytes // (max_size+1) with "
+            f"max_size={mp.max_size}, size={mp.size})",
+            flush=True,
+        )
 
         self.reset()
 
@@ -490,6 +685,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.mamba_evictable_size_ = 0
         self.full_protected_size_ = 0
         self.mamba_protected_size_ = 0
+        self._cumulative_evicted_mamba_slots = 0
+        self._cumulative_evicted_kv_tokens = 0
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
@@ -534,7 +731,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
+            self.root_node,
+            key,
+            value,
+            mamba_value,
+            params.chunked,
+            prev_prefix_len,
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -722,11 +924,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
         elif self.enable_mamba_extra_buffer:
             new_slot = self._alloc_mamba_slot()
+            if new_slot is None:
+                return _skip_cache_unfinished_req(req)
             mamba_value_donated = self.req_to_token_pool.donate_mamba_ping_pong_slot(
                 req, new_slot
             )
         else:
             mamba_value_donated = self._alloc_mamba_slot()
+            if mamba_value_donated is None:
+                return _skip_cache_unfinished_req(req)
             # mamba_pool is a pure PHYSICAL store; translate both slot ids
             # virtual->physical (identity for the non-unified memory pool) before the copy.
             translate = self.req_to_token_pool.translate_mamba_indices
@@ -800,8 +1006,18 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
-        # 1. a leaf node, free full tokens and mamba
+        # 1. a leaf node, free full tokens and mamba. Record both pools'
+        # \\bar L_i (paper §sec:design-formalism-offline): the per-segment
+        # token count is the re-prefill length on KV side and the
+        # chunked-scan distance to rebuild on the recurrent side.
         self._record_remove_event(x)
+        from sglang.srt.mem_cache.common import (
+            record_recovery_len_kv,
+            record_recovery_len_rec,
+        )
+
+        record_recovery_len_kv(self, len(x.value))
+        record_recovery_len_rec(self, len(x.value))
         # Tree values are page-aligned copies of a kv row: page-exact segment.
         self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
         full_num_evicted = len(x.value)
@@ -840,15 +1056,165 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             num_tokens_evicted=full_num_evicted, mamba_num_evicted=mamba_num_evicted
         )
 
+    def _should_use_lpb(self) -> bool:
+        """True iff this cache evicts by LPB (loss-per-byte) rather
+        than recency-LRU. Single source of truth for both
+        `evict_full` and `evict_mamba`, mirroring plain `RadixCache`'s
+        `isinstance(self.eviction_strategy, LPBStrategy)` gate: driven
+        by the `--eviction-policy` boot flag, NOT an env var, so the
+        hybrid path matches the KV-only path."""
+        return self.eviction_policy == "lpb"
+
+    def _lpb_build_eviction_heap(self) -> list:
+        """Paper §sec:design-l1 (eq:lpb-lru): build a min-heap of all
+        currently-evictable mamba nodes ordered by hits-per-byte
+        (lowest first). One-shot O(n) heapify; subsequent picks are
+        O(log n) heappop instead of re-scanning the LRU list each time.
+        Stale entries (nodes whose mamba_value / lock state changes
+        after the heap was built) are filtered at pop time by
+        `_lpb_pop_eviction_victim`.
+
+        Tie-break by `last_access_time` ascending is preserved by the
+        tuple key — same semantics as the prior O(n) scanner.
+        """
+        h = []
+        for node in self.mamba_lru_list.cache.values():
+            if node.mamba_lock_ref > 0 or node.mamba_value is None:
+                continue
+            h.append((
+                node.eviction_priority(),
+                node.last_access_time,
+                node.id,  # final tiebreak for deterministic heap ordering
+                node,
+            ))
+        heapq.heapify(h)
+        return h
+
+    def _lpb_pop_eviction_victim(self, heap: list) -> Optional[TreeNode]:
+        """Pop the next valid eviction victim from the LPB heap.
+        Skips entries whose underlying TreeNode is now locked, has had
+        its mamba_value freed, or has left the mamba LRU list (e.g.
+        evicted by a prior iteration). Returns None if the heap is
+        exhausted."""
+        while heap:
+            _, _, _, node = heapq.heappop(heap)
+            if node.mamba_lock_ref > 0 or node.mamba_value is None:
+                continue
+            if not self.mamba_lru_list.in_list(node):
+                continue
+            return node
+        return None
+
+    def _iter_mamba_victims(self):
+        """Single source of truth for mamba victim ORDER (design.md
+        §"Grow benefit and drain cost are both reuse-aware"). Pure-read
+        lazy generator yielding the evictable mamba nodes, in the order
+        eviction would pick them, under the active `--eviction-policy`.
+
+        BOTH `evict_mamba` (which then frees them) and
+        `_plan_mamba_eviction` / `predict_evict_cost_us(pool="mamba")`
+        (which classify + price them) consume this, so the priced set
+        is byte-identical to the evicted set by construction, mirroring
+        the KV side's `_plan_full_eviction`.
+
+        Order per policy:
+          * LRU: `mamba_lru_list` tail (oldest) forward via the prev
+            chain.
+          * LPB: Phase 1 yields the contiguous tail run of cold
+            (`hit_count == 0`) nodes first (LPB priority 0/size = 0, so
+            they always sort first), walked O(1)/victim. The Phase-2
+            heap over the remaining hit-bearing nodes is built LAZILY,
+            only once the consumer pulls past the cold run, so a drain
+            satisfied entirely by cold nodes never pays the O(n)
+            heapify.
+
+        Consumer contract: a node's successor pointer is captured
+        BEFORE the node is yielded, so a consumer (`evict_mamba`) may
+        free the just-yielded node before pulling the next without
+        invalidating the walk. The captured successor is re-validated
+        against `mamba_lru_list` membership before it is yielded, so a
+        cascade that deletes it (a freed leaf sweeping tombstone
+        parents) terminates the cold-tail walk exactly as the live walk
+        would.
+        """
+        if not self._should_use_lpb():
+            node = self.mamba_lru_list.get_lru_no_lock()
+            while node is not None:
+                nxt = self.mamba_lru_list.get_prev_no_lock(node)
+                yield node
+                if nxt is None or not self.mamba_lru_list.in_list(nxt):
+                    return
+                node = nxt
+            return
+
+        # LPB Phase 1: contiguous cold (hit_count == 0) tail run. Track
+        # yielded ids so Phase 2's heap skips them under a pure-read
+        # consumer (which, unlike `evict_mamba`, has not removed them
+        # from the list, so the `in_list` filter alone would resurface
+        # them).
+        #
+        # Phase 2 is entered ONLY when the cold run ends at a valid
+        # hit-bearing node (`reached_hot`). If instead the captured
+        # successor left the list (a freed leaf's cascade swept it), the
+        # walk terminates here: the live-list walk has no node to resume
+        # from, matching the pre-extraction inline behavior.
+        phase1_ids: set = set()
+        reached_hot = False
+        node = self.mamba_lru_list.get_lru_no_lock()
+        while node is not None and node.hit_count == 0:
+            nxt = self.mamba_lru_list.get_prev_no_lock(node)
+            phase1_ids.add(id(node))
+            yield node
+            if nxt is None or not self.mamba_lru_list.in_list(nxt):
+                return
+            if nxt.hit_count > 0:
+                reached_hot = True
+                break
+            node = nxt
+
+        if node is not None and node.hit_count > 0:
+            # The tail itself was hit-bearing: Phase 1 never ran, go
+            # straight to the heap.
+            reached_hot = True
+        if not reached_hot:
+            return
+
+        # LPB Phase 2: heap over remaining hit-bearing evictable nodes,
+        # built lazily here (the cold-tail loop above already exhausted
+        # the zero-cost run, so we only pay the heapify if the drain
+        # needs hit-bearing victims).
+        heap = self._lpb_build_eviction_heap()
+        victim = self._lpb_pop_eviction_victim(heap)
+        while victim is not None:
+            if id(victim) not in phase1_ids:
+                yield victim
+            victim = self._lpb_pop_eviction_victim(heap)
+
     def evict_mamba(self, mamba_num: int) -> int:
-        """Evict mamba states. Returns the number of mamba states evicted."""
+        """Evict mamba states. Returns the number of mamba states evicted.
+
+        Consumes the shared `_iter_mamba_victims` generator (single
+        source of truth, also consumed by `_plan_mamba_eviction` /
+        `predict_evict_cost_us`), so the evicted set is byte-identical
+        to the priced set, mirroring the KV-side `evict_full` /
+        `_plan_full_eviction` pairing. For each yielded victim this
+        frees either the mamba snapshot alone (internal node, leaving a
+        KV tombstone) or KV + mamba (leaf, plus the tombstone-leaf
+        cascade), until `mamba_num` slots are freed.
+
+        Two policies, gated by `--eviction-policy lpb` (default lru):
+          * Recency-LRU: oldest mamba node first.
+          * LPB (hits-per-byte): cold (`hit_count == 0`) tail run first,
+            then a heap over hit-bearing nodes — see
+            `_iter_mamba_victims`.
+        """
         if self.disable or mamba_num <= 0:
             return 0
-        # get the least recently used node that is not locked, doesn't have to be a leaf
-        x = self.mamba_lru_list.get_lru_no_lock()
+
         mamba_num_evicted = 0
-        # evict lru leaf nodes until mamba_num_tokens is reached
-        while mamba_num_evicted < mamba_num and (self.mamba_lru_list.in_list(x)):
+        for x in self._iter_mamba_victims():
+            if mamba_num_evicted >= mamba_num:
+                break
             assert x.mamba_value is not None, f"node has no mamba value, {x.id=}"
             assert (
                 len(x.mamba_value) == 1
@@ -857,48 +1223,399 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
 
             if len(x.children) > 0:
+                from sglang.srt.mem_cache.common import record_recovery_len_rec
+
+                record_recovery_len_rec(self, len(x.value))
                 # 1. an internal node, free mamba tokens.
                 self._free_mamba_value(x.mamba_value)
                 mamba_num_evicted += len(x.mamba_value)
-
-                # 2. get the next node, update the lru lists
-                x_next = self.mamba_lru_list.get_prev_no_lock(x)
                 self.mamba_lru_list.remove_node(x)
-
-                # 3. tombstone the node
                 self._tombstone_internal_node(x)
             else:
-                _, mamba_evicted_delta, _, x_next = self._evict_leaf_node(x, True)
+                _, mamba_evicted_delta, _, _ = self._evict_leaf_node(x, True)
                 mamba_num_evicted += mamba_evicted_delta
 
-            x = x_next
-
+        # Cumulative mamba-slot eviction count — the Budgeter's grow-side
+        # eviction-rate signal (symmetric to the reuse-aware drain cost): a
+        # pool actively shedding (hot) snapshots should be GROWN. KV's
+        # admission-path tally is admission-only and misses cache eviction on
+        # a mamba-bound workload; this counts the actual mamba cache
+        # evictions. BudgetAgent deltas it per tick.
+        self._cumulative_evicted_mamba_slots += mamba_num_evicted
         return mamba_num_evicted
 
+    def _lpb_build_full_eviction_heap(self) -> list:
+        """Heap of evictable LEAF nodes in full_lru_list, ordered by LPB
+        priority (lowest first). Parallel to _lpb_build_eviction_heap
+        but for full (KV) eviction. Only leaves are eligible because
+        evict_full evicts leaves and walks parent-becomes-leaf
+        chains; LPB just re-orders the leaf-selection step.
+        """
+        h = []
+        for node in self.full_lru_list.cache.values():
+            if node.full_lock_ref > 0:
+                continue
+            if len(node.children) > 0:
+                continue  # not a leaf
+            h.append((
+                node.eviction_priority(),
+                node.last_access_time,
+                node.id,
+                node,
+            ))
+        heapq.heapify(h)
+        return h
+
+    def _lpb_pop_full_eviction_victim(self, heap: list) -> Optional[TreeNode]:
+        """Pop next valid leaf-eviction victim. Skips stale entries
+        (locked, off-list, or no-longer-a-leaf — the last can happen
+        if eviction created new children via tombstoning, which is
+        not currently the case for evict_full but defensive)."""
+        while heap:
+            _, _, _, node = heapq.heappop(heap)
+            if node.full_lock_ref > 0:
+                continue
+            if not self.full_lru_list.in_list(node):
+                continue
+            if len(node.children) > 0:
+                continue
+            return node
+        return None
+
+    def _plan_full_eviction(self, full_num_tokens: int):
+        """Single source of truth for full (KV) eviction (design.md
+        §"Why exact c^evict"). Pure-read; returns
+        `(victims, swept_tombstones)`:
+
+          * `victims` — the real leaves / promoted-parents (in order)
+            that `evict_full` passes to `_evict_leaf_node` to free
+            `full_num_tokens` KV tokens. Each carries a mamba snapshot;
+            evicting it loses KV + mamba.
+          * `swept_tombstones` — the tombstone internal nodes
+            (`mamba_value is None`, left by a prior `evict_mamba`) that
+            `_evict_leaf_node` sweeps as a side effect via
+            `_iteratively_delete_tombstone_leaf` when their last child
+            is freed. They free KV only.
+
+        BOTH `evict_full` (frees `victims`; the sweeps happen inside
+        `_evict_leaf_node`) and `predict_evict_cost_us(pool="kv")` (sums
+        recompute over `victims` + `swept_tombstones`) consume this — so
+        the priced set is byte-identical to the evicted set, and the
+        stop point matches (`evict_full` counts swept tokens via the
+        `_evict_leaf_node` delta, so the planner counts them too).
+
+        Victim order mirrors `evict_full`'s sort key: LRU = lowest
+        `last_access_time` first; LPB = lowest `eviction_priority()`.
+        Parent-promotion + tombstone cascade are simulated via
+        `effective_children`. Pure-read: `evict_full` consumes the
+        returned lists BEFORE mutating. Skip contract: `value is None`
+        / zero-length leaves are skipped.
+        """
+        victims: list = []
+        swept_tombstones: list = []
+        if full_num_tokens <= 0:
+            return victims, swept_tombstones
+        use_lpb = self._should_use_lpb()
+
+        def _leaf_key(node):
+            if use_lpb:
+                return (node.eviction_priority(), node.last_access_time, node.id)
+            return (node.last_access_time, node.id)
+
+        heap = []
+        for node in self.full_lru_list.cache.values():
+            if node.full_lock_ref > 0:
+                continue
+            if len(node.children) > 0:
+                continue
+            heap.append((_leaf_key(node), node))
+        heapq.heapify(heap)
+
+        effective_children: dict[int, int] = {}
+        num_evicted = 0
+        while heap and num_evicted < full_num_tokens:
+            _key, x = heapq.heappop(heap)
+            if x.value is None:
+                continue
+            L_evicted = len(x.value)
+            if L_evicted == 0:
+                continue
+            victims.append(x)
+            num_evicted += L_evicted
+
+            # Parent-promotion + tombstone-sweep cascade, mirroring
+            # `_evict_leaf_node` step 4 (`_iteratively_delete_tombstone_
+            # leaf`): when a node's last evictable child is gone, walk
+            # up. A REAL parent (`mamba_value is not None`) becomes an
+            # evictable leaf — promote it into the heap. A TOMBSTONE
+            # parent is swept by `_evict_leaf_node`, not a victim — so
+            # we record it (frees KV → counts toward the demand, same
+            # as `evict_full`'s delta) and cascade to ITS parent so a
+            # real grandparent still promotes at the right moment.
+            node = x
+            while True:
+                parent = node.parent
+                if parent is None or parent is self.root_node:
+                    break
+                if parent.full_lock_ref != 0:
+                    break
+                key = id(parent)
+                if key not in effective_children:
+                    effective_children[key] = len(parent.children)
+                effective_children[key] -= 1
+                if effective_children[key] != 0:
+                    break
+                if parent.mamba_value is not None:
+                    heapq.heappush(heap, (_leaf_key(parent), parent))
+                    break
+                # tombstone parent → swept internally; its KV frees too.
+                swept_tombstones.append(parent)
+                if parent.value is not None:
+                    num_evicted += len(parent.value)
+                node = parent
+
+        return victims, swept_tombstones
+
+    def _plan_mamba_eviction(self, mamba_num: int):
+        """Pure-read victim plan for mamba-side eviction (design.md
+        §"Grow benefit and drain cost are both reuse-aware, not
+        active-only"), parallel to `_plan_full_eviction` for KV. Returns
+        `(leaf_victims, internal_victims, swept_tombstones)`:
+
+        Sole consumer is `predict_evict_cost_us(pool="mamba")`, which
+        prices the exact set `evict_mamba` would free. Victim ORDER
+        comes from the shared `_iter_mamba_victims` generator that
+        `evict_mamba` also consumes, so the priced set cannot drift from
+        the evicted set (single source of truth, mirroring the KV-side
+        `_plan_full_eviction`). This method adds only the pure-read
+        classification (internal-tombstone vs leaf vs swept-cascade)
+        that pricing needs.
+
+          * `internal_victims` — nodes that still have children when
+            evicted; `evict_mamba` frees only their mamba snapshot and
+            leaves a KV tombstone (`_tombstone_internal_node`). Cost
+            `c_m(s_b)`; frees 1 mamba slot; the node stays in the tree.
+          * `leaf_victims` — nodes with no remaining children;
+            `evict_mamba` frees BOTH KV and mamba via `_evict_leaf_node`
+            and deletes the node. Cost `c_kv(s_b) + c_m(s_b)`; frees 1
+            mamba slot; triggers the tombstone-leaf cascade.
+          * `swept_tombstones` — KV tombstones (mamba already gone) the
+            leaf cascade (`_iteratively_delete_tombstone_leaf`) deletes
+            when their last child is freed. Cost `c_kv(s_b)`; frees 0
+            mamba slots (KV recompute only).
+
+        The consumer sums `Σ n_b · c_i(s_b)` over these three sets, so
+        the priced set is byte-identical to the evicted set.
+
+        Victim order comes from `_iter_mamba_victims` (the same source
+        `evict_mamba` consumes). Effective-children bookkeeping mirrors
+        `_plan_full_eviction`: a leaf eviction (or a tombstone sweep)
+        decrements its parent's child count, so a parent that loses its
+        last child is classified as a leaf / swept exactly as the live
+        walk would. Internal tombstoning does NOT delete the node, so it
+        does not decrement its parent. Pure-read: consumes the generator
+        without mutating; safe to call before `evict_mamba`.
+        """
+        leaf_victims: list = []
+        internal_victims: list = []
+        swept_tombstones: list = []
+        if mamba_num <= 0:
+            return leaf_victims, internal_victims, swept_tombstones
+
+        # Shared victim ORDER (pure-read). The generator already yields
+        # only unlocked, mamba-bearing, in-list nodes.
+        order = list(self._iter_mamba_victims())
+
+        # ---- Simulate the walk with effective-children bookkeeping ----
+        eff_children: dict[int, int] = {}
+
+        def _eff(node) -> int:
+            k = id(node)
+            if k not in eff_children:
+                eff_children[k] = len(node.children)
+            return eff_children[k]
+
+        tombstoned_now: set = set()  # nodes we virtually tombstoned (mamba freed)
+        deleted: set = set()         # nodes removed from the tree (leaf / swept)
+
+        def _sweep_cascade(start_leaf) -> None:
+            # Mirror `_iteratively_delete_tombstone_leaf`: walk up while
+            # the parent is a childless KV tombstone (mamba already gone,
+            # either an original tombstone or one we tombstoned above).
+            node = start_leaf
+            while True:
+                parent = node.parent
+                if parent is None or parent is self.root_node:
+                    break
+                if parent.full_lock_ref > 0:
+                    break
+                eff_children[id(parent)] = _eff(parent) - 1
+                if eff_children[id(parent)] != 0:
+                    break
+                is_tombstone = (
+                    parent.mamba_value is None or id(parent) in tombstoned_now
+                )
+                if not is_tombstone:
+                    break
+                swept_tombstones.append(parent)
+                deleted.add(id(parent))
+                node = parent
+
+        collected = 0
+        for x in order:
+            if collected >= mamba_num:
+                break
+            if id(x) in deleted or id(x) in tombstoned_now:
+                continue
+            if _eff(x) > 0:
+                # internal node → tombstone (frees mamba only); stays in tree.
+                internal_victims.append(x)
+                tombstoned_now.add(id(x))
+                collected += 1  # len(mamba_value) == 1
+            else:
+                # leaf node → frees KV + mamba, deleted + cascade.
+                leaf_victims.append(x)
+                deleted.add(id(x))
+                collected += 1
+                _sweep_cascade(x)
+
+        return leaf_victims, internal_victims, swept_tombstones
+
     def evict_full(self, full_num_tokens: int) -> int:
-        """Evict full KV cache. Returns the number of tokens evicted."""
+        """Evict full KV cache. Returns the number of tokens evicted.
+
+        Victim selection is the shared `_plan_full_eviction` (single
+        source of truth, also consumed by `predict_evict_cost_us`);
+        this method consumes the plan — computed pure-read BEFORE any
+        mutation — then frees each victim via `_evict_leaf_node` (which
+        sweeps the planned tombstones internally).
+
+        Two policies, gated by `--eviction-policy lpb` (default lru):
+          * Recency-LRU baseline: least-recently-accessed leaf first.
+          * LPB (hits-per-byte): lowest `eviction_priority()` first.
+        """
         if self.disable or full_num_tokens <= 0:
             return 0
 
+        victims, _swept = self._plan_full_eviction(full_num_tokens)
         full_num_evicted = 0
-        # get the least recently used leaf node that is not locked
-        x = self.full_lru_list.get_leaf_lru_no_lock()
-
-        while full_num_evicted < full_num_tokens and self.full_lru_list.in_list(x):
+        for x in victims:
             assert (
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
-            full_num_evicted_delta, _, x, x_next = self._evict_leaf_node(x, False)
+            full_num_evicted_delta, _, _, _ = self._evict_leaf_node(x, False)
             full_num_evicted += full_num_evicted_delta
 
-            # if parent has no more children, it is a leaf. It is possible that this node is lru, so
-            # we need to get the first leaf node in the lru list
-            if len(x.parent.children) == 0:
-                x_next = self.full_lru_list.get_leaf_lru_no_lock()
-
-            x = x_next
-
+        # Cumulative KV-token cache-eviction count — the symmetric grow-side
+        # signal for nb_m2k (grow KV when KV sheds hot prefixes). See the
+        # mamba counterpart in `evict_mamba`. BudgetAgent deltas it per tick.
+        self._cumulative_evicted_kv_tokens += full_num_evicted
         return full_num_evicted
+
+    def predict_evict_cost_us(self, num_tokens: int, pool: str = "kv") -> float:
+        """Exact c^evict_i(X) predictor for the hybrid cache (design.md
+        §"Shared cost model" "Why exact c^evict"). Sums
+        `Σ n_b · c_i(s_b)` over the exact blocks the matching pool's
+        eviction would pick to free `num_tokens`, via the same
+        victim-selection plan eviction uses — so the priced set IS the
+        evicted set.
+
+        `pool="kv"`: mirrors `evict_full`. Each picked full-tree leaf
+        carries both a KV value and a mamba snapshot; evicting it loses
+        both, so its recompute is `c_kv(s_b) + c_m(s_b)` — the same
+        `c_i` decomposition `eviction_priority()` uses for the LPB sort
+        key. Tombstone internal nodes swept as a side effect free KV
+        only, so they contribute `c_kv(s_b)` (no `c_m` — mamba already
+        gone). `n_b` is `hits_in_window()` under LPB, else 1.
+
+        `pool="mamba"`: cross_evict / Budgeter m2k-drain (src=mamba).
+        `num_tokens` is the number of mamba SLOTS to free (each
+        evictable node holds one). Prices the `_plan_mamba_eviction`
+        mirror of `evict_mamba`: an internal victim loses only its mamba
+        snapshot (`c_m`), a leaf victim loses both KV and mamba
+        (`c_kv + c_m`), and a tombstone swept by the leaf cascade frees
+        KV only (`c_kv`). `n_b` is `hits_in_window()` under LPB (so a
+        hot cache is expensive to drain and a cold cache is ~free —
+        Phase-1 cold nodes carry `n_b = 0`), else 1. This is the
+        reuse-aware drain cost the Budgeter consumes via
+        `snapshot["mamba_drain_cost_us"]` (design.md §"Grow benefit and
+        drain cost are both reuse-aware, not active-only").
+
+        Returns `+inf` when the cache cannot satisfy `num_tokens`
+        (fail-closed). Does NOT acquire `_alloc_lock`; the caller (the
+        Admitter decision) already holds it.
+        """
+        if pool not in ("kv", "mamba"):
+            raise ValueError(
+                f"MambaRadixCache.predict_evict_cost_us: unknown pool "
+                f"{pool!r} (expected 'kv' or 'mamba')"
+            )
+        if num_tokens <= 0:
+            return 0.0
+        if self.disable:
+            return float("inf")
+
+        from sglang.srt.budgeter.cost_model import get_cost_curves
+        curves = get_cost_curves()
+        use_lpb = self._should_use_lpb()
+
+        if pool == "mamba":
+            leaf_v, internal_v, swept = self._plan_mamba_eviction(num_tokens)
+            mamba_freed = len(leaf_v) + len(internal_v)
+            if mamba_freed < num_tokens:
+                return float("inf")
+            total_cost_ms = 0.0
+            # An internal victim whose KV is ALSO freed this pass (its leaf
+            # cascade tombstones it into `swept`) has its c_kv counted there,
+            # so it contributes c_m here and c_kv via `swept` — together the
+            # whole-prefix total. But an internal victim whose KV STAYS (live
+            # descendants keep it) is never swept, so it would be priced c_m
+            # alone — which collapses to ~0 under κ_M = 0 and lets the m2k
+            # drain over-harvest a hot snapshot. Recovering that
+            # snapshot still needs a full prefix re-prefill (attention and
+            # recurrent layers interleave; the kept KV cannot stand in for the
+            # rest of the forward), so price it by the whole-prefix total
+            # c_kv + c_m, matching a leaf victim and eviction_priority().
+            swept_ids = {id(t) for t in swept}
+            for x in internal_v:
+                s_b = len(x.key) if x.key is not None else 0
+                n_b = x.hits_in_window() if use_lpb else 1
+                c_i_ms = curves.c_m_ms(s_b)
+                if id(x) not in swept_ids:        # KV stays → full re-prefill
+                    c_i_ms += curves.c_kv_ms(s_b)
+                total_cost_ms += n_b * c_i_ms
+            for x in leaf_v:
+                s_b = len(x.key) if x.key is not None else 0
+                n_b = x.hits_in_window() if use_lpb else 1
+                total_cost_ms += n_b * (curves.c_kv_ms(s_b) + curves.c_m_ms(s_b))
+            for t in swept:
+                s_b = len(t.key) if t.key is not None else 0
+                n_b = t.hits_in_window() if use_lpb else 1
+                total_cost_ms += n_b * curves.c_kv_ms(s_b)   # KV only
+            return total_cost_ms * 1000.0
+
+        victims, swept_tombstones = self._plan_full_eviction(num_tokens)
+        num_evicted = 0
+        total_cost_ms = 0.0
+        for x in victims:
+            s_b = len(x.key) if x.key is not None else 0
+            c_i_ms = curves.c_kv_ms(s_b)          # KV value present
+            if x.mamba_value is not None:
+                c_i_ms += curves.c_m_ms(s_b)       # + mamba snapshot
+            n_b = x.hits_in_window() if use_lpb else 1
+            total_cost_ms += n_b * c_i_ms
+            num_evicted += len(x.value)
+        for t in swept_tombstones:
+            # tombstone frees KV only (mamba already gone) → c_kv.
+            s_b = len(t.key) if t.key is not None else 0
+            n_b = t.hits_in_window() if use_lpb else 1
+            total_cost_ms += n_b * curves.c_kv_ms(s_b)
+            if t.value is not None:
+                num_evicted += len(t.value)
+
+        if num_evicted < num_tokens:
+            return float("inf")
+        return total_cost_ms * 1000.0
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         """
@@ -1021,13 +1738,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
-        """Allocate one mamba pool slot, evicting if necessary."""
+    def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+        pool = self.req_to_token_pool.mamba_allocator
         slot = self.req_to_token_pool.mamba_allocator.alloc(1)
-        if slot is None:
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+        if slot is not None:
+            return slot
+        self.evict(EvictParams(num_tokens=0, mamba_num=1))
+        slot = self.req_to_token_pool.mamba_allocator.alloc(1)
+        if slot is not None:
+            return slot
+        if self._mamba_grow_hook is not None and self._mamba_grow_hook(1):
             slot = self.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
         return slot
 
     @property
@@ -1080,6 +1801,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         value: List[torch.Tensor] = []
         best_value_len = 0
         best_last_node = node
+        # Paper §sec:design-l1: under LPB, record a hit on every visited
+        # node so eviction_priority() reflects recent value to the
+        # workload (without this, hit_count never increments). Skip the
+        # deque append in LRU/other modes to keep them zero-overhead,
+        # mirroring `RadixCache._match_prefix_helper`.
+        lpb_active = self._should_use_lpb()
+        hit_path: List[TreeNode] = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             # update best_value_len and best_last_node if needed
@@ -1092,10 +1820,14 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
                 node = new_node
+                if lpb_active:
+                    hit_path.append(new_node)
                 break
             else:
                 value.append(child.value)
                 node = child
+                if lpb_active:
+                    hit_path.append(child)
                 key = key[prefix_len:]
 
                 if len(key):
@@ -1104,6 +1836,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if node.mamba_value is not None:
             best_value_len = len(value)
             best_last_node = node
+
+        # Record hits for every node we visited in the matching walk.
+        # Only do this under LPB and when there was at least some prefix
+        # match — zero-length matches don't credit any node.
+        if lpb_active and best_value_len > 0:
+            for n in hit_path:
+                n.record_hit()
 
         return value, best_last_node, best_value_len
 
@@ -1162,13 +1901,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Defer COW to forward stream: record source index, allocate destination
         if cow_mamba and last_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
-                dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
+                dst_index = self._cow_mamba_slot_or_none(last_node)
                 if dst_index is None:
-                    self.inc_lock_ref(last_node)
-                    self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
-                    self.dec_lock_ref(last_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
+                    return self._no_mamba_match_result()
                 req.mamba_pool_idx = dst_index[0]
             req.mamba_cow_src_index = last_node.mamba_value
             req.mamba_needs_clear = False
@@ -1187,6 +1922,39 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 
+    def _cow_mamba_slot_or_none(self, last_node: TreeNode) -> Optional[torch.Tensor]:
+        """Acquire one mamba slot to copy `last_node.mamba_value` into, or None.
+
+        Order, mirroring `_fork_mamba_with_recovery`: alloc → (None) lock
+        `last_node` + evict an unlocked cold-cache slot + alloc → (None) grow
+        mamba from KV via `_mamba_grow_hook` + alloc → (None). The caller
+        degrades to a mamba cache miss on None; this never asserts.
+        """
+        pool = self.req_to_token_pool.mamba_pool
+        dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst_index is not None:
+            return dst_index
+        # Protect last_node so the evict cannot reclaim the slot we are copying.
+        self.inc_lock_ref(last_node)
+        self.evict(EvictParams(num_tokens=0, mamba_num=1))
+        dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
+        if dst_index is None and self._mamba_grow_hook is not None:
+            if self._mamba_grow_hook(1):
+                dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
+        self.dec_lock_ref(last_node)
+        return dst_index
+
+    def _no_mamba_match_result(self) -> MatchResult:
+        """The empty / root match: no reusable KV or mamba prefix for this
+        request. Same shape as `match_prefix` on an empty key, so the request
+        re-prefills from scratch. Used when a COW copy cannot be allocated."""
+        return MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+            last_device_node=self.root_node,
+            last_host_node=self.root_node,
+            best_match_node=self.root_node,
+        )
+
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
         new_node = TreeNode()
@@ -1197,6 +1965,17 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.mamba_lock_ref = 0
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        # LPB sliding-window hit signal belongs to the shared-prefix
+        # segment (`new_node`); the divergent tail (`child`) starts
+        # fresh. Both `hit_count` (Phase-1 tail walk in `evict_mamba`)
+        # and `_hit_times` (`eviction_priority` denominator) carry over
+        # (paper §sec:design-l1 eq:lpb-lru `n_b` is per-block).
+        new_node.hit_count = child.hit_count
+        new_node._hit_times = child._hit_times
+        child.hit_count = 0
+        child._hit_times = collections.deque(
+            maxlen=TreeNode.lpb_hit_deque_maxlen
+        )
 
         # child time should be later than the new parent's time in the full LRU
         child.last_access_time = get_last_access_time()
@@ -1242,6 +2021,16 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
+        # Track the deepest-snapshot depth during traversal so
+        # that the value we return mirrors what _match_prefix_helper would
+        # return (it stops updating best_value_len at the deepest mamba_value
+        # node). Required for the cache_unfinished_req invariant
+        # `insert.prefix_len <= len(match_prefix.device_indices)` to hold
+        # when the path goes through tombstone-internal-nodes past the
+        # deepest snapshot.
+        deepest_snapshot_depth = (
+            total_prefix_length if node.mamba_value is not None else 0
+        )
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = get_last_access_time()
@@ -1265,9 +2054,21 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
+            # After potential split, `node` is the matched-up-to-here node.
+            # Update deepest_snapshot_depth if this node carries a snapshot.
+            if node.mamba_value is not None:
+                deepest_snapshot_depth = total_prefix_length
+
             if len(key):
                 child_key = key.child_key(self.page_size)
 
+        # A freshly-inserted leaf always carries its mamba snapshot, so we never
+        # create a tombstone leaf here. Tombstones arise only when mamba eviction
+        # later drops a snapshot from an existing internal node (the `elif` below
+        # and _tombstone_internal_node). Snapshot-bearing leaves preserve two
+        # invariants: _evict_leaf_node asserts `mamba_value is not None`, and
+        # match_prefix's `best_value_len` (which only advances at snapshot nodes)
+        # stays consistent with the inserted depth.
         mamba_value_exist = False
         if len(key):
             new_node = TreeNode()
@@ -1277,21 +2078,31 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             new_node.mamba_value = mamba_value
             self.full_lru_list.insert_mru(new_node)
             self.mamba_lru_list.insert_mru(new_node)
+            self.mamba_evictable_size_ += len(mamba_value)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
-            self.mamba_evictable_size_ += len(mamba_value)
             self._record_store_event(new_node)
-        elif node.mamba_value is None:  # add for mamba tombstone
-            node.mamba_value = mamba_value
+        elif node.mamba_value is None:  # add for mamba tombstone (or stay tombstone)
+            if mamba_value is not None:
+                node.mamba_value = mamba_value
+                self.mamba_lru_list.insert_mru(node)
+                self.mamba_evictable_size_ += len(mamba_value)
+                deepest_snapshot_depth = total_prefix_length
             self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.insert_mru(node)
-            self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
         else:  # mamba value already exists
             mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
+            deepest_snapshot_depth = total_prefix_length
 
+        # match_prefix only advances `best_value_len` at snapshot-bearing nodes,
+        # so a matched path can descend past the deepest snapshot through
+        # tombstone-internal nodes that mamba eviction left behind. Return the
+        # deepest-snapshot depth in that case so insert.prefix_len <=
+        # len(match_prefix.device_indices) holds in cache_unfinished_req.
+        if deepest_snapshot_depth < total_prefix_length:
+            return deepest_snapshot_depth, mamba_value_exist
         return total_prefix_length, mamba_value_exist
 
     def _iteratively_delete_tombstone_leaf(

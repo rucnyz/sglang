@@ -771,6 +771,7 @@ class Req(ReqDllmMixin):
         # full_untruncated_fill_ids from lengths alone, so in-place rewrites
         # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
+        self.forced_dispatched = 0
         # Full untruncated sequence: origin + output (+ DLLM mask block).
         # Kept in sync by _refresh_fill_ids; admission only updates
         # extend_range, never mutates this array's length.
@@ -1556,6 +1557,10 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+        # Retract drops dispatched-but-uncommitted tokens; on re-prefill the req
+        # resumes decoding at len(output_ids), so resync the forced counter to
+        # the committed count (0 if output_ids was just cleared above).
+        self.forced_dispatched = len(self.output_ids)
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2629,7 +2634,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         """Reclaim evictable tree-cache entries (shortfall only), then report
         whether the next decode step fits in the KV pool."""
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
+        # Paper §sec:design-l2 SGLang pressure adapter: tree-cache eviction
+        # is the primary admission-pressure relief mechanism on SGLang.
+        # We measure the eviction delta via allocator.available_size
+        # before/after — that delta is the "deferred re-prefill cost"
+        # that the admission gate consults to decide whether a
+        # cross-pool transfer is justified.
+        avail_before = self.token_to_kv_pool_allocator.available_size()
         evict_from_tree_cache(self.tree_cache, num_tokens)
+        avail_after = self.token_to_kv_pool_allocator.available_size()
+        evicted_delta = max(0, avail_after - avail_before)
+        if evicted_delta > 0:
+            self.tree_cache._admission_cumulative_evicted_tokens += evicted_delta
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_decode(
@@ -2651,6 +2667,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
+            # Paper §sec:design-formalism-offline: feed the retract-pool
+            # recovery-length EWMA with the actual seq_len being retracted.
+            from sglang.srt.mem_cache.common import record_recovery_len_retract
+            L_retract = len(req.origin_input_ids) + len(req.output_ids)
+            record_recovery_len_retract(self.tree_cache, L_retract)
             # release memory and don't insert into the tree because we need the space instantly
             self.release_req(idx, len(sorted_indices), server_args)
 

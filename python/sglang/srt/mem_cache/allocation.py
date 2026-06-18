@@ -153,6 +153,23 @@ def alloc_token_slots(
     out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
+        # On-demand KV grow: the arena's LIVE KV cap may be exhausted while
+        # boot-deferred / idle-mamba capacity exists (much of the evictable cache
+        # can sit on capped pages that eviction can't reclaim). Grow KV (m2k)
+        # from the installed hook, re-evict, and retry once before declaring OOM.
+        # Without this the arena's live KV grows only at the Budgeter's fire
+        # cadence and a fast long-context fill crashes where the full-size static
+        # pool does not. No-op (hook None) on stock sglang / Budgeter off.
+        # `_kv_grow_hook` is set unconditionally by every allocator ctor (None
+        # by default), so direct access — not a defensive getattr.
+        _kv_grow = allocator._kv_grow_hook
+        if _kv_grow is not None:
+            _shortfall = num_tokens - allocator.available_size()
+            if _shortfall > 0 and _kv_grow(_shortfall):
+                evict_from_tree_cache(tree_cache, num_tokens)
+                out_cache_loc = allocator.alloc(num_tokens)
+
+    if out_cache_loc is None:
         error_msg = (
             f"Out of memory. Try to lower your batch size.\n"
             f"Try to allocate {num_tokens} tokens.\n"
