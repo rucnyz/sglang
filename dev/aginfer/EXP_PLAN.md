@@ -52,14 +52,14 @@ No other flags. Dynamo router + frontend use defaults.
 
 ### Full matrix
 
-| # | Tiers | Router | B (LRU) | Ours (value) | What we show |
-|---|---|---|---|---|---|
-| **E1** | 4-tier nixl | default | run | run | **Headline win** (value-eviction on full tier stack) |
-| **E2** | 4-tier nixl | ThunderAgent | run | run | Orthogonality (ours helps even with TA admission) |
-| **E3** | 2-tier (no SSD) | default | run | run | No-regression with fewer tiers |
-| **E4** | mooncake | default | run | run | Extensibility to different transport backend |
+| # | Tiers | Router | Arms | What we show |
+|---|---|---|---|---|
+| **E1** | 4-tier nixl | default | B, **TA**, Ours | **Headline win** (all three compared on full tier stack) |
+| **E2** | 4-tier nixl | ThunderAgent | B(=TA+LRU), Ours(=TA+value) | Orthogonality (ours helps even under TA admission) |
+| **E3** | 2-tier (no SSD) | default | B, **TA**, Ours | No-regression with fewer tiers |
+| **E4** | mooncake | default | B, **TA**, Ours | Extensibility to different transport backend |
 
-Recommended order: **E1 → E3 → E2 → E4** (win first, then ablation, then TA, then mooncake).
+Recommended order: **E1 → E3 → E2 → E4**.
 
 ## Methodology
 
