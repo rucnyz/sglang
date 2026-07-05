@@ -30,12 +30,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
-# Needs 2 + 1 slots for mamba request with prefix cache. 2 for ping pong cache, 1 for running mamba state.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
-# Lazy mode: 1 + 1 slots (1 ping-pong + 1 running), second ping-pong allocated on demand at boundary.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
-MAMBA_STATE_PER_REQ_NO_CACHE = 1
-
 logger = logging.getLogger(__name__)
 
 
@@ -425,14 +419,7 @@ def alloc_req_slots(
     num_reqs = len(reqs)
     if isinstance(req_to_token_pool, HybridReqToTokenPool):
         mamba_available_size = req_to_token_pool.mamba_allocator.available_size()
-        if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
-        else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
+        factor = req_to_token_pool.mamba_slots_per_req(tree_cache.supports_mamba())
         mamba_state_needed = num_reqs * factor
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():

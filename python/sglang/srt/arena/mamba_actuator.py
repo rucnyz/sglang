@@ -171,21 +171,27 @@ class MambaArenaActuator:
         return True
 
     def unmark_token_slots(self, token_slots) -> None:
-        """ID-based dst grow restore. Forwards to ``MambaPool.unmark_slots``,
-        which:
-          - drops the given slot IDs from ``_capped_slots``,
-          - appends them to ``free_slots``,
-          - extends ``pool.size`` to cover any restored ID above the prior
-            cap.
+        """ID-based dst grow restore. Routes through the allocator
+        (``_MambaCapAllocator.unmark_pages_capped`` -> ``CappedFreeList.unmark``
+        -> ``_grow_into_tail``) so the restored slots raise
+        ``mamba_allocator.live_size`` — the single source of truth the admission
+        cap reads (``BudgetAgent._maybe_update_admission_cap``). The engine-visible
+        bound ``pool.size`` is then reconciled from the allocator.
 
-        Uniform dispatch surface with ``KVArenaActuator.unmark_token_slots``.
+        Byte-symmetric with ``KVArenaActuator.unmark_token_slots``; the only
+        difference is that ``_MambaCapAllocator`` carries no ``live_size``
+        property, so the new bound is read from ``self.pool.live_size`` (which
+        delegates to the same ``_allocator``).
         """
         if not token_slots:
             return
         ids = torch.tensor(
-            list(token_slots), dtype=torch.int64, device=self.pool.device,
+            list(token_slots), dtype=torch.int64, device=self.allocator.device,
         )
-        self.pool.unmark_slots(ids)
+        self.allocator.unmark_pages_capped(ids)
+        new_live = self.pool.live_size
+        if new_live > self.pool.size:
+            self.pool.size = new_live
 
     def migrate_slot(self, src: int, dst: int) -> bool:
         """Uniform Stage-3 migration surface, matching
