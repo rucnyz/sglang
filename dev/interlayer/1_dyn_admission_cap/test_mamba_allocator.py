@@ -282,3 +282,79 @@ def test_concurrent_mark_unmark_vs_alloc():
         t.join(timeout=5)
     assert not errs, f"errors: {errs}"
     a._assert_invariant()
+
+
+# ---- actuator dst-grow must route through the allocator (single source of truth) ----
+
+def _storage_pool(alloc):
+    """A real MambaPool wired to `alloc` as its single-source-of-truth
+    allocator, carrying only the fields the CPU unmark path touches
+    (storage-only: no conv/temporal tensors)."""
+    from sglang.srt.mem_cache.memory_pool import MambaPool
+    pool = object.__new__(MambaPool)
+    pool._allocator = alloc
+    pool.size = alloc.live_size
+    pool.device = torch.device("cpu")
+    pool._alloc_lock = threading.Lock()
+    # Legacy shadow fields, so the OLD MambaPool.unmark_slots path is still
+    # constructible for the regression comparison; the fix must NOT rely on them.
+    pool._capped_slots = torch.arange(
+        alloc.live_size + 1, alloc.size + 1, dtype=torch.int64
+    )
+    pool.free_slots = torch.arange(1, alloc.live_size + 1, dtype=torch.int64)
+    return pool
+
+
+def test_actuator_unmark_token_slots_grows_live_size():
+    """The k2m dst-grow restore MUST move the allocator's live_size (the single
+    source of truth the admission cap reads), not just legacy MambaPool shadow
+    state. Reproduces the swarm "grew events: 0": before the fix
+    MambaArenaActuator.unmark_token_slots routed to MambaPool.unmark_slots
+    (shadow only), so mamba_allocator.live_size stayed pinned at boot and
+    BudgetAgent._maybe_update_admission_cap never raised max_running."""
+    from sglang.srt.arena.mamba_actuator import MambaArenaActuator, _MambaCapAllocator
+    alloc = _make_alloc(size=8, max_size=32)  # live_size=8, capped tail [9..32]
+    assert alloc.live_size == 8
+    pool = _storage_pool(alloc)
+    # Real actuator method; skip __init__ (arena/CUDA) since unmark_token_slots
+    # only touches self.pool + self.allocator.
+    act = object.__new__(MambaArenaActuator)
+    act.pool = pool
+    act.allocator = _MambaCapAllocator(pool)
+    act.unmark_token_slots([9, 10, 11, 12])  # restore 4 capped tail slots
+    assert pool.live_size == 12, (
+        f"actuator grow must reach the allocator: live_size={pool.live_size}, want 12"
+    )
+    assert pool._allocator.available_size() == 12
+    assert pool.size == 12  # engine-visible bound reconciled from the allocator
+
+
+# ---- admission gate must reflect free-backable capacity across BOTH sub-pools ----
+
+def test_hybrid_mamba_admittable_reqs():
+    """A hybrid request needs a mamba active slot in addition to a req slot. The
+    admission gate (Scheduler.get_num_allocatable_reqs) bounds the batch by
+    mamba_admittable_reqs = (free mamba + evictable cached snapshots) /
+    slots-per-req, mirroring the KV available+evictable gate. This must (a) fall
+    to 0 when mamba is exhausted AND nothing is evictable, so the request DEFERS
+    instead of crashing alloc_req_slots (the swarm crash), and (b) NOT throttle a
+    lightly-loaded pool by ignoring evictable cached snapshots (the base
+    regression the free-only gate caused)."""
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+    pool = object.__new__(HybridReqToTokenPool)
+    pool.enable_mamba_extra_buffer_lazy = False  # -> PREFIX_CACHE factor = 3
+
+    # (a) crash guard: mamba exhausted AND nothing evictable -> gate 0 (defer).
+    mamba = _make_alloc(size=6)
+    pool.mamba_allocator = mamba
+    assert mamba.alloc(6) is not None and mamba.available_size() == 0
+    assert pool.mamba_admittable_reqs(mamba_evictable=0) == 0
+
+    # (b) no-throttle: evictable cached snapshots count toward backable capacity
+    # (alloc_req_slots evicts them before allocating), so free 0 + evictable 90
+    # backs (0 + 90) // 3 = 30 requests, NOT 0.
+    assert pool.mamba_admittable_reqs(mamba_evictable=90) == 30
+
+    # lightly loaded: free 6 + evictable 0 -> 6 // 3 = 2.
+    pool.mamba_allocator = _make_alloc(size=6)
+    assert pool.mamba_admittable_reqs(mamba_evictable=0) == 2

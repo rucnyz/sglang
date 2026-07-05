@@ -1775,6 +1775,16 @@ class MambaPool:
         return subdims_per_tensor
 
 
+# Mamba active-slot slots a single hybrid request needs, by prefix-cache mode.
+# The extra slots over 1 reserve ping-pong / lazy-copy buffers so a cached
+# prefix's recurrent state can be reused without clobbering the live slot.
+# Single source of truth: both alloc_req_slots (supply-side eviction target) and
+# HybridReqToTokenPool.available_size (admission gate) price a request off these.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
+MAMBA_STATE_PER_REQ_NO_CACHE = 1
+
+
 class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
@@ -1980,6 +1990,39 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
+
+    def mamba_slots_per_req(self, supports_mamba: bool = True) -> int:
+        """Mamba active slots one fresh request consumes. Single source of truth
+        shared by ``alloc_req_slots`` (how many mamba slots to free before an
+        alloc) and ``available_size`` (how many requests the mamba pool can back)
+        so the two can never drift."""
+        if not supports_mamba:
+            return MAMBA_STATE_PER_REQ_NO_CACHE
+        return (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+            if self.enable_mamba_extra_buffer_lazy
+            else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+        )
+
+    def mamba_admittable_reqs(
+        self, mamba_evictable: int, supports_mamba: bool = True
+    ) -> int:
+        """How many fresh requests the mamba pool can back right now =
+        (free active slots + evictable cached snapshots) / slots-per-req.
+
+        A hybrid request needs a mamba active slot in addition to a req slot, but
+        the base ``available_size`` counts only req slots — so admitting on req
+        slots alone over-commits mamba and turns a should-be DEFER into an
+        ``alloc_req_slots`` crash. The admission gate (``get_num_allocatable_reqs``)
+        bounds the batch by this so it falls to 0 when mamba is exhausted and the
+        request stays queued (the design's defer action). ``mamba_evictable`` is
+        supplied by the caller from the tree cache (the pool does not own it),
+        mirroring the KV available+evictable gate in ``PrefillAdder``; counting
+        evictable is what keeps a lightly-loaded pool from throttling on the free
+        slots alone."""
+        return (
+            self.mamba_allocator.available_size() + mamba_evictable
+        ) // self.mamba_slots_per_req(supports_mamba)
 
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.

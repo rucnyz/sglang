@@ -2986,6 +2986,23 @@ class Scheduler(
     def get_num_allocatable_reqs(self, running_bs):
         res = get_parallel().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
+        # Hybrid models also consume a mamba active slot per fresh request; the
+        # base available_size counts only req slots. Bound the batch by what the
+        # mamba pool can back (free slots + evictable cached snapshots, mirroring
+        # the KV available+evictable gate in PrefillAdder) so we never admit a
+        # batch the mamba pool cannot back and force alloc_req_slots to raise
+        # instead of leaving the request queued (the design's defer action).
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+        pool = self.req_to_token_pool
+        if isinstance(pool, HybridReqToTokenPool):
+            res = min(
+                res,
+                pool.mamba_admittable_reqs(
+                    self.tree_cache.mamba_evictable_size(),
+                    self.tree_cache.supports_mamba(),
+                ),
+            )
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:

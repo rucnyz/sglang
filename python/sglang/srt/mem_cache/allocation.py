@@ -284,15 +284,10 @@ def alloc_req_slots(
         mamba_available_size = (
             req_to_token_pool.mamba_allocator.schedulable_available_size()
         )
-        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for chunk.
-        if tree_cache.supports_mamba():
-            factor = (
-                MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
-                if req_to_token_pool.enable_mamba_extra_buffer_lazy
-                else MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            )
-        else:
-            factor = MAMBA_STATE_PER_REQ_NO_CACHE
+        # Eviction headroom factor: 3x (or lazy variant) for radix COW, 1x for
+        # chunk. Single source of truth = HybridReqToTokenPool.mamba_slots_per_req
+        # (shared with the scheduler's admittable-reqs gate, HiMA #338).
+        factor = req_to_token_pool.mamba_slots_per_req(tree_cache.supports_mamba())
         mamba_state_needed = num_reqs * factor
         if mamba_available_size < mamba_state_needed:
             if tree_cache is not None and tree_cache.supports_mamba():
