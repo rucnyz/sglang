@@ -4,7 +4,7 @@ The scheduler instantiates one of these and calls `tick()` on every event-loop
 iteration. The agent rate-limits internally: it only does real work every
 `tick_interval_s` seconds. Each tick:
   1. snapshots per-pool state into the JSONL log,
-  2. asks the XPoolPlanner (Budgeter) if a cross-pool transfer is warranted,
+  2. asks the PaybackPlanner (Budgeter) if a cross-pool transfer is warranted,
   3. converts the decision to a FirePlan via XPoolFirePlanner,
   4. executes the plan via XPoolActuator (cuMemUnmap / cuMemMap).
 
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import queue
 import threading
@@ -76,32 +75,6 @@ def _json_default(obj: Any) -> Any:
     if isinstance(total, (int, float)):
         return total
     return str(obj)
-
-
-def _grow_priced_us(recent, grant, dt, cool_s, price_fn):
-    """τ-invariant priced grow benefit (µs) for one pool's recent eviction
-    FLOW. `recent` is the count evicted since the last tick
-    (∝ dt); the planner divides the returned µs by dt to get a rate, so the
-    priced COUNT must be ∝ dt for the rate to be τ-invariant.
-
-    One fire prevents at most `grant` evictions and fires at most once per
-    `cool_s`, so the sustainable prevented count PER TICK is
-    `cap = grant × dt / cool_s`. We price `min(recent, cap)` victims:
-      - unbounded (recent ≤ cap): price the actual flow (∝ dt) → rate ∝ 1.
-      - saturated (recent > cap): `cap` may be fractional (e.g. grant=1), so
-        walk ⌈cap⌉ (≤ recent, bounded/cheap) victims and linearly scale to
-        the exact fractional `cap`. Flooring the count to 1 instead would make
-        the priced count a τ-constant and reintroduce 1/dt coupling.
-    Returns None when there is no signal. `price_fn(n)` prices evicting n
-    victims (e.g. MambaRadixCache.predict_evict_cost_us).
-    """
-    if recent <= 0 or grant <= 0:
-        return None
-    cap = grant * dt / cool_s if cool_s > 0 else float(grant)
-    if recent <= cap:
-        return price_fn(recent)
-    n_walk = min(recent, max(1, math.ceil(cap)))
-    return price_fn(n_walk) * (cap / n_walk)
 
 
 def _mamba_drain_floor(live_size_slots, floor_slots, slots_per_page, requested_pages):
@@ -164,16 +137,20 @@ class BudgetAgent:
         # last-seen cumulative cache evictions per pool.
         self._last_evicted_mamba_slots = 0
         self._last_evicted_kv_tokens = 0
+        # Same, for the reuse-weighted LPB LOSS (us) — the accurate eviction-
+        # cost signal the PaybackPlanner consumes (replaces the raw counts).
+        self._last_evicted_kv_lpb_loss = 0.0
+        self._last_evicted_mamba_lpb_loss = 0.0
         # JSONL snapshot logging. log_enabled flips True only after a
         # successful open(); read paths gate on the flag, never on the
         # raw file handle.
         self.log_enabled = False
         self._log_fp = None
 
-        # XPoolPlanner (Budgeter) + XPoolFirePlanner + XPoolActuator. All
+        # PaybackPlanner (Budgeter) + XPoolFirePlanner + XPoolActuator. All
         # lazy-built on first tick where the agent observes pool state
         # (pool internals may not be fully wired at __init__).
-        self._planner = None        # XPoolPlanner
+        self._planner = None        # PaybackPlanner
         self._fire_planner = None   # XPoolFirePlanner (decision -> FirePlan)
         self._actuator = None       # XPoolActuator (FirePlan -> exec)
         self._kv_act = None         # KVArenaActuator (per-pool)
@@ -193,6 +170,17 @@ class BudgetAgent:
         # the symmetric grow hook on each side is the real burst safety net.
         self._xfer_grow_headroom_slots = int(
             os.environ.get("SGLANG_XPOOL_GROW_HEADROOM_SLOTS", "32")
+        )
+        # KV working-set floor burst term: a k2m drain must always leave one
+        # INDIVISIBLE prefill chunk of KV free+evictable, or alloc_token_slots
+        # OOMs — a chunk cannot be back-filled on demand once the mamba donor
+        # is saturated (the reactive _grow_kv_from_mamba hook returns False).
+        # Unlike the mamba floor's small fork-headroom, the KV headroom IS the
+        # chunk (chunked_prefill_size; max_prefill_tokens when chunking is off).
+        _sa = getattr(self.scheduler, "server_args", None)
+        _cps = getattr(_sa, "chunked_prefill_size", None)
+        self._kv_prefill_chunk_floor = int(
+            _cps if _cps and _cps > 0 else (getattr(_sa, "max_prefill_tokens", 0) or 8192)
         )
         # Latched after the first time _ensure_actuator_chain fails so
         # the WARNING fires once, not on every tick.
@@ -232,7 +220,7 @@ class BudgetAgent:
         # requests while the worker does the multi-ms cuMem* work.
         #
         # Queue depth is small (default 4) because the planner's wall-clock
-        # cooldown (cooldown_min_s, default 32 s) makes back-to-back fires
+        # cooldown (cooldown_s, default 10 s) makes back-to-back fires
         # rare; if the queue does fill, _maybe_fire skips the new fire (logged).
         self._fire_queue_max = int(os.environ.get(
             "SGLANG_HIMA_FIRE_QUEUE_MAX", "4"))
@@ -328,6 +316,8 @@ class BudgetAgent:
         """Called every scheduler iteration. Internally rate-limited."""
         if not self.enabled:
             return
+        if self._actuator is not None:
+            self._actuator.apply_pending_fires()
         if not self._health_checked:
             if not self._do_health_check():
                 self.enabled = False
@@ -432,6 +422,7 @@ class BudgetAgent:
                 int(user_cap) if user_cap is not None else int(pool.max_size)
             )
             init_max_running = int(pool.size)
+            self._boot_max_running = init_max_running
             self._mamba_per_req_ratio = max(
                 1, int(self._last_mamba_size) // max(1, init_max_running)
             )
@@ -452,8 +443,16 @@ class BudgetAgent:
         ceiling = self._user_max_running
         # Compute new admission cap from CURRENT mamba size. Bounded by
         # both the user ceiling and the pool's pre-reserved max.
+        # Floor: m2k fires shrink mamba but should not reduce max_running
+        # below boot value UNLESS mamba is physically too small to support
+        # it. Physical minimum = 2 slots/request (active + fork).
+        # This prevents unnecessary max_running drops while protecting
+        # against "Can not alloc mamba cache" crashes.
+        boot_cap = self._boot_max_running
+        physical_safe_cap = current_mamba_size // 2
+        floor = min(boot_cap, physical_safe_cap)
         new_cap = min(ceiling, pool.max_size, current_mamba_size // ratio)
-        new_cap = max(1, new_cap)  # never drop below 1
+        new_cap = max(new_cap, floor)
 
         if new_cap > pool.size:
             old_size = pool.size
@@ -494,7 +493,7 @@ class BudgetAgent:
 
         self._last_mamba_size = current_mamba_size
 
-    # ---- XPoolPlanner → XPoolFirePlanner → XPoolActuator chain ----
+    # ---- PaybackPlanner + XPoolFirePlanner + XPoolActuator chain ----
 
     def _wire_admitter(self) -> None:
         """Plumb the actuator chain into the scheduler's Admitter — the
@@ -694,6 +693,24 @@ class BudgetAgent:
         """
         return max(0, int(m_used) - int(evictable)) + self._mamba_fork_headroom_slots
 
+    def _kv_working_set_floor_slots(self, kv_used: int) -> int:
+        """The k2m KV floor in TOKENS: reserve the running KV working set PLUS
+        one indivisible prefill chunk of GENUINELY-FREE capacity.
+
+        Unlike the mamba floor (`_mamba_working_set_floor_slots`, which credits
+        evictable because its drain stage evicts+donates cache), do NOT credit
+        evictable KV cache: a k2m fire donates FREE pages only (the cache stays
+        as admission's own eviction buffer), and the swarm's shared-prefix
+        cache is COW-locked by the very batch that needs the chunk, so
+        crediting it lets the drain leave `free + evictable >= chunk` where the
+        evictable then evaporates -> `free < chunk` -> alloc_token_slots OOM
+        (the KV-side twin of the #339 COW-source over-count). `kv_used` already
+        includes the cache, so `kv_used + chunk` leaves >= chunk of
+        genuinely-free capacity; the cache is donated gradually as admission
+        evicts it (low-value cache first, by LPB) and the freed pages become
+        the next fire's donor supply."""
+        return int(kv_used) + self._kv_prefill_chunk_floor
+
     def _grow_mamba_from_kv(self, n_slots: int) -> bool:
         """Synchronously grow mamba by ~`n_slots` slots, transferring chunks
         from KV (k2m). Called from `MambaRadixCache._fork_mamba_with_recovery`
@@ -714,20 +731,22 @@ class BudgetAgent:
         n_chunks = max(1, (int(n_slots) + tps - 1) // tps)
         lcm = max(1, int(self._actuator.lcm_pages))
         n_pages = max(lcm, ((n_chunks + lcm - 1) // lcm) * lcm)
-        # KV free-slack bound, the on-demand counterpart of the tick k2m
-        # bound in `tick`. This k2m grow harvests KV's GENUINELY-FREE pages to
-        # feed mamba; bound the request to KV's idle slack (`available_size`
-        # minus a small headroom) so it never evicts live KV cache. Refuse when
-        # KV has no idle slack (caller falls through to its assert / fail).
+        # KV working-set floor, the on-demand counterpart of the tick k2m
+        # bound in `_maybe_fire`. This k2m grow harvests KV's GENUINELY-FREE
+        # pages to feed mamba; bound the drain by the same KV floor (running
+        # working set + one indivisible prefill chunk) so it never shrinks KV
+        # below a prefill chunk. Refuse when KV has no donatable slack (caller
+        # falls through to its assert / fail).
         try:
             kv_alloc = self.scheduler.token_to_kv_pool_allocator
-            kv_avail = int(kv_alloc.available_size())
             kv_slots_per_page = max(1, int(self._kv_tokens_per_chunk))
-            max_drain_pages = (
-                max(0, kv_avail - self._xfer_grow_headroom_slots)
-                // kv_slots_per_page
+            kv_live = int(kv_alloc.live_size)
+            kv_avail = int(kv_alloc.available_size())
+            kv_used = max(0, kv_live - kv_avail)
+            floor_slots = self._kv_working_set_floor_slots(kv_used)
+            n_pages = _mamba_drain_floor(
+                kv_live, floor_slots, kv_slots_per_page, n_pages,
             )
-            n_pages = min(n_pages, max_drain_pages)
             if n_pages <= 0:
                 return False
         except Exception:
@@ -1134,7 +1153,7 @@ class BudgetAgent:
         return True
 
     def _maybe_fire(self, snapshot: dict) -> None:
-        """XPoolPlanner decides direction → XPoolFirePlanner builds a
+        """PaybackPlanner decides direction → XPoolFirePlanner builds a
         FirePlan from current ownership state → XPoolActuator executes
         it (cuMemUnmap source pages, cuMemMap them into dst pool).
 
@@ -1146,18 +1165,9 @@ class BudgetAgent:
         mamba_pool = getattr(kv_pool, "mamba_pool", None)
         mamba_allocator = getattr(self.scheduler.req_to_token_pool, "mamba_allocator", None)
 
-        # Instantaneous usage per pool. Two flavors:
-        #   usage_*_inst   — TOTAL occupancy (live req slots + radix-cached
-        #                    snapshots). What the planner has historically
-        #                    used. Susceptible to "phantom saturation" when
-        #                    mamba_radix_cache fills with LRU-evictable
-        #                    snapshots that don't actually stall admission.
-        #   usage_*_active — LIVE-only occupancy (subtract evictable). This
-        #                    is what design.md §"Budgeter — steady-state
-        #                    pressure rebalance" calls "admission ceiling"
-        #                    — only live state pins capacity. The planner's
-        #                    persist consec counter uses this so it doesn't
-        #                    fire on phantom cache fill.
+        # Instantaneous usage per pool (observability; not consumed by
+        # PaybackPlanner, but needed for snapshot JSONL and downstream
+        # monitors).
         usage_kv_inst = 0.0
         usage_kv_active = 0.0
         usage_mamba_inst = 0.0
@@ -1167,8 +1177,6 @@ class BudgetAgent:
         tc = self._tree_cache
         if live > 0:
             usage_kv_inst = max(0.0, min(1.0, (live - avail) / live))
-            # Active = total used − radix-cached evictable.
-            # `full_evictable_size` is a base-class-guaranteed method.
             kv_cached = int(tc.full_evictable_size())
             usage_kv_active = max(
                 0.0, min(1.0, (live - avail - kv_cached) / live)
@@ -1192,18 +1200,19 @@ class BudgetAgent:
         snapshot["usage_mamba_inst"] = usage_mamba_inst
         snapshot["usage_mamba_active"] = usage_mamba_active
 
-        # Lazy-build XPoolPlanner (design.md §"Budgeter — steady-state
-        # pressure rebalance").
+        # Lazy-build PaybackPlanner.
         if self._planner is None:
-            from sglang.srt.budgeter.xpool_planner import XPoolPlanner
-            self._planner = XPoolPlanner()
-            logger.info("BudgetAgent: XPoolPlanner attached")
-
-        def _scalar_or_total(v) -> int:
-            t = getattr(v, "total", None)
-            if isinstance(t, (int, float)):
-                return int(t)
-            return int(v) if isinstance(v, (int, float)) else 0
+            from sglang.srt.budgeter.xpool_planner import PaybackPlanner
+            from sglang.srt.budgeter.cost_model import (
+                get_cost_curves,
+                get_runtime_actuator_cost,
+            )
+            rac = get_runtime_actuator_cost()
+            self._planner = PaybackPlanner(
+                cost_curves=get_cost_curves(),
+                fire_cost_us=rac.current_us if rac.is_boot_seeded else 5000.0,
+            )
+            logger.info("BudgetAgent: PaybackPlanner attached")
 
         # Build the actuator chain (+ Admitter wire-in) eagerly on the
         # first tick that gets here. Decoupling from the planner's
@@ -1217,90 +1226,10 @@ class BudgetAgent:
             alloc, kv_pool, mamba_pool, snapshot
         )
 
-        # Reuse-aware mamba drain cost for the planner's m2k NB term
-        # (design.md §"Grow benefit and drain cost are both reuse-aware, not
-        # active-only"). Price draining the mamba snapshots
-        # an m2k fire of dst_chunks_per_action chunks would evict, via the
-        # exact hit-weighted predictor (predict_evict_cost_us), so a hot
-        # cache resists the drain instead of reading as active-slack. The
-        # planner subtracts this once per fire; absent it, the planner
-        # falls back to its legacy active-utilization estimate.
-        if (
-            mamba_pool is not None
-            and self._owner_provider is not None
-            and hasattr(tc, "predict_evict_cost_us")
-        ):
-            mamba_tpp = self._owner_provider.mamba_tokens_per_page()
-            snapshot["mamba_drain_cost_us"] = 0.0
-            snapshot["kv_drain_cost_us"] = 0.0
-
-            # Grow-side eviction benefit (symmetric to the drain
-            # cost): a pool actively shedding (hot) cache this tick should be
-            # GROWN. The benefit of growing pool σ = the reuse-aware cost of
-            # the evictions σ is currently forced into = predict_evict_cost_us
-            # over σ's recent eviction count.
-            #
-            # REQUIRES LPB. The reuse-awareness is the whole
-            # point — it must price COLD-cache turnover at ~0 so we only grow
-            # a pool that is shedding HOT cache. That requires per-node hit
-            # counts (n_b = hits_in_window), which only LPB provides; under
-            # LRU n_b ≡ 1, so predict_evict_cost_us can't tell hot from cold
-            # and prices benign cold turnover as costly. On the natural
-            # workload (mamba cache-full but evicting cold, cache_hit 0.90)
-            # that grew idle mamba by evicting hot KV cache → cache_hit
-            # 0.90→0.42, TTFT 5.7×, tps halved. Under LPB the same workload
-            # fires 0× (cold victims price ~0) and the starve regime still
-            # wins (+24pp). So we gate grow on LPB: under LRU the grow
-            # benefit stays 0 (cross-fire grow is safe-but-neutral; reuse-
-            # aware grow needs LPB). The drain cost above is left active —
-            # under LRU its n_b=1 estimate is conservative (it only
-            # SUPPRESSES m2k), so it can't cause the symmetric harm.
-            #
-            # Bound the priced eviction count at ONE fire's grant: a
-            # single fire grows σ by grant_σ slots, so it prevents at most
-            # that many evictions — pricing the full (unbounded) recent count
-            # would over-credit AND walk the whole pool tree on the scheduler
-            # thread (observed R_kv up to 110k).
-            if tc._should_use_lpb():
-                dca = self._planner.config.dst_chunks_per_action
-                kv_tpp = self._owner_provider.kv_tokens_per_page()
-                grant_m = dca * mamba_tpp
-                grant_kv = dca * kv_tpp
-                # τ-invariant per-fire bound. The grow signal is
-                # a per-tick FLOW the planner divides by dt to get a rate. One
-                # fire prevents at most `grant_σ` evictions and fires at most
-                # once per `cooldown_min_s`, so the sustainable prevented count
-                # PER TICK is `cap = grant_σ × dt / cooldown_min_s`. Pricing
-                # `min(recent, cap)` victims keeps `(…)/dt` τ-invariant in both
-                # the unbounded (recent < cap) and saturated (recent ≥ cap)
-                # regimes, and the per-cadence total ≈ grant_σ. `cap` may be
-                # fractional (e.g. grant_σ=1 slot), so in the saturated branch
-                # we walk ⌈cap⌉ victims (bounded, cheap) and scale to the exact
-                # fractional cap rather than flooring to 1 (a floor would make
-                # the priced count a τ-constant → reintroduce 1/dt coupling).
-                dt = float(snapshot["dt"])
-                cool_s = self._planner.config.cooldown_min_s
-                m_recent = int(snapshot.get("mamba_evicted_slots_recent", 0) or 0)
-                gm = _grow_priced_us(
-                    m_recent, grant_m, dt, cool_s,
-                    lambda n: tc.predict_evict_cost_us(n, pool="mamba"),
-                )
-                if gm is not None:
-                    snapshot["mamba_evict_grow_us"] = gm
-                k_recent = int(snapshot.get("kv_evicted_tokens_recent", 0) or 0)
-                gk = _grow_priced_us(
-                    k_recent, grant_kv, dt, cool_s,
-                    lambda n: tc.predict_evict_cost_us(n, pool="kv"),
-                )
-                if gk is not None:
-                    snapshot["kv_evict_grow_us"] = gk
-
-        qdepth = _scalar_or_total(snapshot.get("num_queue_reqs", 0))
         _p_t0 = time.perf_counter_ns()
-        decision = self._planner.decide(
-            usage_kv_inst, usage_mamba_inst,
-            queue_depth=qdepth, snapshot=snapshot,
-        )
+        clock_s = float(snapshot.get("ts", 0.0))
+        dt = float(snapshot.get("dt", 1.0))
+        decision = self._planner.decide(snapshot, clock_s, dt)
         _p_t_decide = time.perf_counter_ns()
         snapshot["_probe_decide_us"] = (_p_t_decide - _p_t0) // 1000
         snapshot["plan_direction"] = decision.direction or "none"
@@ -1349,59 +1278,50 @@ class BudgetAgent:
         # Build FirePlan from current ownership state. The steady-state
         # rebalance must DRAIN cold cache, not only harvest genuinely-free
         # pages: at steady saturation the source pool's reclaimable slack is
-        # its cold cached snapshots (full-but-quiescent), not free slots
-        # (design.md §"Budgeter — steady-state pressure rebalance": "mamba
-        # pool sits half-empty holding cold cache ... cache hit rate slowly
-        # bleeds"). allow_drain is the execution side of the reuse-aware
-        # mamba_drain_cost_us the planner's nb_m2k already subtracts — but
-        # only safe when that cost can credibly price hot cache (see
-        # `_cross_drain_allowed`).
-        #
-        # allow_migrate=True always requests Stage-3 LIVE-slot migration as a
-        # fallback when free+drain can't reach n_pages. It needs
-        # NO direction gate here because the OwnerProvider walk self-gates:
-        # the KV source (kv_to_mamba) only migrates when SGLANG_XPOOL_KV_MIGRATE
-        # is on AND the pool reports can_migrate_slot() (fail-closed, default
-        # off; per-backend captured-graph replay proven for flashinfer), and the
-        # mamba source (mamba_to_kv) migration is atomic-inert so it
-        # yields nothing. So True is safe in both directions and stays off in
-        # production until the env flag is set.
-        allow_drain = self._cross_drain_allowed(decision.direction)
-        # Demand-driven fire magnitude: transfer all safely donatable source
-        # pages. The cost model decided WHETHER to fire; here we compute
-        # HOW MUCH: source free pages, capped by the working-set floor.
+        # its cold cached snapshots (full-but-quiescent), not free slots.
+        # Budgeter fires are free→free ONLY: transfer free pages from the
+        # source pool to the destination. No drain (no cache eviction), no
+        # migrate (no live slot relocation). Non-destructive by construction.
+        n_free = self._owner_provider.n_free_source_pages(
+            decision.direction) if self._owner_provider else 0
+        # m2k (grow KV from mamba): demand-driven (transfer all free).
+        # k2m (grow mamba from KV): 1 LCM per fire for gradual convergence.
         if decision.direction == "mamba_to_kv":
-            n_pages_target = self._owner_provider.n_free_source_pages(
-                "mamba_to_kv") if self._owner_provider else 0
-            if mamba_pool is not None and n_pages_target > 0:
-                live_size = int(mamba_allocator.live_size)
-                m_used = max(0, live_size - int(mamba_allocator.available_size()))
-                evictable = int(self._tree_cache.mamba_evictable_size())
-                floor_slots = self._mamba_working_set_floor_slots(m_used, evictable)
-                arena = mamba_pool._mamba_temporal_arena
-                slots_per_page = int(arena.tokens_per_chunk) if arena is not None else 0
-                n_pages_target = _mamba_drain_floor(
-                    live_size, floor_slots, slots_per_page, n_pages_target,
-                )
-            if n_pages_target <= 0:
-                snapshot["fire_direction"] = decision.direction
-                snapshot["fire_aborted"] = True
-                snapshot["fire_abort_reason"] = "no donatable source pages"
-                return
+            n_pages_target = n_free
         else:
-            n_pages_target = self._owner_provider.n_free_source_pages(
-                "kv_to_mamba") if self._owner_provider else 0
-            if n_pages_target <= 0:
-                snapshot["fire_direction"] = decision.direction
-                snapshot["fire_aborted"] = True
-                snapshot["fire_abort_reason"] = "no donatable source pages"
-                return
+            lcm = getattr(self._actuator, "lcm_pages", 48) if self._actuator else 48
+            n_pages_target = min(n_free, lcm)
+        if decision.direction == "mamba_to_kv" and mamba_pool is not None and n_pages_target > 0:
+            live_size = int(mamba_allocator.live_size)
+            m_used = max(0, live_size - int(mamba_allocator.available_size()))
+            evictable = int(self._tree_cache.mamba_evictable_size())
+            floor_slots = self._mamba_working_set_floor_slots(m_used, evictable)
+            arena = mamba_pool._mamba_temporal_arena
+            slots_per_page = int(arena.tokens_per_chunk) if arena is not None else 0
+            n_pages_target = _mamba_drain_floor(
+                live_size, floor_slots, slots_per_page, n_pages_target,
+            )
+        elif decision.direction == "kv_to_mamba" and n_pages_target > 0:
+            # Symmetric KV working-set floor: the drain must leave the running
+            # KV working set + one indivisible prefill chunk, or a later
+            # alloc_token_slots OOMs (the swarm crash). Reuses the same
+            # pool-agnostic _mamba_drain_floor clamp as the m2k branch.
+            kv_live = int(alloc.live_size)
+            kv_avail = int(alloc.available_size())
+            kv_used = max(0, kv_live - kv_avail)
+            floor_slots = self._kv_working_set_floor_slots(kv_used)
+            n_pages_target = _mamba_drain_floor(
+                kv_live, floor_slots, self._kv_tokens_per_chunk, n_pages_target,
+            )
+        if n_pages_target <= 0:
+            snapshot["fire_direction"] = decision.direction
+            snapshot["fire_aborted"] = True
+            snapshot["fire_abort_reason"] = "no free source pages"
+            return
         _p_t_build_start = time.perf_counter_ns()
         plan = self._fire_planner.build(
             direction=decision.direction,
             n_pages_target=n_pages_target,
-            allow_drain=allow_drain,
-            allow_migrate=True,
         )
         _p_t_build_done = time.perf_counter_ns()
         snapshot["_probe_build_us"] = (_p_t_build_done - _p_t_build_start) // 1000
@@ -1500,7 +1420,7 @@ class BudgetAgent:
     # ---- Snapshot + close ----
 
     def _snapshot(self, now: float) -> dict:
-        """Capture all signals the planner / pressure adapter consume."""
+        """Capture all signals the planner consumes."""
         sched = self.scheduler
         stats = sched.metrics_reporter.stats
         # stats.num_*_reqs are only refreshed in `_maybe_log_idle_metrics`
@@ -1533,6 +1453,7 @@ class BudgetAgent:
             "cache_hit_rate": stats.cache_hit_rate,
             "num_running_reqs": running_n,
             "num_queue_reqs": queue_n,
+            "max_running_mamba": int(self._last_mamba_size or 0) // max(1, self._mamba_per_req_ratio) if self._last_mamba_size else 0,
             "num_paused_reqs": _count(stats.num_paused_reqs),
             "num_retracted_reqs": _count(stats.num_retracted_reqs),
             "gen_throughput": stats.gen_throughput,
@@ -1584,9 +1505,7 @@ class BudgetAgent:
         # (mem_cache/common.py), unconditionally init'd at cache __init__.
         # Without plumbing these the planner sees L=0 always → c_σ=0 → the
         # eviction-cost half of the NB is dead and only queue/persist
-        # signals can fire. The retract EWMA feeds the pressure adapter's
-        # L-aware retract cost (k_retract); absent ⇒ adapter falls back to
-        # the full-prefill cost.
+        # signals can fire.
         snap["slow_recovery_len_kv"] = float(
             self._tree_cache._slow_recovery_len_kv_ewma
         )
@@ -1608,6 +1527,16 @@ class BudgetAgent:
         snap["kv_evicted_tokens_recent"] = max(0, cum_k - self._last_evicted_kv_tokens)
         self._last_evicted_mamba_slots = cum_m
         self._last_evicted_kv_tokens = cum_k
+
+        # Reuse-weighted LPB LOSS (us) shed per pool this tick — the ACCURATE
+        # eviction-cost signal the PaybackPlanner uses for r_evict (a low-reuse
+        # pool's churn carries ~0 loss, so it stops driving spurious fires).
+        cum_kl = self._tree_cache._cumulative_evicted_kv_lpb_loss
+        cum_ml = self._tree_cache._cumulative_evicted_mamba_lpb_loss
+        snap["kv_evicted_lpb_loss_recent"] = max(0.0, cum_kl - self._last_evicted_kv_lpb_loss)
+        snap["mamba_evicted_lpb_loss_recent"] = max(0.0, cum_ml - self._last_evicted_mamba_lpb_loss)
+        self._last_evicted_kv_lpb_loss = cum_kl
+        self._last_evicted_mamba_lpb_loss = cum_ml
 
         # Pool-occupancy metrics (paper §motivation, bubble figure):
         # (pool.size - pool.available_size()) / pool.size = used / total,

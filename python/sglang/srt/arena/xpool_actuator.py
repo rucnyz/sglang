@@ -44,6 +44,23 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class _PendingApply:
+    """Deferred pool-state update produced by the fire worker, applied on
+    the scheduler thread by ``apply_pending_fires()``.  Separates the
+    CUDA driver work (cuMemUnmap/Map, worker thread) from allocator
+    metadata (pool.size, unmark, scheduler thread)."""
+
+    plan_seq: int
+    src_pool: object
+    dst_pool: object
+    src_tpc: int
+    dst_tpc: int
+    shrunk_pages: int
+    grown_pages: int
+    dst_token_slots: list
+
+
+@dataclass
 class FireToken:
     """Opaque handoff from cap_barrier (sync) to execute_async (worker).
 
@@ -118,6 +135,8 @@ class XPoolActuator:
         # on the free-handle Python list and double-allocate or lose handles.
         # See dev/interlayer/2_admitter/README.md.
         self._fire_inflight = threading.Lock()
+        self._pending_applies: list[_PendingApply] = []
+        self._pending_lock = threading.Lock()
         # Freeze the shared pool so any runtime caller of grow() / extend
         # ops raises instead of silently racing fires. The arenas have
         # already done their init-time growth above; no more legitimate
@@ -370,58 +389,29 @@ class XPoolActuator:
             (_p2-_p1)//1000, (_p3-_p2)//1000, (_p4-_p3)//1000,
         )
 
-        # Do the cuMemUnmap HERE on the scheduler thread (not the worker)
-        # so no new decode batch can launch during the VA remap. The scheduler
-        # is single-threaded: holding it through the unmap guarantees no kernel
-        # touches the about-to-be-unmapped pages. The worker then only does
-        # cuMemMap (grow dst), which is safe (adds new VA, never reads existing).
-        src_names = self._all_subpool_names(src)
-        n_src = len(src_names)
-        dst_names = self._all_subpool_names(dst)
-        n_dst = len(dst_names)
+        # Compute the LCM-rounded transfer count. cuMemUnmap/Map moved to
+        # execute_async (worker thread): free pages are safe to unmap with
+        # in-flight kernels (no kernel accesses free VA). Pool metadata
+        # (pool.size, unmark) deferred to apply_pending_fires on the next
+        # scheduler tick.
+        n_src = len(self._all_subpool_names(src))
+        n_dst = len(self._all_subpool_names(dst))
         target_src_total = n_src * len(plan.pages_to_unmap)
         target_dst_total = n_dst * plan.pages_to_map_dst
+        # Clamp the dst grant to the allocator's physical id-space headroom
+        # (max_size - live_size). The arena's chunk-id space is far larger than
+        # CappedFreeList.size, so an unclamped grant expands to chunk ids past
+        # the ceiling and unmark_token_slots fail-fasts. Feeding the clamped
+        # value into `total = min(src, dst)` reduces per_src here in lockstep
+        # with per_dst (execute_async), so the src pool is never shrunk more
+        # than the dst grows (surplus src pages are restored below).
+        target_dst_total = min(
+            target_dst_total, n_dst * dst_act.grow_headroom_pages()
+        )
         target_total = min(target_src_total, target_dst_total)
         lcm_n = self.lcm_pages
         total = (target_total // lcm_n) * lcm_n
         per_src = total // n_src if n_src else 0
-
-        # Ideal fire: unmap source chunks (cuMemUnmap), then map the
-        # recycled physical handles to destination chunks (cuMemMap).
-        # Total physical memory is conserved (zero extra GPU allocation).
-        # No torch.cuda.synchronize needed: the unmapped slots are FREE
-        # (verified by count_referenced above), so no in-flight kernel
-        # touches their VA. The handles flow through SharedHandlePool.
-        # _free_handles: shrink_explicit pushes, grow pops.
-        per_dst = per_src
-        granted_in_barrier: list[list[int]] | None = None
-        if per_src > 0:
-            for name in src_names:
-                src._arena.shrink_explicit(name, plan.pages_to_unmap[:per_src])
-            granted_in_barrier = []
-            for name in dst_names:
-                ids = dst._arena.grow(name, per_dst)
-                granted_in_barrier.append(ids)
-            n_granted = min(len(ids) for ids in granted_in_barrier) if granted_in_barrier else 0
-            src_pool = src_act.pool
-            dst_pool = dst_act.pool
-            src_tpc = src_act._tokens_per_page()
-            dst_tpc = dst_act._tokens_per_page()
-            shrunk_tokens = per_src * src_tpc
-            grown_tokens = n_granted * dst_tpc
-            src_pool.size = max(0, src_pool.size - shrunk_tokens)
-            dst_pool.size += grown_tokens
-            dst_token_slots = dst_act.expand_pages_to_token_slots(
-                granted_in_barrier[0][:n_granted] if granted_in_barrier else []
-            )
-            dst_act.unmark_token_slots(dst_token_slots)
-            logger.info(
-                "cap_barrier[seq=%d] shrink %d src chunks × %d subpools "
-                "(src.size=%d) + grow %d dst chunks × %d subpools "
-                "(dst.size=%d), unmarked %d dst slots",
-                plan.plan_seq, per_src, n_src, src_pool.size,
-                n_granted, n_dst, dst_pool.size, len(dst_token_slots),
-            )
         unmapped_total = per_src * n_src
         self._restore_src_surplus(src_act, plan.pages_to_unmap[per_src:])
         kept_slots = src_act.expand_pages_to_token_slots(
@@ -441,7 +431,7 @@ class XPoolActuator:
             t_start_ns=t_start,
             unmapped_total=unmapped_total,
             per_src=per_src,
-            granted_in_barrier=granted_in_barrier,
+            granted_in_barrier=None,
         )
 
     # ---- Phase 2: unmap + map + cap-bump (async; worker thread) ----
@@ -521,24 +511,37 @@ class XPoolActuator:
             ) // 1000
             return result
 
-        # --- unmap + map (balanced atomic across sub-pools) ---
-        # The cuMemUnmap (src shrink) was already done in cap_barrier on the
-        # scheduler thread (safe: no new decode batch during the unmap). This
-        # worker only does the cuMemMap (dst grow) + cap-bump.
+        # --- unmap + map (fully async on worker thread) ---
+        # cuMemUnmap on FREE pages is safe with in-flight GPU kernels: no
+        # kernel accesses free-slot VA (verified by count_reachable above).
+        # cuMemMap adds new VA (never touches existing pages). Pool metadata
+        # (pool.size, unmark_dst) is deferred to apply_pending_fires on the
+        # scheduler thread.
+        src_names = self._all_subpool_names(src)
         dst_names = self._all_subpool_names(dst)
+        n_src = len(src_names)
         n_dst = len(dst_names)
-        n_src = len(self._all_subpool_names(src))
         per_src = token.per_src
         unmapped_total = token.unmapped_total
-        per_src = token.per_src
         lcm_n = self.lcm_pages
         target_src_total = n_src * len(plan.pages_to_unmap)
         target_dst_total = n_dst * plan.pages_to_map_dst
+        # Re-clamp to the dst allocator's CURRENT physical headroom (live_size
+        # may have advanced since cap_barrier via a prior fire's apply_pending
+        # on this thread). Authoritative bound: guarantees granted chunk ids
+        # never exceed CappedFreeList.size (mirrors the cap_barrier clamp).
+        target_dst_total = min(
+            target_dst_total, n_dst * dst_act.grow_headroom_pages()
+        )
         target_total = min(target_src_total, target_dst_total)
         total = (target_total // lcm_n) * lcm_n
         per_dst = total // n_dst if n_dst else 0
 
-        result.unmap_us = token.cap_barrier_us
+        unmap_t0 = time.monotonic_ns()
+        if per_src > 0 and token.granted_in_barrier is None:
+            for name in src_names:
+                src._arena.shrink_explicit(name, plan.pages_to_unmap[:per_src])
+        result.unmap_us = (time.monotonic_ns() - unmap_t0) // 1000
         result.unmapped_pages = unmapped_total
 
         map_t0 = time.monotonic_ns()
@@ -616,13 +619,30 @@ class XPoolActuator:
                 plan.plan_seq, granted_per_subpool, actual_per_dst,
                 per_dst, dst_grow_slots,
             )
-        if not token.granted_in_barrier:
-            dst_act.unmark_token_slots(token_slots)
-        logger.info(
-            "execute_async[seq=%d] dst restore: %d slots %s",
-            plan.plan_seq, dst_grow_slots,
-            "(done in cap_barrier)" if token.granted_in_barrier else "(unmarked here)",
-        )
+        if token.granted_in_barrier:
+            logger.info(
+                "execute_async[seq=%d] dst restore: %d slots (done in cap_barrier)",
+                plan.plan_seq, dst_grow_slots,
+            )
+        else:
+            src_tpc = src_act._tokens_per_page()
+            dst_tpc = dst_act._tokens_per_page()
+            pending = _PendingApply(
+                plan_seq=plan.plan_seq,
+                src_pool=src_act.pool,
+                dst_pool=dst_act.pool,
+                src_tpc=src_tpc,
+                dst_tpc=dst_tpc,
+                shrunk_pages=per_src,
+                grown_pages=actual_per_dst,
+                dst_token_slots=list(token_slots),
+            )
+            with self._pending_lock:
+                self._pending_applies.append(pending)
+            logger.info(
+                "execute_async[seq=%d] dst restore: %d slots (deferred to apply_pending)",
+                plan.plan_seq, dst_grow_slots,
+            )
         result.total_us = (time.monotonic_ns() - token.t_start_ns) // 1000
         logger.info(
             "execute_async[seq=%d] DONE dir=%s unmapped=%d granted=%d "
@@ -659,6 +679,38 @@ class XPoolActuator:
         )
         src_alloc.unmark_pages_capped(restore_t)
 
+    # ---- Deferred apply (scheduler thread) -----------------------------
+
+    def apply_pending_fires(self) -> int:
+        """Apply pool metadata from completed async fires.
+
+        Called on the scheduler thread (e.g. in BudgetAgent.tick).
+        Updates pool.size and unmarkes dst slots for each completed fire.
+        Returns the number of pending entries applied.
+        """
+        with self._pending_lock:
+            batch = self._pending_applies
+            self._pending_applies = []
+        if not batch:
+            return 0
+        for p in batch:
+            shrunk_tokens = p.shrunk_pages * p.src_tpc
+            grown_tokens = p.grown_pages * p.dst_tpc
+            p.src_pool.size = max(0, p.src_pool.size - shrunk_tokens)
+            p.dst_pool.size += grown_tokens
+            dst_act = self._resolve_dst_act(p.dst_pool)
+            dst_act.unmark_token_slots(p.dst_token_slots)
+            logger.info(
+                "apply_pending[seq=%d] src.size-=%d dst.size+=%d unmarked=%d",
+                p.plan_seq, shrunk_tokens, grown_tokens, len(p.dst_token_slots),
+            )
+        return len(batch)
+
+    def _resolve_dst_act(self, dst_pool):
+        if self.kv_actuator is not None and self.kv_actuator.pool is dst_pool:
+            return self.kv_actuator
+        return self.mamba_actuator
+
     # ---- Plan-based execution ----------------------------------------
 
     def execute(self, plan: "FirePlan") -> "FirePlanResult":
@@ -671,12 +723,23 @@ class XPoolActuator:
           3. unmap + map — physically `cuMemUnmap` source pages, `cuMemMap`
                            the freed handles into the destination pool.
 
-        Equivalent to `execute_async(cap_barrier(plan))`; preserved as a
-        single entrypoint for callers that don't need the phase split
-        (tests, direct invocation).
+        Equivalent to `execute_async(cap_barrier(plan))` PLUS an inline
+        `apply_pending_fires()`: this is the SYNCHRONOUS entrypoint, so the
+        transfer must be fully complete (physical map + metadata) when it
+        returns. Its callers -- the on-demand grows (`_grow_kv_from_mamba` /
+        `_grow_mamba_from_kv`, invoked from `alloc_token_slots` when the live
+        KV cap is exhausted) and the Admitter -- retry `allocator.alloc()`
+        IMMEDIATELY on return; if the dst unmark were left deferred to the next
+        Budgeter tick, the retry would still see the pre-grow capacity and raise
+        a spurious 'Out of memory' even though the grow physically succeeded
+        (observed as the rep2 OOM on a repeated KV-bound burst). The async
+        Budgeter-worker path (cap_barrier + execute_async, applied on the tick)
+        is unaffected.
         """
         token = self.cap_barrier(plan)
-        return self.execute_async(token)
+        result = self.execute_async(token)
+        self.apply_pending_fires()
+        return result
 
     # ------------------------------------------------------------------
 

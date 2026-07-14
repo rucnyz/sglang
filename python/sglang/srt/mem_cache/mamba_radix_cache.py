@@ -580,6 +580,12 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # BudgetAgent deltas them per tick.
         self._cumulative_evicted_mamba_slots = 0
         self._cumulative_evicted_kv_tokens = 0
+        # LPB LOSS (reuse-weighted recompute cost, us) shed per pool — the
+        # accurate cross-pool eviction-cost signal. Raw slot/token COUNT above
+        # over-values low-reuse evictions (n_b=0 -> ~0 loss), which drove the
+        # swarm k2m/m2k oscillation. BudgetAgent deltas these per tick.
+        self._cumulative_evicted_kv_lpb_loss = 0.0
+        self._cumulative_evicted_mamba_lpb_loss = 0.0
         assert (
             isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
             or isinstance(
@@ -687,6 +693,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.mamba_protected_size_ = 0
         self._cumulative_evicted_mamba_slots = 0
         self._cumulative_evicted_kv_tokens = 0
+        self._cumulative_evicted_kv_lpb_loss = 0.0
+        self._cumulative_evicted_mamba_lpb_loss = 0.0
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
@@ -1137,58 +1145,18 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         parents) terminates the cold-tail walk exactly as the live walk
         would.
         """
-        if not self._should_use_lpb():
-            node = self.mamba_lru_list.get_lru_no_lock()
-            while node is not None:
-                nxt = self.mamba_lru_list.get_prev_no_lock(node)
-                yield node
-                if nxt is None or not self.mamba_lru_list.in_list(nxt):
-                    return
-                node = nxt
-            return
-
-        # LPB Phase 1: contiguous cold (hit_count == 0) tail run. Track
-        # yielded ids so Phase 2's heap skips them under a pure-read
-        # consumer (which, unlike `evict_mamba`, has not removed them
-        # from the list, so the `in_list` filter alone would resurface
-        # them).
-        #
-        # Phase 2 is entered ONLY when the cold run ends at a valid
-        # hit-bearing node (`reached_hot`). If instead the captured
-        # successor left the list (a freed leaf's cascade swept it), the
-        # walk terminates here: the live-list walk has no node to resume
-        # from, matching the pre-extraction inline behavior.
-        phase1_ids: set = set()
-        reached_hot = False
+        # Mamba eviction always uses LRU ordering (recency), even when
+        # KV uses LPB. LPB's cost-per-byte normalization hurts mamba
+        # because mamba's fixed bytes dilute long-prefix entries' value.
+        # LRU's recency heuristic is better for mamba: active sessions
+        # are recent (kept), finished sessions are old (evicted).
         node = self.mamba_lru_list.get_lru_no_lock()
-        while node is not None and node.hit_count == 0:
+        while node is not None:
             nxt = self.mamba_lru_list.get_prev_no_lock(node)
-            phase1_ids.add(id(node))
             yield node
             if nxt is None or not self.mamba_lru_list.in_list(nxt):
                 return
-            if nxt.hit_count > 0:
-                reached_hot = True
-                break
             node = nxt
-
-        if node is not None and node.hit_count > 0:
-            # The tail itself was hit-bearing: Phase 1 never ran, go
-            # straight to the heap.
-            reached_hot = True
-        if not reached_hot:
-            return
-
-        # LPB Phase 2: heap over remaining hit-bearing evictable nodes,
-        # built lazily here (the cold-tail loop above already exhausted
-        # the zero-cost run, so we only pay the heapify if the drain
-        # needs hit-bearing victims).
-        heap = self._lpb_build_eviction_heap()
-        victim = self._lpb_pop_eviction_victim(heap)
-        while victim is not None:
-            if id(victim) not in phase1_ids:
-                yield victim
-            victim = self._lpb_pop_eviction_victim(heap)
 
     def evict_mamba(self, mamba_num: int) -> int:
         """Evict mamba states. Returns the number of mamba states evicted.
@@ -1211,7 +1179,18 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable or mamba_num <= 0:
             return 0
 
+        from sglang.srt.budgeter.cost_model import get_cost_curves, has_cost_curves
+
+        # The per-victim LPB-loss telemetry below is consumed only by the
+        # Budgeter. On a base server (hybrid model, --radix-eviction-policy lru,
+        # no SGLANG_CSIGMA_*) there is no Budgeter and no calibrated cost model,
+        # so skip the pricing rather than let get_cost_curves() fail-close and
+        # crash the eviction path.
+        track_loss = has_cost_curves()
+        curves = get_cost_curves() if track_loss else None
+        use_lpb = self._should_use_lpb()
         mamba_num_evicted = 0
+        lpb_loss_us = 0.0
         for x in self._iter_mamba_victims():
             if mamba_num_evicted >= mamba_num:
                 break
@@ -1221,6 +1200,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             ), f"node has abnormal mamba length, {x.id=}, {len(x.mamba_value)=}"
             assert x != self.root_node, f"root node is not evictable, {x.id=}"
             assert x.mamba_lock_ref == 0, f"node is in use by mamba kv indices, {x.id=}"
+
+            # LPB loss of dropping this recurrent snapshot: n_b * (c_kv + c_m),
+            # the full-prefix re-prefill needed to rebuild the mamba state
+            # (a snapshot cannot be recovered from kept KV alone). n_b=0 =>
+            # ~0 loss. Priced BEFORE eviction; matches predict_evict_cost_us.
+            if track_loss:
+                n_b = x.hits_in_window() if use_lpb else 1
+                s_b = len(x.key) if x.key is not None else 0
+                lpb_loss_us += n_b * (curves.c_kv_us(s_b) + curves.c_m_us(s_b))
 
             if len(x.children) > 0:
                 from sglang.srt.mem_cache.common import record_recovery_len_rec
@@ -1242,6 +1230,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # a mamba-bound workload; this counts the actual mamba cache
         # evictions. BudgetAgent deltas it per tick.
         self._cumulative_evicted_mamba_slots += mamba_num_evicted
+        self._cumulative_evicted_mamba_lpb_loss += lpb_loss_us
         return mamba_num_evicted
 
     def _lpb_build_full_eviction_heap(self) -> list:
@@ -1497,12 +1486,31 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable or full_num_tokens <= 0:
             return 0
 
+        from sglang.srt.budgeter.cost_model import get_cost_curves, has_cost_curves
+
+        # Skip the Budgeter-only LPB-loss pricing when no cost model is
+        # calibrated (base LRU serving); see the twin note in evict_mamba.
+        track_loss = has_cost_curves()
+        curves = get_cost_curves() if track_loss else None
+        use_lpb = self._should_use_lpb()
         victims, _swept = self._plan_full_eviction(full_num_tokens)
         full_num_evicted = 0
+        lpb_loss_us = 0.0
         for x in victims:
             assert (
                 x != self.root_node
             ), f"root node should not exist in full lru list, {x.id=}"
+            # LPB loss BEFORE the node is freed: n_b * c_recompute(s_b), the
+            # reuse-weighted re-prefill cost if this block is re-requested.
+            # n_b=0 for never-reused cache => ~0 loss (the accurate signal that
+            # a low-reuse pool is cheap to shrink; see predict_evict_cost_us).
+            if track_loss:
+                n_b = x.hits_in_window() if use_lpb else 1
+                s_b = len(x.key) if x.key is not None else 0
+                lpb_loss_us += n_b * (
+                    curves.c_kv_us(s_b)
+                    + (curves.c_m_us(s_b) if x.mamba_value is not None else 0.0)
+                )
             full_num_evicted_delta, _, _, _ = self._evict_leaf_node(x, False)
             full_num_evicted += full_num_evicted_delta
 
@@ -1510,6 +1518,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # signal for nb_m2k (grow KV when KV sheds hot prefixes). See the
         # mamba counterpart in `evict_mamba`. BudgetAgent deltas it per tick.
         self._cumulative_evicted_kv_tokens += full_num_evicted
+        self._cumulative_evicted_kv_lpb_loss += lpb_loss_us
         return full_num_evicted
 
     def predict_evict_cost_us(self, num_tokens: int, pool: str = "kv") -> float:

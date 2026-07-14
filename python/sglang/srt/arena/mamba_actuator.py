@@ -125,6 +125,17 @@ class MambaArenaActuator:
         one slot — but the same accessor convention matches KVArenaActuator."""
         return int(self.pool.size) // self._tokens_per_page()
 
+    def grow_headroom_pages(self) -> int:
+        """Physical page headroom before the mamba allocator hits its id-space
+        ceiling (max_size). A cross-fire dst grant must be clamped to this, or
+        the arena (whose chunk-id space is deliberately far larger than the
+        allocator's max_size) hands out chunk ids that expand past
+        CappedFreeList.size and unmark_token_slots fail-fasts. Symmetric with
+        KVArenaActuator.grow_headroom_pages."""
+        alloc = self.pool._allocator
+        headroom_slots = max(0, alloc.max_size - alloc.live_size)
+        return headroom_slots // self._tokens_per_page()
+
     def _tokens_per_page(self) -> int:
         """Internal: tokens-per-page for the mamba arena (== slots-per-
         chunk; typically 1 under page-grain VMM).
