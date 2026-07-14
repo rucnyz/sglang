@@ -234,6 +234,178 @@ def build_case1() -> List[dict]:
     return records
 
 
+# --- BUILD 4: long-context HIGH-CONCURRENCY burst (m2k KV-bound WIN) -----------
+# case1 (52 multi-turn roots) only reaches ~4 concurrent: agentreplay replays each
+# root's turns SEQUENTIALLY with the real inter-turn tool_gap sleeps, so at any
+# instant only the few roots mid-turn are in-flight and the KV pool never binds.
+# This builder instead emits INDEPENDENT single-turn requests (one longest turn per
+# program, no tool_gap, no multi-turn dependency) from EVERY program (roots AND
+# subagents flattened to independent roots, as `--flatten-subagents` does for the
+# swarm), so with `--stagger 0` all N co-arrive and stay in-flight. Prompts are
+# DISTINCT real contexts (NO duplication: identical input_ids would radix-cache-hit
+# and stop pressuring KV). Demand (N * ~90k) >> the default KV pool, so KV binds at
+# the DEFAULT split while mamba stays idle (1 slot/request << 977) -> the m2k regime
+# where sys drains idle mamba to grow KV, admits more long prefills, drains the queue.
+LONGBURST_MIN_PROMPT = 50000   # independent long context; KV-heavy.
+LONGBURST_MAX_PROMPT = 262144  # <= server --context-length.
+OUT_LONGBURST = os.path.join(RQ1, "case1/data/cc_qwen_longburst.jsonl")
+
+
+def build_longburst() -> List[dict]:
+    """Every program's single LONGEST turn, kept as an INDEPENDENT single-turn
+    request, for all programs whose longest turn is in [LONGBURST_MIN, LONGBURST_MAX).
+    Distinct real prompts (no dup), co-arriving (run with --stagger 0)."""
+    by, _parent_of = load_sessions(SRC_LONG)
+    picks = []
+    for pid, recs in by.items():
+        rec = max(recs, key=lambda r: len(r["input_ids"]))
+        n = len(rec["input_ids"])
+        if LONGBURST_MIN_PROMPT <= n < LONGBURST_MAX_PROMPT:
+            picks.append((pid, rec, n))
+    picks.sort(key=lambda x: x[2], reverse=True)  # longest first (deepest KV pressure)
+    records: List[dict] = []
+    for i, (pid, rec, _n) in enumerate(picks):
+        records.append({
+            "t": round(0.001 * i, 4),          # tiny spread; --stagger 0 overrides to simultaneous
+            "program_id": f"lb_{pid}",
+            "step": 1,
+            "parent_program_id": None,
+            "spawned_at_step": None,
+            "spawn_ts": None,
+            "input_ids": rec["input_ids"],                          # FULL real long prompt
+            "forced_output_ids": rec.get("forced_output_ids") or [],
+            "tool_gap_after": 0.0,
+        })
+    return records
+
+
+# --- BUILD 4b: MODERATE-context m2k KV-bound WIN burst --------------------------
+# The documented m2k win (project memory: +10.8% N=3) is at MODERATE context
+# (~16k), NOT maximally-long (76k+). At 16k the prefill is NOT compute-bound at low
+# concurrency (GPU headroom), so growing KV to admit more actually raises throughput
+# (vs 76k where each prefill already saturates the GPU). Run this with a SHRUNK KV
+# pool (MEMFRAC=0.45 + MAMBA_CAP=580) so base is KV-limited BELOW the GPU knee, and
+# MAX_RUNNING=48 pins the ceiling at the knee so sys grows KV up to it (34->48).
+# DISTINCT real ~16k prompts (dedup) so each genuinely occupies KV (dups would
+# radix-cache-hit and share KV, not pressure it).
+MODBURST_MIN_PROMPT = 13000
+MODBURST_MAX_PROMPT = 22000
+OUT_MODBURST = os.path.join(RQ1, "case1/data/cc_qwen_modburst.jsonl")
+
+
+def build_modburst() -> List[dict]:
+    """All DISTINCT real turns with input in [MODBURST_MIN, MODBURST_MAX), each an
+    INDEPENDENT single-turn request. Co-arriving (run with --stagger 0)."""
+    by, _ = load_sessions(SRC_LONG)
+    seen = set()
+    picks = []
+    for pid, recs in by.items():
+        for r in recs:
+            n = len(r["input_ids"])
+            if MODBURST_MIN_PROMPT <= n < MODBURST_MAX_PROMPT:
+                key = tuple(r["input_ids"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                picks.append((pid, r, n))
+    picks.sort(key=lambda x: x[2], reverse=True)
+    records: List[dict] = []
+    for i, (pid, rec, _n) in enumerate(picks):
+        records.append({
+            "t": round(0.001 * i, 4),
+            "program_id": f"mb_{pid}_{i}",
+            "step": 1,
+            "parent_program_id": None,
+            "spawned_at_step": None,
+            "spawn_ts": None,
+            "input_ids": rec["input_ids"],
+            "forced_output_ids": rec.get("forced_output_ids") or [],
+            "tool_gap_after": 0.0,
+        })
+    return records
+
+
+def validate_modburst(path: str) -> None:
+    recs = _read_valid(path)
+    ins = sorted(len(r["input_ids"]) for r in recs)
+    outs = sorted(len(r.get("forced_output_ids") or []) for r in recs)
+    distinct = len({tuple(r["input_ids"]) for r in recs})
+    print("=" * 72)
+    print(f"modburst (moderate-ctx m2k KV-bound WIN) -> {path}")
+    print(f"  requests={len(recs)}  distinct prompts={distinct}")
+    print(f"  prompt-len: min={ins[0]} p50={pct(ins,.5)} max={ins[-1]} "
+          f"(band [{MODBURST_MIN_PROMPT}, {MODBURST_MAX_PROMPT}))")
+    print(f"  output-len/req: p50={pct(outs,.5)} max={outs[-1]}")
+    print(f"  at MEMFRAC=0.45 (~560k KV) fits ~{560000 // max(1, pct(ins,.5))}; "
+          f"MAX_RUNNING=48 ceiling; mamba idle donor")
+    print("=" * 72)
+
+
+# --- BUILD 5: decode-heavy MAMBA-bound burst (k2m throughput WIN attempt) ------
+# A mamba slot is O(1) per request, DECOUPLED from context length, so a short-
+# context workload can bind the mamba cap (max_running ~195) while each decode step
+# is cheap (small KV load + short attention). If at batch 195 the decode is memory
+# (weight-load) bound rather than compute bound, a LARGER batch amortizes the weight
+# load and raises decode throughput -> growing mamba (k2m) wins. The swarm missed
+# this because its 192-token outputs let requests complete before 195 was sustained
+# (avg conc 127 < cap 195). Here outputs are LONG real forced-decode sequences so
+# every admitted request holds its mamba slot through a long decode, sustaining the
+# bind with a deep queue. Short prompts keep KV far from binding so mamba is the sole
+# constraint the Budgeter grows.
+DH_PROMPT_LEN = 2048     # short real prompt prefix -> small KV, low prefill compute.
+DH_OUT_MIN = 1200        # only turns whose REAL output is long (sustains occupancy).
+DH_OUT_LEN = 4000        # keep up to 4000 real forced-output tokens (long decode).
+N_DH = 3000              # >> 195 cap; sustained deep queue.
+DH_WINDOW = 40.0
+OUT_DECODEHEAVY = os.path.join(RQ1, "case2/data/cc_qwen_decodeheavy.jsonl")
+
+
+def build_decodeheavy() -> List[dict]:
+    """Short-context (DH_PROMPT_LEN prefix) + LONG real output (>= DH_OUT_MIN, kept up
+    to DH_OUT_LEN) independent single-turn requests, duplicated to N_DH over a tight
+    window. Binds the mamba cap with a sustained decode queue while KV stays slack."""
+    by, _ = load_sessions(SRC_LONG)
+    longout = []
+    for pid, recs in by.items():
+        for r in recs:
+            if len(r.get("forced_output_ids") or []) >= DH_OUT_MIN:
+                longout.append((pid, r))
+    longout.sort(key=lambda x: len(x[1]["forced_output_ids"]), reverse=True)
+    if not longout:
+        raise SystemExit("no turns with a long real output found")
+    records: List[dict] = []
+    for i in range(N_DH):
+        src_pid, rec = longout[i % len(longout)]
+        dup = i // len(longout)
+        start = DH_WINDOW * i / max(1, N_DH - 1)
+        records.append({
+            "t": round(start, 4),
+            "program_id": f"dh_{src_pid}__d{dup}",
+            "step": 1,
+            "parent_program_id": None,
+            "spawned_at_step": None,
+            "spawn_ts": None,
+            "input_ids": rec["input_ids"][:DH_PROMPT_LEN],
+            "forced_output_ids": (rec.get("forced_output_ids") or [])[:DH_OUT_LEN],
+            "tool_gap_after": 0.0,
+        })
+    return records
+
+
+def validate_decodeheavy(path: str) -> None:
+    recs = _read_valid(path)
+    ins = sorted(len(r["input_ids"]) for r in recs)
+    outs = sorted(len(r.get("forced_output_ids") or []) for r in recs)
+    distinct = len({tuple(r["input_ids"]) for r in recs})
+    print("=" * 72)
+    print(f"decodeheavy (mamba-bound k2m throughput attempt) -> {path}")
+    print(f"  requests={len(recs)}  distinct prompts={distinct}  (all step=1, parent=None)")
+    print(f"  prompt-len: p50={pct(ins,.5)} max={ins[-1]}  (short -> KV slack)")
+    print(f"  output-len: min={outs[0]} p50={pct(outs,.5)} max={outs[-1]}  (LONG -> holds mamba slot)")
+    print(f"  mamba slots needed >> 195 cap (sustained); KV per req ~{pct(ins,.5)} tok (slack)")
+    print("=" * 72)
+
+
 # --- writers + token-exactness check ------------------------------------------
 
 def write_trace(records: List[dict], path: str) -> None:
@@ -419,6 +591,36 @@ def main() -> None:
     if which in ("all", "case3"):
         write_trace(build_phase_a("A_") + build_swarm(PHASE_B_START, "B_"), OUT_CASE3)
         validate_case3(OUT_CASE3)
+    if which in ("longburst",):
+        recs = build_longburst()
+        write_trace(recs, OUT_LONGBURST)
+        validate_longburst(OUT_LONGBURST)
+    if which in ("decodeheavy",):
+        write_trace(build_decodeheavy(), OUT_DECODEHEAVY)
+        validate_decodeheavy(OUT_DECODEHEAVY)
+    if which in ("modburst",):
+        write_trace(build_modburst(), OUT_MODBURST)
+        validate_modburst(OUT_MODBURST)
+
+
+def validate_longburst(path: str) -> None:
+    recs = _read_valid(path)
+    ins = sorted(len(r["input_ids"]) for r in recs)
+    outs = sorted(len(r.get("forced_output_ids") or []) for r in recs)
+    n = len(recs)
+    p50 = pct(ins, 0.5)
+    prog = len({r["program_id"] for r in recs})
+    print("=" * 72)
+    print(f"longburst (high-concurrency long-context m2k burst) -> {path}")
+    print(f"  requests={n}  distinct program_ids={prog}  (all step=1, parent=None, independent)")
+    print(f"  prompt-len: min={ins[0]} p50={p50} max={ins[-1]} "
+          f"(band [{LONGBURST_MIN_PROMPT}, {LONGBURST_MAX_PROMPT}))")
+    print(f"  output-len/req: p50={pct(outs,.5)} max={outs[-1]}")
+    print(f"  total prompt tokens (co-arriving demand) = {sum(ins)}")
+    print(f"  default KV ~1.7M fits ~{1709151 // max(1, p50)} at once; "
+          f"the other {max(0, n - 1709151 // max(1, p50))} QUEUE -> KV binds; "
+          f"mamba {n} slots << 977 (idle donor)")
+    print("=" * 72)
 
 
 if __name__ == "__main__":

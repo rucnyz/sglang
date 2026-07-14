@@ -7,7 +7,7 @@ The implementation realizes the **full paper page-state machine** (4 states × 4
 Cross-pool transfers are routed through the Admitter's cost-model program: any arrival picks the cheapest of seven candidates (own/cross × {free, evict, migrate} plus defer) and synchronously fires the chosen transition. Steady-state rebalance is handled by the Budgeter.
 
 This document describes the **architecture**.
-Where the shipped build differs from the first-principles target (e.g. the discrete-tick EWMA planner vs the BOCPD estimator), the relevant section says so inline.
+Where the shipped build differs from the first-principles target, the relevant section says so inline.
 Progress tracking, the shipped-milestone record, and the forward roadmap live in `PLAN.md`, not here.
 
 **Paper-eval cells.**
@@ -372,38 +372,87 @@ The exact formula, the three demand-grow hooks, and the boot-time static floor a
 
 ## 4. Decision layer: Admitter + Budgeter
 
-Paper's two-phase architecture. Per-arrival cost decisions
-(Admitter) handle bursts synchronously; a slow control loop
-(Budgeter) handles steady-state rebalance via empirical
-pressure signals. In the TARGET the cost model decides everything with
-no static floor; the shipped interim still keeps a coarse static arena
-floor (see §"Allocator floor: working set only" for the target-vs-shipped
-distinction).
+Two components, one cost model, complementary roles.
+Every action is priced in the same unit: **expected µs of system harm**.
+The Admitter picks argmin per arrival; the Budgeter pre-positions free pages in the background.
+Together they cover both per-request admission and aggregate pool sizing.
 
-### Shared cost model
+### Cost model: unified µs pricing
 
-**The Admitter and Budgeter price every action with one shared cost model, so both make consistent choices.** Each action's cost is a sum of a few terms:
+All actions are priced in expected µs of system harm, so comparison is a trivial argmin.
+One offline-calibrated cost curve `c_KV(L)` (quadratic, L = prefix length in tokens) drives both LPB eviction ordering and the decision layer.
+Since sglang does not support mamba-only replay (evicting either pool forces a full re-prefill of the affected segment), `c_M(L) = c_KV(L)` (one curve for both pools).
 
-| term | plain meaning | how we get it |
-|---|---|---|
-| `c^xfer` | time to move bytes between pools | boot probe, then a live running average |
-| `c_m` | time to migrate one slot's state | boot probe |
-| `c^evict` | recompute cost of the cache we would have to evict | computed from sglang's radix tree at decision time, in its active eviction order |
-| `c_i(s)` | recompute cost of re-prefilling a length-`s` prefix | offline calibration per (model, GPU) |
-| `w_q` | SLO penalty per ms a request waits in queue | set by the deployer |
+The per-action costs:
 
-The probe and calibration mechanics, and why migrate needs no degenerate-curve gate while drain does, are in the appendix, §"Cost model (detail)".
+| action | cost (µs) | meaning |
+|--------|-----------|---------|
+| own_free | 0 | use existing free space in the destination pool |
+| cross_free | c_xfer | transfer free pages from the other pool (cuMemUnmap+Map, EWMA-tracked, ~3000µs) |
+| own_evict | spot_cost × P_reaccess × pressure(pool) | evict the cheapest local cache entry |
+| cross_evict | c_xfer + evict_cost_src | drain other pool's cache then transfer |
+| migrate | c_migrate | relocate a live slot (boot-probed per-slot wall time) |
+| defer | w_q × expected_wait | hold the request in queue |
 
-### Admitter: per-arrival cost decision
+`c_evict` has two components multiplied together:
+1. **Per-entry spot cost** (which entry to evict): LPB's `n_hits_in_window × c_KV(depth)` gives the expected re-prefill cost if this entry is later re-accessed.
+For cold entries (hits=0), use `c_KV(L) × P_reaccess_cold` where P_reaccess_cold is calibrated from a ghost list (fraction of evicted cold entries that were later re-accessed; typically 0.01-0.10).
+2. **Pressure multiplier** (system-wide, per pool): `1 + α × P(occupancy)²` where `P(occupancy) = max(0, (occ - low_water) / (1 - low_water))`.
+When the pool has slack: multiplier ≈ 1, eviction is cheap.
+When the pool is near full: multiplier ≈ 3-4x, eviction is expensive (reflecting the chain-reaction externality of sustained eviction churn).
 
-**The Admitter runs once per arriving request: if the request needs room the
-engine cannot give it, the Admitter picks the cheapest of seven actions and fires
-it synchronously before admitting.**
-The seven actions: from the request's own pool, use free space, evict cache, or
-migrate a slot; the same three from the other pool (a cross-pool transfer); or
-defer the request.
-It prices each with the cost model and takes the lowest, breaking ties in a fixed
-order; the migration actions are off by default and capability-gated.
+The ghost list (2048 entries, ~16KB) calibrates P_reaccess_cold and α online: on eviction, record (prefix_hash, depth); on arrival, check for ghost hits (evicted entry was needed again).
+EWMA of realized re-prefill costs = ground truth c_evict, used to adapt parameters every Budgeter tick.
+
+### Admitter: per-arrival argmin
+
+The Admitter runs once per arriving request.
+If the request needs room the engine cannot give it, the Admitter prices all feasible actions (table above), takes the argmin, and fires it synchronously.
+Ties break in a fixed priority order: own_free > cross_free > own_evict > cross_evict > migrate > defer.
+
+In steady state (Budgeter has right-sized the pools): almost all arrivals find own_free (cost=0).
+During cold start or sudden demand: the Admitter compares c_evict vs c_xfer.
+When pressure is low: c_evict < c_xfer → evict a cold entry (harmless, correct).
+When pressure is high: c_evict > c_xfer → cross_free transfer (avoid eviction churn, correct).
+This handles the Phase 1 → Phase 2 transition naturally: early arrivals may cross-transfer (before Budgeter warms up), later arrivals use pre-positioned free pages.
+
+### Budgeter: background free→free pool sizing
+
+The Budgeter runs once per tick (every τ seconds, default 1s).
+It computes a per-pool **harm rate** R(pool) from three signals, then fires background free→free transfers when the payback condition is met.
+
+Three signals capture "this pool is too small" (all in µs/s):
+
+1. **R_evict** (re-computation waste): `evict_rate × c_KV(L)/L` for KV tokens, `evict_rate × avg_L × c_KV(L)/L` for mamba slots (converting slots to equivalent tokens via avg_L = kv_used_tokens / num_running_reqs).
+Both use the same per-token cost (one curve, c_M = c_KV).
+EWMA-smoothed (tau=5s) to prevent single-tick spikes.
+
+2. **R_admission** (concurrency waste): `W_pool × 1e6 / N`, where W_pool is the queue depth attributed to the binding pool (the pool whose max_running is the active concurrency cap), and N is the current running count.
+Each queued request wastes 1/N of every decode step's GPU time.
+Attribution: the pool with higher occupancy receives the queue signal.
+
+3. **Urgency** (proactive multiplier): `max(1, tick_interval / time_to_fill)`, where `time_to_fill = (1 - occupancy) / (d_occupancy/dt)`.
+When occupancy is rising fast and the pool will fill before the next tick, urgency > 1 (act now instead of waiting for eviction to start).
+When occupancy is stable or falling, urgency = 1 (no acceleration).
+
+Total harm rate and fire condition:
+
+```
+R(pool) = urgency(pool) × [R_evict(pool) + R_admission(pool)]
+net_benefit = R(dst) - R(src)
+fire iff: net_benefit × cooldown_s > fire_cost
+direction: grow whichever pool has higher R
+```
+
+The `R(dst) - R(src)` formulation ensures we only fire when the destination's gain exceeds the source's potential loss.
+
+Critical constraint: the Budgeter ONLY transfers free pages.
+It never drains source cache.
+Cache-destructive actions (drain, migrate) are exclusively the Admitter's domain, gated by the per-arrival cost comparison.
+
+Self-convergence: as the pool grows, R(pool) drops → net benefit falls below threshold → fires stop.
+Unified across all workload types: R_evict dominates for KV-bound (case1), R_admission dominates for mamba-bound (case2), both shift naturally under workload changes (case3).
+One knob: `cooldown_s` (default 10s, env `SGLANG_XPOOL_COOLDOWN_S`).
 
 **Symmetric direction (P4.1/P4.2).** A hybrid arrival needs room in BOTH
 pools, `X` KV tokens AND mamba state for its whole lifecycle: one ACTIVE SSM
@@ -641,46 +690,40 @@ tensor invalidates captured graphs (segfault on replay).
 without changing the tensor's `data_ptr`, captured graphs
 keep working post-grow.
 
-### Budgeter: steady-state pressure rebalance
+### Budgeter: proactive pool sizing via payback
 
-The Admitter only fires when an individual arrival's cost
-calculus chooses cross-pool. It misses steady-state imbalance
-that **wastes** cache without breaking admission. Example:
-workload is mildly KV-heavy; admission still succeeds via
-frequent local evictions; meanwhile mamba pool sits half-empty
-holding cold cache. Admitter doesn't see the asymmetry; cache
-hit rate slowly bleeds.
+The Admitter only fires when an individual arrival's cost calculus chooses cross-pool.
+It misses steady-state imbalance that wastes cache without breaking admission (e.g. mamba pool half-empty holding cold cache while KV evicts hot prefixes).
 
-The Budgeter watches for **rate-level imbalance** and fires
-pre-emptive transfers when an imbalance is sustained or newly-started
-and worth the actuator cost. The trigger mathematics come in two
-variants (see §"Trigger rule" below for the full spec + Status): the
-TARGET is a per-pool BOCPD posterior on `pressure_rate_i` evaluated per
-scheduler iteration (NOT yet shipped); the SHIPPED Phase-1
-baseline is the τ-invariant net-benefit (NB) direction planner in
-`xpool_planner.py`, per-second rate signals (raw counts ÷ `dt`),
-EWMA-smoothed, an arg-max-NB direction gated by an actuator-cost
-threshold, and wall-clock `cooldown_min_s` / `amortize_horizon_s`
-(seconds). The polling interval `τ` (`SGLANG_HIMA_TICK_S`, default
-1 s) is a pure sampling rate: working in per-second rates and
-seconds-horizons makes the planner's decisions invariant to `τ`, so `τ`
-is not a behaviour knob. The BOCPD framework is validated against this baseline;
-on stable workloads both reduce to the same fire schedule up to jitter.
+The Budgeter (`PaybackPlanner` in `xpool_planner.py`, approximately 120 lines) runs in the background and pre-positions free pages so future requests find them already in pool.
+Every tick it computes a per-pool harm rate R(pool) from three signals (eviction cost, admission blocking, occupancy trend) and applies the payback formula:
 
-The full trigger math (the empirical pressure signal, the reuse-aware grow and drain costs, the net-benefit cap, and the continuous-time change-point trigger), the per-scenario behaviors, and the ops knobs are in the appendix, §"Budgeter internals".
+```
+fire iff: (R(dst) - R(src)) × cooldown_s > fire_cost
+```
 
-### Why both phases are needed
+Direction: grow whichever pool has the higher harm rate.
+An async worker thread executes the transfer (free-to-free page moves, no drain or migration).
 
+**Self-convergence:** pool grows, eviction rate drops, payback condition no longer met, fires stop.
+This is the complete steady-state control loop, unified for case1/case2/case3.
+One config knob: `cooldown_s` (default 10 s, `SGLANG_XPOOL_COOLDOWN_S`).
+Full internals are in §"Budgeter internals".
 
-| Phase        | Triggers on                                           | Handles                                            |
-| ------------ | ----------------------------------------------------- | -------------------------------------------------- |
-| **Admitter** | A specific arrival's cost calculus chooses cross-pool | Burst (one req can immediately fire the actuator)  |
-| **Budgeter** | EWMA pressure gap > threshold                         | Steady-state mix drift (cache wasted in idle pool) |
+### Two-phase transition: reactive then proactive
 
+The Admitter and Budgeter are complementary, not redundant.
 
-Without Admitter: bursts queue until next tick → unacceptable SLO.
-Without Budgeter: workload mix shifts slowly, cache hit rate
-bleeds even though admission technically still succeeds.
+| Phase        | Triggers on                                          | Handles                                                    |
+| ------------ | ---------------------------------------------------- | ---------------------------------------------------------- |
+| **Admitter** | A specific arrival needs space, cross-pool is cheaper | Burst, cold start (fires synchronously before admitting)   |
+| **Budgeter** | EWMA eviction rate sustains above payback threshold   | Steady-state mix drift (pre-positions pages in background) |
+
+Cold start: the Budgeter's EWMA starts at zero and needs time to accumulate eviction signal.
+During warmup the Admitter fires on-demand whenever `c_evict > c_xfer`.
+Once the Budgeter warms up and starts proactive pre-positioning, future requests find pre-positioned pages via `own_free` (zero latency, no synchronous fire needed).
+Without Admitter: bursts queue until the next background tick.
+Without Budgeter: workload mix shifts slowly, cache hit rate bleeds even though admission technically still succeeds.
 
 ## 5. Walkthrough
 
@@ -787,7 +830,7 @@ Independent of any arrival, the Budgeter (also gated by `SGLANG_HIMA=1`, suppres
 On each tick, `BudgetAgent._ensure_actuator_chain` lazily builds the `XPoolActuator` + `XPoolFirePlanner` + `SchedulerOwnerProvider` on the first tick (needs the scheduler's live pool references, not available at construction), then calls `BudgetAgent._wire_admitter` to push `(actuator, planner, lcm_pages, owner_provider)` into `Scheduler.admitter`.
 Then `BudgetAgent._maybe_fire(snapshot)` runs:
 1. `PoolStatsObserver.snapshot()` reads pool sizes and computes EWMA-smoothed occupancy (`usage_kv_inst` / `usage_kv_active`, `usage_mamba_inst` / `usage_mamba_active`).
-2. `XPoolPlanner.decide(snapshot)` checks the occupancy asymmetry: if one pool sits durably idle while the other stays bound, it computes the cost model's net-benefit (NB) for transferring pages in each direction, and returns the direction with the highest NB (if it exceeds the transfer threshold `XPoolPlannerConfig.nb_threshold`).
+2. `PaybackPlanner.decide(snapshot)` checks the eviction cost asymmetry: if one pool is evicting at a higher rate, it returns the direction that grows that pool (if the payback formula is satisfied).
 3. If a direction is chosen, `_maybe_fire` queries `SchedulerOwnerProvider.n_free_source_pages(direction)` for the source pool's demand-driven magnitude (how many free pages to transfer), caps by `BudgetAgent._mamba_drain_floor` (for m2k, preserving the mamba working-set so the Admitter's on-demand grow has headroom), and fires through `XPoolActuator.cap_barrier` (same mechanism as Step 3).
 4. The fire is subject to `XPoolPlannerConfig.cooldown_min_s` (default 32 s), so the Budgeter fires at most once per cooldown window.
 
@@ -814,11 +857,9 @@ regression.
 Admitter still catches it per arrival, so sub-tick mix shifts
 trigger Admitter cross-pool transfers immediately even if the
 Budgeter doesn't see them until next tick.
-- **No regret bound**. We drop paper's closed-form `π̂_i` for
-empirical pressure signals; in exchange for robustness under
-non-IRM workloads, we lose paper's formal regret guarantee
-on stationary IRM workloads. `cc_traces_headline` is the
-empirical replacement.
+- **No regret bound**. We use empirical eviction-rate signals (payback formula) rather than paper's closed-form `π̂_i` (Che + Erlang-B, assumes IRM/Poisson arrivals).
+In exchange for robustness under non-IRM workloads (agent traffic), we lose paper's formal regret guarantee on stationary IRM workloads.
+The e2e agentreplay results (case1 +6%, case2 no-regression) are the empirical replacement.
 - **α > α_max regime is handled by Migration/Drain, not the
 anywhere-free path**. The paper (appendix line 96-98) flagged
 workloads driving `α > α_max ≈ 0.85` as future work for
@@ -1194,1499 +1235,61 @@ in the budgeter JSONL snapshot.
 
 ## 17. Budgeter internals
 
-#### Empirical pressure signal
+The Budgeter is implemented by `PaybackPlanner` (`xpool_planner.py`).
+The implementation IS the spec; this section summarizes the algorithm for cross-reference from the paper.
 
-We do NOT implement paper's closed-form `π̂_i` (Che + Erlang-B);
-its IRM/Poisson assumptions don't fit real agent traffic. We
-use paper's own admission-pressure adapter (§appendix-trigger)
-as the primary signal:
+### PaybackPlanner algorithm
 
-```
-pressure_rate_i = k_evict   · Ŝ_evict_rate(i)     # tokens evicted per second from pool i's tree-cache
-                + k_retract · Ŝ_retract_rate(i)   # reqs retracted per second at pool i
-                + k_pause   · Ŝ_pause_rate(i)     # reqs paused per second due to pool i
-                + k_queue   · Ŝ_queue_rate(i)     # arrivals deferred per second at pool i
-                + k_persist · Ŝ_persist_rate(i)   # seconds spent above admission ceiling (per iteration)
-                                                  [units: µs of expected loss / s]
-```
+Every scheduler tick (default 1 s, `SGLANG_HIMA_TICK_S`), the agent snapshots pool state and passes it to `PaybackPlanner.decide`.
 
-All weights in µs/unit (Stage-0 calibrated). Raw `S_s(i, t)`
-are per-iteration counts; divide by `dt` to convert to rate.
-The rate stream is then smoothed before composition: EWMA with
-`η ∈ [0.05, 0.2]` (default 0.1) in the SHIPPED discrete-tick variant, or
-fed to the BOCPD estimator in the target variant (§"Trigger rule").
+1. **EWMA update.**
+   Convert raw per-tick eviction counts to rates (items/s), smooth via EWMA with time constant `ewma_tau_s` (default 5 s).
+   The smoothing factor adapts to variable `dt`: `alpha = 1 - exp(-dt / ewma_tau_s)`.
 
-**Per-pool attribution**: when a signal could go either way
-(req holds both KV and mamba state), attribute via SGLang's
-`check_decode_mem` limiting-pool field; ties split 0.5/0.5.
+2. **R_evict: eviction cost rate (µs/s).**
+   EWMA-smoothed eviction rate × per-token recompute cost from the offline cost curve.
+   KV: `evict_tokens/s × c_KV(L)/L`.
+   Mamba: `evict_slots/s × avg_L × c_KV(L)/L` (one slot ≈ avg_L tokens; `c_M = c_KV`).
 
-The adapter (paper appendix `eq:nb-lb`) is **saturation-aware
-by construction**: raw signals are aggregated and then weighted
-by a global saturation-evidence factor and a per-pool attribution
-factor:
+3. **R_admission: concurrency waste (µs/s).**
+   `W_pool × 1e6 / N`, where W_pool is the queue depth attributed to the pool with higher occupancy (the binding concurrency constraint), and N is the current running count.
+   Each queued request wastes 1/N of every decode step's GPU time (Little's Law applied to the decode pipeline).
+   This signal captures the throughput loss from `max_running` being too low.
 
-```
-P_save_σ  = max(0, (u_σ − u_low_σ) / (1 − u_low_σ))    # per-pool saturation index
-P_sat     = max(P_save_kv, P_save_m)                   # global saturation evidence
-adapter   = (queue_us + paused_us + retract_us + evict_us_cold) × P_sat
-pressure_to_σ = adapter × P_save_σ
-```
+4. **Urgency: time-pressure multiplier.**
+   `max(1, tick_interval / time_to_fill)`, where `time_to_fill = (1 - occ) / (d_occ/dt)`.
+   Accelerates the fire when a pool is filling fast enough to overflow before the next tick.
+   Reduces to 1 when occupancy is stable or falling.
 
-where `u_σ` is the active utilization of pool σ and `u_low_σ` is
-the engine's admission low-water mark (the same saturation index
-the eviction-cost term uses, Eq p-loss-save in
-`xpool_planner.py:_pick_direction_by_nb`).
+5. **Total harm rate and fire condition.**
+   `R(pool) = urgency(pool) × [R_evict(pool) + R_admission(pool)]`.
+   `net_benefit = R(dst) - R(src)`.
+   Direction: grow the pool with higher R.
+   Fire iff: `net_benefit × cooldown_s > fire_cost_us`.
+   The `R(dst) - R(src)` subtraction ensures we only fire when the destination's gain exceeds the source's potential loss.
 
-The factorization handles two regimes uniformly:
+### Configuration
 
-- **IRM regime** (paper §appendix-trigger model): signals fire
-only when pools saturate, so `P_sat` is positive whenever the
-surrogate engages and the adapter behaves as in paper's
-unfactored form.
-- **Non-IRM regime** (CC agent traffic, where scheduler-level
-retract / queue events may be triggered by compute or
-dependency stalls rather than memory exhaustion): without the
-`P_sat` factor, signals can fire on near-empty pools. With
-`low_water = 0.40` (mamba) and `mamba_active = 0.42`,
-`P_save_m = 0.03`, so `P_sat ≈ 0.03`, the adapter
-contribution is automatically discounted to a level where
-cost-model decisions no longer trigger spurious fires.
+One knob: `cooldown_s` (default 10 s, env `SGLANG_XPOOL_COOLDOWN_S`).
+`fire_cost_us` is set from the actuator's measured transfer latency, not user-configured.
+`ewma_tau_s` is internal (default 5 s).
 
-`P_save_σ` then handles per-pool attribution as in the standard
-saturation-weighted form (`pool near saturation = credible limiting pool`). A binary excess-share split (`kv_share = kv_excess / total_excess`) would over-attribute pressure to a
-pool only marginally above low-water when the other pool was
-deeply slack; the saturation-weighted `P_save_σ` ramp avoids
-this by requiring saturation evidence before allocating pressure
-mass to pool σ.
+### Self-convergence
 
-#### Grow benefit and drain cost are both reuse-aware, not active-only
+After a fire moves pages `src → dst`:
+- `dst` pool grows, its R drops (more free space → fewer evictions, higher max_running → shorter queue).
+- `src` pool shrinks, its R may increase. If `R(src) > R(dst)`, the next fire reverses direction.
+- Fires stop when `R(dst) - R(src)` × cooldown ≤ fire_cost (marginal transfer no longer pays back).
 
-`P_save_σ` (active utilization) is the correct signal for the
-*admission-pressure* component of the **grow** side: we should not
-grow a pool whose *active* load is slack just because its cache is
-full and **quiescent**, a full-but-cold cache that is not being
-evicted is reclaimable slack, not pressure (this is what keeps the
-Budgeter from growing mamba just because its radix tree is full;
-see `test_G` / `test_T`). The active grow term `c_σ(L) × P_save_σ`
-and the admission-pressure attribution `adapter × P_save_σ` use it.
+This is a negative-feedback loop: the system fires until the marginal gain no longer pays back, then quiesces.
+No oscillation guard is needed because cooldown >= payback horizon by construction (they are the same value).
 
-But active utilization is NOT the whole grow signal, see the
-"grow when shedding hot cache" subsection below: a pool that is
-full AND actively evicting hot snapshots is under real (cache)
-pressure that the active signal misses, so a separate reuse-aware
-eviction-rate term drives the grow decision there.
+### Direction: unified case1/case2/case3
 
-The **drain** side is asymmetric and must NOT reuse `P_loss_σ = P_save_σ`. Draining pool σ evicts the cached snapshots σ holds;
-the cost of that eviction is the **reuse value** of those
-snapshots, their future re-prefill cost weighted by how often
-they are hit, not a function of σ's *active* utilization. The
-active-based `P_loss_σ` is blind to cache reuse: on a hot cache
-that is full (high occupancy, high reuse) but active-slack
-(`P_save_σ ≈ 0`), the active drain penalty `c_σ(L) × P_loss_σ`
-collapses to ~0 and the rebalancer drains the hot cache, evicting
-high-reuse prefixes and *lowering* cache-hit rate. This is the
-`cc_traces_headline` mamba-starve regression (TTFT +23%,
-cache_hit −5.8pp on an 89%-reuse workload): mamba sat at 95%
-occupancy / 40% active, read as slack, and was repeatedly drained
-to grow a only-mildly-pressured KV pool.
-
-Correct drain cost = the policy-aware `c^evict_i` predictor
-(§"Admitter cost program", `eq:c-evict`) applied to the exact
-snapshots an m2k/k2m drain would force out: walk the pool's
-`RadixCache` in active policy (LRU or LPB), sum `Σ n_b · c_i(s_b)`
-over the eviction victims with their path-counted hit counts
-`n_b`. A hot cache yields a large drain cost (high `n_b`); a cold
-cache (test_H) yields a small one. The agent supplies this
-per-action cost to the planner via
-`snapshot["mamba_drain_cost_us"]`, and `nb_m2k` subtracts it
-**once per fire** (the eviction is a one-time event), NOT scaled
-by the active `P_loss_σ`:
-
-```
-nb_m2k = horizon × (c_kv·P_save_kv·marg_kv + pressure_to_kv·marg_kv + grow_kv/dt)
-         + persist_kv·marg_kv
-         − mamba_drain_cost_reuse          # reuse-aware, paid once
-```
-
-(`marg_σ` is the marginal-fire cap, see the next subsection; `grow_kv`
-is the grow-side eviction benefit below. When the reuse-aware drain cost
-is absent the planner falls back to the legacy `horizon × c_m · P_loss_m`
-active estimate, preserving behavior for callers that do not supply it.)
-The symmetric KV drain cost for `nb_k2m` is the same construction over the
-KV RadixCache, `snapshot["kv_drain_cost_us"]`, subtracted once per fire
-The cold-cache DRAIN is implemented for BOTH directions;
-LIVE-slot MIGRATION (Stage-3, relocating in-flight KV slots) is the
-remaining KV-source-migration work, not yet shipped.
-
-#### NB is the net benefit of ONE fire: the marginal-fire cap
-
-The admission-pressure term `pressure_to_σ`, the saturation prior
-`persist_σ`, and the active eviction-cost term `c_σ(L)·P_save_σ` each
-price the value of **relieving pool σ's whole admission backlog**. But a
-single Budgeter fire moves only `n_pages_per_fire` chunks, so it admits
-only a few of the queued requests. Crediting the entire backlog to one
-fire over-counts the benefit: the Budgeter then fires when the MARGINAL
-relief is near-zero (e.g. draining a hot recurrent mamba cache to grow a
-saturated KV pool the fire can only nudge), which is the zero-downside
-violation where dynamic ends up worse than static on a phase-shifting
-(Case-3) load.
-
-The fix scales every per-direction saturation-relief term by the fraction
-of the queue that ONE fire actually clears:
-
-```
-marg_σ = min(1, fire_admit_σ / num_queue)
-```
-
-where `fire_admit_σ` is the number of queued requests one σ-grow fire
-admits (the granted bytes ÷ the average queued-request size), supplied by
-the agent in the snapshot. `marg_σ` multiplies `pressure_to_σ`,
-`persist_σ`, and `c_σ(L)·P_save_σ` (all three price saturation relief one
-fire only partially delivers). It does NOT scale the reuse-aware drain
-cost or the grow-side eviction benefit (`grow_σ`): those are already
-per-unit bounded (the drain is paid once per fire over the exact victims;
-the grow term is the reuse-aware cost of the evictions σ is currently
-forced into). When `num_queue = 0` or the agent does not supply
-`fire_admit_σ`, `marg_σ = 1.0` (whole-queue, the prior behaviour), so the
-cap is byte-neutral when there is no backlog to over-credit.
-
-Without the cap, the residual `c_σ·P_save_σ + persist_σ` (~~70k µs) tips
-`nb_m2k` positive even after the coupled grow benefit (~~5.8M) and the
-paired mamba drain (~5.9M) cancel, so the Budgeter still churns the
-coupled recurrent cache for ~0 net gain.
-
-**Execution gate (fail-closed, `BudgetAgent._cross_drain_allowed`).**
-Pricing the drain in the NB is necessary but not sufficient: the Budgeter
-fire only EXECUTES the drain (passes `allow_drain=True` to
-`XPoolFirePlanner.build`) when the reuse-aware cost can credibly price a
-hot cache as expensive. Two degeneracies each fall back to a free-only
-fire, because each collapses the gate and would re-open the
-starve regression:
-
-- **Eviction policy.** The drain cost weights victims by hit count `n_b`,
-which only LPB provides; under LRU `n_b ≡ 1` and the cost cannot
-distinguish hot from cold, the same gate the grow benefit uses.
-- **Cost curve.** A cross-pool drain evicts cached leaves via the hybrid
-cache's FULL eviction, which drops BOTH a leaf's KV tokens AND its paired
-mamba snapshot, so re-prefilling that leaf recomputes the WHOLE prefix
-(total prefill wall). The offline κ calibration can't split a hybrid
-forward into per-stack costs, so it folds that total into `c_KV` and sets
-`c_M = 0` by design (`calibrate_kappa.py` "HYBRID CAVEAT"); the reuse-aware
-drain cost is then `c_KV + c_M = total + 0`. Therefore the gate requires a
-non-degenerate `**c_KV`** (`kv_alpha = kv_beta = kv_gamma = 0` ⇒ no cost
-signal ⇒ refuse, one-time warning), for BOTH directions, since evict_full's
-per-leaf recompute is the same total either way. It does NOT require `c_M`
-non-degenerate: `**κ_M = 0` is the EXPECTED post-calibration state, not a
-degeneracy** (the prior gate failed closed on `m_alpha=m_beta=0`,
-silently disabling drain after every real calibration; the builtin default's
-non-zero κ_M had masked it).
-
-The drain is priced, and bounded, for the volume the fire
-actually evicts: `n_pages_per_fire` source pages (`SGLANG_BUDGETER_PAGES_ PER_FIRE`), not the planner's `dst_chunks_per_action` threshold unit.
-Growing past the destination pool's `max_size` ceiling is refused (no
-headroom) so the arena never maps a chunk the allocator can't represent
-(the allocator's `unmark_pages_capped` fail-fasts on an out-of-
-ceiling id rather than silently dropping it).
-
-#### Grow when shedding hot cache (the symmetric image of the drain cost)
-
-The drain fix above stops the Budgeter *draining* a pool whose
-cache is hot. The symmetric failure is on the **grow** side: a pool
-that is occupancy-full and actively **evicting hot snapshots**
-(cache-hit bleeding) but whose *active* slot use is only moderate
-reads as "not pressured" under `P_save_σ`, so the active grow term
-`c_σ(L) × P_save_σ` collapses to ~0 and the Budgeter never grows
-it. On the `cc_traces_headline` mamba-starve regime this left mamba
-pinned at 97% occupancy shedding hot cache while `NB[k2m]=0` every
-tick, the dual of the starve regression (drain blind to reuse ↔
-grow blind to eviction).
-
-The fix mirrors the drain cost. The grow benefit for pool σ
-includes the **reuse-aware cost of the evictions σ is currently
-forced into**:
-
-```
-grow_benefit_σ = predict_evict_cost_us(σ, R_σ)        # R_σ = σ's recent eviction count
-nb_k2m += lifetime × grow_mamba      # grow mamba ← mamba shedding cost
-nb_m2k += lifetime × grow_kv         # grow kv    ← kv shedding cost
-```
-
-`R_σ` is the per-tick cache-eviction rate (cumulative
-`_cumulative_evicted_{mamba_slots,kv_tokens}` counters written by
-`evict_mamba` / `evict_full`, delta'd in `BudgetAgent._snapshot`).
-The agent prices it with the same `predict_evict_cost_us` predictor
-as the drain cost and supplies it as
-`snapshot["{mamba,kv}_evict_grow_us"]`. Properties:
-
-- **Reuse-aware by construction**: `predict_evict_cost_us` walks the
-cheapest (coldest) victims first, so a pool shedding only COLD
-cache prices ~0 → no grow (growing to retain cold prefixes is
-pointless). Only HOT shedding yields a benefit.
-- **Gated by actual eviction, not occupancy**: `R_σ = 0` (a full
-but quiescent cache) → `predict(σ, 0) = 0` → no grow. Preserves
-`test_G` / `test_T`.
-- **Not gated by active `P_save_σ`**: this is the whole point, the
-cache-shedding pressure is invisible to active utilization.
-
-This is the prerequisite the eviction-cost half of the NB needed:
-the slow-recovery-length EWMAs (`c_σ(L)`) and these eviction
-counters are written by the cache on every eviction but must be
-plumbed into `BudgetAgent._snapshot` to reach the planner, without
-that wiring the planner sees `L=0` and `R=0` always and the entire
-eviction-cost half of the NB is dead (it was, in production, until
-this fix).
-
-#### When a cross-pool win exists (demand model)
-
-A clean rebalance gain exists iff the boot split is mismatched to the
-workload's prefix-length distribution. KV is consumed per TOKEN (caching
-a prefix of length L costs L KV-slots); mamba per SEQUENCE (1 slot per
-cached session). A prefix HIT needs BOTH. With boot capacities `C_kv`
-(token-slots) / `C_m` (session-slots), working set `S` sessions at avg
-prefix length `L̄`, fully-cached sessions ≈ `min(C_kv/L̄, C_m)`. The
-optimal split is `C_kv/L̄ = C_m` (KV:mamba slot ratio ≈ `L̄ : 1`).
-Because `L̄` is workload-set and the split is fixed, generically one pool
-binds while the other has slack → moving capacity slack→bind caches more
-sessions. This is the precise condition (the per-token vs per-sequence
-growth-rate difference makes the optimal split `L̄`-dependent). Gain
-magnitude is load-dependent: zero under-load (all cached), MAX at
-intermediate load (bound pool is the limit, capacity ≈ working set),
-marginal under overload (`S ≫` total capacity → tiny cached fraction
-either way). Whichever pool binds FIRST as `S` rises sets the win
-direction: mamba (per-seq) binds at `S = C_m`; KV (per-token) at
-`S = C_kv/L̄`. See `4_e2e/cc_traces_headline/README.md` for the empirical
-read on the cc traces (mamba binds first; clean window ≈ the narrow
-`C_m < S < C_kv/L̄` band).
-
-#### Trigger rule (continuous-time + Bayesian change-point detection)
-
-> *Status*: target architecture (not yet shipped); the discrete-
-> tick variant in `xpool_planner.py` is the Phase 1 baseline
-> against which the framework is validated.
->
-> Under the stationary-default regime (a) defined in §"Migration
-> via parameter collapse", the framework preserves stationary-
-> workload decision behavior, on stable `byte_transfer` / `idle_no_regression` replays it
-> produces the same `(src, dst, n_pages)` fire sequence as an
-> "evaluate gap every 30 s" reference scheduler, up to ±1
-> iteration timing jitter (§S1). Under regime (b), the framework
-> **strictly improves** on workloads with abrupt phase shifts
-> (§S2), which is the primary motivation.
->
-> The framework does NOT claim to be a strict superset of any
-> random-walk state estimator (Kalman, EWMA, drift-tracking
-> smoother). The motivation is workload-physics-driven: BOCPD's
-> data-generating model (segments with constant mean + abrupt
-> jumps) matches CC agent traffic directly. See §"Why BOCPD here"
-> below.
->
-> Phase 1 deploys with regime (a) defaults; subsequent phases
-> progressively relax to (b) and (c) with trace-replay A/B
-> validation.
-
-##### Three separated concerns
-
-A naïve discrete tick conflates these concerns (the shipped code
-historically fused them into one τ-coupled `cooldown_ticks`); both the
-τ-invariant shipped planner and the BOCPD target keep them separate:
-
-
-| Concern                          | Shipped (τ-invariant)                                                                              | BOCPD target                       |
-| -------------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| how often to look                | `τ` sampling rate (`SGLANG_HIMA_TICK_S`, default 1 s), behaviour-invariant, not a policy knob | per scheduler iteration (no knob)  |
-| how much to smooth raw signal    | `η` (EWMA on per-second rates, seconds time-constant)                                              | `σ_obs²` + (implicitly) hazard `H` |
-| how fast to react to phase shift | bounded by the EWMA time-constant                                                                  | hazard rate `H = 1/λ`              |
-| min interval between fires       | `cooldown_min_s` (seconds)                                                                         | `cooldown_min`                     |
-| how long a fire must pay back in | `amortize_horizon_s` (seconds)                                                                     | `amortize_horizon`                 |
-
-
-Note the "30 s tick" is purely a *cadence* artifact of the historical
-shipped code, not a property of any estimator: running frequently (per
-iteration or ~1 s) with per-second rates and seconds-horizons makes
-behaviour τ-invariant for BOTH the EWMA-smoothed shipped planner and the
-BOCPD target. Fixing the tick cadence is therefore unrelated to whether
-one adopts BOCPD.
-
-##### Why BOCPD here
-
-The choice is workload-physics-driven, not algebraic-elegance-driven.
-The data-generating process for `pressure_rate_i(t)` looks like:
-
-```
-[user starts a task: long doc summary]
-  pressure_rate ≈ high KV / low mamba    (steady ~30-60 s, small jitter)
-
-[user switches task type]
-  pressure_rate flips abruptly within ~1 s
-
-[user continues new task]
-  pressure_rate ≈ new level, steady ~30-60 s
-```
-
-Two model-class options for this process:
-
-
-| Model                                                  | Assumes                                                                  | Match to CC physics                                                                         |
-| ------------------------------------------------------ | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
-| Kalman / EWMA (random-walk on state)                   | continuous drift with process noise σ_q² per step                        | **Wrong**: posits drift that isn't there; never converges, always wastes signal information |
-| BOCPD (constant-state segments + abrupt change-points) | rate is exactly constant within a phase, jumps discretely between phases | **Bayes-optimal for CC**: matches the data physics directly                                 |
-
-
-BOCPD's assumption is about the *shape of the observed pressure signal*
-(piecewise-constant with abrupt change-points), NOT about the request
-arrival or reuse distribution. This is categorically different from the
-rejected closed-form `π̂_i`, whose IRM/Poisson assumptions model the
-arrival process itself: BOCPD never assumes anything about how requests
-arrive, only that the pressure *time-series* it observes is
-segment-wise stable, which CC task-switching satisfies.
-
-A monotone smoother (EWMA / Kalman) reacts to phase shifts at
-rate `T_smooth`, which is bounded below by the same `T_smooth`
-that controls noise rejection in steady state. There is no
-parameter setting that gets both. BOCPD sidesteps this trade-off
-by maintaining a posterior over **time since last change-point**:
-on a phase shift, evidence accumulates against "long segment"
-and toward "run length = 0"; the estimator re-weights toward
-recent observations within a few iterations without losing
-noise rejection in steady state.
-
-The trade-off direction: BOCPD's constant-state segment model
-assumes within-phase drift is negligible. For CC this is correct.
-For workloads with significant within-phase drift (steady batch
-serving with cache warm-up over minutes), BOCPD may false-positive
-a change-point or under-react to drift; the upgrade path is
-**BOCPD with within-segment random walk** (Saatçi et al. 2010 GP-CPM
-extension; 3rd parameter `σ_q²` added to the segment model). The
-upgrade stays inside the same BOCPD framework, no architectural
-switch needed.
-
-The cost is a posterior vector of length `R_max` (top-K retained
-run lengths) per pool. At `R_max = 100` this is ≈ 800 B per pool
-
-- ~100 FLOPS per iteration, negligible.
-
-##### Pure-function interface
-
-```python
-def budgeter_decide(
-    pool_states: dict[PoolId, PoolState],
-    pressure_signals: dict[PoolId, RawPressureSignal],
-    cost_constants: CostConstants,
-    history: BudgeterHistory,        # BOCPD posterior + last_fire_time
-    params: BudgeterParams,
-    dt: float,                       # seconds since previous call
-    now: float,                      # absolute monotonic time
-) -> Optional[FireDecision]:
-    history.bocpd_update(pressure_signals, dt, params)
-    if now - history.last_fire_time < params.cooldown_min:
-        return None                  # rate-limit gate
-    smoothed_rate = history.posterior_mean()       # marginalized over r
-    mloss_rate = {i: smoothed_rate[i] / pool_states[i].m_mapped
-                  for i in pool_states}
-    src = min(mloss_rate, key=mloss_rate.get)
-    dst = max(mloss_rate, key=mloss_rate.get)
-    gap_rate = mloss_rate[dst] - mloss_rate[src]
-    if gap_rate * params.amortize_horizon
-            <= cost_constants.c_xfer_per_chunk:
-        return None
-    src_free = pool_states[src].m_mapped - pool_states[src].working_set - params.safety_margin
-    if src_free <= 0:
-        return None                  # working-set floor
-    return FireDecision(src=src, dst=dst, n_pages=src_free)
-```
-
-`pool_states`, `pressure_signals`, `cost_constants` carry no
-hidden mutable state. `history` carries the BOCPD posterior +
-last fire timestamp. The whole function is replayable on a
-recorded trace.
-
-##### BOCPD recursion (Adams & MacKay 2007)
-
-Per-pool state: posterior over run length `r_t ∈ {0, 1, …, R_max}`, denoted `π_r,t ≡ P(r_t = r | z_{1:t})`. Underlying
-observation: `z_{i,t} = pressure_signals_raw[i] / dt` (per-iteration
-rate, µs/s).
-
-Three model components:
-
-1. **Hazard function** `H`, probability of a change-point
-  somewhere in the next interval of length `dt`. Default
-   constant-hazard Poisson process with rate `1/λ`:
-   Note the **exponential conversion**: a naive `H = dt/λ` is
-   first-order correct only when `dt/λ ≪ 1`. Under bimodal `dt`
-   (prefill vs decode iterations) or under EM-estimated `λ` in
-   regime (c), `dt/λ` can exceed 1 and break probability
-   semantics. Always use the exponential form. λ may be
-   configured in seconds (`λ_sec`) or in iterations (`λ_iter`);
-   with iterations, `H = 1 − exp(−1/λ_iter)` is dt-invariant
-   and is the recommended form for workloads with bimodal `dt`.
-2. **Segment model**, within a run, observations are Gaussian
-  around a constant segment mean `x_seg`:
-   Conjugate prior on `x_seg`: `x_seg ~ N(μ_0, σ_0²)`. After
-   observing `n` points with sample mean `z̄` in the current
-   segment, the segment posterior is Gaussian with parameters:
-   This is the closed-form Normal-Normal update.
-   **Improper prior limit** (`σ_0² → +∞`, the default): the
-   formula is numerically unstable but well-defined in the
-   limit. Implementation MUST use the natural-parameterization
-   form to handle it correctly:
-  - precision `τ = 1/σ²`; for improper prior `τ_0 = 0`
-  - the implementation stores per-segment `(τ, μ)`; this is
-  equivalent to storing `(μ, σ²)` since `σ² = 1/τ`
-  - first observation under improper prior (n: 0 → 1):
-  `τ_1 = 1/σ_obs²`, `μ_1 = z`, `σ_1² = σ_obs²`
-  - incremental update for subsequent observations (n → n+1)
-  given existing `(τ_n, μ_n)` and new observation `z`:
-    ```
-    τ_{n+1} = τ_n + 1/σ_obs²
-    μ_{n+1} = (τ_n · μ_n + z / σ_obs²) / τ_{n+1}
-    σ²_{n+1} = 1 / τ_{n+1}
-    ```
-  - this incremental form avoids maintaining `Σz_i` explicitly;
-  the implementation only stores `(τ, μ)` per segment
-3. **Predictive likelihood**, probability of the next
-  observation under run length `r`:
-   where `(μ_r, σ_r²)` is the segment posterior after the last
-   `r` observations (per item 2).
-
-Per-iteration update. We maintain two parallel dictionaries:
-`π[r]` (run-length posterior probability) and `μ[r], σ²[r]`
-(segment posterior parameters at run length `r`).
-
-```python
-def bocpd_update(z, dt, params):
-    # 1. predictive likelihood for every retained run length
-    for r in retained:
-        π_pred[r] = gaussian_pdf(z, mean=μ[r],
-                                 var=σ²[r] + params.σ_obs²)
-    H = 1.0 - math.exp(-1.0 / params.λ_iter)   # dt-invariant hazard
-
-    # 2. growth branch: existing r → r+1, weighted by (1 − H)
-    for r in retained:
-        π_new[r + 1] = π[r] * π_pred[r] * (1.0 - H)
-        # segment posterior at NEW index (r+1) = Bayesian update
-        # of the segment posterior at OLD index r by z
-        μ_new[r + 1], σ²_new[r + 1] = bayesian_update(
-            μ[r], σ²[r], z, params.σ_obs²
-        )
-
-    # 3. change-point branch: all old mass collapses to r=0
-    π_new[0] = sum(π[r] * π_pred[r] * H for r in retained)
-    # BASE CASE for r=0: a CP just occurred. By Adams-MacKay's
-    # convention r_t = 0 means "new segment has NOT YET absorbed
-    # any observation" — z weighted the CP transition above
-    # (via π_pred[r]) but it does NOT enter the new segment's
-    # posterior. The first observation absorbed into the segment
-    # is z_{t+1}, which happens next iteration when r=0 grows
-    # to r=1 via the growth branch's bayesian_update. Setting
-    # μ_new[0] = bayesian_update(prior, z, ...) would double-
-    # count z (once in the CP transition weighting, once in the
-    # segment posterior) and bias the new segment's mean toward
-    # the CP-triggering observation.
-    #
-    # NOTE: σ_0² defaults to +∞ (improper prior). The
-    # `bayesian_update` implementation MUST handle this — see
-    # §"BOCPD recursion" item 2's "Improper prior limit" sub-bullet
-    # above. The natural-
-    # parameterization form (precision τ = 1/σ²) handles τ_0 = 0
-    # without numeric overflow; the first growth-branch update
-    # r=0→r=1 then yields (μ_1, σ_1²) = (z_{t+1}, σ_obs²).
-    μ_new[0], σ²_new[0] = (params.μ_0, params.σ_0_sq)  # σ_0² stored as σ_0_sq
-
-    # 4. normalize the run-length posterior
-    Z = sum(π_new.values())
-    π = {r: v / Z for r, v in π_new.items()}
-    μ, σ² = μ_new, σ²_new
-
-    # 5. prune: keep top R_max run lengths by π[r], plus ALWAYS
-    # retain r=0 (with weight zero if pruned out). r=0 is the
-    # only slot that can spawn a fresh segment on the next CP;
-    # losing it would make the framework unable to ever detect
-    # a new change-point until R_max iterations of decay clear
-    # the table.
-    if len(π) > params.R_max:
-        topk = sorted(π.items(), key=lambda kv: -kv[1])[:params.R_max]
-        π = dict(topk)
-        if 0 not in π:
-            π[0] = 0.0
-            μ_new[0], σ²_new[0] = (params.μ_0, params.σ_0_sq)  # σ_0² stored as σ_0_sq
-        Z = sum(π.values()) or 1.0
-        π = {r: v / Z for r, v in π.items()}
-        μ = {r: μ[r] for r in π}; σ² = {r: σ²[r] for r in π}
-```
-
-Key invariants vs Adams-MacKay 2007 pseudocode:
-
-- Steps 2 + 3 keep `(μ, σ²)` indexed consistently with `π`. The
-segment update happens INSIDE the growth branch using the
-pre-shift `r` index; new-index `r+1` slots get the
-Bayesian-updated values.
-- Step 3 r=0 base case is the **unupdated prior** `(μ_0, σ_0²)`.
-The z that triggered the CP weights the CP transition only;
-it is NOT absorbed into the new segment's posterior. The
-first observation absorbed is z_{t+1} on the next iteration
-(via the r=0→r=1 growth branch's `bayesian_update`).
-- Hazard `H = 1 − exp(−1/λ_iter)` is dt-invariant (the canonical
-form; see §S5 for why).
-- Step 5 pruning ALWAYS retains r=0 (with weight 0 if necessary)
-so a future CP can always spawn a new segment.
-
-The output the trigger reads is the standard run-length-
-marginalized posterior mean. **The framework maintains one BOCPD
-posterior per pool**; `history` in `budgeter_decide` is a
-`dict[pool_id → BOCPDPosterior]` and `history.posterior_mean()`
-returns a `dict[pool_id → float]` by dispatching to each pool's
-posterior:
-
-```python
-def posterior_mean(self):
-    # per-pool dispatch; returns dict[pool_id → float]
-    return {pool_id: sum(p.π[r] * p.μ[r] for r in p.retained)
-            for pool_id, p in self.per_pool.items()}
-```
-
-For a single pool, the underlying scalar computation is
-`Σ_r π[r] · μ[r]`.
-
-Right after a detected change-point, the `r=0` slot carries
-non-trivial mass with `μ[0] = μ_0` (the unupdated prior, ≈ 0
-by default), pulling `posterior_mean` toward zero for a few
-iterations until the new segment accumulates evidence. This is
-the post-CP latency described in §"Known framework limitations"
-and quantified in §S2.
-
-##### Parameter set (6 knobs)
-
-The framework uses **iteration-unit hazard** as canonical (it
-is dt-invariant; see §S5). Deployers who reason about expected
-segment length in wall-clock seconds may set `λ_iter` indirectly
-via `λ_iter ≈ λ_sec_target × expected_Hz` (where `expected_Hz`
-is the scheduler's mean iteration rate, typically ~20 Hz in
-production).
-
-
-| Parameter          | Units         | Role                                                                                                                                                                                          | Discrete-tick analog                                  |
-| ------------------ | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `λ_iter`           | iterations    | expected segment length; hazard `H = 1 − exp(−1/λ_iter)` per iteration, dt-invariant                                                                                                          | (no analog; discrete tick can't detect change-points) |
-| `σ_obs`            | µs/s          | per-iteration observation noise stdev                                                                                                                                                         | implicit in EWMA `η`                                  |
-| `μ_0`, `σ_0²`      | µs/s, (µs/s)² | prior on segment mean. Default: `μ_0 = 0`, `σ_0² → +∞` (improper / uninformative prior). The first observation absorbed by a fresh segment then yields posterior `(μ_n, σ_n²) = (z, σ_obs²)`. | n/a                                                   |
-| `cooldown_min`     | seconds       | min interval between fires                                                                                                                                                                    | `cooldown_min_s` (seconds; shipped)                   |
-| `amortize_horizon` | seconds       | payback target                                                                                                                                                                                | `amortize_horizon_s` (seconds; shipped)               |
-
-
-Unchanged operational scalars: `safety_margin`
-(working-set floor), `R_max` (posterior truncation, default 100).
-
-Setting `λ → ∞` makes `H → 0` and disables change-point detection;
-the BOCPD posterior then collapses to a single ever-growing
-segment whose posterior on `x_seg` is the **Bayesian sample mean**
-(gain decays as `1/n` after `n` observations). This is NOT the
-same as Kalman or EWMA, those have constant gain at steady
-state. The `λ → ∞` limit is honest about its semantics: a
-constant-state Bayesian estimator that becomes increasingly
-confident as the segment grows. For CC-style workloads where
-phases are genuinely stable, this is Bayes-optimal; for
-workloads with within-phase drift, an upgrade to BOCPD with
-within-segment random walk is the principled fix (see §"Why
-BOCPD here" for the upgrade-path discussion).
-
-##### Convergence + oscillation guard
-
-After a fire moves `n_pages` chunks src → dst (where `n_pages` = source free pages above the working-set floor):
-
-- `pool_states[dst].m_mapped` increases → `mloss_rate[dst]` drops
-- `pool_states[src].m_mapped` decreases → `mloss_rate[src]` rises
-- `gap_rate` shrinks toward 0
-
-The trigger condition `gap_rate × amortize_horizon > c_xfer_per_chunk` becomes harder to clear; the system fires until
-the marginal gain no longer pays back, then stops.
-
-**Constraint**: set `cooldown_min ≥ amortize_horizon` unless
-you explicitly want counter-fires to be allowed before payback.
-With `cooldown_min < amortize_horizon`, a fire commits to a
-payback target but the next fire can re-evaluate and reverse
-direction before payback completes, this is intended only in
-regime (c) below where BOCPD's change-point posterior is reliable
-enough that a "sudden direction reversal" should reflect a real
-phase shift and the previous fire's payback no longer applies.
-Otherwise the constraint is a hard ops invariant: violating it
-is a config bug. **Equality (`cooldown_min == amortize_horizon`)
-is intentional in regime (c) and counts as constraint-satisfied;
-strict inequality is required only in (a) and (b).**
-
-**Shipped EWMA variant default.** `amortize_horizon_s` derives to
-`cooldown_min_s` (equality) when not set, so the customer reasons about a
-single timescale (`cooldown_min_s` = "how often, at most, to rebalance").
-Equality is chosen, rather than an arbitrary strict-`>` buffer, for which
-there is no principled ratio, because (i) it satisfies the `≥` constraint,
-(ii) the shipped planner now EWMA-smooths the rate stream, which damps the
-noise-induced reversal the (a)/(b) strict-`>` buffer guards against, and
-(iii) it matches the empirically oscillation-free historical operating
-point. Operators who observe oscillation in a noisy regime can set
-`SGLANG_XPOOL_AMORTIZE_S < SGLANG_XPOOL_COOLDOWN_S` to reintroduce the
-buffer (advanced override).
-
-##### Known framework limitations (no in-framework mitigation)
-
-The vanilla Adams-MacKay BOCPD adopted here does NOT distinguish
-between workload-driven and actuator-driven perturbations, and
-does NOT smooth across change-point boundaries with a special
-trigger mode. Three behaviors fall out of this simplicity and
-are documented in the scenarios below:
-
-1. **Fire-induced step may be mis-attributed as a workload
-  change-point** (§S4). The framework's posterior will reset
-   and re-accumulate; this is harmless because `cooldown_min`
-   gates the trigger during the re-accumulation window.
-2. **Post-CP trigger silence for a few iterations** (§S2). After
-  a real CP, the marginalized posterior mean is dominated by
-   `μ_0` until the new segment accumulates ~2-3 observations.
-   The trigger doesn't fire in that window, even if `gap_rate`
-   "should" be large; first fire in the new direction happens
-   when the marginalized mean has shifted enough plus
-   `cooldown_min` permits.
-3. **Direction-reversal oscillation under short `cooldown_min`**
-  (§S2 + regime (c) caveat). With `cooldown_min ≈  amortize_horizon`, a back-and-forth alternating workload can
-   produce a fire sequence that doesn't converge. Regime (c)'s
-   parameter values are documented as **experimental**; ship
-   path only deploys (a) or (b) where `cooldown_min ≫  amortize_horizon` makes oscillation impossible by
-   construction.
-
-Each of these has a documented upgrade path (informed BOCPD,
-post-CP MAP-segment trigger, hysteresis guard) tracked under
-follow-up tasks; we ship the simpler version and revisit if
-`cc_traces_headline` / Migration-earns-its-keep measurements show the limitations actually bite.
-
-#### Concrete behaviors under representative scenarios
-
-Each scenario below gives a concrete input pattern, says which
-regime parameters apply, and describes the framework's exact
-response. Scenarios are self-contained, no external references
-needed to read them.
-
-##### S1. Sustained stationary load (e.g. long-doc summarization batch at constant RPS)
-
-Input: `pressure_rate_kv` ≈ 100 µs/s and `pressure_rate_mamba` ≈
-5 µs/s, both stable for 5 minutes; no workload changes.
-
-Response under regime (a) (`λ_iter = +∞`, `cooldown_min = 30 s`):
-
-- BOCPD's run-length posterior accumulates inside a single
-ever-growing segment; posterior mean converges to the true
-rates.
-- Trigger evaluates per iteration but is gated by `cooldown_min`
-to at most one fire every 30 s.
-- Illustrative arithmetic (taking `m_i = 1` for both pools to
-show the threshold logic clearly; production `gap_rate = (smoothed_rate[dst]/m_dst − smoothed_rate[src]/m_src)`):
-`gap_rate ≈ 95 µs/s`; `gap_rate × amortize_horizon = 95 × 30 = 2850 µs` vs `c_xfer_per_chunk ≈ 70 µs` → fires when
-cooldown expires.
-- **Fire schedule is identical** to a hypothetical "evaluate
-pressure every 30 s and fire if `gap × 30 > c_xfer`" scheduler,
-up to ±1 iteration timing jitter from the fact that BOCPD
-fires on the first iteration *after* cooldown expires.
-
-Response under regime (b) (`λ_iter = 600`, `cooldown_min = 30 s`):
-
-- Same as (a). CC physics: stationary stretches never trigger a
-change-point (predictive likelihood stays high), so `π[0]` stays
-small and the marginalized posterior mean tracks the rate
-identically to (a).
-
-**Baseline (30 s tick) behavior on same input**: EWMA on raw
-pressure converges to the true rates within ~~5-7 iterations
-(~~0.35 s) of stationary observation; trigger evaluated every 30 s
-fires at first tick where `gap × 30 > c_xfer_per_chunk` clears.
-Fire schedule on 5 minutes of stationary load = `5 min / 30 s = 10`
-fires evenly spaced (in the limit of unlimited free pages to spread).
-
-**Verdict: NEUTRAL**. BOCPD's fire `(src, dst, n_pages)` tuples
-match baseline's; timing differs only by ±1 iteration jitter
-(~50 ms) because BOCPD evaluates per iteration and fires on the
-first iteration AFTER cooldown expires.
-
-**Falsification criterion**: on a stationary-trace replay
-(`byte_transfer`), run both BOCPD regime (a) and a 30 s tick
-reference scheduler on the SAME `pressure_signals_raw` stream.
-Assert:
-
-- Fire count identical (modulo last-fire-at-trace-end edge case).
-- Each fire's `(src, dst, n_pages)` tuple identical.
-- The Nth fire's timestamp differs by ≤ `N × dt_max` cumulative
-(`dt_max = 50 ms` per fire; cumulative because BOCPD's
-"first iteration after cooldown" offsets compose across
-successive fires).
-- Cumulative `m_i` divergence between BOCPD and baseline ≤
-`(dt_max × arrival_rate × N × chunks_per_arrival)` chunks.
-Production parameters: `dt_max ≈ 50 ms`, `arrival_rate ≈ 1 req/s`, `chunks_per_arrival_mamba ≈ 1 slot / 1024 slots-per-chunk ≈ 10⁻³ chunks/req`, `chunks_per_arrival_kv ≈ ⟨tokens/req⟩ / tokens-per-chunk ≈ 100/4096 ≈ 0.024 chunks/req`.
-For N = 100 fires:
-`5 req-equivalents × 0.024 chunks/req ≈ 0.12 chunks`,
-≪ a single fire's `n_pages` (source free pages above the working-set floor). This claim is verifiable per production parameters; if a deployment has very different arrival rates or chunk granularity, recompute.
-If any of these fails, regime (a) does not actually preserve
-stationary-workload decision behavior; the framework's
-calibration of `σ_obs` or the posterior tracking is broken.
-Test harness: `dev/interlayer/budgeter/replay_eq.py`.
-
-##### S2. CC user task switch (long-doc summary → short Q&A)
-
-Input: `pressure_rate_kv` steady at 100 µs/s for 60 s, then
-abruptly to 5 µs/s; `pressure_rate_mamba` mirrors (5 → 100).
-Workload phase shift completes within ~1 s.
-
-Response under regime (a):
-
-- `λ = +∞` means no CP detection. Posterior is fit to a single
-long segment; new observations have small Bayesian weight
-(gain ≈ 1/n ≈ 1/1200 after 60 s at 20 Hz).
-- Posterior mean creeps toward new value over ~30 s of post-shift
-observations.
-- During that lag, trigger evaluates against stale posterior →
-may fire wrong direction or under-fire.
-
-Response under regime (b) (`λ_iter = 600`):
-
-- Within ~3-5 post-shift iterations, predictive likelihood at
-long run lengths collapses (the new observations are extremely
-unlikely under the prior-segment posterior).
-- `π[0]` crosses 0.5; CP detected ~150-250 ms after the shift.
-- Marginalized posterior mean (the trigger's input) is now
-weighted: roughly `π[0] × μ_0 + (1-π[0]) × μ[r > 0]`. With
-`μ_0 = 0` and `π[0] ≈ 1` immediately post-CP, marginalized
-mean is pulled toward 0, **trigger temporarily silent for
-the first ~2-3 iterations after CP detection**, until enough
-mass moves to π[r > 0] with `μ[r > 0]` reflecting the new
-segment.
-- After ~3-5 post-CP iterations, marginalized mean tracks new
-level reliably; trigger evaluates against true gap_rate.
-- First fire in new direction: bounded by `cooldown_min` from
-the previous fire plus the post-CP latency.
-**Net response ~5-10× faster than (a)** under regime (b)
-parameters (`cooldown_min = 30 s` in both, but (b) starts the
-cooldown window from the CP-detected time instead of waiting
-for the marginalized mean to slowly track).
-
-**Baseline (30 s tick) behavior on same input**: EWMA on raw
-pressure absorbs the new level over `~τ_ewma_half = ln(2)/η ≈ 7 iterations`
-(~0.35 s), but trigger evaluation only happens at 30 s tick
-boundaries (fixed wall-clock grid). First fire in new direction
-lands at the next tick boundary after the phase shift. Delay =
-`30 − (t_phase − t_last_tick)` where `t_last_tick` is the most
-recent tick boundary on or before the phase shift.
-
-**Verdict: BOCPD WINS only when cooldown has expired before the
-phase shift** (rare). Within a cooldown window, BOCPD ≈ baseline.
-Breakdown by the time elapsed between last fire and phase shift,
-assuming last fire happened at a tick boundary:
-
-
-| `t_phase − t_last_fire`                    | Baseline delay              | BOCPD delay                | BOCPD lead                         |
-| ------------------------------------------ | --------------------------- | -------------------------- | ---------------------------------- |
-| ≥ 30 s (cooldown long expired)             | 0-30 s (uniform, mean 15 s) | 0.5 s (CP detect + settle) | **+0 to +30 s** (mean **+14.5 s**) |
-| 30 s (cooldown just expired, tick aligned) | 0 s                         | 0.5 s                      | **−0.5 s** †                       |
-| 25 s                                       | 5 s                         | 5 s                        | 0 s (cooldown gates both)          |
-| 5 s                                        | 25 s                        | 25 s                       | 0 s                                |
-| 0 s (phase + fire simultaneous)            | 30 s                        | 30 s                       | 0 s                                |
-
-
-> † row "30 s" is the benign best case for the cooldown-edge
-> scenario. The **adversarial** sub-case is documented separately
-> in "Corner case, wrong-direction fire at cooldown boundary"
-> below: when phase shift coincides with cooldown expiry within
-> the discrete ε ≈ 0.17 % window, BOCPD may fire pre-shift
-> direction first → correct fire then waits another full cooldown
-> → effective lead becomes **−`cooldown_min`**, not −0.5 s.
-
-Expected lead depends on phase-shift interarrival relative to
-cooldown:
-
-- If phases come faster than cooldown (every 10-20 s): BOCPD ≈
-baseline (both gated by cooldown / tick boundary respectively).
-- If phases come at cooldown rate (every 30-60 s, typical CC):
-~~50 % of phases fall outside cooldown → mean BOCPD lead
-≈ 50 % × 14.5 s = **~~+7 s** (approximate).
-- If phases come slow (every 5 min+, e.g., long batch): nearly
-all phases fall outside cooldown → mean BOCPD lead **~+14.5 s**.
-
-**Corner case, wrong-direction fire at cooldown boundary**:
-when a phase shift happens AT or just after cooldown expiry,
-BOCPD's posterior still reflects the pre-shift state at the
-moment cooldown gates lift. The trigger may evaluate gap_rate
-against the pre-shift estimate and fire in the (now-wrong)
-direction. CP detection follows within ~0.25 s and the
-posterior shifts toward μ_0; the next trigger evaluation would
-fire correctly, but the cooldown from the spurious fire blocks
-this until `cooldown_min` elapses again, so worst-case correct-
-direction delay is ≈ `2 × cooldown_min`.
-
-In continuous time the probability that a phase shift hits the
-exact cooldown-expiry instant is zero, but in discrete iteration
-time there is a non-zero ε measurement window (~ `dt_max ≈ 50 ms`
-relative to a 30 s cooldown ⇒ ε ≈ 0.17 % of cooldown windows).
-The falsification test (below) MUST report the empirically
-observed wrong-direction-fire rate per phase shift, not just
-mean delay; if rate > 2 ε ≈ 0.4 %, the corner case is hitting
-more often than continuous-time analysis predicts and signal
-calibration (σ_obs too low → premature trigger) should be
-reviewed.
-
-**Falsification criterion**: run a synthetic phase-shift trace
-(phase shifts every 60 s, jittered ±5 s) on both BOCPD regime
-(b) and the 30 s tick baseline. For each phase shift, measure:
-
-- `first_correct_fire_delay` = (time of first fire in
-post-shift direction) − (time of phase shift)
-- `wrong_direction_fire_rate` = (number of fires in pre-shift
-direction within `2 × cooldown_min` after the shift) / (total
-fires within same window)
-
-Assert:
-
-- Median(BOCPD `first_correct_fire_delay`) ≤ Median(baseline
-`first_correct_fire_delay`) × 0.7 (allows for the corner-case
-drag; tighter ratios are calibration-dependent).
-- `wrong_direction_fire_rate` ≤ 1 % over the trace (corner-case
-expected ~0.17 %; observed > 1 % flags signal calibration
-issue, σ_obs likely too low, premature trigger).
-- Average BOCPD lead vs baseline ≥ 0 s (on average BOCPD must
-not be slower).
-
-If `first_correct_fire_delay` median fails: post-CP latency is
-biting (σ_obs too high OR λ_iter too long). If wrong-direction
-rate fails: calibration of σ_obs is too aggressive. If average
-lead is negative: framework's value-add doesn't materialize on
-this workload class, reconsider deploying regime (b) for it.
-Test harness: `dev/interlayer/budgeter/replay_phase_shift.py`
-(Phase 2 task).
-
-##### S3. Single-iteration noise spike (e.g. GPU thermal blip causes one outlier observation)
-
-Input: stable `pressure_rate_kv ≈ 50 µs/s`, then ONE iteration
-of 500 µs/s, then back to 50 µs/s.
-
-Response (any regime with realistic `σ_obs`):
-
-- Single spike has low predictive likelihood at long run lengths;
-posterior mass leaks slightly toward `r = 0` (CP branch).
-- Next iteration returns to normal: predictive likelihood at
-`r > 0` recovers strongly; CP branch evidence collapses.
-- Run-length posterior re-settles within 1-2 iterations.
-- Posterior mean barely moves (one outlier among hundreds of
-prior observations) → no spurious fire.
-
-This is the BOCPD analog of EWMA spike rejection (the
-`no_spike` / `cxfer_ewma_self_suppress` conjectures), achieved
-by the predictive-likelihood weighting rather
-than fixed-gain smoothing.
-
-**Baseline (30 s tick) behavior on same input**: EWMA on raw
-pressure absorbs the spike with weight `η = 0.1`; spike's
-contribution to smoothed value decays at half-life 7 iterations
-(~0.35 s). Trigger at next 30 s boundary sees a smoothed value
-near baseline; no fire.
-
-**Verdict: NEUTRAL**. Both approaches reject the spike. BOCPD's
-posterior is even tighter (predictive likelihood multiplicatively
-weights the spike's contribution to near-zero) but the
-operational outcome is identical: zero fires from a single spike.
-
-**Falsification criterion**: synthetic unit test (sub-second).
-Construct a 1000-iteration trace with stationary `pressure_rate = 50 µs/s` and a single iteration at 500 µs/s. Run BOCPD and 30 s
-tick baseline on identical input. Assert: zero fires from
-either, identical posterior_mean / EWMA-mean at trace end (±5 %).
-Test harness:
-`dev/interlayer/budgeter/test_spike_rejection.py` (existing
-`no_spike` analog; reuse).
-
-##### S4. Fire-induced step (cross-pool transfer commits)
-
-Input: balanced workload, Budgeter fires all source free pages (above the working-set floor)
-src→dst. Immediately after commit, `pressure_rate_dst` drops
-abruptly (more headroom in dst pool); `pressure_rate_src` rises
-abruptly. The actuator's perturbation is indistinguishable from
-a workload phase shift in the observation stream.
-
-Response under vanilla BOCPD (no actuator-awareness):
-
-- The post-fire steps in both pools cause predictive likelihood
-at the (pre-fire) long run lengths to collapse.
-- `π[0]` climbs across the next few iterations; one or both
-pools detect a spurious CP and reset their segment estimators.
-- After ~3-5 iterations the new segment estimates reflect the
-post-fire pressure levels (which are the new operational
-reality: the fire actually changed `m_i`, so post-fire
-pressure_rate IS the new state).
-- During this re-accumulation window, `cooldown_min` gates the
-trigger; no fire happens. The framework cannot tell whether
-the CP was actuator-induced or workload-induced, but
-**operationally the difference doesn't matter**, either way
-the next fire decision waits for `cooldown_min` and uses the
-post-fire pressure level.
-
-**Limitation**: a real workload phase shift that happens to
-coincide with a fire is detected as one CP, not distinguished
-from the actuator's. The framework attributes the cumulative
-step (actuator + workload) to a single phase change; the next
-fire's direction is set against the new combined level. For
-most workloads this is correct (the actuator's effect IS part
-of the new state). For pathological cases where a real shift
-coincides with a fire, the trigger may be slightly mis-directed
-for one cooldown cycle.
-
-**Upgrade path** (future work, not shipped): an "informed BOCPD"
-that subtracts a known actuator-effect estimate `Δ_fire` from
-observations before BOCPD ingests them would distinguish
-actuator-induced from workload-induced CPs. The cost is a
-calibration system for `Δ_fire` (workload-dependent, requires
-empirical EWMA across fires). Not worth the complexity for
-Phase 1-2; revisit if Phase 3 measurements show misdirected
-fires under regime (c).
-
-**Baseline (30 s tick) behavior on same input**: EWMA on
-raw pressure absorbs the fire-induced step gradually. By next
-tick, EWMA reflects ~5/6 of the post-fire baseline. Next tick's
-decision uses the post-fire-ish smoothed value. No internal
-"reset", but operationally the next decision is also based on
-post-fire reality.
-
-**Verdict: NEUTRAL**. Both BOCPD and baseline reach the correct
-post-fire steady state. BOCPD does so by spuriously detecting a
-CP and re-accumulating; baseline does so by EWMA smoothing.
-During the re-accumulation / smoothing window, both schedulers'
-next fire is gated by their cooldown / tick boundary, so the
-bookkeeping difference is not externally visible.
-
-**Falsification criterion**: live workload trace (`byte_transfer`
-or `alternating_saturation`)
-with ≥ 5 fires. For each fire, log the decision sequence
-`(t, src, dst, n_pages)` from both BOCPD and baseline over the
-30 s window after the fire. Assert:
-
-- BOCPD's first post-cooldown fire `(src, dst)` matches baseline's
-next-tick fire `(src, dst)`.
-- Discrepancy rate ≤ 5 % (over total trace fires).
-If discrepancy rate is higher, BOCPD's spurious-CP re-
-accumulation IS biasing decisions; consider upgrade to informed
-BOCPD. Test harness: `dev/interlayer/budgeter/test_fire_step_neutrality.py`.
-
-##### S5. Bimodal `dt` (prefill vs decode iterations alternate)
-
-Input: scheduler iteration duration alternates between ~5 ms
-(decode batch) and ~200 ms (prefill batch).
-
-Response under the shipped per-iteration hazard form
-(`H = 1 − exp(−1 / λ_iter)`):
-
-- Hazard is constant per iteration regardless of `dt`.
-- No bias from `dt` distribution; CP detection latency in
-iterations is the same on decode and prefill iterations.
-
-Counterfactual: if a future version exposed a per-second hazard
-form `H = 1 − exp(−dt / λ_sec)`, then `H` would differ by
-factor ~40 between the two `dt` modes (5 ms vs 200 ms),
-biasing CP detection toward prefill-iteration boundaries even
-on stable workloads. The shipped per-iteration form avoids this
-by construction.
-
-**Baseline (30 s tick) behavior on same input**: tick is
-wall-clock-driven; bimodal iteration durations don't affect
-tick boundaries. EWMA absorbs each iteration's pressure
-contribution proportionally to `dt`. Not biased by bimodal `dt`.
-
-**Verdict: NEUTRAL** under the shipped per-iteration hazard
-configuration. The framework's hazard is dt-invariant by
-construction (no `λ_sec` knob; canonical `λ_iter` only).
-
-**Falsification criterion**: synthetic trace with `dt` strictly
-bimodal (alternating 5 ms / 200 ms iterations), 1000 iterations
-of stationary `pressure_rate = 50 µs/s`. Assert:
-
-- CP detection rate (CPs per 1000 iter) ≤ 1 (i.e., no spurious
-CPs from bimodal `dt`).
-- Posterior mean within ±10 % of true rate over last 100
-iterations.
-If either fails: `λ_iter` is not actually being applied dt-
-invariantly (implementation bug), or bimodal `dt` is interacting
-with another component. Test harness:
-`dev/interlayer/budgeter/test_bimodal_dt.py`.
-
-##### S6. Slow within-phase drift (e.g. cache warm-up over 5 minutes shifts `pressure_rate_kv` from 50 to 100 gradually)
-
-Input: linear drift in pressure_rate over 5 minutes (~20 Hz =
-6000 iterations).
-
-Response under standard Adams-MacKay BOCPD (regime b
-parameters):
-
-- Each iteration's deviation from current segment mean is small;
-predictive likelihood stays high → no CP triggered.
-- Segment posterior mean drifts via 1/n Bayesian update, but
-`n` is large, so the gain is small (~1/6000 by end of drift).
-- Effective lag: posterior mean trails true rate by an amount
-proportional to (drift rate) × (current `n`).
-- **Known limitation**: BOCPD with constant-state segments is
-sub-optimal here. Either the framework eventually fires a
-spurious CP (if drift overshoots `σ_obs`) and segments restart
-from prior, or the trigger uses a stale mean for the duration.
-
-Upgrade path: BOCPD with within-segment random walk (Saatçi et al.
-2010) adds a 3rd parameter `σ_q²` that explicitly models within-
-segment drift; then drift is tracked without lag. Tracked as
-follow-up if `saturated_bubble` or batch-style `cc_traces_headline`
-measurements show lag.
-
-**Baseline (30 s tick) behavior on same input**: EWMA on raw
-pressure has constant gain `η = 0.1`; effective tracking time
-time constant `τ_ewma = 1/η = 10` iterations. Steady-state lag
-under constant drift rate `ρ`: `lag_ewma ≈ ρ × τ_ewma`. For our
-5 min / 50→100 µs/s drift example: `ρ = 0.167 µs/s per iter`,
-`lag_ewma ≈ 1.67 µs/s`, **continuously bounded small lag**.
-
-BOCPD posterior gain `1/n` shrinks over a long segment; for `n = 6000` (5 min × 20 Hz), gain ≈ 0 → posterior frozen at early-
-segment estimate. Lag grows linearly with `n` until a false CP
-fires and resets, typically when accumulated lag ≈ `2σ_obs`.
-For our example: `lag_bocpd` accumulates to ~10-20 µs/s before
-a false-CP reset, then jumps to 0.
-
-**Verdict: POTENTIAL REGRESSION vs baseline for long-stable +
-drifting workloads**. Analytical bounds:
-
-- baseline EWMA effective time constant `τ_ewma = 1/η = 10`
-iterations (for `η = 0.1`); EWMA half-life is `ln(2) × τ_ewma ≈ 7` iterations. Steady-state lag under constant drift rate
-`ρ` is `lag_ewma ≈ ρ × τ_ewma = ρ × 10`. For our example
-(`ρ = 0.167 µs/s/iter`): baseline lag ≈ 1.7 µs/s.
-- BOCPD lag is bounded ABOVE by ≈ `2σ_obs` heuristically. The
-exact bound depends on the false-CP threshold, which itself
-depends on hazard `H` and the predictive-likelihood ratio
-cutoff implicit in the posterior recursion. `2σ_obs` is the
-order-of-magnitude estimate (where predictive likelihood
-drops to ~`exp(-2) ≈ 0.135`, weak enough that CP-branch mass starts climbing meaningfully); the exact crossover for a given` H` is workload-empirical. The falsification test below
-measures the actual bound on the test trace.
-- Ratio is `2σ_obs / (ρ × τ_ewma)`. For `σ_obs = 5 µs/s` and the
-example drift: ratio ≈ 10 / 1.7 ≈ **6×**. For larger `σ_obs = 10 µs/s`: ratio ≈ **12×**.
-
-Operational consequence: trigger evaluates against a stale
-estimate, fire direction may be wrong on the margin.
-
-This is **the one scenario** where BOCPD might fire in the
-wrong direction more often than baseline. **CC traces are
-unlikely to hit this** because CC phases are short (~30 s) and
-within-phase drift is small. Batch-style workloads with very
-long stable phases + significant within-phase drift would.
-
-**Falsification criterion**: synthetic batch-style drift trace
-(constant load with `pressure_rate_kv` ramping 50 → 100 µs/s
-over 5 min, `pressure_rate_mamba` stationary). Run BOCPD regime
-(b) and baseline. Measure:
-
-- Mean absolute lag in `posterior_mean` vs ground-truth drifted
-rate over the 5 min.
-- Number of false CPs (BOCPD's spontaneous resets during
-drift).
-- Fire-direction correctness rate (compare to "perfect" decision
-with ground-truth rate; correct = match the perfect direction).
-
-Pass (S6 verdict held):
-
-- BOCPD mean lag ≤ `2σ_obs + 1 µs/s` (analytical false-CP bound
-with small slack).
-- BOCPD false CP count is consistent with mean lag ≈ `2σ_obs`
-(i.e., `false_CP_count × 2σ_obs ≈ ρ × T_phase`).
-- BOCPD fire-direction correctness ≥ baseline correctness − 5
-percentage points.
-
-Fail (S6 verdict overturned to "serious regression"):
-
-- BOCPD mean lag exceeds the analytical bound by > 2× (suggests
-the false-CP mechanism is not actually firing as expected,
-posterior is stuck without resetting).
-- OR fire-direction correctness drops > 10 pp vs baseline.
-- Then escalate to **upgrade to BOCPD-with-RW-segments** before
-shipping batch workloads.
-
-Test harness: `dev/interlayer/budgeter/test_slow_drift.py`
-(new, Phase 2 task).
-
-##### S8. Change-point burst (CC agent subtask cycling)
-
-Input: workload has back-to-back phase shifts every few seconds
-(e.g., CC agent cycling through subtasks of 3-10 s each).
-`pressure_rate` flips multiple times within a single
-`cooldown_min` window.
-
-Response under regime (b):
-
-- Each phase shift triggers a CP detection within ~3-5
-iterations.
-- Run-length posterior keeps resetting; `π[0]` remains elevated
-across the burst.
-- Marginalized posterior mean = `Σ π[r] · μ[r]` is dominated by
-the spread across recent low-r segments, each tracking a
-different recent phase.
-- For subtasks of duration ≥ 10 s (200+ iterations at 20 Hz),
-individual segments accumulate enough observations that their
-`μ[r]` reflects each subtask's actual rate; the marginalized
-mean during the burst is a weighted average of recent subtask
-rates → trigger evaluates against this average.
-- For subtasks shorter than ~5 s (100 iterations), segments
-barely accumulate; marginalized mean is dragged toward the
-prior μ_0 ≈ 0 by `π[0]` mass; **trigger goes silent for the
-duration of the burst**.
-
-**Baseline (30 s tick) behavior on same input**: EWMA on raw
-pressure tracks the moving average of recent observations
-regardless of phase boundaries. By next tick boundary, EWMA
-reflects a smoothed average of the burst's pressure rates;
-trigger fires if the smoothed gap exceeds threshold.
-
-**Verdict: WORKLOAD-DEPENDENT**,
-
-- **WIN for subtasks ≥ 10 s** (typical CC agent task duration):
-BOCPD's per-subtask CP detection gives more responsive
-per-segment estimates than baseline's averaging.
-- **REGRESSION for subtasks < 5 s** (atypical for CC; might
-occur in tightly-coupled tool-use loops): BOCPD goes silent;
-baseline at least fires based on the averaged smoothed
-signal.
-
-**Falsification criterion**: synthetic burst trace with
-subtasks of varying duration (3 s, 10 s, 30 s).
-
-- For 30 s subtasks: **fire-direction match rate ≥ 80 %**
-(a fire is "matching" if its direction matches the direction
-the subtask's true gap_rate implies; measured per subtask
-with at least one fire).
-- For 10 s subtasks: **fire-direction match rate ≥ 70 %**
-(slight degradation acceptable due to fewer per-subtask
-observations).
-- For 3 s subtasks: **fire count ≤ 1 per minute** (framework
-effectively silent, documented limitation, not a regression
-vs no-framework-at-all behavior).
-
-Test harness: `dev/interlayer/budgeter/test_cp_burst.py` (new).
-
-Decision: ship vanilla regime (b) for CC. If `cc_traces_headline` trace analysis
-reveals that subtask durations < 5 s occur > 5 % of the time,
-revisit (add a "minimum effective segment length" override that
-ignores CPs spaced too closely).
-
-##### S7. Manual operator disable
-
-Input: ops sets `cooldown_min = +∞` via runtime config.
-
-Response: every iteration's trigger evaluation hits the cooldown
-guard and returns `None`. No fires regardless of posterior state.
-Equivalent ops invariant: this is the emergency disable knob.
-
-**Baseline (30 s tick) behavior on same input**: in the
-discrete-tick variant, the equivalent disable knob is a
-`--disable-budgeter` boot flag (or similar). Same outcome: zero
-fires.
-
-**Verdict: NEUTRAL** (trivially).
-
-**Falsification criterion**: unit test, 1000-iteration trace
-with any input. Set `cooldown_min = +∞`. Assert exactly zero
-fires. Test:
-`dev/interlayer/budgeter/test_disable.py`.
-
-##### Summary verdict table: must validate before shipping
-
-
-| Scenario                         | BOCPD vs baseline            | Magnitude                                                                                                                                                                       | Falsification test                      |
-| -------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
-| S1 stationary                    | NEUTRAL                      | identical fires, cumulative timing drift ≤ `N × dt_max ≈ N × 50 ms`                                                                                                             | `replay_eq.py` on `byte_transfer` trace |
-| S2 phase shift                   | **WIN (workload-dependent)** | mean +7 s for CC phase rates; +14.5 s for rare phases; worst best-case −0.5 s; worst adversarial corner-case −`cooldown_min` (~0.17 % of cooldown windows; see §S2 corner case) | `replay_phase_shift.py` synthetic       |
-| S3 noise spike                   | NEUTRAL                      | both reject spike, zero fires                                                                                                                                                   | `test_spike_rejection.py`               |
-| S4 fire-induced step             | NEUTRAL                      | post-cooldown decision identical                                                                                                                                                | `test_fire_step_neutrality.py`          |
-| S5 bimodal dt                    | NEUTRAL                      | no spurious CPs from `dt`                                                                                                                                                       | `test_bimodal_dt.py`                    |
-| S6 slow drift                    | **POTENTIAL REGRESSION**     | BOCPD lag bounded at `2σ_obs` vs baseline `ρ × τ_ewma`; ratio ≈ 5-12× for typical σ_obs ∈ [5, 10] µs/s                                                                          | `test_slow_drift.py`                    |
-| **S8 CP burst (subtasks < 5 s)** | **WORKLOAD-DEPENDENT**       | WIN if subtasks ≥ 10 s; trigger silent if subtasks < 5 s (atypical for CC)                                                                                                      | `test_cp_burst.py`                      |
-| S7 disable                       | NEUTRAL                      | zero fires                                                                                                                                                                      | `test_disable.py`                       |
-
-
-**Hard pre-ship gates** (BOCPD framework cannot replace
-discrete-tick in production until):
-
-1. S1 falsification test PASSES on `byte_transfer` trace (cannot ship without
-  stationary-workload decision invariance, regression in the
-   common case).
-2. S2 falsification test PASSES on the synthetic phase-shift
-  trace (must demonstrate the claimed win to justify shipping
-   the new framework at all, if BOCPD is not better on its
-   target use case, why ship it).
-3. S4 falsification test PASSES on a `byte_transfer` or `alternating_saturation` live trace with
-  ≥ 5 fires (must show fire-step neutrality on real workloads).
-4. S6 falsification test PASSES on synthetic batch-drift trace
-  ↔ if it fails, escalate to BOCPD-with-RW-segments upgrade
-   BEFORE shipping any batch-style production workload (CC
-   shipping unaffected).
-
-S3, S5, S7 are trivial unit tests that should run sub-second
-during normal CI; if any of those regress, something is
-fundamentally broken at the implementation level (not a model
-mismatch).
-
-S8 ships as a documented limitation; before unblocking Phase 3
-deployment, measure CC trace for subtask duration distribution
-and either confirm < 5 % are sub-5 s (S8 limitation accepted) or
-add the "minimum effective segment length" override (Phase 3
-follow-up task).
-
-These are the operational verdicts the framework MUST live up
-to. Every claim above is testable. If reality differs from any
-prediction, the most likely root cause AND alternative causes:
-
-- **S1 fail** → primary: σ_obs calibration broken (recover-
-default procedure wrong). Alternatives: pool-state observation
-pipeline differs between BOCPD and baseline (e.g.,
-different signal-source EWMA upstream); posterior-mean
-computation bug; improper-prior seeding bug (see §Segment
-model improper prior limit).
-- **S2 fail** → primary: σ_obs too high (CP not detected fast
-enough) or λ_iter too long (hazard too small). Alternatives:
-predictive likelihood under the prior segment doesn't collapse fast
-enough on new observations (segment model mismatched to
-workload); cooldown_min implementation gates trigger when it
-shouldn't.
-- **S3 fail** → primary: predictive likelihood mis-implemented.
-Alternative: σ_obs set too low (any deviation reads as CP).
-- **S4 fail** → primary: spurious CP IS leaking into decisions;
-need to revisit the informed-BOCPD upgrade. Alternative:
-cooldown_min not actually applied (gate bypassed).
-- **S5 fail** → primary: λ_iter not actually dt-invariant in
-the implementation (e.g., used λ_sec internally). Alternative:
-`pressure_signals_raw / dt` rate conversion not applied
-uniformly.
-- **S6 fail** (lag exceeds bound) → primary: constant-state
-segment assumption is wrong for the observed workload;
-upgrade to BOCPD-with-RW-segments required. Alternative: false
-CP threshold (2σ_obs) is mis-set; framework not actually
-resetting as expected.
-- **S7 fail** → primary: cooldown gate is broken or
-cooldown_min plumbing missing. Alternative: trigger fires
-before cooldown check.
-- **S8 fail** (silent on subtasks ≥ 10 s) → primary: posterior
-mean computation incorrectly weights `π[0]`. Alternative: μ[r]
-for r > 0 not actually accumulating new-segment observations.
-
-#### Migration via parameter collapse
-
-Three named regimes parameterize the framework for different
-workload classes + deployment phases. Each regime is fully
-described by 6 parameter values; the framework's actual code
-behavior is invariant across regimes (only parameter values
-change).
-
-##### (a) stationary-default (Phase 1 ship config: decision-equivalent to a 30 s tick on stable workloads)
-
-```
-λ_iter       = +∞              # disables change-point detection
-σ_obs        = σ_obs_default   # see calibration below
-μ_0          = 0
-σ_0²         = +∞ (improper)   # uninformative prior; first
-                               # post-CP observation seeds the
-                               # segment as (μ_n, σ_n²) = (z, σ_obs²)
-cooldown_min     = 30 s
-amortize_horizon = 30 s
-```
-
-Semantics: with `λ_iter = +∞` the framework never declares a
-change-point; its posterior is a Bayesian filter on a single
-ever-growing segment. Combined with `cooldown_min = 30 s`, fire
-schedules on stationary workloads (scenario S1) reproduce the
-behavior of a "evaluate gap every 30 s and fire if it clears
-threshold" scheduler up to ±1 iteration timing jitter.
-
-`σ_obs_default` calibration: collect the per-iteration
-`pressure_signals_raw / dt` stream over a representative
-stationary stretch (`byte_transfer` trace or equivalent). Empirical stdev of
-that stream is `σ_obs_default`. There is **no Kalman process-noise
-parameter** in BOCPD; the EWMA-style "smoothing time constant"
-is not directly settable, it emerges from `σ_obs² / σ_0²` and
-the current `n`. Calibration procedure pinned in
-`dev/interlayer/budgeter/calibrate_recover.py`.
-
-Verification: Budgeter-convergence trace replay must show `{src, dst, n_pages}`
-fire sequence matches a 30 s-tick reference implementation up to
-±1 iteration timing jitter. Drift bound per fire: `dt × arrival_rate`
-arrival-equivalents (at production `dt ≈ 50 ms` and arrival rate
-~1 req/s, drift ≈ 0.05 reqs/fire, ≪ a single fire's `n_pages`).
-
-##### (b) phase-aware (Phase 2 ship config: CC-style workloads with sub-30 s phase shifts)
-
-```
-λ_iter       = 600             # ≈ 30 s @ 20 Hz; recommended for CC
-σ_obs        = σ_obs_default   # same calibration as (a)
-μ_0          = 0
-σ_0²         = +∞ (improper)
-cooldown_min     = 30 s        # unchanged to satisfy ≥ amortize_horizon
-amortize_horizon = 30 s
-```
-
-Semantics: hazard rate `H = 1 − exp(−1/600) ≈ 1.7e-3` per
-iteration. CP detected within ~3-5 post-shift iterations
-(scenario S2) → marginalized posterior mean tracks new pressure
-level within ~1 s (post-CP latency described in §S2)
-of the phase shift.
-
-The `λ_iter = 600` value is a design-time estimate based on the
-observation that CC sessions typically run a single task type
-for ~30 s before switching. **No empirical citation yet**, to be
-verified by EM (regime c) on `cc_traces_headline` CC traces. Until then, deploy
-(b) only after trace replay confirms it produces equal-or-better
-fire decisions than (a) on `byte_transfer` / `idle_no_regression` (stationary, no false-CP
-regression) AND on synthetic phase-shift traces (positive lift).
-
-##### (c) self-tuning (Phase 3 ship config: fully adaptive)
-
-```
-λ_iter       # online-estimated via EM every T_em ≈ 5 min
-σ_obs        # online-estimated from residual stream stdev
-μ_0          = 0
-σ_0²         = +∞ (improper)
-cooldown_min     = 5 s         # equal to amortize_horizon — see
-                               # caveat below
-amortize_horizon = 5 s         # short enough to permit counter-fires
-                               # on detected phase shift
-```
-
-**Regime (c) oscillation caveat** (no in-framework guard): with
-`cooldown_min = amortize_horizon`, a workload that alternates
-phase faster than `amortize_horizon` can produce a fire sequence
-that doesn't converge. We do NOT ship an oscillation guard;
-instead we constrain Phase 3 deployment to require:
-(i) **empirical measurement that no phase reversal of
-`|Δrate| ≥ 2σ_obs` occurs within `< 2 × amortize_horizon`**
-**in more than 1 % of non-overlapping `2 × amortize_horizon`-
-duration windows** sampled from a representative CC trace,
-AND
-(ii) **BOCPD's CP recall ≥ 90 % on labeled CC traces** (where
-"labeled" = ground-truth phase boundaries hand-annotated on
-a representative sample of `cc_traces_headline` traffic), so the trigger
-doesn't react to spurious CPs.
-Both (i) and (ii) are measurable; the labeled-trace
-construction and gate evaluation are pending.
-If either gate fails, Phase 3 ships with `cooldown_min = 2 × amortize_horizon` (no oscillation possible by construction)
-instead.
-
-Semantics: BOCPD self-tunes its hazard rate and noise variance
-from the live signal. `cooldown_min == amortize_horizon` satisfies
-the §"Convergence + oscillation guard" constraint at equality,
-this is the regime
-where a CP-detected phase reversal is allowed to immediately
-counter-fire a not-yet-paid-back fire, because BOCPD's evidence
-that "the workload has actually shifted" is strong enough that
-the prior fire's direction is no longer the right one.
-
-**Deployment gate**: regime (c) ships only after BOCPD's CP recall
-is measured ≥ 90 % on a labeled CC trace, i.e. on a trace where
-phase shifts are hand-annotated, BOCPD's detected CPs must align
-with ≥ 90 % of them. This includes the labeled-trace
-construction and gate.
-
-##### Implementation invariants (per regime)
-
-The implementation MUST satisfy three invariants regardless of
-which regime is deployed:
-
-1. **Stationary-workload decision invariance (covers regime a)**.
-  On a stationary trace where `pressure_signals_raw` has no
-   workload phase changes, regime (a) with the parameter values
-   above MUST produce the same `(src, dst, n_pages)` fire
-   sequence as a "evaluate every 30 s and fire if `gap × 30 >  c_xfer`" reference scheduler. Timing may differ by ±`dt_max`
-   per fire (`dt_max` = max scheduler iteration in the trace,
-   typically ≤ 50 ms). The cumulative drift bound over N fires
-   is bounded by `dt_max × arrival_rate × N` arrival-equivalents,
-   ≪ a single fire's `n_pages` for production parameters; verified by
-   `dev/interlayer/budgeter/replay_eq.py`.
-2. `**σ_obs → +∞` freezes the estimator**. With infinite
-  observation noise, posterior mean stays at prior; no
-   observation moves it; no fire can trigger.
-3. `**cooldown_min → +∞` disables all fires** regardless of
-  posterior state, emergency disable knob for ops.
-
-Byte-equivalence to any reference scheduler is NOT claimed and
-NOT required: continuous-time evaluation cannot align fires
-exactly to a 30 s grid because fire timing depends on iteration
-boundaries. The stationary-workload decision invariance (#1) is
-the operationally meaningful guarantee.
-
-##### Relation to paper's shadow-price formulation
-
-Within a single stationary segment, BOCPD's posterior mean on
-`pressure_rate_i` is a consistent estimator of its true mean.
-The trigger condition `mloss_rate_i = pressure_rate_i / m_i`
-then tracks paper's marginal-loss-per-byte
-`−c_i(s̄_i) μ_i'(m_i)` (the per-arrival per-byte form of
-`π_i^{rec}` from `thm:kkt-bridge`, appendix.tex:597-616). The
-fire condition `gap_rate × amortize_horizon > c_xfer/B` is then
-the per-byte realization of the dual KKT `π_i = ν`* evaluated
-at the cheapest cross-pool action from §"Admitter".
-
-Across change-points, `thm:kkt-bridge`'s stationarity assumption
-is violated between segments but holds within each segment. The
-practical relationship to `lem:hyst-drift` (appendix.tex:805),
-which bounds smoother regret under drift rate `ρ` by factor
-`1 + 2ρτ / (L'' · Δ_hyst)`, is that BOCPD addresses the same
-failure mode `lem:hyst-drift` quantifies (drifting `π_i(t)`
-producing stale estimator decisions) by a different mechanism:
-detect and reset rather than absorb-as-error. A constructive
-regret bound for BOCPD that maps to `1 + 2ρτ / (L'' · Δ_hyst)`
-is not derived here and is left to future analytical work; the
-operational claim is just that BOCPD pays detection latency
-(~λ/e) instead of paying the drift integral that `lem:hyst-drift`
-bounds.
-
-#### Observability / diagnostics
-
-Per iteration, JSONL-stream into `budgeter.jsonl`:
-
-- `t`, `dt`
-- `pressure_signals_raw` (per pool, before BOCPD)
-- `posterior_mean[i]`, top-3 retained `(r, π_r, μ_r, σ²_r)`
-tuples per pool (sorted by `π_r` descending)
-- `predictive_likelihood[i]` at the top run length (the
-**innovation analog**: `z − μ_r`* and how surprising it is
-under the current posterior; critical for EM auditing and
-regime (c) validation)
-- `change_point_evidence[i]`: `π_0` (probability of "this is a
-new segment"). A spike past 0.5 marks a detected phase shift
-- `gap_rate`, trigger result (`fired` / `reason_if_skipped`)
-- `params` snapshot (`λ_iter`, `σ_obs`, `μ_0`, `σ_0²`,
-`cooldown_min`, `amortize_horizon`). The snapshot MUST be
-self-contained: a future replay-debug session reconstructs
-the framework state from this and the raw signal stream.
-
-On change-point detection (`π_0 > 0.5`), emit an additional
-event record with:
-
-- full posterior snapshot (all retained `(r, π_r, μ_r, σ²_r)`)
-- pre/post posterior means
-- 30-second history of `pressure_signals_raw` (so the change is
-context-visible in the log without external joins)
-
-Log volume at 20 Hz × 3 retained × 2 pools ≈ 2 MB/min steady-
-state, ~50 KB extra per detected change-point. Rotate every
-100 MB.
-
-#### Failure modes + ops knobs
-
-
-| Symptom                                                        | Likely cause                                                                                             | First-line knob                                                                                                 | Second-line                                    |
-| -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| Fires never trigger though pools imbalanced                    | `σ_obs` too high → posterior ignores signal                                                              | Lower `σ_obs` (or recalibrate against current trace)                                                            | Confirm `cooldown_min` finite                  |
-| Fires oscillate direction                                      | `cooldown_min < amortize_horizon` AND λ too small (false positives)                                      | Raise `cooldown_min` to `≥ amortize_horizon`                                                                    | Raise λ (longer expected segment)              |
-| Estimator slow to recover after fire                           | Run-length posterior overweight on stale segment                                                         | Drop `λ` (more reactive change detection)                                                                       | Check change_point_evidence in log             |
-| Burst of fires after a long quiet period                       | Either filter recovered from underestimate (false BOCPD change-point) OR real backlog of pressure        | Inspect change_point_evidence in log; if false, raise `λ`                                                       | n/a (real backlog is correct behavior)         |
-| Frequent false change-point detections                         | `λ` too small for workload                                                                               | Raise `λ` toward observed segment length                                                                        | Reduce `σ_obs` so noise doesn't read as change |
-| **Actuator wall saturates (fire wall ≫ dt)**                   | Fires fire faster than worker thread can drain                                                           | Raise `cooldown_min`; this throttles at the budgeter, not at fire_worker (which is the wrong place to throttle) | Re-validate `c_xfer_per_chunk` calibration     |
-| `**dt` strongly bimodal** (e.g., prefill vs decode iterations) | Hazard `H = dt/λ` then alternates between two values per iteration class, biasing change-point posterior | Use `λ` in *iterations* (`H = 1/λ_iter`) instead of seconds; or weight by iteration class                       | Confirm bimodality via dt histogram in log     |
-| Want to fully disable                                          | n/a                                                                                                      | `cooldown_min = +∞`                                                                                             | n/a                                            |
-
-
-Each row above MUST be reproducible in a unit test
-(`dev/interlayer/budgeter/test_bocpd_failures.py`) so
-the next person debugging can match symptom → cause → fix
-without reading the whole module.
-
+The `argmax` direction handles all three workload regimes without case-specific logic:
+- **Case 1 (KV-bound):** KV eviction rate is high, mamba eviction rate is low. Direction: `mamba_to_kv`. Grows KV.
+- **Case 2 (mamba-bound):** mamba eviction rate is high. Direction: `kv_to_mamba`. Grows mamba.
+- **Case 3 (workload shift):** eviction rates change as the workload shifts. EWMA tracks the new rates, direction reverses when the other pool's cost rate exceeds the current winner's. Cooldown prevents thrashing during the transition.
 
 
 ## 18. Cost model (detail)
@@ -3647,79 +2250,6 @@ Migration overhead).
 Implementation: *pending* (Migration action in Admitter
 
 - planner_validate sweep).
-
-### Budgeter convergence (positive, pending)
-
-Conjecture: under any stationary workload, the Budgeter
-reaches a pressure-balanced fixed point and stops firing.
-No alternating-direction fires (no oscillation), no
-unbounded fire rate.
-
-Test: skewed-popularity sweep, 10-minute run; from the
-budgeter.jsonl decision log, count:
-
-- `fires_total`
-- `direction_flips`: number of times consecutive fires changed
-direction (kv→mamba immediately followed by mamba→kv, or vice
-versa)
-- `fire_rate_last_min`: fires/minute in the last steady-state
-minute
-
-Pass: `direction_flips ≤ 2` (≤ 2 flips over the whole run; some
-flips during transient are acceptable) AND `fire_rate_last_min ≤ fire_rate_first_min / 10` (rate decays as system converges).
-
-Falsification: persistent high fire rate or many direction
-flips → `amortize_horizon_s` is too small relative to pressure
-noise, or `mloss_i = pressure_i / m_i` is a bad first-order
-approximation for this workload.
-
-Implementation: *pending* (BOCPD Budgeter +
-falsification harnesses).
-
-### cxfer_ewma_self_suppress: `c^xfer` EWMA spike self-suppresses over-fire (negative)
-
-Conjecture: when `ĉ^xfer` rises (e.g., GPU contention makes
-transfers slow), the trigger condition
-`gap_per_chunk × amortize_horizon_s > ĉ^xfer_per_chunk` becomes
-harder to clear automatically. No external rate limiter
-needed, fire rate adapts.
-
-Test (synthetic): inject a 5× spike into `ĉ^xfer` EWMA
-for 30 ticks. Compare fire rate before / during / after:
-`fire_rate_during < fire_rate_before / 3` expected (fewer
-fires because cost is higher per fire).
-
-Pass: `fire_rate_during ≤ fire_rate_before · 0.5` AND, after
-spike returns to baseline, `fire_rate_after ≈ fire_rate_before`
-(no permanent over- or under-correction).
-
-Falsification: fire rate unchanged → EWMA isn't being
-consulted in the trigger; over- or under-correction → EWMA
-half-life mis-tuned.
-
-Implementation: `[2_admitter/cxfer_ewma_self_suppress/](2_admitter/cxfer_ewma_self_suppress/)` (6/6 PASS).
-
-### Sub-tick burst stability (negative, pending)
-
-Conjecture: a workload whose mix oscillates with period
-< Budgeter tick (e.g., KV-heavy and mamba-heavy alternate
-every 200 ms with 1 Hz Budgeter) should NOT cause the
-Budgeter to thrash, EWMA presents averaged signals, so
-Budgeter sees roughly balanced pressure and stays put.
-Admitter still handles each individual req per-arrival.
-
-Test: synthetic workload with 200 ms period mix oscillation;
-1 Hz Budgeter; 5-minute run. Count Budgeter fires.
-
-Pass: `budgeter_fire_count_per_minute ≤ 1` (Budgeter
-mostly idle), `admitter_fire_count_per_minute > 10`
-(Admitter doing the work).
-
-Falsification: Budgeter fires frequently → EWMA isn't
-smoothing enough; or worse, fires in alternating directions
-→ Budgeter is reacting to noise, not signal.
-
-Implementation: *pending* (Budgeter sub-tick stress harness).
 
 ### cc_traces_headline: real-world workload measurable win
 

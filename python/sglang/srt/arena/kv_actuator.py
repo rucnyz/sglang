@@ -46,6 +46,15 @@ class KVArenaActuator:
         handles owned). Higher layers reason in pages, not token-slots."""
         return int(self.pool.size) // self._tokens_per_page()
 
+    def grow_headroom_pages(self) -> int:
+        """Physical page headroom before the KV allocator hits its id-space
+        ceiling (max_size). A cross-fire dst grant must be clamped to this so
+        dst chunk ids never expand past CappedFreeList.size. Symmetric with
+        MambaArenaActuator.grow_headroom_pages."""
+        alloc = self.allocator
+        headroom_slots = max(0, alloc.max_size - alloc.live_size)
+        return headroom_slots // self._tokens_per_page()
+
     def _tokens_per_page(self) -> int:
         """Internal: how many SGLang allocator token-slots live in one
         physical page. Consumed by `expand_pages_to_token_slots`,

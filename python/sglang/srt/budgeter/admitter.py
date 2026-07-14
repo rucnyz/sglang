@@ -489,10 +489,14 @@ class Admitter:
         # so price against THAT to match what `execute_decision` fires.
         if tokens_per_page is None:
             if self.owner_provider is None:
-                raise RuntimeError(
-                    "decide_for_req: tokens_per_page not provided and "
-                    "owner_provider not wired"
-                )
+                # The BudgetAgent wires owner_provider (and the actuator chain)
+                # on its FIRST tick; a request can arrive in the sub-tick window
+                # before that, especially a co-arriving swarm that hits the
+                # queue the instant the server is ready. No cross-pool option
+                # exists until the chain is built, so defer to normal admission
+                # here (consistent with _maybe_admitter_fire's observational
+                # degradation). Cross-pool admission kicks in once wired.
+                return None
             tokens_per_page = int(self.owner_provider.kv_tokens_per_page())
 
         # One-shot: warn if a stale calibration profile (SGLANG_CSIGMA_MODEL)
@@ -505,6 +509,32 @@ class Admitter:
             check_model_mismatch(getattr(sa, "model_path", None))
 
         kv_alloc = scheduler.token_to_kv_pool_allocator
+
+        # ── Fast path: both pools have ample headroom → own_free ──
+        # Lockless approximate reads (GIL-protected integers). A stale
+        # value at worst sends one arrival through the full path, which
+        # sglang's normal alloc/evict handles correctly. Skips cost
+        # model, lock acquisition, and JSONL log: eliminates the
+        # per-arrival tax when neither pool is pressured.
+        x_tokens_fast = len(getattr(req, "origin_input_ids", []) or [])
+        kv_free_approx = int(kv_alloc.available_size())
+        if kv_free_approx >= x_tokens_fast:
+            mamba_pool_fast = _get_mamba_pool(scheduler)
+            mamba_alloc_fast = getattr(
+                getattr(scheduler, "req_to_token_pool", None),
+                "mamba_allocator", mamba_pool_fast,
+            )
+            mamba_free_approx = (
+                int(mamba_alloc_fast.available_size())
+                if mamba_pool_fast is not None else 999
+            )
+            if mamba_free_approx >= self._mamba_arrival_need_slots:
+                return AdmitterDecision(
+                    action="own_free",
+                    reason="fast: headroom",
+                    candidate_costs_us={"own_free": 0.0},
+                )
+
         # Hold the destination allocator's `_alloc_lock` across the
         # capacity snapshot + c^evict prediction + decision (design.md
         # §"Why exact c^evict"). The BudgetAgent worker
@@ -593,9 +623,11 @@ class Admitter:
             # lock so the priced set is byte-identical to a subsequent
             # evict().
             c_xfer_per_page_us = float(self.cost_model.c_xfer_us(1))
-            # own_evict prices c^evict for the full X (the own side is NOT
-            # yet cumulative — a noted follow-up; this task scopes the
-            # cumulative model to the cross candidates).
+            # own_evict prices c^evict for the full X, amortized: the spot
+            # cost of one eviction understates the true cost because eviction
+            # is a chain reaction when the pool is full (each re-insert evicts
+            # another entry). The amortization factor approximates the number
+            # of downstream evictions one allocation triggers under pressure.
             c_evict_dst_us = float(self.cost_model.c_evict_us("kv", x_tokens))
             # cross Drain part: c^evict for the shortfall-targeted drain.
             # A zero target costs nothing AND must bypass the cache-None

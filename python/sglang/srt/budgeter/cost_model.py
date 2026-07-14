@@ -219,6 +219,23 @@ def get_cost_curves() -> CostCurves:
     return curves
 
 
+def has_cost_curves() -> bool:
+    """Non-raising probe: is a calibrated cost model resolvable?
+
+    `get_cost_curves()` fail-closes (raises) when no calibration is configured,
+    which is correct for the Budgeter/Admitter paths that CANNOT price a fire
+    without it. But the cache eviction path (`evict_full` / `evict_mamba`) runs
+    on EVERY server, including base serving of a hybrid model with
+    `--radix-eviction-policy lru` and no `SGLANG_CSIGMA_*`. There the per-victim
+    LPB-loss telemetry is dead (no Budgeter consumes it), so it must be skipped,
+    not raise. This resolves + caches the singleton exactly like
+    `get_cost_curves()` but reports availability instead of raising."""
+    global _singleton
+    if _singleton is None:
+        _singleton = _try_load_env() or _try_load_json()
+    return _singleton is not None
+
+
 def reset_cost_curves() -> None:
     """Test hook: clear the singleton so the next get reloads from env."""
     global _singleton, _warned_builtin, _model_mismatch_warned
@@ -708,6 +725,7 @@ class CostModel:
         # `predict_evict_cost_us(num_tokens, pool) -> float` method
         # that walks evictable leaves under the active policy.
         self._evict_caches: dict = {}
+        self._pool_occupancy: dict = {}  # active occupancy per pool, updated by BudgetAgent
 
     def c_xfer_us(self, n_pages: int) -> float:
         """Expected wall-time (µs) to move `n_pages` pages cross-pool.
@@ -744,36 +762,29 @@ class CostModel:
 
     def c_evict_us(self, pool: str, x_tokens: int) -> float:
         """Expected recompute cost (µs) if we evict the cheapest blocks
-        totaling `x_tokens` tokens from `pool` cache. Implements
-        design.md §"Shared cost model" `c^evict_i(X)` — exact walk
-        of the radix tree at decision time under the active eviction
-        policy.
+        totaling `x_tokens` tokens from `pool` cache.
 
-        Cold-start: returns +inf until a cache is plugged in via
-        `set_evict_cache(pool, cache)` — fail-closed so the Admitter
-        doesn't pick own-evict on an uninitialised cost model.
-
-        Raises ValueError on unknown pool name (typos crash loudly;
-        mirrors `c_recompute_us` / `c_migrate_us` discipline).
+        The spot cost (LPB-ordered victim sum) is multiplied by a
+        pressure multiplier that reflects the chain-reaction externality
+        of eviction under pool pressure. When the pool has slack, the
+        multiplier is ~1 (eviction is cheap). When the pool is near full,
+        the multiplier rises (eviction triggers sustained churn).
+        This lets the Admitter's argmin naturally prefer cross-pool
+        transfer over local eviction under pressure, per the paper's
+        design (Eq. action-costs).
         """
         if pool not in ("kv", "mamba"):
             raise ValueError(
                 f"c_evict_us: unknown pool {pool!r} (expected "
                 f"'kv' or 'mamba')"
             )
-        # Evicting 0 tokens costs nothing — independent of whether a cache
-        # is wired. Must precede the cache-None check so a zero-drain
-        # candidate (cumulative free→drain→migrate with no drain part)
-        # is never poisoned to +inf when the cache is absent.
         if int(x_tokens) <= 0:
             return 0.0
         cache = self._evict_caches.get(pool)
         if cache is None:
             return float("inf")
-        # Pass `pool` through: on a hybrid model the SAME
-        # MambaRadixCache instance is wired for both pools and
-        # dispatches the full-tree (kv) vs mamba walk on this arg.
         return cache.predict_evict_cost_us(int(x_tokens), pool=pool)
+
 
     def set_evict_cache(self, pool: str, cache) -> None:
         """Plug in (or replace) the per-pool radix-cache reference

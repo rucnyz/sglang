@@ -329,6 +329,39 @@ def test_actuator_unmark_token_slots_grows_live_size():
     assert pool.size == 12  # engine-visible bound reconciled from the allocator
 
 
+def test_actuator_grow_headroom_pages_bounds_cross_fire():
+    """A k2m cross-fire must not grant dst mamba slots past the allocator's
+    physical ceiling (max_size): the arena's chunk-id space is deliberately far
+    larger than the CappedFreeList id space, so an unbounded grant hands out
+    chunk ids that expand past max_size and unmark_token_slots fail-fasts
+    (the swarm 'unmark: id N exceeds ceiling' crash). grow_headroom_pages
+    reports the page budget XPoolActuator clamps the grant to."""
+    import types
+    from sglang.srt.arena.mamba_actuator import MambaArenaActuator, _MambaCapAllocator
+
+    alloc = _make_alloc(size=8, max_size=12)  # live_size=8, id-space ceiling 12
+    assert alloc.live_size == 8 and alloc.max_size == 12
+    pool = _storage_pool(alloc)
+    pool._mamba_temporal_arena = types.SimpleNamespace(tokens_per_chunk=1)  # tps=1
+    act = object.__new__(MambaArenaActuator)
+    act.pool = pool
+    act.allocator = _MambaCapAllocator(pool)
+
+    # headroom = (max_size 12 - live_size 8) // tps 1 = 4 pages: the exact grant
+    # ceiling the cross-fire clamp uses.
+    assert act.grow_headroom_pages() == 4
+
+    # A grant WITHIN headroom (ids 9..12) restores fine, growing live to 12.
+    act.unmark_token_slots([9, 10, 11, 12])
+    assert pool.live_size == 12
+    assert act.grow_headroom_pages() == 0  # at the ceiling: no further grant
+
+    # A grant PAST the ceiling (id 13 > max_size 12) is exactly what the clamp
+    # must prevent upstream; unclamped, the allocator fail-fasts (the crash).
+    with pytest.raises(AssertionError):
+        act.unmark_token_slots([13])
+
+
 # ---- admission gate must reflect free-backable capacity across BOTH sub-pools ----
 
 def test_hybrid_mamba_admittable_reqs():
@@ -358,3 +391,148 @@ def test_hybrid_mamba_admittable_reqs():
     # lightly loaded: free 6 + evictable 0 -> 6 // 3 = 2.
     pool.mamba_allocator = _make_alloc(size=6)
     assert pool.mamba_admittable_reqs(mamba_evictable=0) == 2
+
+
+# ---- per-request mamba budget must exclude a request's own COW source -------
+
+def _mamba_tree_with_source(source_slots, other_evictable_slots=0):
+    """A minimal real MambaRadixCache (CPU) carrying one evictable shared-prefix
+    snapshot of `source_slots` mamba slots, plus optionally an unrelated
+    `other_evictable_slots` snapshot. Reuses the production inc_lock_ref /
+    mamba_evictable_size bookkeeping (the lock-drops-evictable mechanism the
+    KV side relies on), so the test exercises the real code path, not an
+    imitation."""
+    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache, TreeNode
+
+    tree = object.__new__(MambaRadixCache)
+    tree.disable = False
+    tree.root_node = TreeNode()
+    tree.mamba_evictable_size_ = 0
+    tree.mamba_protected_size_ = 0
+    tree.full_evictable_size_ = 0
+    tree.full_protected_size_ = 0
+
+    def _add_snapshot(mamba_len):
+        n = TreeNode()
+        n.parent = tree.root_node
+        n.value = torch.arange(1, dtype=torch.int64)  # 1 KV token (walk needs .value)
+        n.mamba_value = torch.arange(mamba_len, dtype=torch.int64)
+        n.mamba_lock_ref = 0
+        n.full_lock_ref = 0
+        tree.mamba_evictable_size_ += mamba_len
+        tree.full_evictable_size_ += len(n.value)
+        return n
+
+    source = _add_snapshot(source_slots)
+    if other_evictable_slots:
+        _add_snapshot(other_evictable_slots)
+    return tree, source
+
+
+def _make_adder(mamba_alloc, tree):
+    from sglang.srt.managers.schedule_policy import PrefillAdder
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+    pool = object.__new__(HybridReqToTokenPool)
+    pool.enable_mamba_extra_buffer_lazy = False  # PREFIX_CACHE factor = 3
+    pool.mamba_allocator = mamba_alloc
+    # The adder reaches the pool via tree_cache.req_to_token_pool (the same
+    # path Scheduler uses), so wire it on the tree, not the adder.
+    tree.req_to_token_pool = pool
+
+    adder = object.__new__(PrefillAdder)
+    adder.tree_cache = tree
+    adder.is_hybrid_ssm_cache = True
+    adder.mamba_slot_offset = 0
+    return adder
+
+
+def test_prefill_adder_defers_own_cow_source():
+    """The swarm crash: a hybrid request COWs from the ONE shared cached mamba
+    snapshot at pool saturation. The batch-level gate (mamba_admittable_reqs)
+    counts that snapshot as reclaimable BEFORE the match, so it over-admits;
+    but the request pins the snapshot as its COW source (inc_lock_ref, the same
+    lock the KV side uses), so evict can never reclaim it -> alloc_req_slots
+    would crash instead of deferring.
+
+    The per-request mamba budget (PrefillAdder.rem_mamba_slots, read INSIDE the
+    _lock_node block after the source is locked, mirroring the KV
+    rem_total_tokens check) must exclude the just-locked source and defer.
+    """
+    import types
+
+    # Saturated pool: 6 slots, 5 already live -> 1 free at gate time. The only
+    # evictable mamba is the shared source snapshot (3 slots).
+    mamba = _make_alloc(size=6)
+    assert mamba.alloc(5) is not None and mamba.available_size() == 1
+    tree, source = _mamba_tree_with_source(source_slots=3)
+    adder = _make_adder(mamba, tree)
+
+    # (1) batch gate BEFORE the match over-admits: (free 1 + evictable 3)//3 = 1.
+    assert adder.tree_cache.req_to_token_pool.mamba_admittable_reqs(
+        tree.mamba_evictable_size(), tree.supports_mamba()
+    ) == 1
+
+    # (2) match time: the COW dst active slot is allocated (req.mamba_pool_idx
+    # set), consuming the last free slot; then the source is locked (the
+    # _lock_node inc_lock_ref in add_one_req).
+    dst = mamba.alloc(1)
+    assert dst is not None and mamba.available_size() == 0
+    req = types.SimpleNamespace(mamba_pool_idx=dst[0])
+    tree.inc_lock_ref(source)
+    assert tree.mamba_evictable_size() == 0  # source excluded once locked
+
+    # (3) per-request budget now sees no reclaimable mamba: 0 free + 0 evictable.
+    # The request still needs its ping-pong buffers (factor 3 minus the 1 COW-dst
+    # already held = 2), so it MUST defer.
+    assert adder.rem_mamba_slots == 0
+    assert adder._mamba_slots_needed(req) == 2
+    assert adder._mamba_slots_needed(req) > adder.rem_mamba_slots, "must defer"
+
+
+def test_prefill_adder_no_false_defer_with_other_evictable():
+    """No-throttle guard: when a DIFFERENT session's snapshot is evictable
+    (not the request's COW source), the budget must count it, so the COW
+    request is admitted -- eviction of the unrelated snapshot backs its
+    ping-pong buffers. Mirrors the KV base no-regression requirement."""
+    import types
+
+    mamba = _make_alloc(size=9)
+    assert mamba.alloc(5) is not None and mamba.available_size() == 4
+    # source snapshot 3 slots + an unrelated evictable snapshot 3 slots.
+    tree, source = _mamba_tree_with_source(source_slots=3, other_evictable_slots=3)
+    adder = _make_adder(mamba, tree)
+
+    dst = mamba.alloc(1)  # COW dst
+    req = types.SimpleNamespace(mamba_pool_idx=dst[0])
+    tree.inc_lock_ref(source)  # source locked; other snapshot stays evictable
+    assert tree.mamba_evictable_size() == 3  # the unrelated snapshot only
+
+    # rem = free 3 + evictable 3 - offset 0 = 6 >= needed 2 -> admit (no defer).
+    assert adder.rem_mamba_slots == 6
+    assert adder._mamba_slots_needed(req) == 2
+    assert adder._mamba_slots_needed(req) <= adder.rem_mamba_slots, "must admit"
+
+
+def test_prefill_adder_mamba_offset_accumulates():
+    """The budget is cumulative across a batch (symmetric with
+    rem_total_token_offset): each admitted request's fresh mamba demand is
+    deducted, so a later request in the same pass sees the earlier consumption
+    and defers before over-committing."""
+    import types
+
+    mamba = _make_alloc(size=12)
+    assert mamba.alloc(6) is not None and mamba.available_size() == 6
+    tree, _ = _mamba_tree_with_source(source_slots=0)  # no cached snapshots
+    adder = _make_adder(mamba, tree)
+
+    fresh = types.SimpleNamespace(mamba_pool_idx=None)  # no COW dst held
+    assert adder._mamba_slots_needed(fresh) == 3  # full active + ping-pong
+    assert adder.rem_mamba_slots == 6  # 6 free + 0 evictable
+
+    # Admit two fresh requests: offset accumulates 3 + 3 = 6.
+    adder.mamba_slot_offset += adder._mamba_slots_needed(fresh)
+    adder.mamba_slot_offset += adder._mamba_slots_needed(fresh)
+    assert adder.rem_mamba_slots == 0
+    # A third fresh request needs 3 but the pass has already committed all 6.
+    assert adder._mamba_slots_needed(fresh) > adder.rem_mamba_slots, "must defer"

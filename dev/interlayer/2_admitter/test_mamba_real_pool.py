@@ -33,6 +33,7 @@ REAL `TokenToKVPoolAllocator` over a real `MHATokenToKVPool` and a REAL
 """
 from __future__ import annotations
 
+import os
 import sys
 
 sys.path.insert(0, "/scratch/yuzhou/projects/sglang/python")
@@ -135,7 +136,7 @@ def _insert_real(cache, pool, alloc, tokens, n_hits=0):
 
     value = alloc.alloc(len(tokens))
     assert value is not None, "KV allocator exhausted in fixture"
-    mamba_value = pool.mamba_pool.alloc(1)
+    mamba_value = pool.mamba_allocator.alloc(1)
     assert mamba_value is not None, "mamba pool exhausted in fixture"
     cache.insert(
         InsertParams(
@@ -502,6 +503,60 @@ def test_7_lpb_drain_cost_hot_gt_cold():
     )
 
 
+def test_8_evict_without_calibration_must_not_crash():
+    """Reproducing test (#343): a hybrid model served WITHOUT a calibrated cost
+    model (base: --radix-eviction-policy lru, no SGLANG_CSIGMA_*) still uses
+    MambaRadixCache, and its eviction path must NOT require the cost model.
+
+    The per-victim LPB-loss telemetry (`evict_mamba` / `evict_full` accumulating
+    `_cumulative_evicted_*_lpb_loss`) is consumed ONLY by the Budgeter; with no
+    calibration it is dead and must be skipped, not raise. Pre-fix, both methods
+    open with an unconditional `get_cost_curves()` which RAISES 'HiMA requires a
+    calibrated cost model' -> the base scheduler SIGQUITs on the first eviction
+    (observed: base completed 501/800, silently invalidating the case1 A/B by
+    dropping the 299 hardest requests as errors)."""
+    import sglang.srt.budgeter.cost_model as cm
+    from sglang.srt.server_args import (
+        ServerArgs,
+        get_global_server_args,
+        set_global_server_args_for_scheduler,
+    )
+
+    try:
+        get_global_server_args()
+    except Exception:
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="Qwen/Qwen3.5-9B")
+        )
+
+    saved_singleton = cm._singleton
+    saved_env = {
+        k: os.environ.pop(k)
+        for k in list(os.environ)
+        if k.startswith("SGLANG_CSIGMA")
+    }
+    cm._singleton = None  # force the uncalibrated state base serving runs in
+    try:
+        assert not cm.has_cost_curves(), (
+            "fixture precondition: no calibration should be resolvable "
+            "(env cleared, singleton reset)"
+        )
+        cache, pool, alloc = _make_real_cache(policy="lru", size=8, kv_size=256)
+        for i in range(6):
+            _insert_real(cache, pool, alloc, [i * 10 + j for j in range(4)])
+        # Pre-fix: get_cost_curves() at the top of each RAISES RuntimeError.
+        n_m = cache.evict_mamba(1)
+        n_k = cache.evict_full(1)
+        assert n_m >= 0 and n_k >= 0
+        print(
+            f"  PASS  8  evict without calibration OK "
+            f"(mamba_evicted={n_m} full_evicted={n_k})"
+        )
+    finally:
+        cm._singleton = saved_singleton
+        os.environ.update(saved_env)
+
+
 def main() -> int:
     tests = [
         test_1_real_init_sets_ground_truth_bytes,
@@ -511,6 +566,7 @@ def main() -> int:
         test_5_dynamic_cap_bb_divides_by_max_size_not_size,
         test_6_predict_mamba_equals_real_evict_mamba_with_cascade,
         test_7_lpb_drain_cost_hot_gt_cold,
+        test_8_evict_without_calibration_must_not_crash,
     ]
     print(f"\n#2/#262 MambaRadixCache REAL-pool tests (n={len(tests)}):")
     passed = 0

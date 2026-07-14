@@ -289,6 +289,32 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 _is_npu = is_npu()
 
 
+def require_mamba_radix_cache_for_hima(tree_cache, disable_radix_cache: bool) -> None:
+    """Fail fast at boot when HiMA is requested on a cache it cannot drive.
+
+    HiMA is a hybrid cross-pool (KV <-> mamba) system: the Budgeter reads
+    per-pool eviction-cost counters and the Admitter reads page ownership from
+    the arena, both defined only on MambaRadixCache. When a model disables
+    radix caching the tree cache is a ChunkCache with no such state, so raise
+    here rather than crash mid-run with an obscure AttributeError /
+    "owner_provider not wired". sglang disables radix for hybrid models whose
+    MambaRadixCache support is not yet implemented (e.g. KimiLinearForCausalLM
+    -> support_mamba_cache=False). isinstance covers MambaRadixCache subclasses
+    (HiMambaRadixCache)."""
+    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+    if not isinstance(tree_cache, MambaRadixCache):
+        raise RuntimeError(
+            f"SGLANG_HIMA=1 requires a MambaRadixCache tree cache, but this "
+            f"model uses {type(tree_cache).__name__} "
+            f"(disable_radix_cache={disable_radix_cache}). HiMA manages the "
+            f"KV<->mamba cross-pool split via the MambaRadixCache arena, which "
+            f"does not exist when radix caching is disabled; run without "
+            f"SGLANG_HIMA on this model, or use a model whose MambaRadixCache "
+            f"is supported."
+        )
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -974,8 +1000,6 @@ class Scheduler(
             from sglang.srt.budgeter import BudgetAgent
             from sglang.srt.budgeter.admitter import Admitter
             from sglang.srt.budgeter.cost_model import get_cost_model
-            from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
-            from sglang.srt.mem_cache.radix_cache import RadixCache
 
             if self.server_args.disaggregation_mode != "null":
                 raise NotImplementedError(
@@ -983,21 +1007,31 @@ class Scheduler(
                     f"'{self.server_args.disaggregation_mode}' yet"
                 )
 
+            require_mamba_radix_cache_for_hima(
+                self.tree_cache, self.disable_radix_cache
+            )
+
             _no_budgeter = os.environ.get("SGLANG_HIMA_NO_BUDGETER") == "1"
             if not _no_budgeter:
                 self.budget_agent = BudgetAgent(self)
-            self.admitter = Admitter(cost_model=get_cost_model())
-            import atexit
-            atexit.register(self.admitter.close)
-            logger.info("HiMA enabled (Admitter + Budgeter)")
-            if type(self.tree_cache) in (RadixCache, MambaRadixCache):
-                cm = get_cost_model()
-                cm.set_evict_cache("kv", self.tree_cache)
-                cm.set_evict_cache("mamba", self.tree_cache)
-                logger.info(
-                    "Admitter c^evict predictor wired (kv+mamba, cache=%s)",
-                    type(self.tree_cache).__name__,
-                )
+            _no_admitter = os.environ.get("SGLANG_HIMA_NO_ADMITTER") == "1"
+            if not _no_admitter:
+                self.admitter = Admitter(cost_model=get_cost_model())
+                import atexit
+                atexit.register(self.admitter.close)
+            logger.info(
+                "HiMA enabled (Admitter=%s Budgeter=%s)",
+                self.admitter is not None,
+                self.budget_agent is not None,
+            )
+            # tree_cache is a MambaRadixCache (or subclass) by the guard above.
+            cm = get_cost_model()
+            cm.set_evict_cache("kv", self.tree_cache)
+            cm.set_evict_cache("mamba", self.tree_cache)
+            logger.info(
+                "Admitter c^evict predictor wired (kv+mamba, cache=%s)",
+                type(self.tree_cache).__name__,
+            )
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -2286,6 +2320,10 @@ class Scheduler(
         if self.admitter is None:
             return
         decision = self.admitter.decide_for_req(req, self)
+        # None = Admitter deferred (not NULL-disagg, or the actuator chain is
+        # not wired yet in the first-tick window) -> normal scheduler admission.
+        if decision is None:
+            return
         if decision.action in ("cross_free", "cross_evict", "cross_migrate"):
             self._maybe_admitter_fire(req, decision)
 
