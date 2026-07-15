@@ -49,6 +49,12 @@ COMMON="--model-path $MODEL --host 127.0.0.1 --port $PORT \
 # KV-bound win needs it set at the GPU compute knee so base is KV-limited BELOW
 # it (headroom) and sys grows KV up to it; unset = sglang default (mamba//ratio).
 [ -n "${MAX_RUNNING:-}" ] && COMMON="$COMMON --max-running-requests $MAX_RUNNING"
+# CUDA graph backend passthrough (both arms, fair). Nemotron-3 defaults to the
+# torch.compile piecewise decode graph, which hits a torch 2.9 meta_mm() signature
+# bug; CUDA_GRAPH_DECODE=full uses the standard captured graph (fast, no compile
+# path). Prefill graph is disabled by default upstream; override if needed.
+[ -n "${CUDA_GRAPH_DECODE:-}" ] && COMMON="$COMMON --cuda-graph-backend-decode $CUDA_GRAPH_DECODE"
+[ -n "${CUDA_GRAPH_PREFILL:-}" ] && COMMON="$COMMON --cuda-graph-backend-prefill $CUDA_GRAPH_PREFILL"
 
 if [ "$ARM" = "base" ]; then
   ENVP="(none)"
@@ -83,6 +89,13 @@ else
     export SGLANG_CSIGMA_KV_ALPHA=1.306635e-07 \
            SGLANG_CSIGMA_KV_BETA=1.601545e-02 \
            SGLANG_CSIGMA_KV_GAMMA=2.420041e+01 \
+           SGLANG_CSIGMA_M_ALPHA=0.0 SGLANG_CSIGMA_M_BETA=0.0 SGLANG_CSIGMA_L_STAR=0.0
+  elif [[ "$MODEL" == *Nemotron* ]]; then
+    # Nemotron-3-Super-120B-A12B / H200 (calibrate.sh, --disable-cuda-graph
+    # + --tp-size 4 --max-mamba-cache-size 16; c_M=0 hybrid single-curve).
+    export SGLANG_CSIGMA_KV_ALPHA=4.869673e-08 \
+           SGLANG_CSIGMA_KV_BETA=4.003409e-02 \
+           SGLANG_CSIGMA_KV_GAMMA=7.036574e+01 \
            SGLANG_CSIGMA_M_ALPHA=0.0 SGLANG_CSIGMA_M_BETA=0.0 SGLANG_CSIGMA_L_STAR=0.0
   else
     export SGLANG_CSIGMA_KV_ALPHA=1.0214961938707212e-07 \
