@@ -1,14 +1,19 @@
 #!/bin/bash
 # Official RQ1 Case 1/2/3: base (LRU) vs sys (LPB+HiMA), N=3 per arm, fresh boot/rep.
-# Reproduces reproduce/RQ1/FINDINGS.md on the token-exact agentreplay traces:
-#   Case1: t6_v2 @ conc 64   (long-horizon agent, KV-bound)
-#   Case2: t12   @ conc 64   (agent swarm, high eviction volume)
-#   Case3: t6_v2 @ conc 128  (Case1 trace at 2x concurrency = dynamic/high pressure)
+# Token-exact agentreplay traces, built from the frozen corpus per REPRODUCE.md
+# (`convert --projects data/corpus/data/contrib`, program-identical across tokenizers):
+#   Case1: t6  @ conc 64   (long-horizon agent, KV-bound)
+#   Case2: t12 @ conc 64   (agent swarm, high eviction volume)
+#   Case3: t6  @ conc 128  (Case1 trace at 2x concurrency = dynamic/high pressure)
 # stagger=0.5, default config; only workload/concurrency differ.
 # CASES env selects a subset, e.g. CASES="case2 case3" bash run_official_case123.sh
+#
+# The pre-2026-07 numbers in FINDINGS.md were measured on the SUPERSEDED
+# direct-from-projects traces (cc_qwen_t6_v2, 1200 req). Those are not comparable
+# to a corpus-built run: same base-vs-sys question, different workload mix.
 set -eu
 SCRIPT=/scratch/yuzhou/projects/sglang/reproduce/RQ1/run_arm.sh
-T6=/scratch/yuzhou/projects/agentreplay/data/traces/cc_qwen_t6_v2.jsonl
+T6=/scratch/yuzhou/projects/agentreplay/data/traces/cc_qwen_t6.jsonl
 T12=/scratch/yuzhou/projects/agentreplay/data/traces/cc_qwen_t12.jsonl
 PORT=${PORT:-30097}; GPU=${GPU:-7}
 STAGGER=0.5
