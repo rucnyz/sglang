@@ -624,14 +624,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             f"mamba_pool.max_size must be >= size to compute B_b, got "
             f"max_size={mp.max_size}, size={mp.size}"
         )
-        # B_b denominator is the PHYSICAL allocated slot count = max_size+1
-        # (design.md "Padded slot 0": the mamba State tensors are
-        # allocated at max_size+1 rows, which equals size+1 when not in
-        # dynamic-cap mode). mem_usage_bytes() sums those tensors, so
-        # dividing by max_size+1 yields the true per-slot byte cost.
-        # Dividing by size would over-estimate B_b by (size+1)/size and
-        # skew LPB's KV-vs-mamba weighting.
-        bytes_per_slot = int(mp.mamba_cache.mem_usage_bytes()) // (mp.max_size + 1)
+        # Per-slot physical byte cost for LPB's loss-per-byte ratio.
+        # State.bytes_per_slot() computes prod(shape[1:]) * itemsize per
+        # field — the bytes of a SINGLE slot row, independent of how many
+        # rows the backing tensor has. This is correct for both
+        # arena-backed tensors (whose shape[0] reflects VA, not physical
+        # slots) and standard tensors (shape[0] = max_size+1).
+        bytes_per_slot = mp.mamba_cache.bytes_per_slot()
         assert bytes_per_slot > 0, (
             f"mamba per-slot byte denominator (B_b) must be positive, got "
             f"{bytes_per_slot} from mem_usage_bytes={mp.mamba_cache.mem_usage_bytes()} "
