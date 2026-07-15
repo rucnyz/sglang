@@ -27,11 +27,14 @@ trace (100s of MB, gitignored — see `caseN/data/README.md` to populate). Resul
   `--mamba-scheduler-strategy extra_buffer` (the one knob that keeps overlap ON
   for hybrid mamba + radix cache). mem-frac / context / pool split = sglang
   defaults — the A/B measures the cross-pool change, not tuning.
-- `case_default_build.py` — builds the case2/case3 traces from case1's trace
-  (swarm source) + the agentreplay corpus long source.
-- `ablations/` — eviction axis (`ab*_262k`: base / inter / full), tick cadence
-  (`ablate_tick`), decode profile (`profile_decode`), case2 sweeps (`ablate_case2*`).
+- `REPRODUCE.md` — the from-scratch index: pull the corpus, build the traces,
+  calibrate the per-model cost curve, run the arms. Start there.
+- `run_campaign_crossmodel.sh` — the whole cross-model table, serially.
 - `FINDINGS.md` — investigation journal + headline results.
+
+Traces are always rebuilt from the frozen agentreplay corpus (the single data
+source of truth); nothing else is a trace source, and the built traces are never
+committed (they detokenize back to private sessions).
 
 ## Prerequisites
 
