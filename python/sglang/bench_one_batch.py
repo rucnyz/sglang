@@ -324,6 +324,15 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
     else:
         model_runner = ModelRunner(**runner_kwargs)
         model_runner.alloc_memory_pool()
+        # Mamba2 models (e.g. Nemotron-H) need the selective_state_update backend
+        # initialized BEFORE init_backends() warms up / captures the cuda graph
+        # (which runs a mamba forward and asserts otherwise). The scheduler does
+        # this in init_mamba_backend() before warmup; bench_one_batch bypasses the
+        # scheduler, so mirror the order here (no-op for non-mamba models).
+        from sglang.srt.layers.attention.mamba.ops import (
+            initialize_mamba_selective_state_update_backend,
+        )
+        initialize_mamba_selective_state_update_backend(server_args)
         model_runner.init_backends()
     rank_print(f"max_total_num_tokens={model_runner.max_total_num_tokens}")
     tokenizer = get_tokenizer(
