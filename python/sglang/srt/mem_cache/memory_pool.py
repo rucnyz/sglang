@@ -556,6 +556,19 @@ class MambaPool:
                 if getattr(self, f.name) is not None
             )
 
+        def bytes_per_slot(self) -> int:
+            """Physical bytes per single slot, independent of how many slots
+            the backing tensors have (works for both arena and non-arena)."""
+            total = 0
+            for f in dataclasses.fields(self):
+                v = getattr(self, f.name)
+                if isinstance(v, list):
+                    for t in v:
+                        total += int(np.prod(t.shape[1:])) * t.dtype.itemsize
+                else:
+                    total += int(np.prod(v.shape[1:])) * v.dtype.itemsize
+            return total
+
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         # None under --enable-gdn-replayssm-spec: the spec ring owns rollback
