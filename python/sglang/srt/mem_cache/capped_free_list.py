@@ -135,6 +135,7 @@ class CappedFreeList:
         violation, so the hot path stays append-only (no per-token isin tax)."""
         if ids.numel() == 0:
             return
+        ids = _norm(ids, self.device)
         if self.need_sort:
             self.pending = torch.cat((self.pending, ids))
         else:

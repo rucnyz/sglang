@@ -171,3 +171,76 @@ KV-pool-not-arena-backed step.
 the 48B row); \sys is not measurable. To make ANY MLA model win, one must first
 implement arena-backing for the MLA KV pool (MultiTensorArena + SharedHandlePool
 + latent-layout chunk transfer + fa3-backend read) — a major extension.
+
+## Nemotron-3-Super-120B-A12B (2026-07-15) — TP4, third measured model
+
+GPU: 4×H200 (GPUs 3,4,5,7), TP=4, MEMFRAC=0.85, MAMBA_CAP=256,
+MAMBA_STRAT=no_buffer, CUDA_GRAPH_DECODE=full, CUDA_GRAPH_PREFILL=disabled,
+REASONING=none. Traces: corpus-built cc_nemotron_t6 (1199 req / 195 prog) and
+cc_nemotron_t12 (1789 req / 146 prog). N=3 reps per arm, same-boot (not fresh-boot).
+
+Two TP4-specific bugs fixed during this campaign:
+1. `CappedFreeList.free()` missing `_norm(ids, self.device)` — ids from the
+   scheduler (cuda:0) contaminated the free list on ranks 1-3 → device mismatch
+   crash in `count_reachable`/`unmark`.
+2. `BudgetAgent._fire_worker_loop` missing `torch.cuda.set_device(gpu_id)` — the
+   worker thread defaulted bare `"cuda"` to cuda:0 regardless of rank, so `_norm`
+   moved tensors to the wrong device.
+
+### Summary
+
+| Case | trace @ conc | base tps (N=3) | sys tps (N=3) | dTPS | dTTFT p99 | err |
+|------|-------------|----------------|---------------|------|-----------|-----|
+| Case1 | t6 @ 64    | 635.2±0.6 | 671.4±1.7 | **+5.7%** | **−22%** | 0 |
+| Case2 | t12 @ 64   | 533.1±0.8 | 642.6±14.9 | **+20.5%** | **−22%** | 0 |
+| Case3 | t6 @ 128   | 638.6±1.1 | 583.5±4.6 | −8.6% | **−91%** | 0 |
+
+Case2 is the largest throughput win across all models (+20.5%). Case3 trades 8.6%
+throughput for 95% TTFT improvement (20.5s→0.93s mean): at conc=128 the mamba pool
+binds (4830 k2m fires, 0 m2k), HiMA correctly donates KV→mamba to admit more
+requests, collapsing queue wait at the cost of higher per-token decode latency.
+
+### Case1: cc_nemotron_t6 @ conc 64 (KV-bound, main-table cell)
+
+| Metric | base (N=3) | sys (N=3) | delta |
+|--------|-----------|-----------|-------|
+| throughput_tok_s | 635.2±0.6 | 671.4±1.7 | **+5.7%** |
+| cache_hit | 0.6196 | 0.7062 | +8.7pp |
+| TTFT mean (ms) | 902 | 714 | **−20.8%** |
+| TTFT p50 (ms) | 409 | 376 | −8.1% |
+| TTFT p90 (ms) | 2412 | 1757 | **−27.2%** |
+| TTFT p99 (ms) | 4721 | 3679 | **−22.1%** |
+| TPOT mean (ms) | 108.8 | 97.3 | −10.6% |
+| n_error | 0 | 0 | |
+
+Per-rep tps: base [635.4, 634.5, 635.6], sys [672.2, 672.5, 669.4].
+
+### Case2: cc_nemotron_t12 @ conc 64 (agent swarm, high eviction)
+
+| Metric | base (N=3) | sys (N=3) | delta |
+|--------|-----------|-----------|-------|
+| throughput_tok_s | 533.1±0.8 | 642.6±14.9 | **+20.5%** |
+| cache_hit | 0.5453 | 0.7301 | +18.5pp |
+| TTFT mean (ms) | 1279 | 891 | **−30.3%** |
+| TTFT p90 (ms) | 3205 | 2113 | **−34.1%** |
+| TTFT p99 (ms) | 7583 | 5921 | **−21.9%** |
+| TPOT mean (ms) | 123.4 | 92.8 | −24.8% |
+| n_error | 0 | 0 | |
+
+Per-rep tps: base [532.3, 533.1, 533.9], sys [632.6, 635.6, 659.7].
+
+### Case3: cc_nemotron_t6 @ conc 128 (mamba-bound, QoE trade)
+
+| Metric | base (N=3) | sys (N=3) | delta |
+|--------|-----------|-----------|-------|
+| throughput_tok_s | 638.6±1.1 | 583.5±4.6 | −8.6% |
+| cache_hit | 0.6235 | 0.6989 | +7.5pp |
+| TTFT mean (ms) | 20475 | 934 | **−95.4%** |
+| TTFT p90 (ms) | 46768 | 2288 | **−95.1%** |
+| TTFT p99 (ms) | 58392 | 5455 | **−90.7%** |
+| TPOT p50 (ms) | 226.6 | 295.5 | +30.4% |
+| n_error | 0 | 0 | |
+
+Per-rep tps: base [639.3, 637.3, 639.2], sys [588.3, 583.0, 579.2].
+Mamba-bound regime: 4830 k2m fires / 0 m2k. HiMA donates KV→mamba to increase
+max_running, collapsing the 20s+ queue wait into sub-second TTFT.

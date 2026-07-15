@@ -1625,6 +1625,8 @@ class BudgetAgent:
         cuMem* ops, preventing two fires from competing for the same
         shared_pool free handles.
         """
+        import torch
+        torch.cuda.set_device(self.scheduler.ps.gpu_id)
         while True:
             token = self._fire_queue.get()
             if token is None:  # shutdown sentinel
