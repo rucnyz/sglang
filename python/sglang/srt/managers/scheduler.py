@@ -1011,9 +1011,12 @@ class Scheduler(
                 self.tree_cache, self.disable_radix_cache
             )
 
-            _no_budgeter = os.environ.get("SGLANG_HIMA_NO_BUDGETER") == "1"
-            if not _no_budgeter:
-                self.budget_agent = BudgetAgent(self)
+            # SGLANG_HIMA_NO_BUDGETER is handled INSIDE BudgetAgent
+            # (planner_disabled): the agent still builds the actuator
+            # chain and wires the Admitter — gating construction here
+            # left admitter.actuator=None and silently degraded the
+            # "w/o Budgeter" ablation cell to LPB-only.
+            self.budget_agent = BudgetAgent(self)
             _no_admitter = os.environ.get("SGLANG_HIMA_NO_ADMITTER") == "1"
             if not _no_admitter:
                 self.admitter = Admitter(cost_model=get_cost_model())
