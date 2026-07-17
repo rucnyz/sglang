@@ -383,8 +383,9 @@ class XPoolActuator:
                 granted_in_barrier=None,
             )
 
-        if plan.drains or plan.migrations:
-            self._run_stage0(plan, src_act)
+        # Legacy path — reached only for drain/migration plans (the fast
+        # path above returned for free-only plans).
+        self._run_stage0(plan, src_act)
         _p1 = time.monotonic_ns()
         cap_slots = src_act.expand_pages_to_token_slots(plan.pages_to_unmap)
         _p2 = time.monotonic_ns()
@@ -404,10 +405,7 @@ class XPoolActuator:
         # pre-mark snapshot tells 'free' from 'referenced'. The one small GPU
         # sync per fire is acceptable (fires are ~1/s) and only over the
         # cap-target slots.
-        if plan.drains or plan.migrations:
-            n_referenced = alloc.count_referenced(cap_t)
-        else:
-            n_referenced = 0
+        n_referenced = alloc.count_referenced(cap_t)
         if n_referenced > 0:
             logger.error(
                 "cap_barrier[seq=%d] ABORT: %d of %d cap targets "
