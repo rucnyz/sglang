@@ -625,11 +625,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             f"max_size={mp.max_size}, size={mp.size}"
         )
         # Per-slot physical byte cost for LPB's loss-per-byte ratio.
-        # State.bytes_per_slot() computes prod(shape[1:]) * itemsize per
-        # field — the bytes of a SINGLE slot row, independent of how many
-        # rows the backing tensor has. This is correct for both
-        # arena-backed tensors (whose shape[0] reflects VA, not physical
-        # slots) and standard tensors (shape[0] = max_size+1).
+        # State.bytes_per_slot() normalizes each conv/temporal tensor by
+        # its own slot-dim size, so the result is exact for the stacked,
+        # per-layer, and arena (VA-inflated leading dim) layouts alike;
+        # speculative draft caches are excluded. See
+        # dev/interlayer/4_e2e/cc_zero_downside/test_mamba_bytes_per_slot.py.
         bytes_per_slot = mp.mamba_cache.bytes_per_slot()
         assert bytes_per_slot > 0, (
             f"mamba per-slot byte denominator (B_b) must be positive, got "
@@ -642,7 +642,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # LPB's denominator uses ground-truth bytes.
         print(
             f"[LPB] bytes_per_mamba_slot = {bytes_per_slot} "
-            f"(real, from mamba_pool: mem_usage_bytes // (max_size+1) with "
+            f"(State.bytes_per_slot(): conv+temporal, slot-dim normalized; "
             f"max_size={mp.max_size}, size={mp.size})",
             flush=True,
         )
