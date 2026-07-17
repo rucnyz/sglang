@@ -135,6 +135,58 @@ def test_4_default_hook_is_sync_execute():
     print("test_4 OK  (default hook = synchronous inline execute)")
 
 
+def test_5_async_does_not_block_the_caller():
+    """PERF: the whole point of routing Admitter fires through the async
+    worker is that execute_decision must NOT block the scheduler thread for
+    the 10-30ms cuMemUnmap/Map. With a fake actuator whose execute() takes
+    FIRE_MS, the synchronous default blocks the caller ~FIRE_MS, while the
+    async submit (cap_barrier inline + hand-off) returns near-instantly."""
+    import time
+
+    FIRE_S = 0.10  # stand-in for the ~10-30ms cuMem work
+
+    # --- synchronous default: execute() runs inline, so the caller blocks ---
+    adm_sync = _admitter_reaching_fire()
+    real_exec = adm_sync.actuator.execute
+
+    def slow_execute(plan):
+        time.sleep(FIRE_S)
+        return real_exec(plan)
+
+    adm_sync.actuator.execute = slow_execute
+    dec = _cross_decision(adm_sync)
+    t0 = time.perf_counter()
+    adm_sync.execute_decision(dec, x_tokens=4096, src_pool=dec.src_pool,
+                              dst_pool=dec.dst_pool, tokens_per_page=1024)
+    sync_wall = time.perf_counter() - t0
+
+    # --- async submit: cap_barrier is instant, the slow work is off-thread ---
+    adm_async = _admitter_reaching_fire()
+    real_exec2 = adm_async.actuator.execute
+
+    def async_submit(plan):
+        # mirror BudgetAgent._submit_admitter_fire's async contract: do the
+        # cheap inline part, hand the slow execute() to a worker thread.
+        import threading
+        threading.Thread(target=lambda: (time.sleep(FIRE_S), real_exec2(plan)),
+                         daemon=True).start()
+        return (False, None)  # enqueued; sync_result unknown
+
+    adm_async._fire_submit = async_submit
+    dec2 = _cross_decision(adm_async)
+    t1 = time.perf_counter()
+    adm_async.execute_decision(dec2, x_tokens=4096, src_pool=dec2.src_pool,
+                               dst_pool=dec2.dst_pool, tokens_per_page=1024)
+    async_wall = time.perf_counter() - t1
+
+    assert sync_wall >= FIRE_S * 0.9, (
+        f"sync path should block ~{FIRE_S*1e3:.0f}ms, blocked {sync_wall*1e3:.1f}ms")
+    assert async_wall < FIRE_S * 0.2, (
+        f"async path must not block the caller; blocked {async_wall*1e3:.1f}ms")
+    print(f"test_5 OK  (sync blocks {sync_wall*1e3:.0f}ms vs async "
+          f"{async_wall*1e3:.1f}ms — {sync_wall/max(async_wall,1e-6):.0f}x off the scheduler thread)")
+
+
 if __name__ == "__main__":
     for name in sorted(k for k in dir() if k.startswith("test_")):
         globals()[name]()
