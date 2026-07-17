@@ -107,3 +107,41 @@ class TestPaybackConvergence:
                     fired_late += 1
         assert fired_early > 0, "should fire during eviction phase"
         assert fired_late == 0, "should NOT fire well after eviction stops (EWMA decayed)"
+
+
+class TestPaybackMargin:
+    """payback_margin scales the fire threshold: fire iff payback > cost x margin."""
+
+    def test_margin_1_fires(self):
+        p = PaybackPlanner(
+            config=PaybackConfig(cooldown_s=1.0, payback_margin=1.0),
+            fire_cost_us=100.0,
+        )
+        fired = [
+            t for t in range(50)
+            if p.decide(_snap(kv_evict=500), clock_s=float(t), dt=1.0).direction
+        ]
+        assert fired, "margin 1.0 must fire on a signal well above fire_cost"
+
+    def test_high_margin_suppresses_fire(self):
+        # Same signal, threshold raised to 100 * 1000 = 100k us -- far above
+        # any payback this signal can reach; must never fire.
+        p = PaybackPlanner(
+            config=PaybackConfig(cooldown_s=1.0, payback_margin=1000.0),
+            fire_cost_us=100.0,
+        )
+        for t in range(50):
+            d = p.decide(_snap(kv_evict=500), clock_s=float(t), dt=1.0)
+            assert d.direction is None, f"tick {t}: fired despite margin 1000"
+
+    def test_margin_env_roundtrip(self):
+        from sglang.srt.budgeter.xpool_planner import _config_from_env
+        from sglang.srt.environ import envs
+
+        assert PaybackConfig().payback_margin == 1.0
+        with envs.SGLANG_XPOOL_PAYBACK_MARGIN.override(2.5):
+            assert _config_from_env().payback_margin == 2.5
+
+    def test_margin_must_be_positive(self):
+        with pytest.raises(ValueError):
+            PaybackConfig(payback_margin=0.0)
