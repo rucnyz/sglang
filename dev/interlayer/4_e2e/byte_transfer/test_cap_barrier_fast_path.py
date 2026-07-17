@@ -426,6 +426,60 @@ def test_8_floor_does_not_touch_m2k():
     print("test_8 OK  (m2k unaffected by the kv serving floor)")
 
 
+
+
+def test_9_kv_serving_floor_clamps_k2m_legacy_drain_path():
+    """The k2m serving floor must also hold on the LEGACY drain/migration
+    path — where the Admitter's cross_evict / cross_migrate k2m plans land
+    (they carry drains, so they skip the free-only fast path). Without the
+    clamp here, cumulative Admitter k2m drains push KV available below the
+    floor and the next prefill OOMs (the crash 48f2ce5414 fixed only on the
+    fast path). Stage-0 is mocked out; this isolates the clamp math."""
+    tps = 64
+    kv_real = _build_kv_real(tps=tps)
+    mamba_real = _build_mamba_real(tps=1)
+
+    class _FloorAlloc(_CappedListAllocator):
+        def __init__(self, n_slots, avail):
+            super().__init__(n_slots)
+            self._avail = avail
+
+        def available_size(self):
+            return self._avail
+
+        def count_referenced(self, cap_t):
+            # Stage-0 is mocked out; report the drained pages as genuinely
+            # free so cap_barrier's "are these actually free?" verify passes
+            # and we reach the clamp under test.
+            return 0
+
+    # KV 1000 available, floor 500 -> at most (1000-500)//64 = 7 pages.
+    alloc = _FloorAlloc(200_000, avail=1000)
+    kv_act = _FakeActuator(kv_real, alloc, 10**9)
+    kv_act._tokens_per_page = lambda: tps
+    mamba_act = _FakeActuator(mamba_real, _CappedListAllocator(4096), 10**9)
+    x = _build_xpool(n_kv_sub=(1, 1), n_mamba_sub=(1, 1),
+                     kv_act=kv_act, mamba_act=mamba_act)
+    x.kv_serving_floor_tokens = 500
+    x._run_stage0 = lambda plan, src_act: None  # isolate the clamp from Stage-0
+
+    from sglang.srt.arena.fire_plan import FirePlan
+    # Non-empty drains -> the plan takes the LEGACY path, not the fast path.
+    plan = FirePlan(
+        direction="kv_to_mamba",
+        pages_to_unmap=list(range(10, 90)),
+        pages_to_map_dst=80,
+        plan_seq=9,
+        drains=(10, 11),
+        migrations=(),
+    )
+    token = x.cap_barrier(plan)
+    assert token.per_src == 7, (
+        f"legacy-path floor clamp failed: per_src={token.per_src} (want 7)"
+    )
+    print("test_9 OK  (k2m serving floor clamps the legacy drain/migration "
+          "path too — Admitter cross_evict/cross_migrate no longer underflows KV)")
+
 if __name__ == "__main__":
     test_1_tensor_expand_equals_list_expand_kv()
     test_2_tensor_expand_equals_list_expand_mamba()
@@ -435,4 +489,5 @@ if __name__ == "__main__":
     test_6_fast_path_perf_budget()
     test_7_kv_serving_floor_clamps_k2m()
     test_8_floor_does_not_touch_m2k()
+    test_9_kv_serving_floor_clamps_k2m_legacy_drain_path()
     print("\nALL TESTS PASSED")
