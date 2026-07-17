@@ -27,15 +27,25 @@ logger = logging.getLogger(__name__)
 class PaybackConfig:
     cooldown_s: float = 10.0
     ewma_tau_s: float = 5.0
+    # Fire iff payback > fire_cost × margin. 1.0 = break-even threshold;
+    # higher demands the transfer recoup a multiple of its cost before firing.
+    payback_margin: float = 1.0
 
     def __post_init__(self):
         if self.cooldown_s <= 0:
             raise ValueError(f"cooldown_s must be positive, got {self.cooldown_s}")
+        if self.payback_margin <= 0:
+            raise ValueError(
+                f"payback_margin must be positive, got {self.payback_margin}"
+            )
 
 
 def _config_from_env() -> PaybackConfig:
+    from sglang.srt.environ import envs
+
     return PaybackConfig(
         cooldown_s=float(os.environ.get("SGLANG_XPOOL_COOLDOWN_S", "10.0")),
+        payback_margin=envs.SGLANG_XPOOL_PAYBACK_MARGIN.get(),
     )
 
 
@@ -133,14 +143,16 @@ class PaybackPlanner:
             )
 
         payback = net_benefit_rate * self.config.cooldown_s
-        if payback > self._fire_cost_us:
+        threshold_us = self._fire_cost_us * self.config.payback_margin
+        if payback > threshold_us:
             self._last_fire_clock = clock_s
             self._fire_count += 1
             return PlanDecision(
                 direction=direction,
                 reason=f"payback: net={net_benefit_rate:.0f}us/s × {self.config.cooldown_s:.0f}s "
-                       f"= {payback:.0f}us > {self._fire_cost_us:.0f}us "
-                       f"(R_kv={r_kv:.0f}[evict={r_evict_kv:.0f}+admit={r_admit_kv:.0f}] "
+                       f"= {payback:.0f}us > {threshold_us:.0f}us "
+                       f"(margin {self.config.payback_margin:.1f}, "
+                       f"R_kv={r_kv:.0f}[evict={r_evict_kv:.0f}+admit={r_admit_kv:.0f}] "
                        f"R_m={r_m:.0f}[evict={r_evict_m:.0f}+admit={r_admit_m:.0f}])",
             )
 

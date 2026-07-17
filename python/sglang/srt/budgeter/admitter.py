@@ -484,6 +484,7 @@ class Admitter:
         which fires the actuator and leaves the freshly-bumped dst
         capacity in the allocator for PrefillAdder's normal alloc.
         """
+        _t0 = time.perf_counter()
         # Pricing/feasibility basis: the actuator transfers whole VMM chunks
         # of `kv_tokens_per_page()` KV tokens each (arch/dtype-dependent),
         # so price against THAT to match what `execute_decision` fires.
@@ -721,8 +722,14 @@ class Admitter:
                     tokens_per_page=tokens_per_page,
                 )
 
+        decide_us = (time.perf_counter() - _t0) * 1e6
         if self._log_fp is not None:
-            self._log_decision(decision, x_tokens=x_tokens, queue_len=queue_len)
+            self._log_decision(
+                decision,
+                x_tokens=x_tokens,
+                queue_len=queue_len,
+                decide_us=decide_us,
+            )
         return decision
 
     def _mamba_tokens_per_chunk(self, scheduler, mamba_pool) -> int:
@@ -875,11 +882,16 @@ class Admitter:
         return 0, 0
 
     def _log_decision(self, decision: AdmitterDecision, *,
-                      x_tokens: int, queue_len: int) -> None:
+                      x_tokens: int, queue_len: int,
+                      decide_us: Optional[float] = None) -> None:
         """Emit one JSON line for this decision. Schema:
           ts, action, reason, dst_pool, src_pool, x_tokens, fire_x_tokens,
-          queue_len, candidate_costs_us,
+          queue_len, candidate_costs_us, decide_us,
           (optional) fire_granted_pages, fire_total_us, fire_aborted.
+
+        `decide_us` is the wall time of the whole `decide_for_req` call
+        (scheduler-side state derivation + the pure `decide`), i.e. the
+        per-arrival scheduler-thread cost of the Admitter.
 
         `dst_pool` is the GROW direction — "mamba" marks the symmetric k2m
         grow, so a reader can count how often the Admitter grew mamba from KV
@@ -908,6 +920,9 @@ class Admitter:
                 k: (None if v == float("inf") else round(v, 1))
                 for k, v in decision.candidate_costs_us.items()
             },
+            "decide_us": (
+                round(decide_us, 1) if decide_us is not None else None
+            ),
         }
         fr = decision.fire_result
         if fr is not None:

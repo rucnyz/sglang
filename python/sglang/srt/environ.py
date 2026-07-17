@@ -891,6 +891,10 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # HiMA cross-pool budgeter (legacy SGLANG_HIMA_*/SGLANG_XPOOL_* knobs
+    # predate this class and are still read at their call sites)
+    SGLANG_XPOOL_PAYBACK_MARGIN = EnvFloat(1.0)
+
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
     # ===================================================================
