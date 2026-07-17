@@ -120,6 +120,17 @@ class BudgetAgent:
         self._health_checked = False
 
         self.enabled = True
+        # SGLANG_HIMA_NO_BUDGETER=1 — the "w/o Budgeter" ablation cell:
+        # suppress the tick-path PaybackPlanner (no background pool
+        # resizing) while keeping everything the Admitter depends on —
+        # the actuator chain build + Admitter wire-in, apply_pending_fires,
+        # telemetry, and the fire worker. (Previously this env gated
+        # BudgetAgent construction entirely in the scheduler, which left
+        # admitter.actuator=None and silently degraded the Admitter to
+        # observational mode, so the cell measured LPB-only.)
+        self.planner_disabled = (
+            os.environ.get("SGLANG_HIMA_NO_BUDGETER") == "1"
+        )
         # Polling interval (seconds). This is a pure SAMPLING RATE, not a
         # behaviour knob: the planner prices signals as per-second rates and
         # gates the cooldown in wall-clock seconds, so decisions are
@@ -1225,6 +1236,14 @@ class BudgetAgent:
         chain_ready = self._ensure_actuator_chain(
             alloc, kv_pool, mamba_pool, snapshot
         )
+
+        # "w/o Budgeter" ablation: the chain above stays built (the
+        # Admitter's per-arrival fires depend on it), but the tick-path
+        # planner never decides/fires.
+        if self.planner_disabled:
+            snapshot["plan_direction"] = "none"
+            snapshot["plan_reason"] = "budgeter disabled (SGLANG_HIMA_NO_BUDGETER)"
+            return
 
         _p_t0 = time.perf_counter_ns()
         clock_s = float(snapshot.get("ts", 0.0))
