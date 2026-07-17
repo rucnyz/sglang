@@ -571,6 +571,41 @@ class Admitter:
                     candidate_costs_us={"own_free": 0.0},
                 )
 
+        # ── No-backlog gate: skip the whole slow path when a cross-* fire
+        # cannot possibly win ──────────────────────────────────────────────
+        # The slow path below runs an UNCONDITIONAL c^evict("kv", x_tokens)
+        # tree walk to price own_evict. In a KV-bound regime that curve cache
+        # is busted (every decode-step KV eviction invalidates it), so the
+        # walk is a full O(evictable) scan PER ARRIVAL on the single scheduler
+        # thread — displacing the next run_batch launch and stalling decode
+        # cadence. It only earns its cost if a cross-* fire could be chosen.
+        #
+        # A cross candidate costs at least c_xfer(lcm_pages) (lcm_pages is the
+        # minimum fire, so every cross candidate rounds up to >= it), while
+        # defer costs queue_len * w_q. So when queue_len * w_q < c_xfer(lcm),
+        # defer is STRICTLY cheaper than every cross candidate — cross can
+        # never be the argmin and the entire walk buys nothing. Return defer
+        # lockless, before the walk. Returning defer vs own_evict is inert:
+        # the scheduler fires only on cross_* (else it just appends the req to
+        # waiting_queue and PrefillAdder allocs/evicts next iteration), and no
+        # reservation is taken at admission. Fail-safe: a degenerate floor
+        # (unprobed actuator -> c_xfer 0) or stale lcm_pages=1 makes the
+        # condition false and falls through to the full slow path — extra
+        # work, never a wrong skip.
+        w_q_us = float(self.cost_model.w_q_us())
+        c_xfer_floor_us = float(self.cost_model.c_xfer_us(self.lcm_pages))
+        queue_len_fast = len(getattr(scheduler, "waiting_queue", []) or [])
+        if (
+            c_xfer_floor_us > 0.0
+            and w_q_us > 0.0
+            and queue_len_fast * w_q_us < c_xfer_floor_us
+        ):
+            return AdmitterDecision(
+                action="defer",
+                reason="fast: no backlog (cross cannot beat defer)",
+                candidate_costs_us={"defer": queue_len_fast * w_q_us},
+            )
+
         # Hold the destination allocator's `_alloc_lock` across the
         # capacity snapshot + c^evict prediction + decision (design.md
         # §"Why exact c^evict"). The BudgetAgent worker
