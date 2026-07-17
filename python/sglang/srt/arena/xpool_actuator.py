@@ -467,6 +467,22 @@ class XPoolActuator:
         n_dst = len(self._all_subpool_names(dst))
         target_src_total = n_src * len(plan.pages_to_unmap)
         target_dst_total = n_dst * plan.pages_to_map_dst
+        # k2m serving floor (same invariant as the free-only fast path above):
+        # a k2m fire may never shrink the KV allocator's available tokens below
+        # the floor. This drain/migration path is where the Admitter's
+        # cross_evict / cross_migrate k2m plans land (they carry drains, so they
+        # miss the fast path); `pages_to_unmap` here already includes the
+        # Stage-0-freed drained pages, so `available_size()` is the post-drain
+        # basis. Without it, cumulative Admitter k2m drains push KV available
+        # below the floor and the next prefill's alloc_token_slots OOMs — the
+        # crash 48f2ce5414 fixed on the fast path, still reachable here.
+        if plan.direction == "kv_to_mamba" and self.kv_serving_floor_tokens:
+            tps_src = src_act._tokens_per_page()
+            avail = int(src_act.allocator.available_size())
+            shrinkable_pages = max(
+                0, (avail - self.kv_serving_floor_tokens) // tps_src
+            )
+            target_src_total = min(target_src_total, n_src * shrinkable_pages)
         # Clamp the dst grant to the allocator's physical id-space headroom
         # (max_size - live_size). The arena's chunk-id space is far larger than
         # CappedFreeList.size, so an unclamped grant expands to chunk ids past
