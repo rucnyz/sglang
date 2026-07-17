@@ -114,9 +114,12 @@ def test_3_sync_fallback_prices_transfer():
     print("test_3 OK  (sync fallback attaches result + updates cost model)")
 
 
-def test_4_legacy_path_when_unwired():
+def test_4_default_hook_is_sync_execute():
+    # An Admitter with no BudgetAgent override defaults to the synchronous
+    # inline fire (_sync_fire -> actuator.execute). BudgetAgent overrides this
+    # with the async submit in production.
     adm = _admitter_reaching_fire()
-    assert adm._fire_submit is None, "fresh Admitter must have no submit hook"
+    assert adm._fire_submit == adm._sync_fire, "default hook must be _sync_fire"
     calls = {"execute": 0}
     orig = adm.actuator.execute
 
@@ -128,8 +131,8 @@ def test_4_legacy_path_when_unwired():
     dec = _cross_decision(adm)
     adm.execute_decision(dec, x_tokens=4096, src_pool=dec.src_pool,
                          dst_pool=dec.dst_pool, tokens_per_page=1024)
-    assert calls["execute"] == 1, "unwired Admitter must fall back to actuator.execute"
-    print("test_4 OK  (no hook -> legacy synchronous execute preserved)")
+    assert calls["execute"] == 1, "default hook must run one synchronous execute"
+    print("test_4 OK  (default hook = synchronous inline execute)")
 
 
 if __name__ == "__main__":

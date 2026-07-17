@@ -351,12 +351,12 @@ class XPoolActuator:
         # ---- FAST PATH: free-only plan (no drains, no migrations) ----
         # Clamp the grant BEFORE expanding/marking. The planner routinely
         # offers far more pages than the dst headroom admits (observed: 80
-        # offered, ~5 granted on Nemotron-3 case3); the legacy path expanded
+        # offered, ~5 granted on Nemotron-3 case3); the drain/migration path expanded
         # and marked ALL offered pages (~655K token-slot ids through a
         # Python list -> CUDA tensor, ~200+ ms of SCHEDULER-THREAD time per
         # fire) and then unmarked the ~94% surplus. Pure integer clamping
         # first + vectorized expansion of only the kept pages brings the
-        # cap-barrier to <1 ms. Drain/migration plans keep the legacy
+        # cap-barrier to <1 ms. Drain/migration plans keep the
         # mark-all-then-restore path below (Stage-0 pre-conditioning is
         # entangled with the full offered set).
         if not plan.drains and not plan.migrations:
@@ -406,7 +406,7 @@ class XPoolActuator:
                 granted_in_barrier=None,
             )
 
-        # Legacy path — reached only for drain/migration plans (the fast
+        # Drain/migration path — reached only for drain/migration plans (the fast
         # path above returned for free-only plans).
         self._run_stage0(plan, src_act)
         _p1 = time.monotonic_ns()
