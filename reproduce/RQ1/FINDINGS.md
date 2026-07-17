@@ -53,7 +53,9 @@ GPU 7, TP=1, MEMFRAC=0.85. Calibrated 35B csigma (`calibrate.sh`).
 | static-best RATIO 0.8 | 477.0 | — | — | 0 |
 
 35B is an MoE (~3B active), so decode is cheap and it is nearer compute-bound
-than 9B -> smaller throughput gain (+1.3% vs 9B +5.5%); the latency win holds.
+than 9B -> smaller throughput gain (+1.3% vs 9B +13.3% canonical); the
+latency win holds. NOTE: 35B still measured on the deleted t6_v2 trace —
+its absolute numbers are not comparable to the canonical 9B table above.
 
 **35B Case2/Case3 \sys CRASH** (658-948 err/rep): c_M=0 is wrong for 35B's
 mamba-bound regimes (open issue #276). Only Case1 is measurable.
