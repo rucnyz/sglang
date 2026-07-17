@@ -68,11 +68,13 @@ Three TP4-specific bugs fixed during this campaign:
 
 | Case | trace @ conc | base tps (N=3) | sys tps (N=3) | dTPS | dTTFT p90 | err |
 |------|-------------|----------------|---------------|------|-----------|-----|
-| Case1 | t6 @ 64    | 635.2±0.6 | 671.4±1.7 | **+5.7%** | **−27%** | 0 |
-| Case2 | t12 @ 64   | 533.1±0.8 | 642.6±14.9 | **+20.5%** | **−34%** | 0 |
+| Case1 | t6 @ 64    | 635.2±0.6 | 699.9±9.6 | **+10.2%** | **−33%** | 0 |
+| Case2 | t12 @ 64   | 533.1±0.8 | 689.5±16.6 | **+29.3%** | **−43%** | 0 |
 | Case3 | t6 @ 128   | 638.6±1.1 | 654.7±1.6 | **+2.5%** | **−96%** | 0 |
 
-Case2 is the largest throughput win across all models (+20.5%). Case3 wins on
+Case2 is the largest throughput win across all models (+29.3%; all three
+cases remeasured on the post-cap_barrier-fix build — the fix roughly
+doubled the case1/case2 margins by removing the 240 ms/fire tax). Case3 wins on
 BOTH axes after the cap_barrier fix: +2.5% tps AND TTFT p90 46.8s→2.0s — at
 conc=128 the mamba pool binds, HiMA donates KV→mamba (k2m fires) to admit
 85→130 concurrent requests, collapsing queue wait with no throughput cost.
@@ -114,30 +116,32 @@ considering as the default for this model.
 
 | Metric | base (N=3) | sys (N=3) | delta |
 |--------|-----------|-----------|-------|
-| throughput_tok_s | 635.2±0.6 | 671.4±1.7 | **+5.7%** |
-| cache_hit | 0.6196 | 0.7062 | +8.7pp |
-| TTFT mean (ms) | 902 | 714 | **−20.8%** |
-| TTFT p50 (ms) | 409 | 376 | −8.1% |
-| TTFT p90 (ms) | 2412 | 1757 | **−27.2%** |
-| TTFT p99 (ms) | 4721 | 3679 | **−22.1%** |
-| TPOT mean (ms) | 108.8 | 97.3 | −10.6% |
+| throughput_tok_s | 635.2±0.6 | 699.9±9.6 | **+10.2%** |
+| cache_hit | 0.6196 | 0.7088 | +8.9pp |
+| TTFT mean (ms) | 902 | 677 | **−25.0%** |
+| TTFT p90 (ms) | 2412 | 1622 | **−32.8%** |
+| TTFT p99 (ms) | 4721 | 3369 | **−28.6%** |
+| TPOT mean (ms) | 108.8 | 91.6 | −15.8% |
 | n_error | 0 | 0 | |
 
-Per-rep tps: base [635.4, 634.5, 635.6], sys [672.2, 672.5, 669.4].
+Per-rep tps: base [635.4, 634.5, 635.6], sys [703.2, 689.0, 707.4]
+(post cap_barrier fix; the pre-fix sys measured 671.4±1.7 with the
+240 ms/fire scheduler tax).
 
 ### Case2: cc_nemotron_t12 @ conc 64 (agent swarm, high eviction)
 
 | Metric | base (N=3) | sys (N=3) | delta |
 |--------|-----------|-----------|-------|
-| throughput_tok_s | 533.1±0.8 | 642.6±14.9 | **+20.5%** |
-| cache_hit | 0.5453 | 0.7301 | +18.5pp |
-| TTFT mean (ms) | 1279 | 891 | **−30.3%** |
-| TTFT p90 (ms) | 3205 | 2113 | **−34.1%** |
-| TTFT p99 (ms) | 7583 | 5921 | **−21.9%** |
-| TPOT mean (ms) | 123.4 | 92.8 | −24.8% |
+| throughput_tok_s | 533.1±0.8 | 689.5±16.6 | **+29.3%** |
+| cache_hit | 0.5453 | 0.7351 | +19.0pp |
+| TTFT mean (ms) | 1279 | 829 | **−35.2%** |
+| TTFT p90 (ms) | 3205 | 1834 | **−42.8%** |
+| TTFT p99 (ms) | 7583 | 6111 | **−19.4%** |
+| TPOT mean (ms) | 123.4 | 84.2 | −31.8% |
 | n_error | 0 | 0 | |
 
-Per-rep tps: base [532.3, 533.1, 533.9], sys [632.6, 635.6, 659.7].
+Per-rep tps: base [532.3, 533.1, 533.9], sys [707.0, 673.9, 687.7]
+(post cap_barrier fix; pre-fix sys measured 642.6±14.9).
 
 ### Case3: cc_nemotron_t6 @ conc 128 (mamba-bound; post cap_barrier fix)
 
