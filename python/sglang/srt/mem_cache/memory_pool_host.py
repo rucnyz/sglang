@@ -1709,13 +1709,18 @@ class MambaPoolHost(HostKVCache):
         self.conv_state_shapes = [
             conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
         ]
-        self.temporal_state_shape = device_pool.mamba_cache.temporal.shape[2:]
+        # Support both stacked (Tensor) and per-layer (List[Tensor]) temporal.
+        if isinstance(device_pool.mamba_cache.temporal, list):
+            self.temporal_state_shape = device_pool.mamba_cache.temporal[0].shape[1:]
+            self.temporal_dtype = device_pool.mamba_cache.temporal[0].dtype
+        else:
+            self.temporal_state_shape = device_pool.mamba_cache.temporal.shape[2:]
+            self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
         self.temporal_state_elem_size = int(np.prod(self.temporal_state_shape))
         self.conv_state_elem_sizes = [
             int(np.prod(conv_shape)) for conv_shape in self.conv_state_shapes
         ]
         self.conv_dtype = device_pool.mamba_cache.conv[0].dtype
-        self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
         self.dtype = self.conv_dtype
         self.size_per_token = self.get_size_per_token()
 

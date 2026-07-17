@@ -208,6 +208,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.managers.forced_tokens import forced_override_positions
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
@@ -286,6 +287,32 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+
+
+def require_mamba_radix_cache_for_hima(tree_cache, disable_radix_cache: bool) -> None:
+    """Fail fast at boot when HiMA is requested on a cache it cannot drive.
+
+    HiMA is a hybrid cross-pool (KV <-> mamba) system: the Budgeter reads
+    per-pool eviction-cost counters and the Admitter reads page ownership from
+    the arena, both defined only on MambaRadixCache. When a model disables
+    radix caching the tree cache is a ChunkCache with no such state, so raise
+    here rather than crash mid-run with an obscure AttributeError /
+    "owner_provider not wired". sglang disables radix for hybrid models whose
+    MambaRadixCache support is not yet implemented (e.g. KimiLinearForCausalLM
+    -> support_mamba_cache=False). isinstance covers MambaRadixCache subclasses
+    (HiMambaRadixCache)."""
+    from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+    if not isinstance(tree_cache, MambaRadixCache):
+        raise RuntimeError(
+            f"SGLANG_HIMA=1 requires a MambaRadixCache tree cache, but this "
+            f"model uses {type(tree_cache).__name__} "
+            f"(disable_radix_cache={disable_radix_cache}). HiMA manages the "
+            f"KV<->mamba cross-pool split via the MambaRadixCache arena, which "
+            f"does not exist when radix caching is disabled; run without "
+            f"SGLANG_HIMA on this model, or use a model whose MambaRadixCache "
+            f"is supported."
+        )
 
 
 class Scheduler(
@@ -966,6 +993,49 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
 
+        _hima = os.environ.get("SGLANG_HIMA") == "1"
+        self.budget_agent = None
+        self.admitter = None
+        if _hima:
+            from sglang.srt.budgeter import BudgetAgent
+            from sglang.srt.budgeter.admitter import Admitter
+            from sglang.srt.budgeter.cost_model import get_cost_model
+
+            if self.server_args.disaggregation_mode != "null":
+                raise NotImplementedError(
+                    f"HiMA does not support disaggregation mode "
+                    f"'{self.server_args.disaggregation_mode}' yet"
+                )
+
+            require_mamba_radix_cache_for_hima(
+                self.tree_cache, self.disable_radix_cache
+            )
+
+            # SGLANG_HIMA_NO_BUDGETER is handled INSIDE BudgetAgent
+            # (planner_disabled): the agent still builds the actuator
+            # chain and wires the Admitter — gating construction here
+            # left admitter.actuator=None and silently degraded the
+            # "w/o Budgeter" ablation cell to LPB-only.
+            self.budget_agent = BudgetAgent(self)
+            _no_admitter = os.environ.get("SGLANG_HIMA_NO_ADMITTER") == "1"
+            if not _no_admitter:
+                self.admitter = Admitter(cost_model=get_cost_model())
+                import atexit
+                atexit.register(self.admitter.close)
+            logger.info(
+                "HiMA enabled (Admitter=%s Budgeter=%s)",
+                self.admitter is not None,
+                self.budget_agent is not None,
+            )
+            # tree_cache is a MambaRadixCache (or subclass) by the guard above.
+            cm = get_cost_model()
+            cm.set_evict_cache("kv", self.tree_cache)
+            cm.set_evict_cache("mamba", self.tree_cache)
+            logger.info(
+                "Admitter c^evict predictor wired (kv+mamba, cache=%s)",
+                type(self.tree_cache).__name__,
+            )
+
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
         uses_transformers_backend = (
@@ -1495,6 +1565,9 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
 
+            if self.budget_agent is not None:
+                self.budget_agent.tick()
+
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
@@ -1553,6 +1626,9 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+            if self.budget_agent is not None:
+                self.budget_agent.tick()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
         # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
@@ -2222,6 +2298,7 @@ class Scheduler(
             if self._abort_on_queued_limit(req):
                 return
             self._prefetch_kvcache(req)
+            self._admitter_on_arrival(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2238,6 +2315,52 @@ class Scheduler(
                 req.time_stats.set_retract_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _admitter_on_arrival(self, req: Req) -> None:
+        """Score an arriving request against the cost model and, if the
+        cheapest action is cross-pool, fire synchronously so PrefillAdder's
+        next-iteration alloc finds the freshly-grown dst capacity."""
+        if self.admitter is None:
+            return
+        decision = self.admitter.decide_for_req(req, self)
+        # None = Admitter deferred (not NULL-disagg, or the actuator chain is
+        # not wired yet in the first-tick window) -> normal scheduler admission.
+        if decision is None:
+            return
+        if decision.action in ("cross_free", "cross_evict", "cross_migrate"):
+            self._maybe_admitter_fire(req, decision)
+
+    def _maybe_admitter_fire(self, req: Req, decision) -> None:
+        """Drive ``Admitter.execute_decision`` when cross-* is the chosen
+        action AND the Budgeter's actuator chain has been built.
+
+        The Budgeter constructs its ``XPoolActuator`` + ``XPoolFirePlanner``
+        on the first tick via ``BudgetAgent._ensure_actuator_chain``,
+        which also wires (actuator, planner, lcm_pages) into this
+        scheduler's ``self.admitter``. Until that happens
+        ``self.admitter.actuator is None`` — degrade to observational
+        mode (decision is still logged by ``decide_for_req``).
+
+        The fire leaves the freshly-bumped dst capacity in the
+        allocator; PrefillAdder's normal ``alloc`` consumes it on the
+        next scheduler iteration. No reservation is taken at admission.
+        """
+        # BudgetAgent pushes (actuator, planner, lcm_pages) into the
+        # Admitter the moment its chain is built (agent.py — search for
+        # "BudgetAgent: Admitter wired"). If admitter.actuator is None
+        # here, the chain hasn't been built yet (Budgeter hasn't ticked
+        # since boot) — degrade to observational mode; decide() was
+        # still logged by decide_for_req().
+        if self.admitter.actuator is None:
+            return
+        x_tokens = len(req.origin_input_ids)
+        self.admitter.execute_decision(
+            decision,
+            x_tokens=x_tokens,
+            src_pool=decision.src_pool,
+            dst_pool=decision.dst_pool,
+            tokens_per_page=self.admitter.owner_provider.kv_tokens_per_page(),
+        )
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -2594,6 +2717,23 @@ class Scheduler(
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
+        # Hybrid models also consume a mamba active slot per fresh request; the
+        # base available_size counts only req slots. Bound the batch by what the
+        # mamba pool can back (free slots + evictable cached snapshots, mirroring
+        # the KV available+evictable gate in PrefillAdder) so we never admit a
+        # batch the mamba pool cannot back and force alloc_req_slots to raise
+        # instead of leaving the request queued (the design's defer action).
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+        pool = self.req_to_token_pool
+        if isinstance(pool, HybridReqToTokenPool):
+            res = min(
+                res,
+                pool.mamba_admittable_reqs(
+                    self.tree_cache.mamba_evictable_size(),
+                    self.tree_cache.supports_mamba(),
+                ),
+            )
         return res
 
     def _should_delay_dflash_prefill_for_batching(self, running_bs: int) -> bool:
@@ -3051,6 +3191,22 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _apply_forced_tokens(self, batch: ScheduleBatch, next_token_ids) -> None:
+        if next_token_ids is None:
+            return
+        overrides = forced_override_positions(batch.reqs)
+        if not overrides:
+            return
+        idx = torch.tensor(
+            [o[0] for o in overrides], device=next_token_ids.device, dtype=torch.long
+        )
+        val = torch.tensor(
+            [o[1] for o in overrides],
+            device=next_token_ids.device,
+            dtype=next_token_ids.dtype,
+        )
+        next_token_ids[idx] = val
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -3120,6 +3276,14 @@ class Scheduler(
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
+                        # Teacher-forcing: overwrite the sampled
+                        # tokens with the forced ones on the GPU, before they
+                        # enter the future buffer (stash). The single forcing
+                        # point for the overlap schedule; token-exact under
+                        # --enable-overlap. A no-op without forced_output_ids,
+                        # and for spec_v2 (the stash payload is next_draft_input,
+                        # not next_token_ids), which agentreplay never uses.
+                        self._apply_forced_tokens(batch, batch_result.next_token_ids)
                         if batch_result.delay_sample_func is None:
                             stash_payload = (
                                 batch_result.next_draft_input
@@ -3180,6 +3344,7 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                self._apply_forced_tokens(batch, batch_result.next_token_ids)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
                     # Non-spec: relay via future_map, gathered next iter.
                     self.future_map.stash(
@@ -3440,6 +3605,12 @@ class Scheduler(
                 if tc.enable_storage:
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
+
+            # Cross-pool Budgeter: a fire in flight is mid-mutating the KV/mamba
+            # pools (cuMemUnmap/Map + cap state); they must drain before a
+            # destructive flush_cache → allocator.clear() that resets capacity.
+            if self.budget_agent is not None:
+                idle &= not self.budget_agent.has_inflight_fires()
 
         return idle
 

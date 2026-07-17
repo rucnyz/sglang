@@ -41,6 +41,16 @@ class ChunkCache(BasePrefixCache):
     """
 
     def __init__(self, params: CacheInitParams):
+        # Recovery-length EWMAs (paper sec:design-formalism-offline): written by
+        # record_recovery_len_{kv,rec,retract} on eviction/retraction; the planner
+        # c_sigma(L) and pressure adapter read them via the Budgeter snapshot.
+        self._slow_recovery_len_kv_ewma = 0.0
+        self._slow_recovery_len_rec_ewma = 0.0
+        self._slow_recovery_len_retract_ewma = 0.0
+        # Cumulative KV tokens reclaimed by admission-pressure eviction
+        # (check_decode_mem); read via the Budgeter snapshot as the
+        # deferred re-prefill cost the admission gate consults.
+        self._admission_cumulative_evicted_tokens = 0
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size

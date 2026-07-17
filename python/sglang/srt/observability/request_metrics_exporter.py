@@ -90,6 +90,14 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         self._current_file_handler = None
         self._current_file_lock = asyncio.Lock()
         self._current_hour_suffix = None
+        # Opt-in single-file mode: a fixed suffix (via SGLANG_REQUEST_METRICS_SUFFIX)
+        # makes the exporter write ONE named, non-rotated file
+        # `sglang-request-metrics-<suffix>.log`, so one experiment's per-request
+        # records live in a single inspectable JSONL we name — instead of the
+        # default per-hour rotation that splits a run across files (which makes a
+        # naive newest-only reader compare different request subsets). Unset =
+        # original hourly behavior.
+        self._fixed_suffix = os.environ.get("SGLANG_REQUEST_METRICS_SUFFIX") or None
 
     def _ensure_file_handler(self, hour_suffix: str):
         """Ensure the file handler is open for the current hour suffix."""
@@ -135,7 +143,7 @@ class FileRequestMetricsExporter(RequestMetricsExporter):
         try:
             # Get the log file path for the current time.
             current_time = datetime.now()
-            hour_suffix = current_time.strftime("%Y%m%d_%H")
+            hour_suffix = self._fixed_suffix or current_time.strftime("%Y%m%d_%H")
 
             async with self._current_file_lock:
                 # Ensure correct file handler is open for current hour

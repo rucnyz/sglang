@@ -87,11 +87,19 @@ class SchedulerInvariantChecker:
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():
             protected = self.tree_cache.full_protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
-            total = self.token_to_kv_pool_allocator.size
+            # Honor live_size when the cross-pool actuator has capped this
+            # allocator. Mirrors the non-hybrid branch below.
+            total = self.token_to_kv_pool_allocator.live_size
         else:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
-            total = self.max_total_num_tokens
+            # Honor live_size if the allocator was capped by the budgeter.
+            alloc = self.token_to_kv_pool_allocator
+            total = (
+                alloc.live_size * alloc.page_size
+                if alloc.live_size != alloc.size
+                else self.max_total_num_tokens
+            )
         return self._check_pool_invariant(
             "full",
             ps.full_available_size,
@@ -120,7 +128,7 @@ class SchedulerInvariantChecker:
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
             self.pool_stats_observer.session_held_mamba_slots(),
-            self.req_to_token_pool.mamba_pool.size,
+            self.req_to_token_pool.mamba_allocator.live_size,
         )
         if leak:
             # Page-level leak diagnosis for mamba
@@ -132,6 +140,12 @@ class SchedulerInvariantChecker:
             expected_full_pages = set(
                 range(1, self.token_to_kv_pool_allocator.size + 1)
             )
+            # Exclude pages the cross-pool actuator capped: their chunks are
+            # unmapped, so they are intentionally out of circulation, not
+            # leaked. Mirrors live_size on the KV side.
+            capped = self.token_to_kv_pool_allocator._capped_pages
+            if capped is not None and capped.numel() > 0:
+                expected_full_pages -= set(capped.tolist())
             leaked_full_pages = (
                 expected_full_pages - free_full_pages - cached_full_pages
             )

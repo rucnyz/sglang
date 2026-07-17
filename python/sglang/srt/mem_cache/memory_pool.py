@@ -25,9 +25,27 @@ from __future__ import annotations
 import abc
 import dataclasses
 import logging
+import os
+import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+
+# Path-A actuator (XPoolActuator) requires both pools to be allocated
+# via MultiTensorArena on a shared SharedHandlePool. Promote
+if os.environ.get("SGLANG_HIMA") == "1":
+    os.environ.setdefault("SGLANG_ARENA_SHARED", "1")
+
+
+def kv_live_migration_enabled() -> bool:
+    """Single source of truth for whether live KV-slot migration
+    (cross_migrate src=kv, Stage-3) is enabled. Read by BOTH boot-time KV-pool
+    construction (to set ``enable_kv_cache_copy`` so ``move_kv_cache`` works)
+    and the Budgeter's Stage-3 walk gate (``SchedulerOwnerProvider``), so the
+    two can never disagree. Fail-closed: default OFF until per-backend
+    captured-graph replay coverage lands (proved on flashinfer; other backends
+    not yet validated)."""
+    return os.environ.get("SGLANG_XPOOL_KV_MIGRATE", "0") == "1"
 
 import numpy as np
 import torch
@@ -207,7 +225,21 @@ def _set_kv_buffer_prefix_valid_impl(
 
 
 class ReqToTokenPool:
-    """A memory pool that maps a request to its token locations."""
+    """A memory pool that maps a request to its token locations.
+
+    `size` is the LIVE admission cap (number of slot ids `alloc()` may
+    hand out). When `max_size > size` (the dynamic-cap mode), the
+    underlying `req_to_token` tensor is backed by a VA-stable
+    `ReqTokenVAArena` whose `data_ptr()` is stable across `grow()` /
+    `shrink()`. CUDA-captured kernels that bake in the pointer keep
+    working post-resize.
+
+    When `max_size == size` (the default, back-compat mode), the
+    tensor is a standard `torch.zeros` allocation — byte-identical to
+    the non-arena path. No arena involved.
+
+    Dynamic-cap mode is opt-in: callers must pass `max_size > size`.
+    """
 
     enable_mamba_extra_buffer_lazy: bool = False
 
@@ -217,22 +249,136 @@ class ReqToTokenPool:
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
+        *,
+        max_size: Optional[int] = None,
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
+        if max_size is None:
+            max_size = size
+        if max_size < size:
+            raise ValueError(
+                f"max_size={max_size} must be >= size={size}"
+            )
+
         self.size = size
         # +1 padding row at index 0: cuda-graph padded batches default
-        # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
+        # req_pool_indices to 0, so dummy reads/writes land on the pad row
+        # harmlessly. Valid slot ids are 1..size; admission never hands out
+        # id 0. `_alloc_size` is the current row count (pad + live), tracked
+        # so clear() can rebuild free_slots and grow/shrink can offset by +1.
         self._alloc_size = size + 1
+        self.max_size = max_size
         self.max_context_len = max_context_len
         self.device = device
-        with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+
+        # Row size in bytes for the (rows, max_context_len) int32 table.
+        # All grows are in row units; arena handles the chunk rounding.
+        self._row_bytes = max_context_len * 4  # int32
+
+        if max_size > size:
+            # Dynamic-cap mode: VA-stable backing.
+            from sglang.srt.arena.req_token_arena import ReqTokenVAArena
+
+            # Reserve max_size+1 rows (pad row 0 + max_size usable rows);
+            # grow() maps more usable rows up to this ceiling.
+            self._va_arena = ReqTokenVAArena(
+                max_bytes=(max_size + 1) * self._row_bytes,
+                device_id=torch.cuda.current_device(),
+                pool_name="req_to_token",
             )
+            # Map the pad row + `size` usable rows at boot.
+            self._va_arena.set_mapped_bytes(self._alloc_size * self._row_bytes)
+            # Tensor aliases the FULL VA range (shape = (max_size+1, ...)).
+            # Slot ids in [1, size] are valid; admission gate (free_slots)
+            # never hands out ids outside that range, so unmapped rows are
+            # never accessed.
+            self.req_to_token = self._va_arena.as_tensor(
+                dtype=torch.int32,
+                shape=(max_size + 1, max_context_len),
+            )
+            # Zero-init the mapped portion (pad row + live rows); matches the
+            # torch.zeros baseline.
+            self.req_to_token[: self._alloc_size].zero_()
+            torch.cuda.synchronize()
+        else:
+            self._va_arena = None
+            with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                self.req_to_token = torch.zeros(
+                    (self._alloc_size, max_context_len),
+                    dtype=torch.int32,
+                    device=device,
+                )
+
         self.free_slots = list(range(1, self._alloc_size))
+
+    def grow(self, new_size: int) -> int:
+        """Extend the live admission cap to `new_size` (no-op if smaller).
+
+        Maps additional physical pages, extends `free_slots` to expose
+        slot ids `[size, new_size)` for allocation. Tensor `data_ptr()`
+        unchanged. Returns the new `self.size`.
+
+        Only valid in dynamic-cap mode (`max_size > size`).
+        Raises if `new_size > max_size`.
+        """
+        if self._va_arena is None:
+            raise RuntimeError(
+                "ReqToTokenPool.grow requires dynamic-cap mode "
+                "(construct with max_size > size)"
+            )
+        if new_size <= self.size:
+            return self.size
+        if new_size > self.max_size:
+            raise ValueError(
+                f"grow: new_size={new_size} > max_size={self.max_size}"
+            )
+        # Map physical pages for the new rows (pad row + new_size usable rows).
+        self._va_arena.set_mapped_bytes((new_size + 1) * self._row_bytes)
+        # Zero-init the newly-exposed rows so admission sees clean state.
+        # Slot id s lives at row s; the new ids are size+1..new_size.
+        self.req_to_token[self.size + 1 : new_size + 1].zero_()
+        torch.cuda.synchronize()
+        # Expose the new slot ids.
+        self.free_slots.extend(range(self.size + 1, new_size + 1))
+        self.size = new_size
+        self._alloc_size = new_size + 1
+        return self.size
+
+    def shrink(self, new_size: int) -> int:
+        """Reduce live admission cap to `new_size` (no-op if larger).
+
+        Unmaps physical pages for rows `[new_size, size)`. Caller must
+        ensure those slot ids are currently in `free_slots` (not held
+        by a running req) — enforced by assertion.
+
+        Returns new `self.size`.
+        """
+        if self._va_arena is None:
+            raise RuntimeError(
+                "ReqToTokenPool.shrink requires dynamic-cap mode"
+            )
+        if new_size >= self.size:
+            return self.size
+        if new_size < 0:
+            raise ValueError(f"shrink: new_size={new_size} must be >= 0")
+        # All slot ids in (new_size, size] must be currently free.
+        free_set = set(self.free_slots)
+        held = [s for s in range(new_size + 1, self.size + 1) if s not in free_set]
+        if held:
+            raise RuntimeError(
+                f"ReqToTokenPool.shrink: cannot shrink to {new_size}; "
+                f"slot ids still held: {held[:8]}{'…' if len(held)>8 else ''}"
+            )
+        # Drop the shrunk slot ids from free_slots (keep 1..new_size).
+        self.free_slots = [s for s in self.free_slots if s <= new_size]
+        # Unmap the physical pages (pad row + new_size usable rows).
+        self._va_arena.set_mapped_bytes((new_size + 1) * self._row_bytes)
+        self.size = new_size
+        self._alloc_size = new_size + 1
+        return self.size
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -276,6 +422,39 @@ class ReqToTokenPool:
         self.free_slots = list(range(1, self._alloc_size))
 
 
+def _arena_tokens_per_chunk(chunk_bytes: int, per_token_bytes: int) -> int:
+    """Per-sequence SSM slots that fit in one VMM chunk.
+
+    The `MultiTensorArena` packs WHOLE per-token states per chunk, so it
+    requires `chunk_bytes` to be an exact multiple of `per_token_bytes`
+    (`MultiTensorArena.__init__` raises on `chunk_bytes % per_token != 0`).
+    This validates the same constraint at pool-config time and returns
+    `chunk_bytes // per_token_bytes`.
+
+    A bare `chunk_bytes // per_token_bytes` floors a non-dividing state (and
+    yields 0 for a per-token state larger than one chunk), then sizes the pool
+    with that wrong value; the mismatch only surfaces later as a
+    `MultiTensorArena` ValueError mid-boot. Failing here, at config, with an
+    actionable message is clearer.
+    """
+    if per_token_bytes <= 0:
+        raise ValueError(
+            f"per-token SSM state must be positive, got {per_token_bytes} bytes"
+        )
+    if chunk_bytes % per_token_bytes != 0:
+        suggested = (
+            (chunk_bytes + per_token_bytes - 1) // per_token_bytes
+        ) * per_token_bytes
+        raise ValueError(
+            f"SGLANG_ARENA_CHUNK_BYTES ({chunk_bytes}) must be a multiple of "
+            f"the per-token SSM state size ({per_token_bytes} bytes); the mamba "
+            f"VMM arena packs whole per-token states per chunk and cannot split "
+            f"one across chunks. Set SGLANG_ARENA_CHUNK_BYTES to a multiple of "
+            f"{per_token_bytes} (e.g. {suggested})."
+        )
+    return chunk_bytes // per_token_bytes
+
+
 class MambaPool:
     @dataclass(frozen=True, kw_only=True)
     class State:
@@ -301,6 +480,39 @@ class MambaPool:
                 for f in dataclasses.fields(self)
             )
 
+        # The two per-slot state fields. Speculative draft caches
+        # (SpeculativeState extras) are per-draft scratch, not per-slot
+        # state — evicting a slot does not free them, so they are
+        # excluded from the per-slot byte accounting.
+        _PER_SLOT_FIELDS = ("conv", "temporal")
+
+        def bytes_per_slot(self) -> int:
+            """Physical bytes ONE slot frees on eviction (conv + temporal,
+            all layers). Normalizes each tensor by ITS OWN slot-dim size,
+            which makes the result exact for every layout:
+
+              conv:     list of (num_layers, slots+1, ...)   -> slot dim 1
+              temporal, stacked Tensor (num_layers, slots+1, ...) -> slot dim 1
+              temporal, per-layer list of (slots+1|VA_rows, ...) -> slot dim 0
+
+            For arena-backed per-layer tensors the leading dim is the VA row
+            count, not the physical slot count — but numerator and
+            denominator scale together, so `total_bytes // n_rows` is still
+            the exact per-slot slice size. (A previous version divided
+            `mem_usage_bytes()` by max_size+1, which the arena VA inflated
+            ~150x; and an interim `prod(shape[1:])` form mis-guessed the
+            slot dim for layer-stacked tensors, ~13x high.)"""
+            total = 0
+            for name in self._PER_SLOT_FIELDS:
+                v = getattr(self, name)
+                if isinstance(v, list):
+                    slot_dim = 1 if name == "conv" else 0
+                    for t in v:
+                        total += get_tensor_size_bytes(t) // t.shape[slot_dim]
+                else:
+                    total += get_tensor_size_bytes(v) // v.shape[1]
+            return int(total)
+
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         intermediate_ssm: torch.Tensor
@@ -316,6 +528,7 @@ class MambaPool:
         device: str,
         enable_memory_saver: bool = False,
         speculative_num_draft_tokens: Optional[int] = None,
+        max_size: Optional[int] = None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -326,8 +539,45 @@ class MambaPool:
         )
         num_mamba_layers = len(mamba_layer_ids)
 
-        self.size = size
+        # Dynamic-cap mode (Phase 7): conv_state + free_slots sized for
+        # max_size; live admission cap starts at `size`. The actuator
+        # calls set_capacity_slots(N) up to max_size to lift the cap
+        # (the existing grow path pulls slot ids from `_capped_slots`).
+        #
+        # Semantic of `self.size`: the LIVE capacity cap, updated by
+        # `set_capacity_slots` on BOTH grow and shrink (Phase-7 dynamic).
+        # This DIFFERS from `BaseTokenToKVPoolAllocator.size` on the KV
+        # side, which stays fixed at init (high-water) and tracks the live
+        # cap separately in `_cap`/`_capped_pages` — mamba folds the cap
+        # into `self.size` directly. Two distinct shrink paths act on this
+        # pool: (1) the admission-cap path `set_capacity_slots(n)` lowers
+        # `self.size` to `n`; (2) the cross-pool cap-barrier path
+        # (`_MambaCapAllocator.mark_pages_capped`) does NOT touch
+        # `self.size` — it moves slots into `_capped_slots`, so allocatable
+        # capacity drops below `self.size`. Hence `live_size = self.size −
+        # (_capped_slots ≤ self.size).count()` — only capped slots WITHIN
+        # the live range subtract, since `_capped_slots` may also carry
+        # boot-deferred IDs in `(size, max_size]` whose chunks are unmapped.
+        # See the `live_size` property for the exact masked-sum form.
+        if max_size is None:
+            max_size = size
+        if max_size < size:
+            raise ValueError(f"max_size={max_size} must be >= size={size}")
+        self.size = size            # live cap (set_capacity_slots-updated)
+        self.max_size = max_size    # pre-allocated upper bound
         self.device = device
+        # Symmetric to `BaseTokenToKVPoolAllocator._alloc_lock`: the
+        # cross-pool actuator's worker thread mutates `free_slots` /
+        # `_capped_slots` / `self.size` via `set_capacity_slots` and
+        # `unmark_slots` while the scheduler thread is in `alloc` /
+        # `free` / `migrate_slot`. Without this lock the read-then-rebind
+        # sequence in either side can race the other (mask shape
+        # mismatch → IndexError, or stale cat → same slot handed twice).
+        self._alloc_lock = threading.Lock()
+        # Per-slot tensors are pre-allocated at `max_size` so they can
+        # be addressed past init without reallocation (data_ptr stable
+        # for CUDA-graph safety).
+        alloc_size = max_size
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -344,7 +594,7 @@ class MambaPool:
         ):
             conv_state = [
                 torch.zeros(
-                    size=(num_mamba_layers, size + 1) + conv_shape,
+                    size=(num_mamba_layers, alloc_size + 1) + conv_shape,
                     dtype=conv_dtype,
                     device=device,
                 )
@@ -366,11 +616,167 @@ class MambaPool:
                 # CPU uses a different layout of conv_state for kernel optimization
                 conv_state = _init_amx_conv_state(conv_state)
 
-            temporal_state = torch.zeros(
-                size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                dtype=ssm_dtype,
-                device=device,
+            # When SGLANG_MAMBA_PERLAYER=1, temporal_state is a List[Tensor]
+            # of length num_mamba_layers, each shape
+            # (size+1, *temporal_state_shape). Mirrors the per-layer KV pool
+            # layout, makes the pool VMM-arena-friendly. Default off.
+            #
+            # When SGLANG_MAMBA_ARENA=1 (implies SGLANG_MAMBA_PERLAYER=1),
+            # temporal_state's per-layer tensors come from a MultiTensorArena,
+            # sharing the chunk-bitmap actuator with the KV pool so cross-pool
+            # transfer can move physical bytes.
+            # Unconditionally declare the arena attribute so callers
+            # can always do a direct None check instead of
+            # `getattr(..., None)`. Stays None unless the arena branch
+            # below actually constructs the MultiTensorArena.
+            self._mamba_temporal_arena = None
+            shared_arena = os.environ.get("SGLANG_ARENA_SHARED") == "1"
+            self._mamba_arena = (
+                os.environ.get("SGLANG_MAMBA_ARENA") == "1"
+                or shared_arena
             )
+            self._mamba_perlayer = (
+                self._mamba_arena
+                or os.environ.get("SGLANG_MAMBA_PERLAYER") == "1"
+            )
+            logger.info(
+                "MambaPool: temporal layout=%s, arena=%s, shared=%s, "
+                "num_layers=%d, size=%d, temporal_shape=%s, conv_shapes=%s",
+                "per-layer-list" if self._mamba_perlayer else "stacked",
+                self._mamba_arena,
+                shared_arena,
+                num_mamba_layers, size, tuple(temporal_state_shape),
+                [tuple(s) for s in conv_state_shape],
+            )
+            if self._mamba_arena:
+                from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
+                # Compute chunk-aligned slot count.
+                # Phase A5: ablation honors SGLANG_ARENA_CHUNK_BYTES.
+                # T1 (paper §3.2.1): default to CUDA VMM's native 2 MiB page
+                # granularity on H200. Chunk-grain (e.g., 64 MiB) is selectable
+                # via SGLANG_ARENA_CHUNK_BYTES for legacy A/B comparison.
+                chunk_bytes = int(os.environ.get(
+                    "SGLANG_ARENA_CHUNK_BYTES", str(2 * 1024 * 1024)
+                ))
+                per_token_bytes = (
+                    int(np.prod(temporal_state_shape))
+                    * torch.tensor([], dtype=ssm_dtype).element_size()
+                )
+                tokens_per_chunk = _arena_tokens_per_chunk(
+                    chunk_bytes, per_token_bytes
+                )
+                tot = size + 1
+                tot_aligned = (
+                    (tot + tokens_per_chunk - 1) // tokens_per_chunk
+                ) * tokens_per_chunk
+
+                shared_pool = None
+                # max_tokens > init_tokens reserves VA past the initial
+                # physical mapping so cross-pool transfer can actually grow
+                # this arena: when peer releases a chunk, the freed handle
+                # gets cuMemMap'd into [init_chunks, max_chunks) of THIS
+                # arena's VA range. Without this headroom, max_chunks =
+                # init_chunks and the actuator's grow() returns 0 (B3 4-cell
+                # v1: 10 fires, all unmapped=0 granted=0 — pure overhead).
+                # The headroom is VA-only — no physical handles are
+                # allocated for [init, max), they only get mapped at
+                # transfer time. So this does NOT cost any KV/mamba budget.
+                #
+                # T5 (paper §3.2.1): SGLANG_ARENA_MAMBA_HEADROOM_BYTES, if
+                # set, takes precedence over SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS.
+                # Default 80 GiB ensures the actuator can actually pull a
+                # peer-released ~25 GiB recurrent budget into a peer pool
+                # whose chunks are 2 MiB (T1).
+                mamba_headroom_bytes_env = os.environ.get(
+                    "SGLANG_ARENA_MAMBA_HEADROOM_BYTES",
+                )
+                if shared_arena and mamba_headroom_bytes_env is not None:
+                    mamba_growth_chunks = (
+                        int(mamba_headroom_bytes_env) // chunk_bytes
+                    )
+                elif shared_arena:
+                    # Default to 80 GiB headroom; legacy CHUNKS env still
+                    # honored for explicit overrides like "=4".
+                    legacy_chunks_env = os.environ.get(
+                        "SGLANG_ARENA_MAMBA_HEADROOM_CHUNKS"
+                    )
+                    if legacy_chunks_env is not None:
+                        mamba_growth_chunks = int(legacy_chunks_env)
+                    else:
+                        mamba_growth_chunks = (
+                            (80 * 1024 * 1024 * 1024) // chunk_bytes
+                        )
+                else:
+                    mamba_growth_chunks = 0
+                mamba_max_tokens = (
+                    tot_aligned + mamba_growth_chunks * tokens_per_chunk
+                )
+                if shared_arena:
+                    from sglang.srt.arena.shared_pool import (
+                        get_or_create_shared_handle_pool,
+                    )
+                    shared_pool = get_or_create_shared_handle_pool(
+                        device_id=torch.cuda.current_device(),
+                        chunk_bytes=chunk_bytes,
+                    )
+
+                # Static-min/soft split (paper §sec:design-l2-actuator). All
+                # init_chunks worth of physical handles are cuMemMap'd at
+                # boot — the pool boots at full baseline capacity, no
+                # donation to a shared queue. The static_min defines the
+                # FLOOR below which the cross-pool actuator never shrinks
+                # ("the bytes the pool needs to admit any traffic"). When
+                # shared_arena is enabled we set static_min
+                # to 1 chunk per sub-pool, leaving (init - 1) chunks per
+                # sub-pool transferable via drain protocol on fire. When
+                # shared_arena is off, static_min = init = no shrink
+                # possible (matches non-L2 baseline behavior identically).
+                init_chunks = tot_aligned // tokens_per_chunk
+                mamba_static_min_chunks = 1 if shared_arena else init_chunks
+                mamba_static_min_tokens = mamba_static_min_chunks * tokens_per_chunk
+                self._mamba_temporal_arena = MultiTensorArena(
+                    device_id=torch.cuda.current_device(),
+                    n_layers=num_mamba_layers,
+                    n_kinds=1,
+                    per_token_shape=tuple(temporal_state_shape),
+                    dtype=ssm_dtype,
+                    max_tokens=mamba_max_tokens,
+                    init_tokens=tot_aligned,
+                    static_min_tokens=mamba_static_min_tokens,
+                    chunk_bytes=chunk_bytes,
+                    external_handle_pool=shared_pool,
+                )
+                temporal_state = [
+                    self._mamba_temporal_arena.tensor(i, 0)
+                    for i in range(num_mamba_layers)
+                ]
+                # Match torch.zeros initial state for slot 0 (pad slot).
+                for buf in temporal_state:
+                    buf[:1].zero_()
+                logger.info(
+                    "MambaPool arena: tot=%d (aligned=%d), tokens_per_chunk=%d, "
+                    "chunk_bytes=%d, per_token_bytes=%d, shared=%s, "
+                    "subpool_offset=%d, n_subpools=%d",
+                    tot, tot_aligned, tokens_per_chunk, chunk_bytes,
+                    per_token_bytes, shared_arena,
+                    self._mamba_temporal_arena._subpool_offset,
+                    num_mamba_layers,
+                )
+            elif self._mamba_perlayer:
+                temporal_state = [
+                    torch.zeros(
+                        size=(alloc_size + 1,) + temporal_state_shape,
+                        dtype=ssm_dtype,
+                        device=device,
+                    )
+                    for _ in range(num_mamba_layers)
+                ]
+            else:
+                temporal_state = torch.zeros(
+                    size=(num_mamba_layers, alloc_size + 1) + temporal_state_shape,
+                    dtype=ssm_dtype,
+                    device=device,
+                )
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
@@ -431,6 +837,29 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
+            # The padded slot 0 is used for writing dummy outputs from padded tokens.
+            # In dynamic-cap mode (max_size > size), free_slots covers
+            # ONLY the live cap; the deferred ids [size+1, max_size+1)
+            # go into _capped_slots so the existing set_capacity_slots
+            # grow path can pull them in when the actuator lifts the cap.
+            self.free_slots = torch.arange(
+                1, self.size + 1, dtype=torch.int64, device=self.device
+            )
+            if self.size < self.max_size:
+                self._capped_slots = torch.arange(
+                    self.size + 1, self.max_size + 1,
+                    dtype=torch.int64, device=self.device,
+                )
+            else:
+                self._capped_slots = torch.empty(
+                    0, dtype=torch.int64, device=self.device,
+                )
+            # Paper §sec:design-l2: at boot, pool maps init_chunks (= live cap
+            # slots usable). Allocator hands out the live range — engine
+            # behaves identically to non-L2 baseline. The actuator only
+            # shrinks via drain protocol (cap allocator → wait for in-flight
+            # tail-slot reqs to drain → cuMemUnmap), which dynamically
+            # re-caps the allocator at fire time. No boot-time cap needed.
             self.mem_usage = self.mamba_cache.mem_usage_bytes() / GB
             self.num_mamba_layers = num_mamba_layers
 
@@ -441,29 +870,232 @@ class MambaPool:
     def mamba2_layer_cache(self, layer_id: int):
         return self.mamba_cache.at_layer_idx(layer_id)
 
+    def available_size(self):
+        if hasattr(self, "_allocator") and self._allocator is not None:
+            return self._allocator.available_size()
+        return len(self.free_slots)
+
     def clear_slots(self, indices: torch.Tensor):
-        """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        """Zero out mamba state at the given pool indices. Must run on the
+        forward stream. Driven by `req.mamba_needs_clear`: a freshly allocated
+        slot is handed out dirty and zeroed here, not at alloc time, so alloc
+        launches no extra kernel and the clear overlaps the forward pass.
+
+        Expands a scalar GPU zero into each slot (no CPU-GPU sync). The scalar
+        is allocated ONCE per dtype and broadcast-expanded per tensor; a fresh
+        `torch.zeros(1)` per layer would launch one extra tiny allocation
+        kernel per layer for an identical result. The arena backs `temporal`
+        as a per-layer list (slot on dim 0); the non-arena pool stacks it into
+        one tensor (slot on dim 1), so both layouts are handled.
+        """
         need_size = len(indices)
-        for i in range(len(self.mamba_cache.conv)):
-            t = self.mamba_cache.conv[i]
+        conv = self.mamba_cache.conv
+        if conv:
+            conv_zero = torch.zeros(1, dtype=conv[0].dtype, device=conv[0].device)
+            for t in conv:
+                t[:, indices] = conv_zero.expand(
+                    t.shape[0], need_size, *t.shape[2:]
+                )
+        if isinstance(self.mamba_cache.temporal, list):
+            temporal = self.mamba_cache.temporal
+            temporal_zero = torch.zeros(
+                1, dtype=temporal[0].dtype, device=temporal[0].device
+            )
+            for t in temporal:
+                t[indices] = temporal_zero.expand(need_size, *t.shape[1:])
+        else:
+            t = self.mamba_cache.temporal
             z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
                 t.shape[0], need_size, *t.shape[2:]
             )
             t[:, indices] = z
-        t = self.mamba_cache.temporal
-        z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-            t.shape[0], need_size, *t.shape[2:]
-        )
-        t[:, indices] = z
+
+    @property
+    def _no_cross_fire(self) -> bool:
+        """True when `_capped_slots` is empty AND the live cap still equals the
+        pre-allocated upper bound, so every live slot id lies in
+        `[1, self.size] == [1, self.max_size]`: no freed id can exceed the cap
+        and no id can be a capped (unmapped) slot.
+
+        `free` uses this to take the plain free-list path (matching the
+        non-budgeter baseline), skipping the `torch.isin` membership test and
+        the `free_index > self.size` mask whose `.any()` forces a
+        device-to-host sync on every free.
+
+        SAFETY rests on one invariant: `_capped_slots` holds the id of EVERY
+        slot whose VMM chunk is unmapped. Every path that unmaps a chunk
+        populates `_capped_slots` or lowers `self.size` under `_alloc_lock`
+        before the unmap (`migrate_slot`, `set_capacity_slots` SHRINK, the
+        above-cap `free` branch, `_MambaCapAllocator.mark_pages_capped`), so
+        this predicate reads False the instant any live slot could be unmapped;
+        `unmark_slots` / `set_capacity_slots` GROW only restore ids the actuator
+        just re-mapped. The ONE known violator is `clear()`: it rebuilds
+        `_capped_slots` from `self.size`, dropping below-cap actuator marks
+        (flush-boundary crash), so the fast path is only fully sound once
+        `clear()` preserves those marks. The crash manifests identically on the slow
+        path (post-`clear()` `_capped_slots` is empty, so its filter is a no-op
+        too), so it is orthogonal to this fast path.
+        """
+        return self._capped_slots.numel() == 0 and self.size == self.max_size
+
+    def migrate_slot(self, src: int, dst: int) -> bool:
+        """T4 (paper §3.2.3): atomic per-slot migration. Copies the
+        recurrent-state contents of slot `src` to slot `dst`, then
+        updates allocator side state: `src` joins _capped_slots
+        (held out, about to be unmapped), `dst` removed from free_slots
+        (now live with src's data).
+
+        Caller's responsibility: update any in-flight request whose
+        `mamba_pool_idx == src` to `dst`. The slot's tensor bytes are
+        moved here; the *owning-request pointer* is the caller's job
+        (it has the scheduler reference; this pool does not).
+
+        Caller must also wrap the call with `torch.cuda.synchronize`
+        before (so all in-flight kernels using src finish reading) and
+        after (so the copy is visible before the next kernel launch).
+        Strictly between scheduler steps this is automatic.
+
+        Returns True if migration succeeded; False if `dst` is not
+        currently free or `src` and `dst` are equal.
+        """
+        if src == dst:
+            return False
+        with self._alloc_lock:
+            # Verify dst is free.
+            is_dst_free = bool((self.free_slots == dst).any().item())
+            if not is_dst_free:
+                return False
+
+            # Copy state across all conv tensors and the temporal tensor(s).
+            for t in self.mamba_cache.conv:
+                t[:, dst, ...].copy_(t[:, src, ...])
+            if isinstance(self.mamba_cache.temporal, list):
+                for t in self.mamba_cache.temporal:
+                    t[dst, ...].copy_(t[src, ...])
+            else:
+                t = self.mamba_cache.temporal
+                t[:, dst, ...].copy_(t[:, src, ...])
+            # Speculative-decoding: SpeculativeState adds intermediate_ssm
+            # (Tensor) + intermediate_conv_window (List[Tensor]). Without
+            # this branch, migration silently strips speculative state and
+            # the next decode reads stale data.
+            if isinstance(self.mamba_cache, MambaPool.SpeculativeState):
+                t = self.mamba_cache.intermediate_ssm
+                t[:, dst, ...].copy_(t[:, src, ...])
+                for t in self.mamba_cache.intermediate_conv_window:
+                    t[:, dst, ...].copy_(t[:, src, ...])
+
+            # Allocator-side state: dst removed from free_slots; src into
+            # _capped_slots (NOT free_slots — its chunk is about to be
+            # unmapped by the actuator).
+            self.free_slots = self.free_slots[self.free_slots != dst]
+            existing = self._capped_slots
+            src_t = torch.tensor([src], dtype=self.free_slots.dtype, device=self.device)
+            if existing.numel() == 0:
+                self._capped_slots = src_t
+            elif not bool(torch.isin(src_t, existing).any().item()):
+                # Dedupe against existing _capped_slots: a slot can be
+                # recycled and migrated again before its prior cap is
+                # released; without this, `_capped_slots` double-counts.
+                self._capped_slots = torch.cat([existing, src_t])
+            self._assert_capped_slots_invariant()
+            return True
+
+    def clear(self):
+        # flush_cache resets the pool to "every MAPPED slot is free", but a slot
+        # whose VMM chunk is currently unmapped must STAY capped — otherwise the
+        # next alloc hands out unmapped VA. `_capped_slots` already
+        # holds exactly the unmapped set (every mutator maintains the invariant;
+        # `unmark_slots` drops an id only when its chunk is re-mapped), of two
+        # kinds: below-cap actuator marks (id ≤ size, recorded by
+        # `_MambaCapAllocator.mark_pages_capped` without lowering self.size) and
+        # the boot-deferred / shrunk tail (size, max_size]. So we PRESERVE
+        # `_capped_slots` as-is and rebuild `free_slots` as the live range minus
+        # the capped ids. Reconstructing `_capped_slots` from self.size alone
+        # would drop the below-cap marks and re-enter unmapped slots.
+        # Mirrors KV's `CappedFreeList.reset`, which keeps its `marks` set.
+        with self._alloc_lock:
+            live = torch.arange(
+                1, self.size + 1, dtype=torch.int64, device=self.device
+            )
+            capped = self._capped_slots
+            if capped.numel() > 0:
+                self.free_slots = live[~torch.isin(live, capped)]
+            else:
+                self.free_slots = live
+            self._assert_capped_slots_invariant()
+
+    @property
+    def live_size(self) -> int:
+        if hasattr(self, "_allocator") and self._allocator is not None:
+            return self._allocator.live_size
+        capped = self._capped_slots
+        if capped.numel() == 0:
+            return self.size
+        n_below_cap = int((capped <= self.size).sum().item())
+        return self.size - n_below_cap
+
+    def unmark_slots(self, ids: torch.Tensor) -> int:
+        """Restore specific slot IDs from ``_capped_slots`` back into
+        ``free_slots``. Mirrors KV's
+        ``BaseTokenToKVPoolAllocator.unmark_pages_capped(ids)``.
+
+        Used by the cross-pool actuator with the IDs returned by
+        ``chunk_arena.grow`` — i.e. the slot positions whose chunks
+        were just freshly mapped. ``self.size`` extends to cover any
+        restored ID that lies above the current cap.
+
+        Contract:
+          - Restore = ``_capped_slots ∩ ids``. IDs in ``ids`` not in
+            ``_capped_slots`` are silently ignored (already free or
+            never owned), so callers can pass raw arena output.
+          - Returns the actual restore count.
+        """
+        if ids.numel() == 0:
+            return 0
+        with self._alloc_lock:
+            capped = self._capped_slots
+            if capped.numel() == 0:
+                return 0
+            # Restore = capped ∩ ids. Drop those from _capped_slots,
+            # append to free_slots.
+            in_restore = torch.isin(capped, ids)
+            restore = capped[in_restore]
+            if restore.numel() == 0:
+                return 0
+            # `self.size` is the upper bound of the live slot range.
+            # `_capped_slots` may carry IDs both ≤ size (marked off by
+            # `_MambaCapAllocator.mark_pages_capped`) and > size (boot-
+            # deferred slots from `[init+1..max_size]` pre-allocation).
+            # Restoring IDs ≤ size does not move the boundary; restoring
+            # IDs > size extends it to cover the new maximum.
+            self._capped_slots = capped[~in_restore]
+            self.free_slots = torch.cat([self.free_slots, restore])
+            self.size = max(self.size, int(restore.max().item()))
+            return int(restore.numel())
+
+    def live_capacity_tokens(self) -> int:
+        return self.live_size
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
             self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
                 :, src_indices
             ]
-        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-            :, src_indices
-        ]
+        if isinstance(self.mamba_cache.temporal, list):
+            for t in self.mamba_cache.temporal:
+                t[dst_indices] = t[src_indices]
+        else:
+            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+                :, src_indices
+            ]
+
+    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
+        dst_index = self._allocator.alloc(1)
+        if dst_index is None:
+            return None
+        self.copy_from(src_index, dst_index)
+        return dst_index
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -471,9 +1103,15 @@ class MambaPool:
             conv[:, indices].to("cpu", non_blocking=True)
             for conv in self.mamba_cache.conv
         ]
-        temporal_cpu = self.mamba_cache.temporal[:, indices].to(
-            "cpu", non_blocking=True
-        )
+        if isinstance(self.mamba_cache.temporal, list):
+            temporal_cpu = [
+                t[indices].to("cpu", non_blocking=True)
+                for t in self.mamba_cache.temporal
+            ]
+        else:
+            temporal_cpu = self.mamba_cache.temporal[:, indices].to(
+                "cpu", non_blocking=True
+            )
         current_platform.synchronize()
         return conv_cpu, temporal_cpu
 
@@ -482,9 +1120,13 @@ class MambaPool:
         current_platform.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
             conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
-        self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
-            self.mamba_cache.temporal.device, non_blocking=True
-        )
+        if isinstance(self.mamba_cache.temporal, list):
+            for i, t in enumerate(self.mamba_cache.temporal):
+                t[indices] = temporal_cpu[i].to(t.device, non_blocking=True)
+        else:
+            self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
+                self.mamba_cache.temporal.device, non_blocking=True
+            )
         current_platform.synchronize()
 
     def get_contiguous_buf_infos(self):
@@ -492,56 +1134,92 @@ class MambaPool:
         Get buffer info for RDMA registration.
         Only returns conv and temporal state buffers, excluding intermediate buffers
         used for speculative decoding (intermediate_ssm, intermediate_conv_window).
-        """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            # Skip intermediate buffers used only for speculative decoding
-            # These buffers have different size (spec_state_size + 1) and should not be transferred
-            if field in ("intermediate_ssm", "intermediate_conv_window"):
-                continue
-            value = getattr(self.mamba_cache, field)
-            if isinstance(value, list):
-                state_tensors.extend(value)
-            else:
-                state_tensors.append(value)
-        data_ptrs, data_lens, item_lens = [], [], []
 
-        for _, state_tensor in enumerate(state_tensors):
+        When temporal is a per-layer-split List[Tensor] (len ==
+        num_mamba_layers, entries don't carry a layer axis), the entries
+        are treated directly as per-layer buffers (no extra layer-indexing).
+        """
+        # Per-logical-state list of "layer-indexable views"; each entry is
+        # something where `entry[layer_id]` returns the per-layer buffer.
+        # For stacked tensors and conv-shape lists this is the entry itself;
+        # for per-layer-split lists the wrapping list IS already layer-indexed.
+        state_views = []
+        for fname in vars(self.mamba_cache):
+            if fname in ("intermediate_ssm", "intermediate_conv_window"):
+                continue
+            value = getattr(self.mamba_cache, fname)
+            if isinstance(value, list):
+                if (
+                    len(value) == self.num_mamba_layers
+                    and value[0].shape[0] != self.num_mamba_layers
+                ):
+                    # Per-layer split: the list itself is the layer-indexed view.
+                    state_views.append(value)
+                else:
+                    # List of per-conv-shape stacked tensors.
+                    for v in value:
+                        state_views.append(v)
+            else:
+                state_views.append(value)
+
+        data_ptrs, data_lens, item_lens = [], [], []
+        for view in state_views:
             data_ptrs += [
-                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
+                view[i].data_ptr() for i in range(self.num_mamba_layers)
             ]
-            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
+            data_lens += [view[i].nbytes for i in range(self.num_mamba_layers)]
             item_lens += [
-                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
+                view[i][0].nbytes for i in range(self.num_mamba_layers)
             ]
         return data_ptrs, data_lens, item_lens
 
     def get_state_dim_per_tensor(self):
-        """Get the sliceable dimension size for each state tensor.
+        """Get the sliceable dimension size for each (state-tensor, layer).
 
         For mamba state, the layout is:
         - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
         - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
 
-        The 3rd dimension (index 2) is the one that gets sliced by TP.
-        Returns the size of this dimension for each tensor (repeated for each layer).
+        Each logical state-tensor contributes num_mamba_layers entries.
+
+        When SGLANG_MAMBA_PERLAYER=1 and temporal is a List[Tensor] of
+        length num_mamba_layers (each entry shape
+        (size+1, sliceable_dim, ...)), it counts as ONE logical
+        state-tensor (sliceable_dim = entry[0].shape[1], repeated
+        num_mamba_layers times).
         """
-        state_tensors = []
-        for field in vars(self.mamba_cache):
-            value = getattr(self.mamba_cache, field)
+        sliceable_dims = []
+        for fname in vars(self.mamba_cache):
+            value = getattr(self.mamba_cache, fname)
             if isinstance(value, list):
-                state_tensors.extend(value)
+                # Distinguish "list of conv-shape tensors, each layer-stacked"
+                # from "per-layer-split temporal (one tensor per layer)".
+                if (
+                    len(value) == self.num_mamba_layers
+                    and value[0].shape[0] != self.num_mamba_layers
+                ):
+                    sliceable_dims.append(value[0].shape[1])
+                else:
+                    for v in value:
+                        sliceable_dims.append(v.shape[2])
             else:
-                state_tensors.append(value)
+                # Stacked: [num_layers, size+1, sliceable_dim, ...]
+                sliceable_dims.append(value.shape[2])
 
         dim_per_tensor = []
-        for state_tensor in state_tensors:
-            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
-            # The sliceable dimension is at index 2 (after num_layers and size)
-            sliceable_dim = state_tensor.shape[2]
-            # Repeat for each layer since we have per-layer data_ptrs
-            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        for d in sliceable_dims:
+            dim_per_tensor += [d] * self.num_mamba_layers
         return dim_per_tensor
+
+
+# Mamba active-slot slots a single hybrid request needs, by prefix-cache mode.
+# The extra slots over 1 reserve ping-pong / lazy-copy buffers so a cached
+# prefix's recurrent state can be reused without clobbering the live slot.
+# Single source of truth: both alloc_req_slots (supply-side eviction target) and
+# HybridReqToTokenPool.available_size (admission gate) price a request off these.
+MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
+MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
+MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -563,20 +1241,60 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
         enable_overlap_schedule: bool = True,
         start_layer: Optional[int] = None,
+        max_size: Optional[int] = None,
     ):
         super().__init__(
             size=size,
             max_context_len=max_context_len,
             device=device,
             enable_memory_saver=enable_memory_saver,
+            max_size=max_size,
         )
 
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_mamba_extra_buffer_lazy = enable_mamba_extra_buffer_lazy
         self.enable_memory_saver = enable_memory_saver
+        # On-demand mamba (active-slot) grow: optional synchronous k2m grow
+        # callback the BudgetAgent installs. The active-slot alloc below calls it
+        # when mamba_pool.alloc fails, so a mamba-phase burst grows mamba from
+        # idle KV instead of crashing "Not enough space for mamba cache" — the
+        # symmetric counterpart of the KV allocator's _kv_grow_hook. This lets
+        # the budgeter's on-demand mamba grow floor stay at the current working
+        # set instead of statically reserving max_running for a future burst.
+        # None on stock sglang / Budgeter off.
+        self._mamba_active_grow_hook = None
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
+        # Mamba growable headroom for cross-pool fires. The mamba
+        # pool must be in dynamic-cap mode (max_size > size) for the
+        # cross-pool actuator's k2m grants to `unmark_slots` chunks into
+        # the live cap; with max_size == size, `_capped_slots` is empty
+        # and every grant is a no-op (the pool stays pinned at boot size,
+        # cache_hit never recovers). The old gate keyed this on the REQ
+        # pool's dynamic-cap mode (`self.max_size > self.size`), which is
+        # the wrong condition — an arena-backed (cross-fire) mamba pool
+        # needs the headroom regardless. We therefore also enable it when
+        # the mamba pool is arena-backed. The cap is a bounded multiple of
+        # the boot mamba size (NOT the full arena VA headroom): conv_state
+        # is physically allocated at max_size (only the SSM/temporal state
+        # is arena-backed VA-on-demand), so an unbounded max_size would
+        # balloon conv. SGLANG_XPOOL_MAMBA_MAX_FACTOR tunes it (default 4×,
+        # enough to reach the workload-optimal mamba size on the starve
+        # bench where S* ≈ 4× the 64-slot boot).
+        _mamba_arena = (
+            os.environ.get("SGLANG_ARENA_SHARED") == "1"
+            or os.environ.get("SGLANG_MAMBA_ARENA") == "1"
+        )
+        if self.max_size > self.size:
+            mamba_max_size = self.max_size * 3
+        elif _mamba_arena:
+            _factor = max(2, int(
+                os.environ.get("SGLANG_XPOOL_MAMBA_MAX_FACTOR", "4")
+            ))
+            mamba_max_size = mamba_size * _factor
+        else:
+            mamba_max_size = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -585,6 +1303,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_mamba_extra_buffer=enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            mamba_max_size=mamba_max_size,
         )
 
     def _init_mamba_pool(
@@ -596,6 +1315,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         device: str,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
+        mamba_max_size: Optional[int] = None,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -605,14 +1325,22 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=self.enable_memory_saver,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            max_size=mamba_max_size,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
             device=device,
+            max_size=mamba_max_size,
         )
+        self.mamba_pool._allocator = self.mamba_allocator
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
+        # Size by the full req_to_token row count (max_size + 1, including the
+        # pad row 0). The tensor aliases the whole VA range, so its shape[0] is
+        # stable across grow/shrink: data_ptr() stays put, required for
+        # CUDA-graph capture safety. Cost: ~4 bytes per row, negligible vs the
+        # multi-GiB req_to_token table that needs the full VA-arena treatment.
         req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
@@ -629,12 +1357,52 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
+    def mamba_slots_per_req(self, supports_mamba: bool = True) -> int:
+        """Mamba active slots one fresh request consumes. Single source of truth
+        shared by ``alloc_req_slots`` (how many mamba slots to free before an
+        alloc) and ``available_size`` (how many requests the mamba pool can back)
+        so the two can never drift."""
+        if not supports_mamba:
+            return MAMBA_STATE_PER_REQ_NO_CACHE
+        return (
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY
+            if self.enable_mamba_extra_buffer_lazy
+            else MAMBA_STATE_PER_REQ_PREFIX_CACHE
+        )
+
+    def mamba_admittable_reqs(
+        self, mamba_evictable: int, supports_mamba: bool = True
+    ) -> int:
+        """How many fresh requests the mamba pool can back right now =
+        (free active slots + evictable cached snapshots) / slots-per-req.
+
+        A hybrid request needs a mamba active slot in addition to a req slot, but
+        the base ``available_size`` counts only req slots — so admitting on req
+        slots alone over-commits mamba and turns a should-be DEFER into an
+        ``alloc_req_slots`` crash. The admission gate (``get_num_allocatable_reqs``)
+        bounds the batch by this so it falls to 0 when mamba is exhausted and the
+        request stays queued (the design's defer action). ``mamba_evictable`` is
+        supplied by the caller from the tree cache (the pool does not own it),
+        mirroring the KV available+evictable gate in ``PrefillAdder``; counting
+        evictable is what keeps a lightly-loaded pool from throttling on the free
+        slots alone."""
+        return (
+            self.mamba_allocator.available_size() + mamba_evictable
+        ) // self.mamba_slots_per_req(supports_mamba)
+
     # For chunk prefill req, we do not need to allocate mamba cache,
     # We could use allocated mamba cache instead.
-    def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
+    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+        fresh_reqs = [r for r in reqs if r.req_pool_idx is None]
         select_index = super().alloc(reqs)
         if select_index is None:
             return None
+
+        # Reqs that THIS call gave a fresh mamba slot / ping-pong buffer to (not
+        # reused from a radix-cache COW or a prior chunk). Only these are
+        # cleared and freed on a rollback.
+        fresh_mamba_reqs: list["Req"] = []
+        fresh_track_reqs: list["Req"] = []
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
@@ -642,16 +1410,29 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
                 pass
             else:
-                mid = self.mamba_allocator.alloc(1)
-                assert (
-                    mid is not None
-                ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_allocator.available_size()=}, {len(reqs)=}"
+                mid = self._alloc_active_mamba_slot()
+                if mid is None:
+                    self._rollback_active_alloc(
+                        fresh_reqs, fresh_mamba_reqs, fresh_track_reqs
+                    )
+                    return None
                 req.mamba_pool_idx = mid[0]
+                # Fresh slot is handed out dirty; the forward stream zeroes it
+                # via clear_slots, driven by this flag (deferred-clear model).
                 req.mamba_needs_clear = True
+                fresh_mamba_reqs.append(req)
             mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
-                    self._alloc_ping_pong_buffer(req)
+                    buf = self.mamba_allocator.alloc(self.mamba_ping_pong_track_buffer_size)
+                    if buf is None:
+                        self._rollback_active_alloc(
+                            fresh_reqs, fresh_mamba_reqs, fresh_track_reqs
+                        )
+                        return None
+                    req.mamba_ping_pong_track_buffer = buf
+                    req.mamba_next_track_idx = 0
+                    fresh_track_reqs.append(req)
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
         assert len(select_index) == len(
             mamba_indices
@@ -668,6 +1449,45 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 ping_pong_tensor
             )
         return select_index
+
+    def _alloc_active_mamba_slot(self) -> Optional[torch.Tensor]:
+        """Allocate one active mamba slot, or None. On a full pool, fire the
+        on-demand k2m grow hook (idle KV -> mamba) and retry once. Lets the
+        on-demand mamba grow floor stay at the current working set instead of
+        statically reserving max_running. Never asserts; the caller rolls back
+        and returns None so the scheduler back-pressures."""
+        mid = self.mamba_allocator.alloc(1)
+        if mid is None and self._mamba_active_grow_hook is not None:
+            if self._mamba_active_grow_hook(1):
+                mid = self.mamba_allocator.alloc(1)
+        return mid
+
+    def _rollback_active_alloc(
+        self,
+        fresh_reqs: List["Req"],
+        fresh_mamba_reqs: List["Req"],
+        fresh_track_reqs: List["Req"],
+    ) -> None:
+        """Undo a partially-completed `alloc` batch, leaving the pool and every
+        req exactly as before the call so the caller can defer cleanly. Frees
+        only what THIS call acquired: the fresh mamba slots, the fresh ping-pong
+        buffers, and the fresh req_pool slots. Reused (radix-cache COW / chunked)
+        slots are left untouched."""
+        for req in fresh_mamba_reqs:
+            self.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(0))
+            req.mamba_pool_idx = None
+            # Clear the deferred-clear flag set alongside the fresh slot, so a
+            # rolled-back req never carries `mamba_needs_clear=True` with
+            # `mamba_pool_idx=None` (mirrors Req.reset). The forward-stream
+            # collector would otherwise do `None.unsqueeze(0)`.
+            req.mamba_needs_clear = False
+        for req in fresh_track_reqs:
+            self.mamba_allocator.free(req.mamba_ping_pong_track_buffer)
+            req.mamba_ping_pong_track_buffer = None
+            req.mamba_next_track_idx = None
+        for req in fresh_reqs:
+            self.free_slots.append(req.req_pool_idx)
+            req.req_pool_idx = None
 
     def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
         return self.req_index_to_mamba_index_mapping[req_indices]
@@ -847,6 +1667,25 @@ def unwrap_write_loc(loc_info):
 
 
 class KVCache(abc.ABC):
+    # Optional ChunkArena backing for cross-pool growth. Declared at
+    # the base so EVERY KVCache subclass exposes it and callers can do a
+    # direct `pool._kv_arena is None` check instead of `getattr(.., None)`.
+    # MHATokenToKVPool overrides it with a live MultiTensorArena when
+    # SGLANG_KV_ARENA=1; non-arena backends (MLA, torch.zeros MHA) leave it
+    # None. HybridLinearKVPool forwards it to its inner full-attention pool.
+    _kv_arena = None
+
+    def can_move_kv_cache(self) -> bool:
+        """Whether `move_kv_cache` can actually relocate a slot's bytes on this
+        pool. Declared at the base so callers (the Stage-3 migration walk +
+        allocator.can_migrate_slot) can ask directly instead
+        of probing for the method — a generic KVCache CANNOT (default False).
+        MHATokenToKVPool overrides it (True once warmed via enable_kv_cache_copy
+        or under the native-copy path); MLA pools have no move_kv_cache and
+        keep the False default, so an MLA(-hybrid) pool refuses migration with
+        ZERO mutation rather than asserting/AttributeError-ing mid-fire."""
+        return False
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -1089,47 +1928,140 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                if self.kv_cache_layout == "vectorized_5d":
-                    total_slots = self.size + self.page_size
-                    num_blocks = total_slots // self.page_size
-                    x = self._kv_vector_x
-                    # K: (num_blocks, H, D_k // X, page, X)
-                    self.k_buffer = [
-                        torch.zeros(
-                            (
-                                num_blocks,
-                                self.head_num,
-                                self.head_dim // x,
-                                self.page_size,
-                                x,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
+        # Unconditionally declare the arena attribute so callers can
+        # always do a direct None check instead of `getattr(..., None)`.
+        # Stays None for the non-arena (torch.zeros) backend.
+        self._kv_arena = None
+        # Optional ChunkArena-backed allocation. Gated by
+        # SGLANG_KV_ARENA=1. Restricted to head_dim == v_head_dim for now;
+        # falls through to default for the asymmetric case.
+        # SGLANG_ARENA_SHARED=1 implies KV_ARENA=1 and routes this arena's
+        # MultiTensorArena onto the process-singleton SharedHandlePool so
+        # cross-pool (KV ↔ mamba) transfer can move physical handles
+        # between the two pools.
+        shared_arena = os.environ.get("SGLANG_ARENA_SHARED") == "1"
+        use_arena = (
+            (os.environ.get("SGLANG_KV_ARENA") == "1" or shared_arena)
+            and self.head_dim == self.v_head_dim
+            and not self.enable_custom_mem_pool
+        )
+        logger.info(
+            "MHATokenToKVPool buffers: backend=%s (SGLANG_KV_ARENA=%s, "
+            "SGLANG_ARENA_SHARED=%s, head_dim==v_head_dim=%s, "
+            "custom_mem_pool=%s), size=%d, page_size=%d, layer_num=%d, "
+            "head_num=%d, head_dim=%d",
+            "arena" if use_arena else "torch.zeros",
+            os.environ.get("SGLANG_KV_ARENA", "<unset>"),
+            os.environ.get("SGLANG_ARENA_SHARED", "<unset>"),
+            self.head_dim == self.v_head_dim,
+            self.enable_custom_mem_pool,
+            self.size, self.page_size, self.layer_num,
+            self.head_num, self.head_dim,
+        )
+        if use_arena:
+            from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                # For the first cut, init = max (no soft-cap headroom);
+                # set_capacity_tokens(n) will be added to enable runtime
+                # resize once the budgeter is wired in 2e.4.d.
+                tot = self.size + self.page_size
+                # Phase A5: ablation honors SGLANG_ARENA_CHUNK_BYTES.
+                # T1 (paper §3.2.1): default to CUDA VMM's native 2 MiB page
+                # granularity on H200. Chunk-grain (e.g., 64 MiB) is selectable
+                # via SGLANG_ARENA_CHUNK_BYTES for legacy A/B comparison.
+                chunk_bytes = int(os.environ.get(
+                    "SGLANG_ARENA_CHUNK_BYTES", str(2 * 1024 * 1024)
+                ))
+                per_token_bytes = (
+                    self.head_num * self.head_dim
+                    * torch.tensor([], dtype=self.store_dtype).element_size()
+                )
+                tokens_per_chunk = _arena_tokens_per_chunk(
+                    chunk_bytes, per_token_bytes
+                )
+                # Round up to chunk-aligned token count.
+                tot_aligned = (
+                    (tot + tokens_per_chunk - 1) // tokens_per_chunk
+                ) * tokens_per_chunk
+
+                shared_pool = None
+                # See MambaPool note above: VA-only headroom for the actuator.
+                # T5 (paper §3.2.1): SGLANG_ARENA_KV_HEADROOM_BYTES takes
+                # precedence over the legacy SGLANG_ARENA_KV_HEADROOM_CHUNKS.
+                # Default 80 GiB ensures the KV pool can grow into a
+                # peer-released ~80 GiB budget at 2 MiB grain (T1).
+                kv_headroom_bytes_env = os.environ.get(
+                    "SGLANG_ARENA_KV_HEADROOM_BYTES"
+                )
+                if shared_arena and kv_headroom_bytes_env is not None:
+                    kv_growth_chunks = (
+                        int(kv_headroom_bytes_env) // chunk_bytes
+                    )
+                elif shared_arena:
+                    legacy_chunks_env = os.environ.get(
+                        "SGLANG_ARENA_KV_HEADROOM_CHUNKS"
+                    )
+                    if legacy_chunks_env is not None:
+                        kv_growth_chunks = int(legacy_chunks_env)
+                    else:
+                        kv_growth_chunks = (
+                            (80 * 1024 * 1024 * 1024) // chunk_bytes
                         )
-                        for _ in range(self.layer_num)
-                    ]
-                    # V: (num_blocks, H, page // X, D_v, X)
-                    self.v_buffer = [
-                        torch.zeros(
-                            (
-                                num_blocks,
-                                self.head_num,
-                                self.page_size // x,
-                                self.v_head_dim,
-                                x,
-                            ),
-                            dtype=self.store_dtype,
-                            device=self.device,
-                        )
-                        for _ in range(self.layer_num)
-                    ]
                 else:
+                    kv_growth_chunks = 0
+                kv_max_tokens = tot_aligned + kv_growth_chunks * tokens_per_chunk
+                if shared_arena:
+                    from sglang.srt.arena.shared_pool import (
+                        get_or_create_shared_handle_pool,
+                    )
+                    shared_pool = get_or_create_shared_handle_pool(
+                        device_id=torch.cuda.current_device(),
+                        chunk_bytes=chunk_bytes,
+                    )
+
+                # Static-min/soft split — see MambaPool note above.
+                # Boot maps init_chunks fully; static_min is the floor for
+                # actuator shrink (1 chunk per sub-pool when shared_arena=on,
+                # else == init for non-L2 baseline behavior).
+                init_chunks = tot_aligned // tokens_per_chunk
+                kv_static_min_chunks = 1 if shared_arena else init_chunks
+                kv_static_min_tokens = kv_static_min_chunks * tokens_per_chunk
+                self._kv_arena = MultiTensorArena(
+                    device_id=torch.cuda.current_device(),
+                    n_layers=self.layer_num,
+                    n_kinds=2,
+                    per_token_shape=(self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    max_tokens=kv_max_tokens,
+                    init_tokens=tot_aligned,
+                    static_min_tokens=kv_static_min_tokens,
+                    chunk_bytes=chunk_bytes,
+                    external_handle_pool=shared_pool,
+                )
+                # Paper §sec:design-l2: pool boots at full init capacity. The
+                # actuator dynamically caps the allocator during drain when
+                # firing a shrink; no boot-time cap needed.
+                logger.info(
+                    "MHATokenToKVPool arena: tot_tokens=%d (tot_aligned=%d), "
+                    "tokens_per_chunk=%d, chunk_bytes=%d, per_token_bytes=%d, "
+                    "shared=%s, subpool_offset=%d, n_subpools=%d",
+                    tot, tot_aligned, tokens_per_chunk, chunk_bytes,
+                    per_token_bytes, shared_arena,
+                    self._kv_arena._subpool_offset,
+                    self.layer_num * 2,
+                )
+            self.k_buffer = [self._kv_arena.tensor(i, 0) for i in range(self.layer_num)]
+            self.v_buffer = [self._kv_arena.tensor(i, 1) for i in range(self.layer_num)]
+            # Match torch.zeros semantics for the padded slot at index 0.
+            for buf in self.k_buffer + self.v_buffer:
+                buf[: self.page_size].zero_()
+        else:
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                with (
+                    torch.cuda.use_mem_pool(self.custom_mem_pool)
+                    if self.enable_custom_mem_pool
+                    else nullcontext()
+                ):
                     # [size, head_num, head_dim] for each layer
                     # The padded slot 0 is used for writing dummy outputs from padded tokens.
                     self.k_buffer = [
@@ -1175,6 +2107,43 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+
+    def set_capacity_tokens(self, n_tokens: int) -> int:
+        """Resize the KV pool to back exactly `n_tokens` of capacity (plus padding).
+
+        Only valid when the pool was created with SGLANG_KV_ARENA=1. Returns
+        the actual capacity (rounded up to chunk granularity by the arena).
+        Caller is responsible for ensuring no live allocation references
+        token indices >= the new capacity before calling shrink.
+        """
+        if self._kv_arena is None:
+            raise RuntimeError(
+                "set_capacity_tokens requires SGLANG_KV_ARENA=1 at pool creation"
+            )
+        target = n_tokens + self.page_size
+        # The arena rounds to its chunk granularity; clamp to its max.
+        chunk = self._kv_arena._arena.chunk_size
+        per_token = self._kv_arena.per_token_bytes
+        tokens_per_chunk = chunk // per_token
+        target_aligned = (
+            (target + tokens_per_chunk - 1) // tokens_per_chunk
+        ) * tokens_per_chunk
+        target_aligned = min(target_aligned, self._kv_arena.max_tokens)
+        prev = self._kv_arena.current_capacity_tokens()
+        self._kv_arena.set_capacity_tokens(target_aligned)
+        new_advertised = target_aligned - self.page_size
+        logger.info(
+            "MHATokenToKVPool.set_capacity_tokens: req=%d -> aligned=%d "
+            "(prev=%d, advertised=%d, page_size=%d)",
+            n_tokens, target_aligned, prev, new_advertised, self.page_size,
+        )
+        return new_advertised
+
+    def live_capacity_tokens(self) -> int:
+        """Currently-backed token capacity (excludes padding)."""
+        if self._kv_arena is not None:
+            return self._kv_arena.current_capacity_tokens() - self.page_size
+        return self.size  # static path: capacity == size
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -1340,7 +2309,7 @@ class MHATokenToKVPool(KVCache):
             device_module=self.device_module,
             # size + page_size = real slots + the reserved padding slot (padded /
             # dummy tokens write there); valid index range is [0, size + page_size).
-            size_limit=self.size + self.page_size,
+            size_limit=self.k_buffer[0].shape[0] if self._kv_arena is not None else self.size + self.page_size,
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
         )
@@ -1428,6 +2397,16 @@ class MHATokenToKVPool(KVCache):
             commit_lens,
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
+        )
+
+    def can_move_kv_cache(self) -> bool:
+        # Capable under the native-copy path (no warmup needed) OR once
+        # enable_kv_cache_copy has initialized _kv_copy_config. Mirrors the two
+        # branches of move_kv_cache below so the capability check can't drift
+        # from what move_kv_cache actually requires.
+        return (
+            envs.SGLANG_NATIVE_MOVE_KV_CACHE.get()
+            or self._kv_copy_config is not None
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -1805,6 +2784,10 @@ class HybridLinearKVPool(KVCache):
                 layer_num=self.full_layer_nums,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
+                # Live KV-slot migration relocates bytes via move_kv_cache,
+                # which needs _kv_copy_config. The MLA branch
+                # below has no move_kv_cache (migrate_slot fails loud there),
+                # so the flag is forwarded only on the MHA path.
                 enable_kv_cache_copy=enable_kv_cache_copy,
             )
         else:
@@ -1837,6 +2820,13 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+    @property
+    def _kv_arena(self):
+        # The arena (if any) lives on the inner full-attention pool; forward
+        # so callers see the same `_kv_arena` interface as a plain KVCache
+        # (KV-growable wiring).
+        return self.full_kv_pool._kv_arena
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -1931,6 +2921,12 @@ class HybridLinearKVPool(KVCache):
                     cache_k,
                     cache_v,
                 )
+
+    def can_move_kv_cache(self) -> bool:
+        # Forward to the inner full-attention pool: MHA inner -> its real
+        # capability; MLA inner -> KVCache base default False (MLA has no
+        # move_kv_cache), so an MLA hybrid refuses migration cleanly.
+        return self.full_kv_pool.can_move_kv_cache()
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)

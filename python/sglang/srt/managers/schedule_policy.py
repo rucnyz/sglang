@@ -457,6 +457,10 @@ class PrefillAdder:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
         self.rem_total_token_offset = num_mixed_decode_tokens
         self.cur_rem_token_offset = num_mixed_decode_tokens
+        # Cumulative mamba active-slot demand committed by this prefill pass,
+        # symmetric with rem_total_token_offset on the KV side. Only meaningful
+        # when is_hybrid_ssm_cache; see rem_mamba_slots.
+        self.mamba_slot_offset = 0
 
         self.req_states = None
         self.can_run_list = []
@@ -533,6 +537,33 @@ class PrefillAdder:
                 + self.tree_cache.evictable_size()
             )
         return available_and_evictable - self.rem_total_token_offset
+
+    @property
+    def rem_mamba_slots(self):
+        """Mamba active-slot budget for the hybrid sub-pool, symmetric with
+        rem_total_tokens: live free slots + evictable cached snapshots minus the
+        demand this pass has already committed (mamba_slot_offset). Read INSIDE
+        the add_one_req _lock_node block, where a just-matched COW source is
+        already locked out of mamba_evictable_size (the same lock-drops-evictable
+        mechanism the KV budget relies on), so a request never counts its own
+        COW source as reclaimable capacity."""
+        return (
+            self.tree_cache.req_to_token_pool.mamba_allocator.available_size()
+            + self.tree_cache.mamba_evictable_size()
+            - self.mamba_slot_offset
+        )
+
+    def _mamba_slots_needed(self, req: Req) -> int:
+        """Fresh mamba active slots this request will draw at alloc_req_slots:
+        the active + ping-pong set (mamba_slots_per_req) minus a COW-destination
+        active slot already secured at match time (req.mamba_pool_idx set).
+        Mirrors the KV budget charging only extend_input_len, never the reused
+        prefix."""
+        factor = self.tree_cache.req_to_token_pool.mamba_slots_per_req(
+            self.tree_cache.supports_mamba()
+        )
+        already_held = 1 if req.mamba_pool_idx is not None else 0
+        return max(0, factor - already_held)
 
     @property
     def rem_swa_tokens(self):
@@ -612,6 +643,7 @@ class PrefillAdder:
         extend_input_len: int,
         max_new_tokens: int,
         retracted_stain: bool,
+        mamba_slots: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -621,6 +653,9 @@ class PrefillAdder:
         self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
         self.cur_rem_token_offset += extend_input_len + page_overhead
         self.rem_input_tokens -= extend_input_len
+        # Commit this request's fresh mamba demand so a later request in the same
+        # pass sees it (symmetric with rem_total_token_offset).
+        self.mamba_slot_offset += mamba_slots
 
         if self.is_hybrid_swa:
             self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
@@ -928,6 +963,16 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
+            mamba_needed = 0
+            if self.is_hybrid_ssm_cache:
+                # A hybrid request needs mamba active slots too. Checked here,
+                # inside _lock_node, so a just-matched COW source is already
+                # locked out of mamba_evictable_size and never counts as
+                # reclaimable capacity for the request that pins it.
+                mamba_needed = self._mamba_slots_needed(req)
+                if mamba_needed > self.rem_mamba_slots:
+                    return AddReqResult.NO_TOKEN
+
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -982,6 +1027,7 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
+                    mamba_slots=mamba_needed,
                 )
             else:
                 # Make sure at least one page is available
@@ -1017,7 +1063,7 @@ class PrefillAdder:
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
-                    prefix_len, trunc_len, 0, req.retracted_stain
+                    prefix_len, trunc_len, 0, req.retracted_stain, mamba_slots=mamba_needed
                 )
 
         return self.budget_state()
