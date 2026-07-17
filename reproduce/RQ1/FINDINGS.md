@@ -172,3 +172,38 @@ max_running 85→130, collapsing the 20s+ queue wait into sub-second TTFT at
 no throughput cost. (Sys reps ran on GPUs 1,3,5,7 vs base on 3,4,5,7; the
 pre-fix rerun on 1,3,5,7 measured 592.9 vs the 3,4,5,7 campaign's 580.6, so
 the GPU-set effect is ~2%, well below the +12% fix recovery.)
+
+## RQ2: Component Ablation (Qwen3.5-9B, 2026-07-17)
+
+Canonical corpus traces, N=3 fresh-boot reps per cell, ALL 15 cells
+error-free. Build: cap_barrier fix + k2m serving floor (48f2ce5414).
+Arms: full = SGLANG_HIMA=1 + LPB; w/oB = SGLANG_HIMA_NO_BUDGETER=1
+(planner suppressed, Admitter + LPB stay); w/oA = SGLANG_HIMA_NO_ADMITTER=1;
+w/oLPB = HiMA with --radix-eviction-policy lru.
+Raw data: hybrid-inference figures/data/qwen9b_rq2/.
+
+| regime | base | full | w/o Budgeter | w/o Admitter | w/o LPB |
+|--------|------|------|--------------|--------------|---------|
+| longhorizon t6@64 | 913.4±4.9 | 1035.1±21.1 (+13.3%) | 981.7±6.8 (+7.5%) | 1042.3±5.6 (+14.1%) | 986.5±16.5 (+8.0%) |
+| swarm t12@64 | 716.6±1.8 | 779.2±6.5 (+8.7%) | 746.5±3.0 (+4.2%) | 789.2±8.5 (+10.1%) | 727.5±7.2 (+1.5%) |
+| dynamic t6@128 | 348.7±1.6 | 1019.2±9.6 (+192.3%) | 973.5±0.9 (+179.2%) | 1051.7±9.5 (+201.6%) | 1069.5±14.8 (+206.7%) |
+
+TTFT mean (ms): longhorizon 441 / 296 / 372 / 287 / 349; swarm 699 / 544 /
+654 / 544 / 623; dynamic 120,603 / 397 / 1,616 / 389 / 392 (w/oB dynamic
+TTFT p90 = 7,250 vs full 986 — 7.4x).
+
+Attribution:
+- **Budgeter**: load-bearing everywhere. Removing it costs 4.2-5.2% tps in
+  every regime and always the largest TTFT hit; in dynamic the
+  Admitter-only backstop keeps +179% of the +192% win but TTFT p90
+  inflates 7.4x (cooldown-limited per-arrival grants lag the shift).
+- **LPB**: regime-dependent; carries the swarm win (w/oLPB 727.5 is
+  statistically at base 716.6) and about half the longhorizon margin, but
+  is counterproductive in dynamic (-4.7% vs full; LRU hit .850 vs .833 —
+  under active resizing the working set churns faster than loss-per-byte
+  estimates adapt).
+- **Admitter**: no steady-state benefit at replayed arrival rates —
+  w/oA >= full in all 3 regimes (+0.7/+1.3/+3.2%); sync arrival-path
+  fires only add overhead when the 1s tick absorbs arrivals. Its value is
+  the planner-off backstop (see w/oB dynamic) and burst insurance inside
+  a tick period.
