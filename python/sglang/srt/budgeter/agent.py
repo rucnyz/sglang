@@ -529,10 +529,70 @@ class BudgetAgent:
         # selection agree by construction, no slot-vs-page mismatch).
         adm.owner_provider = self._owner_provider
         adm.lcm_pages = self._actuator.lcm_pages
+        # Route Admitter cross-* fires through the SAME async cap_barrier +
+        # shared-worker path the Budgeter tick uses (no 10-30ms sync stall
+        # on the scheduler thread).
+        adm._fire_submit = self._submit_admitter_fire
         logger.info(
-            "BudgetAgent: Admitter wired (lcm_pages=%d)",
-            adm.lcm_pages,
+            "BudgetAgent: Admitter wired (lcm_pages=%d, async_fire=%s)",
+            adm.lcm_pages, self._fire_async_enabled,
         )
+
+    def _submit_admitter_fire(self, plan):
+        """Submit an Admitter-selected FirePlan through the same path as a
+        Budgeter tick fire. Returns ``(aborted, sync_result)``:
+          - async (default): cap_barrier inline, hand off to the shared fire
+            worker; returns ``(False, None)`` on enqueue, ``(True, None)`` if
+            cap_barrier aborts or the queue is full. The dst capacity is
+            applied by ``apply_pending_fires`` at the next scheduler iteration
+            (before the re-queued request is served); the worker warms the
+            c^xfer EWMA on completion.
+          - sync fallback (``SGLANG_HIMA_FIRE_ASYNC=0``): full execute inline;
+            returns ``(result.aborted, result)`` so the Admitter can price the
+            realized transfer.
+        Stamps the PaybackPlanner cooldown clock on a successful async
+        submit so the next Budgeter tick cannot immediately fire the reverse
+        direction (k2m<->m2k oscillation)."""
+        if not self._fire_async_enabled:
+            result = self._actuator.execute(plan)
+            return (result.aborted, result)
+
+        self._ensure_fire_worker()
+        token = self._actuator.cap_barrier(plan)
+        if token.aborted:
+            return (True, None)
+        try:
+            self._fire_queue.put_nowait(token)
+        except queue.Full:
+            # Roll back the cap-barrier so the reserved pages return to the
+            # free list instead of leaking (mirror the Budgeter tick path).
+            alloc = getattr(token.src_act, "allocator", None)
+            if alloc is not None and hasattr(alloc, "unmark_pages_capped"):
+                try:
+                    alloc.unmark_pages_capped(token.cap_t)
+                except Exception:
+                    logger.exception(
+                        "Admitter fire: cap-barrier rollback failed after "
+                        "queue-full (seq=%d)", token.plan.plan_seq,
+                    )
+            logger.warning(
+                "Admitter fire: queue full (depth=%d max=%d); deferring "
+                "(seq=%d)", self._fire_queue.qsize(), self._fire_queue_max,
+                token.plan.plan_seq,
+            )
+            return (True, None)
+        # Cooldown interlock: the planner's decide() gates on
+        # clock_s - _last_fire_clock < cooldown_s, where clock_s is the
+        # snapshot's wall-clock "ts" (time.time(); see tick()/_snapshot).
+        # Stamp the SAME clock so the next Budgeter tick is cooldown-gated
+        # against this Admitter fire and cannot immediately fire the reverse
+        # direction (k2m<->m2k oscillation).
+        if self._planner is not None:
+            try:
+                self._planner._last_fire_clock = time.time()
+            except Exception:
+                pass
+        return (False, None)
 
     def _log_chain_unavailable(self, snapshot: dict, reason: str) -> None:
         """Stash the actuator-chain-unavailable reason in the snapshot
