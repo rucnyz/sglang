@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.evict_policy import LPBStrategy
 from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
 
 if TYPE_CHECKING:
@@ -366,6 +367,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # (check_decode_mem); read via the Budgeter snapshot as the
         # deferred re-prefill cost the admission gate consults.
         self._admission_cumulative_evicted_tokens = 0
+        # c^evict prefix-curve cache (see evict_cost_curve.py): keeps the
+        # Admitter's per-arrival pricing off the O(evictable-nodes) walk.
+        from sglang.srt.mem_cache.evict_cost_curve import EvictCostCurveCache
+
+        self._evict_curve_cache = EvictCostCurveCache()
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
@@ -742,6 +748,17 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return float("inf")
 
+        from sglang.srt.environ import envs
+
+        cached = self._evict_curve_cache.get_cost(
+            "kv",
+            num_tokens,
+            self._build_evict_curve,
+            envs.SGLANG_XPOOL_EVICT_CURVE_MAX_AGE_S.get(),
+        )
+        if cached is not None:
+            return cached
+
         from sglang.srt.budgeter.cost_model import get_cost_curves
         curves = get_cost_curves()
         lpb_active = isinstance(self.eviction_strategy, LPBStrategy)
@@ -758,10 +775,28 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             return float("inf")
         return total_cost_ms * 1000.0
 
+    def _build_evict_curve(self):
+        """One full victim walk -> cumulative (tokens, cost) curve for the
+        c^evict cache. Same per-victim cost as the exact walk above."""
+        from sglang.srt.budgeter.cost_model import get_cost_curves
+        from sglang.srt.mem_cache.evict_cost_curve import EvictCostCurve
+
+        curves = get_cost_curves()
+        lpb_active = isinstance(self.eviction_strategy, LPBStrategy)
+
+        def entries():
+            for x in self._iter_evict_victims(self.evictable_size()):
+                s_b = len(x.key) if x.key is not None else 0
+                n_b = x.hits_in_window() if lpb_active else 1
+                yield len(x.value), n_b * curves.c_kv_ms(s_b) * 1000.0
+
+        return EvictCostCurve(entries())
+
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
             return EvictResult()
 
+        self._evict_curve_cache.invalidate()
         start_time = time.perf_counter()
         from sglang.srt.mem_cache.common import record_recovery_len_kv
 
