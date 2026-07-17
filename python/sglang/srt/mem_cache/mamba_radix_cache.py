@@ -553,11 +553,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         # (check_decode_mem); read via the Budgeter snapshot as the
         # deferred re-prefill cost the admission gate consults.
         self._admission_cumulative_evicted_tokens = 0
-        # c^evict prefix-curve cache (see evict_cost_curve.py): keeps the
-        # Admitter's per-arrival pricing off the O(evictable-nodes) walk.
-        from sglang.srt.mem_cache.evict_cost_curve import EvictCostCurveCache
-
-        self._evict_curve_cache = EvictCostCurveCache()
         # Cumulative cache-eviction counters: the Budgeter's grow-side
         # eviction-rate signals (symmetric to the reuse-aware drain cost).
         # A pool actively shedding (hot) entries should be GROWN. KV's
@@ -980,8 +975,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return EvictResult()
 
-        self._evict_curve_cache.invalidate()
-
         full_num_evicted = 0
         mamba_num_evicted = 0
 
@@ -1108,7 +1101,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         if self.disable or mamba_num <= 0:
             return 0
-        self._evict_curve_cache.invalidate()
 
         from sglang.srt.budgeter.cost_model import get_cost_curves, has_cost_curves
 
@@ -1414,7 +1406,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         if self.disable or full_num_tokens <= 0:
             return 0
-        self._evict_curve_cache.invalidate()
 
         from sglang.srt.budgeter.cost_model import get_cost_curves, has_cost_curves
 
@@ -1494,21 +1485,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return float("inf")
 
-        from sglang.srt.environ import envs
-
-        cached = self._evict_curve_cache.get_cost(
-            pool,
-            num_tokens,
-            (
-                self._build_evict_curve_mamba
-                if pool == "mamba"
-                else self._build_evict_curve_full
-            ),
-            envs.SGLANG_XPOOL_EVICT_CURVE_MAX_AGE_S.get(),
-        )
-        if cached is not None:
-            return cached
-
         from sglang.srt.budgeter.cost_model import get_cost_curves
         curves = get_cost_curves()
         use_lpb = self._should_use_lpb()
@@ -1570,70 +1546,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if num_evicted < num_tokens:
             return float("inf")
         return total_cost_ms * 1000.0
-
-    def _build_evict_curve_full(self):
-        """Full-tree victim walk -> cumulative (tokens, cost) curve, same
-        per-victim cost as the exact pool="kv" walk. Cascade-swept
-        tombstones are appended at the end (their sweep position inside
-        the walk is not exposed by the plan) — a slight under-pricing of
-        mid-range targets, bounded by the tombstone share."""
-        from sglang.srt.budgeter.cost_model import get_cost_curves
-        from sglang.srt.mem_cache.evict_cost_curve import EvictCostCurve
-
-        curves = get_cost_curves()
-        use_lpb = self._should_use_lpb()
-        victims, swept = self._plan_full_eviction(self.full_evictable_size())
-
-        def entries():
-            for x in victims:
-                s_b = len(x.key) if x.key is not None else 0
-                c_i_ms = curves.c_kv_ms(s_b)
-                if x.mamba_value is not None:
-                    c_i_ms += curves.c_m_ms(s_b)
-                n_b = x.hits_in_window() if use_lpb else 1
-                yield len(x.value), n_b * c_i_ms * 1000.0
-            for t in swept:
-                s_b = len(t.key) if t.key is not None else 0
-                n_b = t.hits_in_window() if use_lpb else 1
-                toks = len(t.value) if t.value is not None else 0
-                yield toks, n_b * curves.c_kv_ms(s_b) * 1000.0
-
-        return EvictCostCurve(entries())
-
-    def _build_evict_curve_mamba(self):
-        """Mamba victim walk -> cumulative (slots, cost) curve, same
-        per-victim cost decomposition as the exact pool="mamba" walk
-        (internal victims whose KV stays are priced at the whole-prefix
-        c_kv + c_m). Swept tombstones are appended at the end with zero
-        slot contribution, matching the exact walk's supply accounting."""
-        from sglang.srt.budgeter.cost_model import get_cost_curves
-        from sglang.srt.mem_cache.evict_cost_curve import EvictCostCurve
-
-        curves = get_cost_curves()
-        use_lpb = self._should_use_lpb()
-        leaf_v, internal_v, swept = self._plan_mamba_eviction(
-            self.mamba_evictable_size()
-        )
-        swept_ids = {id(t) for t in swept}
-
-        def entries():
-            for x in leaf_v:
-                s_b = len(x.key) if x.key is not None else 0
-                n_b = x.hits_in_window() if use_lpb else 1
-                yield 1, n_b * (curves.c_kv_ms(s_b) + curves.c_m_ms(s_b)) * 1000.0
-            for x in internal_v:
-                s_b = len(x.key) if x.key is not None else 0
-                n_b = x.hits_in_window() if use_lpb else 1
-                c_i_ms = curves.c_m_ms(s_b)
-                if id(x) not in swept_ids:
-                    c_i_ms += curves.c_kv_ms(s_b)
-                yield 1, n_b * c_i_ms * 1000.0
-            for t in swept:
-                s_b = len(t.key) if t.key is not None else 0
-                n_b = t.hits_in_window() if use_lpb else 1
-                yield 0, n_b * curves.c_kv_ms(s_b) * 1000.0
-
-        return EvictCostCurve(entries())
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         """

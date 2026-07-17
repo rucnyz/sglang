@@ -894,9 +894,6 @@ class Envs:
     # HiMA cross-pool budgeter (legacy SGLANG_HIMA_*/SGLANG_XPOOL_* knobs
     # predate this class and are still read at their call sites)
     SGLANG_XPOOL_PAYBACK_MARGIN = EnvFloat(1.0)
-    # Max age of the cached c^evict prefix curve before the Admitter's
-    # pricing walk is redone; 0 disables the cache (exact walk per query).
-    SGLANG_XPOOL_EVICT_CURVE_MAX_AGE_S = EnvFloat(0.5)
 
     # ===================================================================
     # KV-Canary / Token-Oracle (testing-only)
