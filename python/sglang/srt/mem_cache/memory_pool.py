@@ -556,18 +556,38 @@ class MambaPool:
                 if getattr(self, f.name) is not None
             )
 
+        # The two per-slot state fields. Speculative draft caches
+        # (SpeculativeState extras) are per-draft scratch, not per-slot
+        # state — evicting a slot does not free them, so they are
+        # excluded from the per-slot byte accounting.
+        _PER_SLOT_FIELDS = ("conv", "temporal")
+
         def bytes_per_slot(self) -> int:
-            """Physical bytes per single slot, independent of how many slots
-            the backing tensors have (works for both arena and non-arena)."""
+            """Physical bytes ONE slot frees on eviction (conv + temporal,
+            all layers). Normalizes each tensor by ITS OWN slot-dim size,
+            which makes the result exact for every layout:
+
+              conv:     list of (num_layers, slots+1, ...)   -> slot dim 1
+              temporal, stacked Tensor (num_layers, slots+1, ...) -> slot dim 1
+              temporal, per-layer list of (slots+1|VA_rows, ...) -> slot dim 0
+
+            For arena-backed per-layer tensors the leading dim is the VA row
+            count, not the physical slot count — but numerator and
+            denominator scale together, so `total_bytes // n_rows` is still
+            the exact per-slot slice size. (A previous version divided
+            `mem_usage_bytes()` by max_size+1, which the arena VA inflated
+            ~150x; and an interim `prod(shape[1:])` form mis-guessed the
+            slot dim for layer-stacked tensors, ~13x high.)"""
             total = 0
-            for f in dataclasses.fields(self):
-                v = getattr(self, f.name)
+            for name in self._PER_SLOT_FIELDS:
+                v = getattr(self, name)
                 if isinstance(v, list):
+                    slot_dim = 1 if name == "conv" else 0
                     for t in v:
-                        total += int(np.prod(t.shape[1:])) * t.dtype.itemsize
+                        total += get_tensor_size_bytes(t) // t.shape[slot_dim]
                 else:
-                    total += int(np.prod(v.shape[1:])) * v.dtype.itemsize
-            return total
+                    total += get_tensor_size_bytes(v) // v.shape[1]
+            return int(total)
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
