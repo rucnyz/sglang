@@ -159,6 +159,7 @@ def _build_xpool(n_kv_sub=(8, 2), n_mamba_sub=(40, 2), kv_act=None, mamba_act=No
     x.n_kv_subpools = n_kv_sub[0] * n_kv_sub[1]
     x.n_mamba_subpools = n_mamba_sub[0] * n_mamba_sub[1]
     x.stage0_handler = None
+    x.kv_serving_floor_tokens = 0
     return x
 
 
@@ -312,7 +313,9 @@ def test_5_token_math_matches_legacy_formula():
 
 
 def test_6_fast_path_perf_budget():
-    """Prod shape: 80 pages x 8192 tps. Legacy: ~200ms. Budget: <20ms."""
+    """Prod shape: 80 pages x 8192 tps. Relative budget (load-immune):
+    the fast path must beat the legacy expand+tensor cost by >=5x measured
+    in the same process (absolute numbers swing 40x with machine load)."""
     tps = 8192
     kv_real = _build_kv_real(tps=tps)
     mamba_real = _build_mamba_real(tps=1)
@@ -321,10 +324,21 @@ def test_6_fast_path_perf_budget():
     mamba_act = _FakeActuator(mamba_real, _CappedListAllocator(4096), 5)
     x = _build_xpool(kv_act=kv_act, mamba_act=mamba_act)
 
+    pages = list(range(100, 180))
+
+    # Legacy cost proxy: full-offered-set python expand + list->tensor
+    # (the dominant terms of the pre-fix cap_barrier).
+    legacy = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        slots = kv_real.expand_pages_to_token_slots(pages)
+        torch.tensor(slots, dtype=torch.int64)
+        legacy.append((time.perf_counter() - t0) * 1000)
+    t_legacy = min(legacy)
+
     times = []
     for seq in range(5):
-        plan = _make_plan("kv_to_mamba", list(range(100, 180)), map_dst=80,
-                          seq=seq + 1)
+        plan = _make_plan("kv_to_mamba", pages, map_dst=80, seq=seq + 1)
         t0 = time.perf_counter()
         token = x.cap_barrier(plan)
         times.append((time.perf_counter() - t0) * 1000)
@@ -332,9 +346,84 @@ def test_6_fast_path_perf_budget():
         if token.cap_t.numel():
             alloc.unmark_pages_capped(token.cap_t)
     best = min(times)
-    assert best < 20.0, f"fast path too slow: {best:.1f}ms (budget 20ms)"
-    print(f"test_6 OK  (fast path cap_barrier: {best:.2f}ms at prod shape; "
-          f"legacy was ~200-240ms)")
+    assert best < t_legacy / 5, \
+        f"fast path {best:.1f}ms not >=5x faster than legacy {t_legacy:.1f}ms"
+    print(f"test_6 OK  (fast path {best:.2f}ms vs legacy expand+tensor "
+          f"{t_legacy:.1f}ms, {t_legacy/best:.0f}x)")
+
+
+def test_7_kv_serving_floor_clamps_k2m():
+    """k2m fires must never shrink KV available below the serving floor
+    (one prefill chunk + decode headroom) — the missing invariant behind
+    the 9B dynamic OOM crash ('Available full tokens: 6408, evictable 0')."""
+    tps = 64
+    kv_real = _build_kv_real(tps=tps)
+    mamba_real = _build_mamba_real(tps=1)
+
+    class _FloorAlloc(_CappedListAllocator):
+        def __init__(self, n_slots, avail):
+            super().__init__(n_slots)
+            self._avail = avail
+
+        def available_size(self):
+            return self._avail
+
+    # KV has 1000 tokens available; floor 500 -> at most (1000-500)//64 = 7
+    # shrinkable pages regardless of what the planner offers.
+    alloc = _FloorAlloc(200_000, avail=1000)
+    kv_act = _FakeActuator(kv_real, alloc, 10**9)
+    kv_act._tokens_per_page = lambda: tps
+    mamba_act = _FakeActuator(mamba_real, _CappedListAllocator(4096), 10**9)
+    x = _build_xpool(n_kv_sub=(1, 1), n_mamba_sub=(1, 1),
+                     kv_act=kv_act, mamba_act=mamba_act)
+    x.kv_serving_floor_tokens = 500
+
+    plan = _make_plan("kv_to_mamba", list(range(10, 90)), map_dst=80)
+    token = x.cap_barrier(plan)
+    assert token.per_src == 7, f"floor clamp failed: per_src={token.per_src}"
+
+    # floor disabled (0) -> no clamp
+    alloc2 = _FloorAlloc(200_000, avail=1000)
+    kv_act2 = _FakeActuator(kv_real, alloc2, 10**9)
+    kv_act2._tokens_per_page = lambda: tps
+    x2 = _build_xpool(n_kv_sub=(1, 1), n_mamba_sub=(1, 1),
+                      kv_act=kv_act2, mamba_act=mamba_act)
+    x2.kv_serving_floor_tokens = 0
+    token2 = x2.cap_barrier(_make_plan("kv_to_mamba", list(range(10, 90)),
+                                       map_dst=80, seq=2))
+    assert token2.per_src == 80, f"floor=0 should not clamp: {token2.per_src}"
+
+    # avail already below floor -> zero-page fire (fail closed, no underflow)
+    alloc3 = _FloorAlloc(200_000, avail=400)
+    kv_act3 = _FakeActuator(kv_real, alloc3, 10**9)
+    kv_act3._tokens_per_page = lambda: tps
+    x3 = _build_xpool(n_kv_sub=(1, 1), n_mamba_sub=(1, 1),
+                      kv_act=kv_act3, mamba_act=mamba_act)
+    x3.kv_serving_floor_tokens = 500
+    token3 = x3.cap_barrier(_make_plan("kv_to_mamba", list(range(10, 90)),
+                                       map_dst=80, seq=3))
+    assert token3.per_src == 0, f"below-floor must grant 0: {token3.per_src}"
+    print("test_7 OK  (k2m serving floor: clamps to headroom, 0-disables, "
+          "fails closed below floor)")
+
+
+def test_8_floor_does_not_touch_m2k():
+    """The KV serving floor is a k2m (KV-source) guard only; m2k fires
+    (mamba source) are governed by the admission-cap floor elsewhere."""
+    tps = 64
+    kv_real = _build_kv_real(tps=tps)
+    mamba_real = _build_mamba_real(tps=1)
+    mamba_alloc = _CappedListAllocator(200_000)
+    mamba_act = _FakeActuator(mamba_real, mamba_alloc, 10**9)
+    kv_act = _FakeActuator(kv_real, _CappedListAllocator(200_000), 10**9)
+    x = _build_xpool(n_kv_sub=(1, 1), n_mamba_sub=(1, 1),
+                     kv_act=kv_act, mamba_act=mamba_act)
+    x.kv_serving_floor_tokens = 10**9  # absurd floor; must not affect m2k
+
+    plan = _make_plan("mamba_to_kv", list(range(10, 50)), map_dst=40)
+    token = x.cap_barrier(plan)
+    assert token.per_src == 40, f"m2k must ignore the kv floor: {token.per_src}"
+    print("test_8 OK  (m2k unaffected by the kv serving floor)")
 
 
 if __name__ == "__main__":
@@ -344,4 +433,6 @@ if __name__ == "__main__":
     test_4_fast_path_endstate_equals_legacy_semantics()
     test_5_token_math_matches_legacy_formula()
     test_6_fast_path_perf_budget()
+    test_7_kv_serving_floor_clamps_k2m()
+    test_8_floor_does_not_touch_m2k()
     print("\nALL TESTS PASSED")

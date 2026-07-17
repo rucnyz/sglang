@@ -98,10 +98,22 @@ class XPoolActuator:
         kv_actuator=None,
         mamba_actuator=None,
         stage0_handler=None,
+        kv_serving_floor_tokens: int = 0,
     ) -> None:
         self.kv = kv_arena
         self.mamba = mamba_arena
         self.shared = shared_pool
+        # Serving floor for k2m fires: a fire may never shrink the KV
+        # allocator's AVAILABLE tokens below this — the pool must always
+        # admit one full prefill chunk plus a decode step, else
+        # alloc_token_slots raises "Out of memory" with nothing evictable
+        # and the scheduler dies (observed: 9B dynamic t6@128, available
+        # 6408 < chunk 8192 after the Admitter's k2m drained the pool;
+        # the cap_barrier fast path made fires cheap enough to outrun
+        # request completion, unmasking the missing invariant).
+        # 0 disables (test/back-compat); the BudgetAgent wires
+        # 2*chunked_prefill_size + max_running_requests.
+        self.kv_serving_floor_tokens = int(kv_serving_floor_tokens)
         # Per-pool actuators are mandatory: cap-barrier and migrate need
         # allocator access, which only the per-pool actuator exposes.
         self.kv_actuator = kv_actuator
@@ -351,6 +363,17 @@ class XPoolActuator:
             n_src = len(self._all_subpool_names(src))
             n_dst = len(self._all_subpool_names(dst))
             target_src_total = n_src * len(plan.pages_to_unmap)
+            # k2m serving floor: never shrink the KV allocator's available
+            # tokens below the floor (one prefill chunk + decode headroom).
+            # per_src pages remove per_src * tokens-per-page allocatable
+            # slots, so cap the src-side page count accordingly.
+            if plan.direction == "kv_to_mamba" and self.kv_serving_floor_tokens:
+                tps_src = src_act._tokens_per_page()
+                avail = int(src_act.allocator.available_size())
+                shrinkable_pages = max(
+                    0, (avail - self.kv_serving_floor_tokens) // tps_src
+                )
+                target_src_total = min(target_src_total, n_src * shrinkable_pages)
             target_dst_total = n_dst * plan.pages_to_map_dst
             target_dst_total = min(
                 target_dst_total, n_dst * dst_act.grow_headroom_pages()
