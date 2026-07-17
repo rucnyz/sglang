@@ -138,13 +138,14 @@ class Admitter:
         # Admitter's feasibility and the planner's page selection agree by
         # construction. None until `BudgetAgent._wire_admitter` pushes it.
         self.owner_provider = None
-        # Async fire submission hook. BudgetAgent wires this to its
-        # `_submit_admitter_fire` (the SAME cap_barrier + shared-worker-queue
-        # path the Budgeter tick uses), so an Admitter cross-* fire does NOT
-        # run the 10-30ms cuMemUnmap/Map synchronously on the scheduler
-        # thread. None until wired (tests / pre-tick boot) -> execute_decision
-        # falls back to the legacy synchronous actuator.execute.
-        self._fire_submit = None
+        # Fire submission hook: (plan) -> (aborted, sync_result). Defaults to
+        # a synchronous inline execute; BudgetAgent overwrites it at wire-in
+        # with `_submit_admitter_fire`, the SAME cap_barrier + shared-worker
+        # path the Budgeter tick uses, so a cross-* fire does not run the
+        # 10-30ms cuMemUnmap/Map on the scheduler thread. Production always
+        # runs the async override (the Admitter only fires once wired); the
+        # sync default backs unit tests and SGLANG_HIMA_FIRE_ASYNC=0.
+        self._fire_submit = self._sync_fire
         # LCM of (n_kv_subpools, n_mamba_subpools). The actuator rounds
         # any planner-requested page count up to a multiple of this LCM
         # to keep per-sub-pool growth uniform; cost decisions must use
@@ -417,54 +418,35 @@ class Admitter:
             )
             return decision
 
-        if self._fire_submit is not None:
-            # Async path (default): cap_barrier runs inline on the scheduler
-            # thread (reserving the transfer so the request can be admitted),
-            # and the 10-30ms cuMemUnmap/Map is handed to the shared fire
-            # worker. The dst capacity materializes at the next scheduler
-            # iteration's apply_pending_fires — before the re-queued request
-            # is served by PrefillAdder, so no immediate alloc retry is
-            # needed here (the scheduler appends the req to waiting_queue
-            # after this returns; it never allocs synchronously on arrival).
-            # The worker updates the c^xfer EWMA on completion, so the cost
-            # model still warms from Admitter fires. sync_result is non-None
-            # only on the legacy synchronous fallback (async disabled).
-            aborted, sync_result = self._fire_submit(plan)
-            if aborted:
-                decision.action = "defer"
-                decision.reason = "fire aborted (submit)"
-                return decision
-            if sync_result is not None:
-                decision.fire_result = sync_result
-                if sync_result.granted_pages > 0:
-                    self.cost_model.update_xfer(
-                        total_us=float(sync_result.total_us),
-                        n_chunks=int(sync_result.granted_pages),
-                    )
-            return decision
-
-        # Legacy direct path (no BudgetAgent wired — unit tests / pre-tick
-        # boot): full synchronous execute on the calling thread.
-        result = self.actuator.execute(plan)
-        decision.fire_result = result
-        if result.aborted:
+        # Submit the fire through the wired path. Default is `_sync_fire`
+        # (execute inline, return the realized FirePlanResult); the BudgetAgent
+        # overwrites `_fire_submit` with its async cap_barrier + shared-worker
+        # submit at wire-in, which returns sync_result=None (the fire completes
+        # on the worker and warms the c^xfer EWMA there). Either way, on abort
+        # the arrival degrades to defer.
+        aborted, sync_result = self._fire_submit(plan)
+        if aborted:
             decision.action = "defer"
-            decision.reason = f"fire aborted: {result.abort_reason}"
+            decision.reason = "fire aborted"
             return decision
-
-        # Producer-side EWMA wiring: Admitter's sync fires also update
-        # `c^xfer` so the cost model warms up from Admitter-driven
-        # transfers (not just Budgeter's). Without this, the Admitter is
-        # open-loop and depends entirely on Budgeter fires to warm the
-        # EWMA — but Budgeter and Admitter can race or one can be
-        # disabled. Closed-loop wiring keeps the cost model accurate.
-        if result.granted_pages > 0:
-            self.cost_model.update_xfer(
-                total_us=float(result.total_us),
-                n_chunks=int(result.granted_pages),
-            )
-
+        if sync_result is not None:
+            decision.fire_result = sync_result
+            # Producer-side EWMA: a synchronous fire warms c^xfer here (the
+            # async path warms it on the worker instead).
+            if sync_result.granted_pages > 0:
+                self.cost_model.update_xfer(
+                    total_us=float(sync_result.total_us),
+                    n_chunks=int(sync_result.granted_pages),
+                )
         return decision
+
+    def _sync_fire(self, plan):
+        """Default fire hook: execute the plan inline and return
+        ``(aborted, result)``. The whole cuMemUnmap/Map runs on the calling
+        thread. BudgetAgent overrides this with the async submit in
+        production; this backs unit tests and SGLANG_HIMA_FIRE_ASYNC=0."""
+        result = self.actuator.execute(plan)
+        return (result.aborted, result)
 
     # ------------------------------------------------------------------
     # Scheduler hook + JSONL log
