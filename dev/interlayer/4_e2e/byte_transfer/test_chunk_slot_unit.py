@@ -42,6 +42,8 @@ class _StubArena:
         # cap admission growth at arena VA upper bound — stub must
         # match the real arena's API.
         self.max_chunks_per_pool = max_chunks
+        # KVArenaActuator.__init__ reads the arena's VA ceiling.
+        self.max_tokens = tps * max_chunks
 
 
 class _StubKVPool:
@@ -57,6 +59,15 @@ class _StubKVPool:
         pass
 
 
+class _StubMambaAllocator:
+    """MambaArenaActuator.__init__ checks for CappedFreeList wiring
+    (set_capacity) and _MambaCapAllocator reads .device."""
+    device = "cpu"
+
+    def set_capacity(self, n):
+        pass
+
+
 class _StubMambaPool:
     """Minimal MambaPool stand-in."""
     def __init__(self, size, tps):
@@ -67,6 +78,7 @@ class _StubMambaPool:
         self._capped_slots = torch.empty(0, dtype=torch.int64, device="cpu")
         # _MambaCapAllocator reads pool.free_slots.device — give a real tensor.
         self.free_slots = torch.arange(1, size + 1, dtype=torch.int64, device="cpu")
+        self._allocator = _StubMambaAllocator()
 
     def set_capacity_slots(self, n_slots):
         pass
