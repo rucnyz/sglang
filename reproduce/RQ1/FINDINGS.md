@@ -15,20 +15,32 @@ run_arm.sh sys arm exports:
 
 Base arm: --radix-eviction-policy lru, no SGLANG_HIMA.
 
-## Qwen3.5-9B (2026-07-06) — 1×H200
+## Qwen3.5-9B (2026-07-17, canonical traces) — 1×H200
 
-GPU 7, TP=1. Traces: cc_qwen_t6_v2 (1200 req / 200 prog), cc_qwen_t12 (1795 req).
-N=3 fresh boots per arm via `run_official_case123.sh`.
+TP=1, N=3 fresh-boot reps per arm. Traces: canonical corpus-built
+cc_qwen_t6 (1199 req / 195 prog) and cc_qwen_t12 (1789 req / 146 prog) —
+these REPLACE the deleted t6_v2/old-t12 traces, so the 2026-07-06 numbers
+(444.3/468.9 etc.) are not comparable and are superseded by this table.
+Build: post cap_barrier fix (7827ee453c) + k2m serving floor (48f2ce5414).
 
-| Case | trace @ conc | base tps (N=3) | sys tps (N=3) | dTPS | dTTFT mean | err |
-|------|--------------|----------------|---------------|------|------------|-----|
-| Case1 | t6_v2 @ 64  | 444.3±0.9 | 468.9±0.9 | **+5.5%** | **−46.4%** | 0 |
-| Case2 | t12   @ 64  | 282.4±7.8 | 295.3±16.3 | +4.6% | **−71.8%** | 0 |
-| Case3 | t6_v2 @ 128 | 449.9±0.6 | 475.7±1.1 | **+5.7%** | **−59.4%** | 0 |
+| Case | trace @ conc | base tps (N=3) | sys tps (N=3) | dTPS | TTFT mean | TTFT p90 | err |
+|------|-------------|----------------|---------------|------|-----------|----------|-----|
+| Case1 | t6 @ 64   | 913.4±4.9 | 1035.1±21.1 | **+13.3%** | 441→296 (**−33%**) | 1233→680 (**−45%**) | 0 |
+| Case2 | t12 @ 64  | 716.6±1.8 | 779.2±6.5 | **+8.7%** | 699→544 (**−22%**) | 1926→1545 (**−20%**) | 0 |
+| Case3 | t6 @ 128  | 348.7±1.6 | 1019.2±9.6 | **+192.3%** | 120,603→397 (**−99.7%**) | 262,108→986 (**−99.6%**) | 0 |
 
-Case2 tps std is wide due to a symmetric SW-power-cap dip (base rep2 271.4,
-sys rep3 272.3; H200 700 W throttle). Sys's clean reps [306.7, 306.9] clear
-base's [287.6, 288.3] by +6.5%.
+Case1 also improves TPOT mean 61.6→47.8 ms (−22%); Case2 80.6→69.5 ms
+(−14%); cache hit +9.8pp / +6.6pp / +20.8pp.
+
+**Case3 is the concurrency-unlock regime**: at conc 128 the mamba pool
+caps base's admissible batch, queue wait explodes (TTFT mean 120.6 s, p90
+262 s, TPOT mean 1623 ms from head-of-line stalls). HiMA's k2m donation
+admits the full offered concurrency: 348.7→1019.2 tok/s (2.9×), TTFT p99
+285.5 s→2.2 s, TPOT mean 92 ms. Requires the k2m serving floor
+(48f2ce5414): without it the now-cheap fires drain the KV pool below one
+prefill chunk and the scheduler OOMs ("Available full tokens: 6408 ...
+evictable: 0") — the pre-floor sys arm crashed in rep 2 of this exact
+cell (rep1 throttled to 229.9 tok/s by the same drain).
 
 ## Qwen3.5-35B-A3B (2026-07) — 1×H200
 
