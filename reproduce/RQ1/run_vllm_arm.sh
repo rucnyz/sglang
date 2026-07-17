@@ -18,7 +18,7 @@ TRACE=$1; STAGGER=$2; MAXCONC=$3; LIMIT=$4; OUTDIR=$5
 GPU=${GPU:-7}; PORT=${PORT:-30098}; MODEL=${MODEL:-Qwen/Qwen3.5-9B}
 GPUS=${GPUS:-$GPU}; TP=${TP:-1}
 MAXLEN=${MAXLEN:-40000}; MEMFRAC=${MEMFRAC:-0.90}; MAXSEQS=${MAXSEQS:-256}
-VP=/scratch/yuzhou/projects/vllm-env/bin
+VP=${VLLM_BIN:-/scratch/yuzhou/projects/vllm-baseline/.venv/bin}
 AR=/scratch/yuzhou/projects/agentreplay
 mkdir -p "$OUTDIR"
 
