@@ -625,11 +625,24 @@ class BudgetAgent:
             kv_actuator=self._kv_act,
             mamba_actuator=self._mamba_act,
         )
+        # k2m serving floor: one full prefill chunk + a decode step for
+        # every running request must always remain allocatable in the KV
+        # pool, or alloc_token_slots OOMs with nothing evictable and the
+        # scheduler dies (see XPoolActuator.kv_serving_floor_tokens).
+        _sa = self.scheduler.server_args
+        _kv_floor = 2 * int(_sa.chunked_prefill_size or 8192) + int(
+            getattr(self.scheduler, "max_running_requests", 0) or 0
+        )
         self._actuator = XPoolActuator(
             kv_arena=kv_arena, mamba_arena=mamba_arena,
             shared_pool=shared_pool,
             kv_actuator=self._kv_act, mamba_actuator=self._mamba_act,
             stage0_handler=self._stage0_handler,
+            kv_serving_floor_tokens=_kv_floor,
+        )
+        logger.info(
+            "XPoolActuator: kv_serving_floor_tokens=%d "
+            "(2*chunked_prefill + max_running)", _kv_floor,
         )
         model_runner = getattr(
             getattr(self.scheduler, "model_worker", None), "model_runner", None
