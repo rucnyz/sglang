@@ -53,26 +53,62 @@ CUDA_GRAPH_DECODE=full, CUDA_GRAPH_PREFILL=disabled, REASONING=none.
 Traces: corpus-built cc_nemotron_t6 (1199 req / 195 prog) and
 cc_nemotron_t12 (1789 req / 146 prog). N=3 reps per arm, same-boot.
 
-Two TP4-specific bugs fixed during this campaign:
+Three TP4-specific bugs fixed during this campaign:
 1. `CappedFreeList.free()` missing `_norm(ids, self.device)` — ids from the
    scheduler (cuda:0) contaminated the free list on ranks 1-3 → device mismatch
    crash in `count_reachable`/`unmark`.
 2. `BudgetAgent._fire_worker_loop` missing `torch.cuda.set_device(gpu_id)` — the
    worker thread defaulted bare `"cuda"` to cuda:0 regardless of rank, so `_norm`
    moved tensors to the wrong device.
+3. `cap_barrier` mark-then-clamp (commit 7827ee453c, see "Case3 root cause"
+   below) — 240 ms of scheduler-thread time per fire; the sole cause of the
+   original Case3 −8.6% regression.
 
 ### Summary
 
-| Case | trace @ conc | base tps (N=3) | sys tps (N=3) | dTPS | dTTFT p99 | err |
+| Case | trace @ conc | base tps (N=3) | sys tps (N=3) | dTPS | dTTFT p90 | err |
 |------|-------------|----------------|---------------|------|-----------|-----|
-| Case1 | t6 @ 64    | 635.2±0.6 | 671.4±1.7 | **+5.7%** | **−22%** | 0 |
-| Case2 | t12 @ 64   | 533.1±0.8 | 642.6±14.9 | **+20.5%** | **−22%** | 0 |
-| Case3 | t6 @ 128   | 638.6±1.1 | 583.5±4.6 | −8.6% | **−91%** | 0 |
+| Case1 | t6 @ 64    | 635.2±0.6 | 671.4±1.7 | **+5.7%** | **−27%** | 0 |
+| Case2 | t12 @ 64   | 533.1±0.8 | 642.6±14.9 | **+20.5%** | **−34%** | 0 |
+| Case3 | t6 @ 128   | 638.6±1.1 | 654.7±1.6 | **+2.5%** | **−96%** | 0 |
 
-Case2 is the largest throughput win across all models (+20.5%). Case3 trades 8.6%
-throughput for 95% TTFT improvement (20.5s→0.93s mean): at conc=128 the mamba pool
-binds (4830 k2m fires, 0 m2k), HiMA correctly donates KV→mamba to admit more
-requests, collapsing queue wait at the cost of higher per-token decode latency.
+Case2 is the largest throughput win across all models (+20.5%). Case3 wins on
+BOTH axes after the cap_barrier fix: +2.5% tps AND TTFT p90 46.8s→2.0s — at
+conc=128 the mamba pool binds, HiMA donates KV→mamba (k2m fires) to admit
+85→130 concurrent requests, collapsing queue wait with no throughput cost.
+
+### Case3 root cause (the original −8.6% regression, now fixed)
+
+The pre-fix sys arm measured 583.5±4.6 (−8.6%). Isolation matrix:
+
+| | rr=85 | rr=130 |
+|---|---|---|
+| no HiMA (mamba cache 416) | 679.9 | **694.9** (high concurrency is BETTER) |
+| HiMA, pre-fix | 675.9 (win) | 583.5 (−8.6%) |
+| HiMA, fixed | — | **654.7 (+2.5%)** |
+
+High concurrency was innocent. The regression was entirely per-fire overhead:
+every k2m fire's `cap_barrier` ran on the scheduler thread and expanded +
+marked the planner's FULL offered page set (n_pages=80 → 655,360 token-slot
+ids through a Python list → CUDA tensor), then clamped the grant to the dst
+headroom (~5 pages) and unmarked the ~94% surplus — measured
+`cap_barrier_us` p50 = 240 ms in the fire records of every run, winners
+included. Because each fire granted ~6% of the ask, the Admitter re-fired
+every cooldown: ~400 fires/rank/rep × 240 ms ≈ 97 s/rep of stolen scheduler
+time = the regression. Loss concentrated in concurrency-transition windows
+(fire-heavy): rr≥100 windows WITH fires cost 235 ms/pass vs 169 ms without.
+
+Fix (7827ee453c): free-only plans clamp BEFORE expand/mark (pure int math)
+and mark only the kept pages, with vectorized expansion. Post-fix fire
+records: cap_barrier_us p50 = 46 µs (5200×), total fire time 1299 s → 13 s
+per 3-rep run. Unit tests:
+dev/interlayer/4_e2e/byte_transfer/test_cap_barrier_fast_path.py (end-state
+equivalence vs legacy semantics on a real CappedFreeList + token-math
+corners + perf budget).
+
+Side observation: base with MAMBA_CAP=416 (vs 256) reaches 679.9–694.9
+(hit 0.62→0.65) — the larger mamba state cache alone is worth ~6%; worth
+considering as the default for this model.
 
 ### Case1: cc_nemotron_t6 @ conc 64 (KV-bound, main-table cell)
 
@@ -103,18 +139,20 @@ Per-rep tps: base [635.4, 634.5, 635.6], sys [672.2, 672.5, 669.4].
 
 Per-rep tps: base [532.3, 533.1, 533.9], sys [632.6, 635.6, 659.7].
 
-### Case3: cc_nemotron_t6 @ conc 128 (mamba-bound, QoE trade)
+### Case3: cc_nemotron_t6 @ conc 128 (mamba-bound; post cap_barrier fix)
 
 | Metric | base (N=3) | sys (N=3) | delta |
 |--------|-----------|-----------|-------|
-| throughput_tok_s | 638.6±1.1 | 583.5±4.6 | −8.6% |
-| cache_hit | 0.6235 | 0.6989 | +7.5pp |
-| TTFT mean (ms) | 20475 | 934 | **−95.4%** |
-| TTFT p90 (ms) | 46768 | 2288 | **−95.1%** |
-| TTFT p99 (ms) | 58392 | 5455 | **−90.7%** |
-| TPOT p50 (ms) | 226.6 | 295.5 | +30.4% |
+| throughput_tok_s | 638.6±1.1 | 654.7±1.6 | **+2.5%** |
+| cache_hit | 0.6235 | 0.7029 | +7.9pp |
+| TTFT mean (ms) | 20475 | 813 | **−96.0%** |
+| TTFT p90 (ms) | 46768 | 2007 | **−95.7%** |
+| TPOT p50 (ms) | 226.6 | 223.7 | −1.3% |
 | n_error | 0 | 0 | |
 
-Per-rep tps: base [639.3, 637.3, 639.2], sys [588.3, 583.0, 579.2].
-Mamba-bound regime: 4830 k2m fires / 0 m2k. HiMA donates KV→mamba to increase
-max_running, collapsing the 20s+ queue wait into sub-second TTFT.
+Per-rep tps: base [639.3, 637.3, 639.2], sys [652.9, 655.8, 655.4].
+Mamba-bound regime: ~4600 k2m fires / 0 m2k. HiMA donates KV→mamba to raise
+max_running 85→130, collapsing the 20s+ queue wait into sub-second TTFT at
+no throughput cost. (Sys reps ran on GPUs 1,3,5,7 vs base on 3,4,5,7; the
+pre-fix rerun on 1,3,5,7 measured 592.9 vs the 3,4,5,7 campaign's 580.6, so
+the GPU-set effect is ~2%, well below the +12% fix recovery.)
