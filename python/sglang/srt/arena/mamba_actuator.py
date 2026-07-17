@@ -172,6 +172,27 @@ class MambaArenaActuator:
             out.extend(range(p * tps, (p + 1) * tps))
         return out
 
+    def expand_pages_to_token_slots_tensor(self, page_ids, device) -> torch.Tensor:
+        """Vectorized `expand_pages_to_token_slots` (see KVArenaActuator
+        counterpart): same contract, returns an int64 tensor on `device`.
+        One tensor op instead of an O(pages*tps) Python list."""
+        tps = self._tokens_per_page()
+        pages = torch.as_tensor([int(p) for p in page_ids], dtype=torch.int64)
+        if pages.numel() == 0:
+            return torch.empty(0, dtype=torch.int64, device=device)
+        if bool((pages == 0).any()):
+            raise ValueError(
+                "expand_pages_to_token_slots_tensor: page 0 carries "
+                "padded slot 0 (see design.md §\"Per-unit sizes\"); "
+                "unmapping chunk 0 corrupts the padded-output "
+                "target. With mamba tps=1, this also silently "
+                "dropped chunk 0 entirely."
+            )
+        slots = (
+            pages.unsqueeze(1) * tps + torch.arange(tps, dtype=torch.int64)
+        ).flatten()
+        return slots.to(device)
+
     def page_is_fully_free(self, page_id: int, free_token_set: set) -> bool:
         if page_id == 0:
             return False  # chunk 0 carries padded slot 0; never unmap it.

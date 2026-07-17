@@ -334,9 +334,57 @@ class XPoolActuator:
         # reentrant) `_alloc_lock`, so a caller-held lock would self-deadlock.
         # Per-op locks on each mark/unmark/free mutation are the actual
         # mechanism; scheduler-single-threadedness is the rest.
+        alloc = src_act.allocator
+
+        # ---- FAST PATH: free-only plan (no drains, no migrations) ----
+        # Clamp the grant BEFORE expanding/marking. The planner routinely
+        # offers far more pages than the dst headroom admits (observed: 80
+        # offered, ~5 granted on Nemotron-3 case3); the legacy path expanded
+        # and marked ALL offered pages (~655K token-slot ids through a
+        # Python list -> CUDA tensor, ~200+ ms of SCHEDULER-THREAD time per
+        # fire) and then unmarked the ~94% surplus. Pure integer clamping
+        # first + vectorized expansion of only the kept pages brings the
+        # cap-barrier to <1 ms. Drain/migration plans keep the legacy
+        # mark-all-then-restore path below (Stage-0 pre-conditioning is
+        # entangled with the full offered set).
+        if not plan.drains and not plan.migrations:
+            n_src = len(self._all_subpool_names(src))
+            n_dst = len(self._all_subpool_names(dst))
+            target_src_total = n_src * len(plan.pages_to_unmap)
+            target_dst_total = n_dst * plan.pages_to_map_dst
+            target_dst_total = min(
+                target_dst_total, n_dst * dst_act.grow_headroom_pages()
+            )
+            target_total = min(target_src_total, target_dst_total)
+            lcm_n = self.lcm_pages
+            total = (target_total // lcm_n) * lcm_n
+            per_src = total // n_src if n_src else 0
+            unmapped_total = per_src * n_src
+            kept_cap_t = src_act.expand_pages_to_token_slots_tensor(
+                plan.pages_to_unmap[:per_src], alloc.device
+            )
+            moved_to_capped = alloc.mark_pages_capped(kept_cap_t)
+            _p5 = time.monotonic_ns()
+            cap_barrier_us = (_p5 - cap_t0) // 1000
+            logger.debug(
+                "cap_barrier[seq=%d] fast-path: offered=%d kept=%d pages "
+                "slots=%d marked=%d in %d us",
+                plan.plan_seq, len(plan.pages_to_unmap), per_src,
+                kept_cap_t.numel(), moved_to_capped, cap_barrier_us,
+            )
+            return FireToken(
+                plan=plan, src=src, dst=dst,
+                src_act=src_act, dst_act=dst_act,
+                cap_t=kept_cap_t, cap_slots_count=int(kept_cap_t.numel()),
+                cap_barrier_us=cap_barrier_us,
+                t_start_ns=t_start,
+                unmapped_total=unmapped_total,
+                per_src=per_src,
+                granted_in_barrier=None,
+            )
+
         if plan.drains or plan.migrations:
             self._run_stage0(plan, src_act)
-        alloc = src_act.allocator
         _p1 = time.monotonic_ns()
         cap_slots = src_act.expand_pages_to_token_slots(plan.pages_to_unmap)
         _p2 = time.monotonic_ns()
