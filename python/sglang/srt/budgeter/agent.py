@@ -588,10 +588,7 @@ class BudgetAgent:
         # against this Admitter fire and cannot immediately fire the reverse
         # direction (k2m<->m2k oscillation).
         if self._planner is not None:
-            try:
-                self._planner._last_fire_clock = time.time()
-            except Exception:
-                pass
+            self._planner._last_fire_clock = time.time()
         return (False, None)
 
     def _log_chain_unavailable(self, snapshot: dict, reason: str) -> None:
