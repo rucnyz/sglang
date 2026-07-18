@@ -109,6 +109,135 @@ class TestPaybackConvergence:
         assert fired_late == 0, "should NOT fire well after eviction stops (EWMA decayed)"
 
 
+class TestConvergenceBackoff:
+    """When fires do NOT reduce the harm they target — harm is not capacity-
+    elastic because the working set exceeds total memory (the 35B-swarm case) —
+    the planner must back off instead of firing every tick forever for zero
+    gain. When fires DO reduce harm (elastic), it keeps firing until converged.
+    """
+
+    def _run(self, evict_feed, ticks=200, cooldown=1.0, fire_cost=1000.0):
+        p = PaybackPlanner(config=PaybackConfig(cooldown_s=cooldown), fire_cost_us=fire_cost)
+        fires = []
+        state = {"fired": False}
+        for t in range(ticks):
+            m_evict = evict_feed(t, state)
+            d = p.decide(_snap(kv_evict=0, m_evict=m_evict), clock_s=float(t), dt=1.0)
+            state["fired"] = bool(d.direction)
+            if d.direction:
+                fires.append(t)
+        return fires
+
+    def test_unresponsive_harm_backs_off(self):
+        # Harm stays high forever regardless of fires (inelastic working set).
+        # Without backoff this fires ~once/cooldown = ~200×. Backoff caps the
+        # cadence at cooldown * 2**cap = 16s, so far fewer fires over 200 ticks.
+        fires = self._run(lambda t, s: 8000.0)
+        assert 0 < len(fires) < 40, f"backoff should throttle inelastic harm: {len(fires)} fires"
+        gaps = [fires[i + 1] - fires[i] for i in range(len(fires) - 1)]
+        assert gaps and max(gaps) >= 8, f"backoff should widen the cooldown: gaps={gaps}"
+
+    def test_responsive_harm_keeps_firing(self):
+        # Elastic: each fire drops the harm (pool grew, eviction fell). The
+        # planner should keep firing at the base cooldown until harm decays
+        # below the fire threshold (converged) — no premature backoff.
+        def feed(t, s):
+            h = s.get("h", 40000.0)
+            if s.get("fired"):
+                h *= 0.4
+            s["h"] = h
+            return h
+        fires = self._run(feed, ticks=80)
+        assert len(fires) >= 5, f"elastic harm should keep firing: {len(fires)}"
+        early_gaps = [fires[i + 1] - fires[i] for i in range(min(3, len(fires) - 1))]
+        assert all(g <= 2 for g in early_gaps), f"effective fires stay at base cooldown: {early_gaps}"
+
+    def test_backoff_beats_no_backoff_on_inelastic(self):
+        # Direct contrast: the backoff arm must fire strictly fewer times than a
+        # backoff-disabled arm (converge_backoff_cap=0 -> 2**0=1, no widening)
+        # on the same inelastic feed.
+        def run(cap):
+            p = PaybackPlanner(config=PaybackConfig(cooldown_s=1.0, converge_backoff_cap=cap),
+                               fire_cost_us=1000.0)
+            return sum(
+                1 for t in range(200)
+                if p.decide(_snap(m_evict=8000.0), clock_s=float(t), dt=1.0).direction
+            )
+        assert run(4) < run(0), "backoff must throttle vs no-backoff on inelastic harm"
+
+    def test_effective_fire_resets_backoff(self):
+        # Back off on inelastic harm, then make it elastic: a fire that drops
+        # harm must reset the streak so firing resumes at the base cadence.
+        p = PaybackPlanner(config=PaybackConfig(cooldown_s=1.0), fire_cost_us=1000.0)
+        # Phase 1: inelastic -> backoff engages.
+        for t in range(60):
+            p.decide(_snap(m_evict=8000.0), clock_s=float(t), dt=1.0)
+        assert p._dir_ineffective.get("kv_to_mamba", 0) > 0, "should have accumulated ineffective streak"
+        # Phase 2: harm drops sharply (elastic) -> next fire is effective -> reset.
+        p.decide(_snap(m_evict=100.0), clock_s=200.0, dt=1.0)
+        d = p.decide(_snap(m_evict=8000.0), clock_s=201.0, dt=1.0)
+        # after a reset the direction can fire again promptly
+        assert p._dir_ineffective.get("kv_to_mamba", 0) == 0 or d.direction is not None
+
+
+class TestActiveUsageGuard:
+    """Never grow a pool by shrinking one with strictly higher active usage.
+    r_evict is a cache-reuse signal blind to live-work displacement; on 35B swarm
+    the smaller mamba pool sheds more re-prefill cost (tombstoning the hot
+    shared-prefix trunk) yet KV carries more live work — growing mamba there
+    steals from the bottleneck. The guard blocks exactly that."""
+
+    def _snap_active(self, kv_evict=0, m_evict=0, kv_active=0.0, m_active=0.0):
+        return {
+            "kv_evicted_lpb_loss_recent": float(kv_evict),
+            "mamba_evicted_lpb_loss_recent": float(m_evict),
+            "usage_kv_active": float(kv_active),
+            "usage_mamba_active": float(m_active),
+        }
+
+    def test_blocks_growing_less_active_pool(self):
+        # mamba sheds more loss (would fire k2m) but KV is the more live-active
+        # pool -> guard blocks k2m (the 35B-swarm pathology).
+        p = PaybackPlanner(config=PaybackConfig(cooldown_s=1.0), fire_cost_us=100.0)
+        fired = [
+            p.decide(self._snap_active(m_evict=5000, kv_active=0.56, m_active=0.50),
+                     clock_s=float(t), dt=1.0).direction
+            for t in range(50)
+        ]
+        assert not any(fired), f"guard must block k2m when KV is more active: {[d for d in fired if d]}"
+
+    def test_allows_growing_more_active_pool(self):
+        # mamba sheds more loss AND mamba is the more-active pool -> k2m allowed.
+        p = PaybackPlanner(config=PaybackConfig(cooldown_s=1.0), fire_cost_us=100.0)
+        fired = [
+            t for t in range(50)
+            if p.decide(self._snap_active(m_evict=5000, kv_active=0.40, m_active=0.60),
+                        clock_s=float(t), dt=1.0).direction == "kv_to_mamba"
+        ]
+        assert fired, "guard must allow k2m when mamba is the more-active pool"
+
+    def test_allows_m2k_toward_more_active_kv(self):
+        # KV sheds more loss AND KV is more active -> m2k (grow KV) allowed (9B).
+        p = PaybackPlanner(config=PaybackConfig(cooldown_s=1.0), fire_cost_us=100.0)
+        fired = [
+            t for t in range(50)
+            if p.decide(self._snap_active(kv_evict=5000, kv_active=0.56, m_active=0.50),
+                        clock_s=float(t), dt=1.0).direction == "mamba_to_kv"
+        ]
+        assert fired, "guard must allow m2k (grow the more-active KV pool)"
+
+    def test_ablation_guard_off_restores_pathology(self):
+        # with the guard disabled, k2m fires even when KV is more active.
+        p = PaybackPlanner(config=PaybackConfig(cooldown_s=1.0, active_usage_guard=False),
+                           fire_cost_us=100.0)
+        fired = [
+            t for t in range(50)
+            if p.decide(self._snap_active(m_evict=5000, kv_active=0.56, m_active=0.50),
+                        clock_s=float(t), dt=1.0).direction
+        ]
+        assert fired, "guard OFF must restore the unguarded k2m pathology"
+
+
 class TestPaybackMargin:
     """payback_margin scales the fire threshold: fire iff payback > cost x margin."""
 
