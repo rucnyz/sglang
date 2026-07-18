@@ -27,20 +27,39 @@ Build: post cap_barrier fix (7827ee453c) + k2m serving floor (48f2ce5414).
 |------|-------------|----------------|---------------|------|-----------|----------|-----|
 | Case1 | t6 @ 64   | 913.4±4.9 | 1035.1±21.1 | **+13.3%** | 441→296 (**−33%**) | 1233→680 (**−45%**) | 0 |
 | Case2 | t12 @ 64  | 716.6±1.8 | 779.2±6.5 | **+8.7%** | 699→544 (**−22%**) | 1926→1545 (**−20%**) | 0 |
-| Case3 | t6 @ 128  | 348.7±1.6 | 1019.2±9.6 | **+192.3%** | 120,603→397 (**−99.7%**) | 262,108→986 (**−99.6%**) | 0 |
+| Case3 | t6 @ 128  | ~~348.7±1.6~~ **970** | ~~1019.2~~ **1071±7.5** | ~~+192.3%~~ **+8.7%** | 14.0s→2.4s (**−83%**) | — | 0 |
 
 Case1 also improves TPOT mean 61.6→47.8 ms (−22%); Case2 80.6→69.5 ms
 (−14%); cache hit +9.8pp / +6.6pp / +20.8pp.
 
-**Case3 is the concurrency-unlock regime**: at conc 128 the mamba pool
-caps base's admissible batch, queue wait explodes (TTFT mean 120.6 s, p90
-262 s, TPOT mean 1623 ms from head-of-line stalls). HiMA's k2m donation
-admits the full offered concurrency: 348.7→1019.2 tok/s (2.9×), TTFT p99
-285.5 s→2.2 s, TPOT mean 92 ms. Requires the k2m serving floor
-(48f2ce5414): without it the now-cheap fires drain the KV pool below one
-prefill chunk and the scheduler OOMs ("Available full tokens: 6408 ...
-evictable: 0") — the pre-floor sys arm crashed in rep 2 of this exact
-cell (rep1 throttled to 229.9 tok/s by the same drain).
+**⚠️ Case3 CORRECTED (2026-07-18): the original 2.9× was a starved-base
+measurement artifact.** The original `base` run (348.7 tok/s, P99 285 s) booted
+with a **5× smaller pool than every other arm** — 202 mamba slots / 354 K KV
+tokens vs 977 / 1.71 M on `full` and all ablations — because a co-tenant occupied
+its GPU at run time (`available_gpu_mem` 4.88 GB vs 20.87 GB; same
+`mem_fraction_static=0.8387`). At conc 128 that starved KV pool thrashes, hence the
+285 s tail. It is the *only* 202-slot run in the whole corpus (audited
+`qwen9b_rq2`, `qwen35b_rq2`, `nemo_120b`; all other cells are pool-matched).
+
+The correct **full-pool** comparison (6 reps across `qwen9b_shift_inv` +
+`rq2_refresh/shifting`, all 849–1005 mamba slots):
+
+| arm (full pool) | tps | P99 TTFT |
+|---|---|---|
+| default (ratio 0.9) | 970 | 14.0 s |
+| static-best (ratio 0.7) | 1069 | 3.6 s |
+| **HiMA full** | 1045–1071 | **2.4 s** |
+
+So on t6@128 HiMA **matches the best hand-tuned static split's throughput** (1069,
+which needs oracle knowledge of the 0.7 ratio) at the **lowest P99** (2.4 s):
+**+8.7 % TPS, −83 % P99 over default, no oracle needed** — not 2.9×. t6@128 is
+static-optimal (one fixed ratio wins throughout; no mid-run binding shift), so the
+Budgeter can only *match* static-best here; a genuine mid-run shift is a separate,
+still-to-build showcase.
+
+The k2m serving floor (48f2ce5414) is still required and real: without it the
+now-cheap fires drain the KV pool below one prefill chunk and the scheduler OOMs
+("Available full tokens: 6408 ... evictable: 0").
 
 ## Qwen3.5-35B-A3B (2026-07) — 1×H200
 
