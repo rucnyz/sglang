@@ -141,7 +141,7 @@ CUDA_VISIBLE_DEVICES=$GPUS HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 SVPID=$!
 
 ready=0
-for i in $(seq 1 200); do
+for i in $(seq 1 ${BOOT_TRIES:-200}); do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)
   if [ "$code" = "200" ]; then ready=1; echo "[$ARM] ready after ~$((i*5))s"; break; fi
   if ! kill -0 $SVPID 2>/dev/null; then echo "[$ARM] SERVER DIED"; tail -25 "$OUTDIR/server_${ARM}.log"; exit 1; fi

@@ -61,6 +61,21 @@ The k2m serving floor (48f2ce5414) is still required and real: without it the
 now-cheap fires drain the KV pool below one prefill chunk and the scheduler OOMs
 ("Available full tokens: 6408 ... evictable: 0").
 
+## Main-table fill (2026-07-19)
+
+- **9B swarm static-best**: RATIO sweep 0.8/0.9/0.95 (swarm is recurrent-bound,
+  so the high end), best = 0.8 at 736.7 tok/s (P50 255, P99 3449, err 0). The
+  main-table ordering HiMA 779.2 > static-best 736.7 > default 716.6 holds.
+  vLLM swarm 337.9 (n_err 22, MAXLEN 262144) is not in the table (the vLLM
+  column is long-horizon only).
+- **120B boot fix**: the old NEMO_ENV `REASONING=none` is now an INVALID
+  `--reasoning-parser` choice on the HiMA-branch sglang (valid: auto, qwen3,
+  ...) — argparse exits before writing any log, which masqueraded as a
+  16.7-min "BOOT TIMEOUT" (server_*.log 0 bytes). Fix: drop `REASONING=none`
+  (run_arm.sh defaults to qwen3, which only affects output parsing, not
+  throughput/TTFT). Added `BOOT_TRIES` env to run_arm.sh's boot loop for slow
+  cold TP4 boots (231 GB weight load exceeds the default 200×5s = 16.7 min).
+
 ## Qwen3.5-35B-A3B (2026-07) — 1×H200
 
 GPU 7, TP=1, MEMFRAC=0.85. Calibrated 35B csigma (`calibrate.sh`).

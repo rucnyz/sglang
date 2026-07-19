@@ -12,12 +12,16 @@
 # Usage:
 #   run_vllm_arm.sh <trace> <stagger> <maxconc> <limit|-> <outdir>
 # Env: GPU (default 7), PORT (default 30098), MODEL (default Qwen/Qwen3.5-9B),
-#      MAXLEN (default 40000), MEMFRAC (default 0.90), MAXSEQS (default 256).
+#      MAXLEN (default 262144 = Qwen3.5-9B native max ctx, matches SGLang's
+#      context_len; 40000 silently rejected ~14% of long-horizon requests),
+#      MEMFRAC (default 0.90), MAXSEQS (default 256),
+#      MAXBATCH (chunked-prefill batch, default 8192 = SGLang chunked_prefill_size).
 set -u
 TRACE=$1; STAGGER=$2; MAXCONC=$3; LIMIT=$4; OUTDIR=$5
 GPU=${GPU:-7}; PORT=${PORT:-30098}; MODEL=${MODEL:-Qwen/Qwen3.5-9B}
 GPUS=${GPUS:-$GPU}; TP=${TP:-1}
-MAXLEN=${MAXLEN:-40000}; MEMFRAC=${MEMFRAC:-0.90}; MAXSEQS=${MAXSEQS:-256}
+MAXLEN=${MAXLEN:-262144}; MEMFRAC=${MEMFRAC:-0.90}; MAXSEQS=${MAXSEQS:-256}
+MAXBATCH=${MAXBATCH:-8192}
 VP=${VLLM_BIN:-/scratch/yuzhou/projects/vllm-baseline/.venv/bin}
 AR=/scratch/yuzhou/projects/agentreplay
 mkdir -p "$OUTDIR"
@@ -37,7 +41,8 @@ TPARG=""; [ "$TP" -gt 1 ] 2>/dev/null && TPARG="--tensor-parallel-size $TP"
 CUDA_VISIBLE_DEVICES=$GPUS HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   $VP/vllm serve "$MODEL" --served-model-name "$MODEL" \
   --host 127.0.0.1 --port $PORT --max-num-seqs $MAXSEQS $TPARG \
-  --max-model-len $MAXLEN --gpu-memory-utilization $MEMFRAC \
+  --max-model-len $MAXLEN --max-num-batched-tokens $MAXBATCH \
+  --gpu-memory-utilization $MEMFRAC --enable-prefix-caching \
   --trust-remote-code > "$OUTDIR/server_vllm.log" 2>&1 &
 SVPID=$!
 
