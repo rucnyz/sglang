@@ -140,3 +140,17 @@ Later-commit resolutions:
   acceptance = NO NEW failures vs the old tree (old tree already has stale
   tests, e.g. test_scheduler_hook 16F/9P on both — pre-existing contract drift
   from the no-backlog/fast-path Admitter evolution).
+
+## Validation environment log (2026-07-30)
+- Dedicated venv at .venv (torch 2.11.0+cu130, sglang-kernel 0.4.5,
+  flashinfer 0.6.15.post1) — the shared /scratch venv stays on the old stack.
+- Smoke attempts: GPU2 boot stalled at torch dlopen (driver init lock,
+  post-pytest-suite unwind); GPU6 boot printed server_args then stalled in
+  launcher CUDA init (R-state, 0 CPU ticks, single thread = driver stall, NOT
+  a code deadlock). Two unkillable processes left: 2096184 (GPU2),
+  2363179 (GPU6). Playbook: quiet mode; self-arming lane waits for driver
+  reap + stable heavy probes, then reruns smoke on GPU6.
+- Deprecation noticed at boot: --mamba-scheduler-strategy ->
+  --mamba-radix-cache-strategy (update reproduce scripts post-smoke).
+- Box has pending reboot debt (GPU5 leak since July) — a reboot would clear
+  all three issues at once; needs user coordination (GPU3 tenant).
