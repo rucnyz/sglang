@@ -14,7 +14,7 @@ PORT=${PORT:-30097}; GPU=${GPU:-7}; MODEL=${MODEL:-Qwen/Qwen3.5-9B}
 # Multi-GPU: GPUS is the CUDA_VISIBLE_DEVICES list (default = single $GPU); TP is
 # tensor-parallel size (default 1). For a big model, e.g. GPUS=0,1,2,3 TP=4.
 GPUS=${GPUS:-$GPU}; TP=${TP:-1}; GPU0=${GPUS%%,*}
-VENV=/scratch/yuzhou/projects/sglang/.venv/bin/python
+VENV=${VENV:-/scratch/yuzhou/projects/sglang/.venv/bin/python}
 AR=/scratch/yuzhou/projects/agentreplay
 mkdir -p "$OUTDIR"
 
