@@ -114,3 +114,29 @@ UnifiedMambaTokenToKVPoolAllocator path vs our arena (double-virtualization).
   OR'd into 4 enable_kv_cache_copy gates, (4) T2 placement-bias need_sort,
   (5) arena dynamic-cap max_size for TokenToKVPoolAllocator (page_size==1 site,
   uses sizes.max_total_num_tokens + token_to_kv_pool local).
+
+## Rebase COMPLETE (31 commits on b78d3999b5; c^evict-cache pair skipped as net-zero)
+Later-commit resolutions:
+- 959461d2e8: common.py took upstream (file gutted upstream); factor logic in
+  allocation.py unified onto HybridReqToTokenPool.mamba_slots_per_req (#338).
+- 9e3c4fdddf: schedule_policy took HEAD — OUR #339-343 machinery was UPSTREAMED
+  verbatim (rem_mamba_slots/_mamba_slots_needed) and evolved (mamba_gap_reserve);
+  mamba_radix kept our LPB-loss cumulative fields + wide assert.
+- 0c8ea1ccae: bench_one_batch is a deprecation shim now; SSU-init ported to
+  python/sglang/benchmark/one_batch.py (import from
+  sglang.kernels.ops.mamba.triton_ops.ssu_dispatch) between alloc_memory_pool
+  and init_attention_backends.
+- f130df4627 + cde49a0541: SKIPPED as an exact net-zero pair (verified).
+- e99973a403: LPBStrategy import added alongside upstream's new imports.
+
+## Static checks
+- py_compile over every HiMA-touched python file: PASS.
+- Core imports from worktree (PYTHONPATH override over the scratch venv):
+  server_args, memory_pool, kv_cache_configurator, allocation, radix caches,
+  budgeter agent/admitter, arena: PASS.
+
+## Test methodology (in progress)
+- dev/interlayer suite run on BOTH trees (rebase@GPU2, old-with-WIP@GPU4);
+  acceptance = NO NEW failures vs the old tree (old tree already has stale
+  tests, e.g. test_scheduler_hook 16F/9P on both — pre-existing contract drift
+  from the no-backlog/fast-path Admitter evolution).
