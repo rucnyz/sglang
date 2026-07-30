@@ -1565,24 +1565,19 @@ class MambaPool:
                     f"overlap={sorted(overlap)}"
                 )
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
         else:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
                     :, src_indices
                 ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
-        if isinstance(self.mamba_cache.temporal, list):
-            for t in self.mamba_cache.temporal:
+        # Temporal: the HiMA arena backs it as a per-layer LIST (slot on dim 0);
+        # the stacked pool keeps one tensor (slot on dim 1).
+        temporal = self.mamba_cache.temporal
+        if isinstance(temporal, list):
+            for t in temporal:
                 t[dst_indices] = t[src_indices]
-        else:
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
+        elif temporal.numel() > 0:
+            temporal[:, dst_indices] = temporal[:, src_indices]
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
         # ReplaySSM spec-verify ring: a copied checkpoint has no pending ring
