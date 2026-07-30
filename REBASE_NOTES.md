@@ -154,3 +154,27 @@ Later-commit resolutions:
   --mamba-radix-cache-strategy (update reproduce scripts post-smoke).
 - Box has pending reboot debt (GPU5 leak since July) — a reboot would clear
   all three issues at once; needs user coordination (GPU3 tenant).
+
+## VALIDATION COMPLETE (2026-07-30)
+Three merge-seam bugs were flushed out by testing and fixed:
+1. model_runner.py lost `import os` in the init_cuda_graphs splice (NameError
+   at the arena-TLB warmup gate).
+2. Upstream moved hybrid-SSM tree-cache default to UnifiedRadixCache;
+   registry.py now selects MambaRadixCache when SGLANG_HIMA=1 (HiMA's arena
+   lives on that path).
+3. copy_from kept upstream's stacked-only temporal branches ahead of the
+   list-aware block -> AttributeError on the deferred mamba COW path with the
+   per-layer arena. Unified into one list/stacked path.
+
+Final A/B (t6 first 150 programs @64, GPU6, 1 rep each, dedicated venv):
+  base 552.3 tok/s  P50 52  P99 905  err 0  len_match 1.0  cache 0.924
+  sys  554.6 tok/s  P50 53  P99 617  err 0  len_match 1.0  cache 0.924
+- Token-exact forcing intact (len_match 1.0); HiMA direction reproduces
+  (tput parity, P99 -32%); budgeter.jsonl 115 ticks.
+Smoke: both arms healthy ~55-60s, generate correct, all three arenas up on the
+shared handle pool.
+Ops notes: first boot on torch 2.11 JIT-compiles ~73 min with the full RQ1
+graph set (warm after); kill -9 on booting CUDA procs still poisons the driver
+(use graceful SIGTERM teardown + quiet gates); run_arm VENV is now
+env-overridable; --mamba-scheduler-strategy is deprecated upstream (alias
+still works).
