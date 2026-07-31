@@ -1,8 +1,20 @@
-"""Base allocator class for the token-to-KV pool allocators.
+"""
+Copyright 2025 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
 Carries HiMA's additions to the base class on top of upstream: _capped_pages,
-_capped_lo, _set_capped_pages, live_size, _kv_grow_hook, _alloc_lock (all
-needed for cross-pool cap management by the arena).
+live_size, _kv_grow_hook, _alloc_lock (all needed for cross-pool cap
+management by the arena).
 """
 
 from __future__ import annotations
@@ -15,12 +27,6 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
-
-# Sentinel for `_capped_lo` when `_capped_pages` is empty: a value no page-id
-# can reach. A fixed constant (not `size + 1`) so `__init__` need not read
-# `self.size` — subclasses (SWA) expose `size` as a property whose backing is
-# set only after `super().__init__()` returns.
-_CAPPED_LO_EMPTY = 1 << 62
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
@@ -70,13 +76,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.free_group = []
         # Held-out pages, always present so readers need no fallback. Empty
         # for the lifetime of a non-arena pool (no cross-fire cap). `live_size`
-        # is `self.size - self._capped_pages.numel()`. `_capped_lo` mirrors
-        # `min(_capped_pages)` as a plain Python int. `_set_capped_pages` is the
-        # SINGLE writer and keeps `_capped_lo` in lockstep; empty → sentinel
-        # `_CAPPED_LO_EMPTY`. Must not read `self.size` here — SWA's `size`
-        # property backing isn't set until after `super().__init__()`.
-        self._set_capped_pages(torch.empty(0, dtype=torch.int64, device=device))
-        self._cap = size  # live admission cap (≤ max_size)
+        # is `self.size - self._capped_pages.numel()`.
+        self._capped_pages = torch.empty(0, dtype=torch.int64, device=device)
         # Protects free_pages / release_pages / _capped_pages against
         # concurrent mutation; held by alloc()/free() and inherited by every
         # subclass. Acquire is ~100 ns, negligible against alloc's per-call cost.
@@ -104,15 +105,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """
         return self.size - int(self._capped_pages.numel())
 
-    def _set_capped_pages(self, capped: torch.Tensor) -> None:
-        """Single writer of `_capped_pages`, keeping `_capped_lo` (the min
-        capped page-id, as a plain Python int) in lockstep. Empty → sentinel
-        `_CAPPED_LO_EMPTY`. On these non-arena pools it is called once at boot
-        with an empty tensor and the capped set stays empty for the pool's life.
-        """
-        self._capped_pages = capped
-        self._capped_lo = int(capped.min()) if capped.numel() > 0 else _CAPPED_LO_EMPTY
-
     def free_group_begin(self):
         self.is_not_in_free_group = False
         self.free_group = []
@@ -124,18 +116,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
     def merge_and_sort_free(self):
         with self._alloc_lock:
-            self._merge_and_sort_free_unlocked()
-
-    def _merge_and_sort_free_unlocked(self):
-        """Internal: caller must hold _alloc_lock. Used by alloc() which
-        already acquired the lock — Python's threading.Lock is non-
-        reentrant, so we can't recurse into the public method."""
-        if len(self.release_pages) > 0:
-            self.free_pages = torch.cat((self.free_pages, self.release_pages))
-            self.free_pages, _ = torch.sort(self.free_pages)
-            self.release_pages = torch.empty(
-                (0,), dtype=self.release_pages.dtype, device=self.device
-            )
+            if len(self.release_pages) > 0:
+                self.free_pages = torch.cat((self.free_pages, self.release_pages))
+                self.free_pages, _ = torch.sort(self.free_pages)
+                self.release_pages = torch.empty(
+                    (0,), dtype=self.release_pages.dtype, device=self.device
+                )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented

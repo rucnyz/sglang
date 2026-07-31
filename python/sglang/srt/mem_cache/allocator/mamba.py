@@ -1,4 +1,18 @@
-"""CappedFreeList-based slot allocator for the Mamba state pool.
+"""
+Copyright 2026 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+CappedFreeList-based slot allocator for the Mamba state pool.
 
 Mirrors ``TokenToKVPoolAllocator`` on the KV side: the CappedFreeList is the
 SINGLE source of truth for which slots are free, capped (cross-pool reserved),
@@ -15,7 +29,7 @@ from typing import Iterator, Optional
 
 import torch
 
-from sglang.srt.mem_cache.capped_free_list import _NO_TAIL, CappedFreeList
+from sglang.srt.mem_cache.capped_free_list import CappedFreeList
 
 
 class MambaSlotAllocator:
@@ -40,6 +54,10 @@ class MambaSlotAllocator:
         self.device = device
         self._fl = CappedFreeList(ceiling, device, need_sort=False, boot_cap=size)
         self._alloc_lock = threading.Lock()
+        # Active preallocated batch for `alloc_group_begin` / `alloc_group_end`.
+        # When non-None, `alloc(1)` consumes the next slot from this iterator
+        # instead of calling `_do_alloc(1)` per request. Reset to None outside
+        # a group window so `alloc` falls through to the per-call path.
         self._alloc_iter: Optional[Iterator] = None
         self.clear()
 
@@ -67,6 +85,7 @@ class MambaSlotAllocator:
         return self.available_size()
 
     def alloc_group_begin(self, num_reqs: int):
+        """Pre-allocate a batch of slots for match_prefix to amortize overhead."""
         self._alloc_iter = None
         if num_reqs > 0:
             result = self._do_alloc(num_reqs)
@@ -74,6 +93,7 @@ class MambaSlotAllocator:
                 self._alloc_iter = iter(result.split(1))
 
     def alloc_group_end(self):
+        """Return any unused pre-allocated slots from the current group."""
         if self._alloc_iter is not None:
             remaining = list(self._alloc_iter)
             if remaining:

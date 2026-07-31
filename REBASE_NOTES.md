@@ -192,3 +192,38 @@ mamba_gap_reserve) wholesale going forward. The #339-343 schedule_policy
 refinements (COW discount, per-pass offset) are retired — do NOT re-port.
 The running swarm A/B is validation only (crash-guard + sane shape), not a
 re-port trigger.
+
+## CLEANUP PASS (2026-07-31, branch renamed HiMA-latest)
+User directive: scrub the branch of dead/unnecessary divergence vs upstream.
+A 56-agent divergence audit (adversarially verified) produced 27 safe actions
++ 2 blocked; all 27 applied, both blocks honored:
+- disaggregation/utils.py: reverted to upstream verbatim (whitespace-only diff).
+- allocation.py: dropped 3 orphaned MAMBA_STATE_PER_REQ_* imports.
+- allocator/base.py: restored Apache header; deleted the dead _capped_lo
+  bookkeeping (_CAPPED_LO_EMPTY, _set_capped_pages, _cap — the live cap state
+  moved into CappedFreeList long ago); inlined _merge_and_sort_free_unlocked
+  (the _alloc_lock STAYS — cross-fire worker vs scheduler thread).
+- allocator/token.py: restored Apache header; deleted _capped_lo /
+  _n_allocatable debug properties, backup/restore_state (no callers), and the
+  AssertionError _merge_and_sort_free_unlocked stub.
+- allocator/mamba.py: restored Apache header + upstream alloc_group_*
+  docstrings + the _alloc_iter comment; import trimmed to CappedFreeList only.
+- mamba_radix_cache.py: deleted all four _lpb_*_eviction_heap/victim methods
+  (mamba eviction is LRU-order-only; LPB still prices loss via n_b) and their
+  stale docstring references; dropped 2 unused `pool =` locals; restored
+  upstream's _insert_helper call formatting.
+- memory_pool.py: deleted MambaPool._no_cross_fire, clear(), fork_from,
+  live_capacity_tokens, and both calls to the UNDEFINED
+  _assert_capped_slots_invariant (any completed migrate_slot would have
+  raised AttributeError — latent bug removed); restored upstream's
+  get_contiguous_buf_infos body (safe: the patched
+  _iter_transfer_state_tensors yields layer-indexable per-layer lists);
+  MAMBA_STATE_PER_REQ_* now deferred-imported from common.py (upstream's
+  single source of truth) instead of a local copy; deleted
+  MHATokenToKVPool.set_capacity_tokens / live_capacity_tokens (no callers —
+  the actuator drives MultiTensorArena directly); restored upstream blank-line
+  spacing.
+- BLOCKED (kept): MambaPool.unmark_slots (live caller: cross-pool actuator);
+  HybridReqToTokenPool inline ping-pong alloc (classification right, action
+  wrong — behavior differs from a naive revert).
+Post-cleanup: py_compile sweep + full mem_cache import chain OK.

@@ -19,9 +19,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.common import (
-    MAMBA_STATE_PER_REQ_NO_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE,
-    MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
     available_and_evictable_str,
     evict_from_tree_cache,
 )

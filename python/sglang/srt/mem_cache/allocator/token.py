@@ -1,4 +1,18 @@
-"""CappedFreeList-based KV allocator.
+"""
+Copyright 2025 SGLang Team
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+CappedFreeList-based KV allocator.
 
 HiMA's TokenToKVPoolAllocator: wraps a CappedFreeList that handles the
 cross-pool capped-page state (the implicit tail + drained marks) so
@@ -17,8 +31,6 @@ from sglang.srt.mem_cache.capped_free_list import _NO_TAIL, CappedFreeList
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
-
-_CAPPED_LO_EMPTY = 1 << 62
 
 
 class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -74,7 +86,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     # OwnerProvider, Budgeter telemetry, debug logs) and tests reach into the
     # allocator's free/capped tensors by these names; they now project the
     # CappedFreeList state. Read-only: nothing external writes them (the base
-    # ctor that did is bypassed; `restore_state` writes `_fl` directly).
+    # ctor that did is bypassed).
     # ------------------------------------------------------------------ #
     @property
     def free_pages(self) -> torch.Tensor:
@@ -95,20 +107,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         """Current live admission cap = the highest backed id. It IS the tail
         boundary, so it tracks cross-fire grows and can never go stale."""
         return self.size if self._fl.tail_lo == _NO_TAIL else self._fl.tail_lo - 1
-
-    @property
-    def _capped_lo(self) -> int:
-        """Lowest capped id (tail start, or a lower mark). Debug telemetry."""
-        lo = self._fl.tail_lo
-        if self._fl.marks.numel():
-            lo = min(lo, int(self._fl.marks.min()))
-        return lo
-
-    @property
-    def _n_allocatable(self) -> int:
-        """Allocatable id count (= available_size: free ids minus the drained
-        marks, plus the release buffer). Debug telemetry only."""
-        return self._fl.available()
 
     @property
     def live_size(self) -> int:
@@ -136,22 +134,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def merge_and_sort_free(self):
         with self._alloc_lock:
             self._fl.merge()
-
-    def _merge_and_sort_free_unlocked(self):
-        # The base method rebinds `free_pages` (a read-only property here). It is
-        # unreachable on this allocator (merge_and_sort_free is overridden), but
-        # override it to name the right path if a future base-path call appears.
-        raise AssertionError(
-            "_merge_and_sort_free_unlocked is a base-allocator method; the arena "
-            "allocator merges through self._fl.merge() (see merge_and_sort_free)."
-        )
-
-    def backup_state(self):
-        return (self._fl.free_ids, self._fl.pending)
-
-    def restore_state(self, state):
-        with self._alloc_lock:
-            self._fl.free_ids, self._fl.pending = state
 
     def alloc(self, need_size: int):
         """Hand out `need_size` slots, or None if short. The free list holds

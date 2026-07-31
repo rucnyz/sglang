@@ -35,7 +35,8 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 # Path-A actuator (XPoolActuator) requires both pools to be allocated
-# via MultiTensorArena on a shared SharedHandlePool. Promote
+# via MultiTensorArena on a shared SharedHandlePool. Promote HiMA
+# activation to the shared handle pool here so both pools agree.
 if os.environ.get("SGLANG_HIMA") == "1":
     os.environ.setdefault("SGLANG_ARENA_SHARED", "1")
 
@@ -1041,6 +1042,7 @@ class MambaPool:
                         dtype=torch.float32,
                         device=device,
                     )
+
             if speculative_num_draft_tokens is not None:
                 if _is_npu:
                     temporal_state = temporal_state.transpose(-1, -2)
@@ -1369,34 +1371,6 @@ class MambaPool:
             t = self.mamba_cache.temporal
             t[:, indices] = 0
 
-    @property
-    def _no_cross_fire(self) -> bool:
-        """True when `_capped_slots` is empty AND the live cap still equals the
-        pre-allocated upper bound, so every live slot id lies in
-        `[1, self.size] == [1, self.max_size]`: no freed id can exceed the cap
-        and no id can be a capped (unmapped) slot.
-
-        `free` uses this to take the plain free-list path (matching the
-        non-budgeter baseline), skipping the `torch.isin` membership test and
-        the `free_index > self.size` mask whose `.any()` forces a
-        device-to-host sync on every free.
-
-        SAFETY rests on one invariant: `_capped_slots` holds the id of EVERY
-        slot whose VMM chunk is unmapped. Every path that unmaps a chunk
-        populates `_capped_slots` or lowers `self.size` under `_alloc_lock`
-        before the unmap (`migrate_slot`, `set_capacity_slots` SHRINK, the
-        above-cap `free` branch, `_MambaCapAllocator.mark_pages_capped`), so
-        this predicate reads False the instant any live slot could be unmapped;
-        `unmark_slots` / `set_capacity_slots` GROW only restore ids the actuator
-        just re-mapped. The ONE known violator is `clear()`: it rebuilds
-        `_capped_slots` from `self.size`, dropping below-cap actuator marks
-        (flush-boundary crash), so the fast path is only fully sound once
-        `clear()` preserves those marks. The crash manifests identically on the slow
-        path (post-`clear()` `_capped_slots` is empty, so its filter is a no-op
-        too), so it is orthogonal to this fast path.
-        """
-        return self._capped_slots.numel() == 0 and self.size == self.max_size
-
     def migrate_slot(self, src: int, dst: int) -> bool:
         """T4 (paper §3.2.3): atomic per-slot migration. Copies the
         recurrent-state contents of slot `src` to slot `dst`, then
@@ -1457,32 +1431,7 @@ class MambaPool:
                 # recycled and migrated again before its prior cap is
                 # released; without this, `_capped_slots` double-counts.
                 self._capped_slots = torch.cat([existing, src_t])
-            self._assert_capped_slots_invariant()
             return True
-
-    def clear(self):
-        # flush_cache resets the pool to "every MAPPED slot is free", but a slot
-        # whose VMM chunk is currently unmapped must STAY capped — otherwise the
-        # next alloc hands out unmapped VA. `_capped_slots` already
-        # holds exactly the unmapped set (every mutator maintains the invariant;
-        # `unmark_slots` drops an id only when its chunk is re-mapped), of two
-        # kinds: below-cap actuator marks (id ≤ size, recorded by
-        # `_MambaCapAllocator.mark_pages_capped` without lowering self.size) and
-        # the boot-deferred / shrunk tail (size, max_size]. So we PRESERVE
-        # `_capped_slots` as-is and rebuild `free_slots` as the live range minus
-        # the capped ids. Reconstructing `_capped_slots` from self.size alone
-        # would drop the below-cap marks and re-enter unmapped slots.
-        # Mirrors KV's `CappedFreeList.reset`, which keeps its `marks` set.
-        with self._alloc_lock:
-            live = torch.arange(
-                1, self.size + 1, dtype=torch.int64, device=self.device
-            )
-            capped = self._capped_slots
-            if capped.numel() > 0:
-                self.free_slots = live[~torch.isin(live, capped)]
-            else:
-                self.free_slots = live
-            self._assert_capped_slots_invariant()
 
     @property
     def live_size(self) -> int:
@@ -1532,9 +1481,6 @@ class MambaPool:
             self.free_slots = torch.cat([self.free_slots, restore])
             self.size = max(self.size, int(restore.max().item()))
             return int(restore.numel())
-
-    def live_capacity_tokens(self) -> int:
-        return self.live_size
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
@@ -1586,13 +1532,6 @@ class MambaPool:
             self.replayssm_cache_base[dst_indices] = 0
         if self.replayssm_is_flush is not None:
             self.replayssm_is_flush[dst_indices] = 0
-
-    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
-        dst_index = self._allocator.alloc(1)
-        if dst_index is None:
-            return None
-        self.copy_from(src_index, dst_index)
-        return dst_index
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -1693,48 +1632,17 @@ class MambaPool:
             for state_tensor in tensors:
                 yield field, state_tensor, slice_axis
 
-
     def get_contiguous_buf_infos(self):
-        """
-        Get buffer info for RDMA registration.
-        Only returns conv and temporal state buffers, excluding intermediate buffers
-        used for speculative decoding (intermediate_ssm, intermediate_conv_window).
-
-        When temporal is a per-layer-split List[Tensor] (len ==
-        num_mamba_layers, entries don't carry a layer axis), the entries
-        are treated directly as per-layer buffers (no extra layer-indexing).
-        """
-        # Per-logical-state list of "layer-indexable views"; each entry is
-        # something where `entry[layer_id]` returns the per-layer buffer.
-        # For stacked tensors and conv-shape lists this is the entry itself;
-        # for per-layer-split lists the wrapping list IS already layer-indexed.
-        state_views = []
-        for fname in vars(self.mamba_cache):
-            if fname in ("intermediate_ssm", "intermediate_conv_window"):
-                continue
-            value = getattr(self.mamba_cache, fname)
-            if isinstance(value, list):
-                if (
-                    len(value) == self.num_mamba_layers
-                    and value[0].shape[0] != self.num_mamba_layers
-                ):
-                    # Per-layer split: the list itself is the layer-indexed view.
-                    state_views.append(value)
-                else:
-                    # List of per-conv-shape stacked tensors.
-                    for v in value:
-                        state_views.append(v)
-            else:
-                state_views.append(value)
-
+        """Get transferable state buffer information for RDMA registration."""
         data_ptrs, data_lens, item_lens = [], [], []
-        for view in state_views:
+
+        for _, state_tensor, _ in self._iter_transfer_state_tensors():
             data_ptrs += [
-                view[i].data_ptr() for i in range(self.num_mamba_layers)
+                state_tensor[i].data_ptr() for i in range(self.num_mamba_layers)
             ]
-            data_lens += [view[i].nbytes for i in range(self.num_mamba_layers)]
+            data_lens += [state_tensor[i].nbytes for i in range(self.num_mamba_layers)]
             item_lens += [
-                view[i][0].nbytes for i in range(self.num_mamba_layers)
+                state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
             ]
         return data_ptrs, data_lens, item_lens
 
@@ -1801,16 +1709,6 @@ class MambaPool:
             )
             subdims_per_tensor += [subdims] * self.num_mamba_layers
         return subdims_per_tensor
-
-
-# Mamba active-slot slots a single hybrid request needs, by prefix-cache mode.
-# The extra slots over 1 reserve ping-pong / lazy-copy buffers so a cached
-# prefix's recurrent state can be reused without clobbering the live slot.
-# Single source of truth: both alloc_req_slots (supply-side eviction target) and
-# HybridReqToTokenPool.available_size (admission gate) price a request off these.
-MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
-MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY = 2
-MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -2024,6 +1922,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
         shared by ``alloc_req_slots`` (how many mamba slots to free before an
         alloc) and ``available_size`` (how many requests the mamba pool can back)
         so the two can never drift."""
+        # Deferred: common.py imports this module at its own top level.
+        from sglang.srt.mem_cache.common import (
+            MAMBA_STATE_PER_REQ_NO_CACHE,
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE,
+            MAMBA_STATE_PER_REQ_PREFIX_CACHE_LAZY,
+        )
+
         if not supports_mamba:
             return MAMBA_STATE_PER_REQ_NO_CACHE
         return (
@@ -2756,7 +2661,6 @@ class MHATokenToKVPool(KVCache):
         self._kv_buffer_descs = self._build_kv_buffer_descs()
         self._init_data_ptrs_and_strides()
 
-
     def _create_quantized_buffers(self):
         # Quantized recipes own packed-data, scale, and workspace shapes.
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -2852,7 +2756,6 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
 
-
     def _kv_buffer_shapes(self):
         """(k_shape, v_shape)"""
         if self.use_hnd:
@@ -2865,7 +2768,6 @@ class MHATokenToKVPool(KVCache):
             (rows, self.head_num, self.head_dim),
             (rows, self.head_num, self.v_head_dim),
         )
-
 
     def _create_buffers_normal(self):
         # Optional ChunkArena-backed allocation. Gated by
@@ -3129,43 +3031,6 @@ class MHATokenToKVPool(KVCache):
         if self._post_capture_owner is not None:
             self._post_capture_owner.close()
             self._post_capture_owner = None
-
-    def set_capacity_tokens(self, n_tokens: int) -> int:
-        """Resize the KV pool to back exactly `n_tokens` of capacity (plus padding).
-
-        Only valid when the pool was created with SGLANG_KV_ARENA=1. Returns
-        the actual capacity (rounded up to chunk granularity by the arena).
-        Caller is responsible for ensuring no live allocation references
-        token indices >= the new capacity before calling shrink.
-        """
-        if self._kv_arena is None:
-            raise RuntimeError(
-                "set_capacity_tokens requires SGLANG_KV_ARENA=1 at pool creation"
-            )
-        target = n_tokens + self.page_size
-        # The arena rounds to its chunk granularity; clamp to its max.
-        chunk = self._kv_arena._arena.chunk_size
-        per_token = self._kv_arena.per_token_bytes
-        tokens_per_chunk = chunk // per_token
-        target_aligned = (
-            (target + tokens_per_chunk - 1) // tokens_per_chunk
-        ) * tokens_per_chunk
-        target_aligned = min(target_aligned, self._kv_arena.max_tokens)
-        prev = self._kv_arena.current_capacity_tokens()
-        self._kv_arena.set_capacity_tokens(target_aligned)
-        new_advertised = target_aligned - self.page_size
-        logger.info(
-            "MHATokenToKVPool.set_capacity_tokens: req=%d -> aligned=%d "
-            "(prev=%d, advertised=%d, page_size=%d)",
-            n_tokens, target_aligned, prev, new_advertised, self.page_size,
-        )
-        return new_advertised
-
-    def live_capacity_tokens(self) -> int:
-        """Currently-backed token capacity (excludes padding)."""
-        if self._kv_arena is not None:
-            return self._kv_arena.current_capacity_tokens() - self.page_size
-        return self.size  # static path: capacity == size
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")

@@ -738,12 +738,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         if value is None:
             value = torch.tensor([x for x in key.raw_token_ids()], dtype=torch.int64)
         prefix_len, mamba_exist = self._insert_helper(
-            self.root_node,
-            key,
-            value,
-            mamba_value,
-            params.chunked,
-            prev_prefix_len,
+            self.root_node, key, value, mamba_value, params.chunked, prev_prefix_len
         )
         return InsertResult(prefix_len=prefix_len, mamba_exist=mamba_exist)
 
@@ -1072,46 +1067,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         hybrid path matches the KV-only path."""
         return self.eviction_policy == "lpb"
 
-    def _lpb_build_eviction_heap(self) -> list:
-        """Paper §sec:design-l1 (eq:lpb-lru): build a min-heap of all
-        currently-evictable mamba nodes ordered by hits-per-byte
-        (lowest first). One-shot O(n) heapify; subsequent picks are
-        O(log n) heappop instead of re-scanning the LRU list each time.
-        Stale entries (nodes whose mamba_value / lock state changes
-        after the heap was built) are filtered at pop time by
-        `_lpb_pop_eviction_victim`.
-
-        Tie-break by `last_access_time` ascending is preserved by the
-        tuple key — same semantics as the prior O(n) scanner.
-        """
-        h = []
-        for node in self.mamba_lru_list.cache.values():
-            if node.mamba_lock_ref > 0 or node.mamba_value is None:
-                continue
-            h.append((
-                node.eviction_priority(),
-                node.last_access_time,
-                node.id,  # final tiebreak for deterministic heap ordering
-                node,
-            ))
-        heapq.heapify(h)
-        return h
-
-    def _lpb_pop_eviction_victim(self, heap: list) -> Optional[TreeNode]:
-        """Pop the next valid eviction victim from the LPB heap.
-        Skips entries whose underlying TreeNode is now locked, has had
-        its mamba_value freed, or has left the mamba LRU list (e.g.
-        evicted by a prior iteration). Returns None if the heap is
-        exhausted."""
-        while heap:
-            _, _, _, node = heapq.heappop(heap)
-            if node.mamba_lock_ref > 0 or node.mamba_value is None:
-                continue
-            if not self.mamba_lru_list.in_list(node):
-                continue
-            return node
-        return None
-
     def _iter_mamba_victims(self):
         """Single source of truth for mamba victim ORDER (design.md
         §"Grow benefit and drain cost are both reuse-aware"). Pure-read
@@ -1123,17 +1078,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         (which classify + price them) consume this, so the priced set
         is byte-identical to the evicted set by construction, mirroring
         the KV side's `_plan_full_eviction`.
-
-        Order per policy:
-          * LRU: `mamba_lru_list` tail (oldest) forward via the prev
-            chain.
-          * LPB: Phase 1 yields the contiguous tail run of cold
-            (`hit_count == 0`) nodes first (LPB priority 0/size = 0, so
-            they always sort first), walked O(1)/victim. The Phase-2
-            heap over the remaining hit-bearing nodes is built LAZILY,
-            only once the consumer pulls past the cold run, so a drain
-            satisfied entirely by cold nodes never pays the O(n)
-            heapify.
 
         Consumer contract: a node's successor pointer is captured
         BEFORE the node is yielded, so a consumer (`evict_mamba`) may
@@ -1168,12 +1112,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         frees either the mamba snapshot alone (internal node, leaving a
         KV tombstone) or KV + mamba (leaf, plus the tombstone-leaf
         cascade), until `mamba_num` slots are freed.
-
-        Two policies, gated by `--eviction-policy lpb` (default lru):
-          * Recency-LRU: oldest mamba node first.
-          * LPB (hits-per-byte): cold (`hit_count == 0`) tail run first,
-            then a heap over hit-bearing nodes — see
-            `_iter_mamba_victims`.
         """
         if self.disable or mamba_num <= 0:
             return 0
@@ -1231,44 +1169,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._cumulative_evicted_mamba_slots += mamba_num_evicted
         self._cumulative_evicted_mamba_lpb_loss += lpb_loss_us
         return mamba_num_evicted
-
-    def _lpb_build_full_eviction_heap(self) -> list:
-        """Heap of evictable LEAF nodes in full_lru_list, ordered by LPB
-        priority (lowest first). Parallel to _lpb_build_eviction_heap
-        but for full (KV) eviction. Only leaves are eligible because
-        evict_full evicts leaves and walks parent-becomes-leaf
-        chains; LPB just re-orders the leaf-selection step.
-        """
-        h = []
-        for node in self.full_lru_list.cache.values():
-            if node.full_lock_ref > 0:
-                continue
-            if len(node.children) > 0:
-                continue  # not a leaf
-            h.append((
-                node.eviction_priority(),
-                node.last_access_time,
-                node.id,
-                node,
-            ))
-        heapq.heapify(h)
-        return h
-
-    def _lpb_pop_full_eviction_victim(self, heap: list) -> Optional[TreeNode]:
-        """Pop next valid leaf-eviction victim. Skips stale entries
-        (locked, off-list, or no-longer-a-leaf — the last can happen
-        if eviction created new children via tombstoning, which is
-        not currently the case for evict_full but defensive)."""
-        while heap:
-            _, _, _, node = heapq.heappop(heap)
-            if node.full_lock_ref > 0:
-                continue
-            if not self.full_lru_list.in_list(node):
-                continue
-            if len(node.children) > 0:
-                continue
-            return node
-        return None
 
     def _plan_full_eviction(self, full_num_tokens: int):
         """Single source of truth for full (KV) eviction (design.md
@@ -1747,7 +1647,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _alloc_mamba_slot(self) -> Optional[torch.Tensor]:
-        pool = self.req_to_token_pool.mamba_allocator
         slot = self.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is not None:
             return slot
@@ -1938,7 +1837,6 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba from KV via `_mamba_grow_hook` + alloc → (None). The caller
         degrades to a mamba cache miss on None; this never asserts.
         """
-        pool = self.req_to_token_pool.mamba_pool
         dst_index = self.req_to_token_pool.mamba_allocator.alloc(1)
         if dst_index is not None:
             return dst_index
