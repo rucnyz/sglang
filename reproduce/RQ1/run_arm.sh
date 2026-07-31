@@ -149,8 +149,12 @@ sleep 2
 # a widened N=3 std). Wait until the prior server's device memory is actually
 # released (free recovers toward the ~140 GB empty-H200 baseline) before boot.
 for i in $(seq 1 60); do
-  FREE=$(nvidia-smi -i "$GPU0" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)
-  [ "${FREE:-0}" -gt 130000 ] 2>/dev/null && break
+  ALLFREE=1
+  for g in $(echo "$GPUS" | tr ',' ' '); do
+    FREE=$(nvidia-smi -i "$g" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1)
+    [ "${FREE:-0}" -gt 130000 ] 2>/dev/null || ALLFREE=0
+  done
+  [ "$ALLFREE" = "1" ] && break
   sleep 2
 done
 
@@ -167,7 +171,7 @@ for i in $(seq 1 ${BOOT_TRIES:-200}); do
   if ! kill -0 $SVPID 2>/dev/null; then echo "[$ARM] SERVER DIED"; tail -25 "$OUTDIR/server_${ARM}.log"; exit 1; fi
   sleep 5
 done
-[ "$ready" = "1" ] || { echo "[$ARM] BOOT TIMEOUT"; tail -25 "$OUTDIR/server_${ARM}.log"; kill -- -$SVPID 2>/dev/null; for _ in $(seq 1 90); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done; kill -9 -- -$SVPID 2>/dev/null; exit 2; }
+[ "$ready" = "1" ] || { echo "[$ARM] BOOT TIMEOUT"; tail -25 "$OUTDIR/server_${ARM}.log"; kill $SVPID 2>/dev/null; for _ in $(seq 1 120); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done; kill -- -$SVPID 2>/dev/null; sleep 20; kill -9 -- -$SVPID 2>/dev/null; exit 2; }
 
 LIMARG=""; [ "$LIMIT" != "-" ] && LIMARG="--limit $LIMIT"
 # STAGGER=- omits --stagger so root arrival uses the trace's own absolute t
@@ -185,7 +189,18 @@ done
 
 # Graceful teardown: SIGTERM drains CUDA contexts cleanly; kill -9 on a live
 # CUDA process poisons the driver for the next boot (unkillable R-zombies).
+# TERM the PARENT first: launch_server orchestrates an orderly child
+# shutdown on SIGTERM. TERMing the whole group at once kills schedulers
+# mid-CUDA-op, the parent then never exits, and the -9 fallback poisons the
+# driver for the NEXT boot (seen as TCPStore "1/2 clients joined" on the
+# following arm). Group TERM/KILL are last resorts only.
+kill $SVPID 2>/dev/null
+for _ in $(seq 1 120); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done
+if kill -0 $SVPID 2>/dev/null; then
+  kill -- -$SVPID 2>/dev/null
+  for _ in $(seq 1 30); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done
+  kill -9 -- -$SVPID 2>/dev/null
+fi
+# reap stragglers in the group either way (detokenizer/mp helpers)
 kill -- -$SVPID 2>/dev/null
-for _ in $(seq 1 90); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done
-kill -9 -- -$SVPID 2>/dev/null
 echo "[$ARM] DONE -> $OUTDIR"
