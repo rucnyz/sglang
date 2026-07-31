@@ -227,3 +227,18 @@ A 56-agent divergence audit (adversarially verified) produced 27 safe actions
   HybridReqToTokenPool inline ping-pong alloc (classification right, action
   wrong — behavior differs from a naive revert).
 Post-cleanup: py_compile sweep + full mem_cache import chain OK.
+
+## POST-CLEANUP VALIDATION (2026-07-31) — ALL GREEN
+- py_compile sweep + full mem_cache import chain: OK.
+- CappedFreeList contract tests (CPU, worktree tree): 30/30 pass.
+- Smoke (GPU6, warm JIT): base healthy ~50s, sys ~55s, generation correct,
+  three arenas + budgeter (12 ticks) alive; no driver poison across the
+  graceful teardown between arms.
+- Swarm A/B t12@64, 300 progs (sys re-run post-cleanup with gracified
+  run_arm): base 148.2 tok/s P50 60 P99 700; sys 148.2 tok/s P50 59 P99 701;
+  both err 0, len_match_rate 1.0, cache_hit 0.9356 (identical) — HiMA is
+  cost-neutral on this base-optimal workload, as designed.
+- Earlier t6@64 150-prog A/B (pre-cleanup tree, same code paths): tput parity
+  with P99 −32% — the HiMA win direction reproduces on the rebased stack.
+Branch HiMA-latest pushed to rucnyz/sglang @ this commit; local HiMA-v0516
+alias deleted. Rebase COMPLETE.
