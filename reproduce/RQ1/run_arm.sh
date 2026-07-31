@@ -147,7 +147,7 @@ for i in $(seq 1 ${BOOT_TRIES:-200}); do
   if ! kill -0 $SVPID 2>/dev/null; then echo "[$ARM] SERVER DIED"; tail -25 "$OUTDIR/server_${ARM}.log"; exit 1; fi
   sleep 5
 done
-[ "$ready" = "1" ] || { echo "[$ARM] BOOT TIMEOUT"; tail -25 "$OUTDIR/server_${ARM}.log"; kill -9 $SVPID 2>/dev/null; exit 2; }
+[ "$ready" = "1" ] || { echo "[$ARM] BOOT TIMEOUT"; tail -25 "$OUTDIR/server_${ARM}.log"; kill $SVPID 2>/dev/null; for _ in $(seq 1 30); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done; kill -9 $SVPID 2>/dev/null; exit 2; }
 
 LIMARG=""; [ "$LIMIT" != "-" ] && LIMARG="--limit $LIMIT"
 # STAGGER=- omits --stagger so root arrival uses the trace's own absolute t
@@ -163,5 +163,9 @@ for rep in $(seq 1 "$NREPS"); do
   echo "[$ARM] rep $rep: $(grep -oE '\"cache_hit\": [0-9.]+|\"throughput_tok_s\": [0-9.]+' "$OUTDIR/${ARM}_r${rep}.json" | tr '\n' ' ')"
 done
 
+# Graceful teardown: SIGTERM drains CUDA contexts cleanly; kill -9 on a live
+# CUDA process poisons the driver for the next boot (unkillable R-zombies).
+kill $SVPID 2>/dev/null
+for _ in $(seq 1 30); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done
 kill -9 $SVPID 2>/dev/null
 echo "[$ARM] DONE -> $OUTDIR"
