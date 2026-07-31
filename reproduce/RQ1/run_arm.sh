@@ -97,6 +97,17 @@ else
            SGLANG_CSIGMA_KV_BETA=1.601545e-02 \
            SGLANG_CSIGMA_KV_GAMMA=2.420041e+01 \
            SGLANG_CSIGMA_M_ALPHA=0.0 SGLANG_CSIGMA_M_BETA=0.0 SGLANG_CSIGMA_L_STAR=0.0
+  elif [[ "$MODEL" == *Kimi* ]]; then
+    # Kimi-Linear-48B-A3B / H200 TP2 (calibrate.sh sweep 2026-07-31,
+    # --disable-cuda-graph --max-mamba-cache-size 16; envelope-filtered fit:
+    # reproducible pathological bench shapes L=512/1536/2560/16384 excluded —
+    # L=1536 measures 38 s in bench_one_batch on this stack, see
+    # dev/interlayer/5_mla_arena/CALIBRATION.md; quad RMS 21.6 ms on the
+    # clean set). c_M=0 as for all hybrids.
+    export SGLANG_CSIGMA_KV_ALPHA=6.371070e-08 \
+           SGLANG_CSIGMA_KV_BETA=9.678044e-03 \
+           SGLANG_CSIGMA_KV_GAMMA=4.774296e+01 \
+           SGLANG_CSIGMA_M_ALPHA=0.0 SGLANG_CSIGMA_M_BETA=0.0 SGLANG_CSIGMA_L_STAR=0.0
   elif [[ "$MODEL" == *Nemotron* ]]; then
     # Nemotron-3-Super-120B-A12B / H200 (calibrate.sh, --disable-cuda-graph
     # + --tp-size 4 --max-mamba-cache-size 16; c_M=0 hybrid single-curve).
