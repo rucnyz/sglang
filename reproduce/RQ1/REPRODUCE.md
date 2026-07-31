@@ -161,13 +161,15 @@ parse output anyway.
 
 | cell | blocker |
 |------|---------|
-| Kimi-Linear-48B sys | sglang sets `support_mamba_cache=False` for `KimiLinearForCausalLM` -> the tree cache is a ChunkCache, not a MambaRadixCache, so HiMA cannot attach (boot guard `require_mamba_radix_cache_for_hima` fails fast). Kimi is also MLA, so it is blocked twice. |
+| Kimi-Linear-48B sys | UNBLOCKED 2026-07-31 (branch HiMA-latest): upstream v0.5.16 caches KDA state in the radix tree (`RadixLinearAttention` era; Kimi is in the mamba-radix + extra_buffer arch lists), and `MLATokenToKVPool` now has MultiTensorArena backing (dev/interlayer/5_mla_arena). Chain-attach proven on the t6@64 slice. Per-model env: `GPUS=<2 gpus> TP=2 REASONING=none MEMFRAC=0.85 ALLOW_TRUNC=1` (run_arm exports the calibrated csigma + 18 MiB arena chunk for `*Kimi*`). |
 | Ling-2.6-flash sys | MLA: the KV cache is a compressed-latent pool, and HiMA's arena backing exists only in `MHATokenToKVPool` (gated on `head_dim == v_head_dim`). `kv_arena=None` -> the shared chain never builds -> zero cross-pool fires. See FINDINGS.md. |
 | 35B Case2/Case3 sys | crashes (658-948 err/rep): `c_M=0` mis-serves 35B's mamba-bound regimes (open issue #276). Case1 is measurable. |
 
-A model is HiMA-measurable only if BOTH gates pass: it gets a MambaRadixCache
-(`support_mamba_cache=True`) AND its full-attention layers are standard MHA/GQA
-(`num_key_value_heads`, no `kv_lora_rank`), because the arena lives in MHATokenToKVPool.
+A model is HiMA-measurable only if it gets a MambaRadixCache. The old second
+gate (MHA/GQA-only full-attention layers) fell 2026-07-31: the arena now backs
+`MLATokenToKVPool` too (dev/interlayer/5_mla_arena), which is how Kimi-Linear
+became measurable. Ling-2.6-flash remains blocked only by whatever keeps it off
+MambaRadixCache on this tree (unverified since the rebase).
 
 ## 6. Results
 

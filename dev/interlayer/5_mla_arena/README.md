@@ -93,9 +93,14 @@ this grain (the 2 MiB-native claim in T1 applies to the GQA models).
 
 ## Status
 
-- [ ] design note (this file) committed
-- [ ] MLA arena branch + actuator message + loud-inert guard
-- [ ] unit test green on idle GPU
-- [ ] stock smoke green (guard silent)
-- [ ] HiMA smoke green (chain attached, proof in log)
-- [ ] A/B smoke on cc_kimi_t6 slice
+- [x] design note (this file) committed
+- [x] MLA arena branch + actuator message + loud-inert guard (53dc2684fb)
+- [x] unit test green on idle GPU (12/12, GPU2)
+- [x] stock smoke green (guard silent; TP2 healthy 65 s, generation correct)
+- [x] HiMA smoke green (both arenas on the shared pool; chain gated only on
+      the then-missing csigma — fail-close verified in the wild)
+- [x] calibration (CALIBRATION.md; envelope-filtered, quad RMS 21.6 ms)
+- [x] A/B on cc_kimi_t6 slice (150 progs @64, 2026-07-31): sys log shows
+      "XPoolActuator chain attached" on TP0+TP1; base 764.8 tok/s
+      P50 82 / P99 5427; sys 788.4 (+3.1%) P50 78 / P99 4348 (-20%);
+      both err 0, len_match 1.0, cache_hit 0.9339 identical.
