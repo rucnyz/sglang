@@ -28,9 +28,9 @@ COMMON="--model-path $MODEL --host 127.0.0.1 --port $PORT \
   --enable-cache-report --log-level info --trust-remote-code"
 [ "$TP" -gt 1 ] 2>/dev/null && COMMON="$COMMON --tp $TP"
 # mamba-scheduler-strategy extra_buffer keeps overlap ON on hybrid-MAMBA models
-# (it builds a conv-state track buffer). Kimi-Linear (linear-attn, no mamba conv
-# state) has conv_states_shape=None -> extra_buffer crashes; MAMBA_STRAT=no_buffer
-# skips it (overlap auto-off, correctness intact). Default extra_buffer for mamba.
+# (it builds a conv-state track buffer). Kimi-Linear works with extra_buffer on
+# this tree (v0.5.16 KDA track-snapshot fix, CI-guarded); the old v0.5.11
+# "conv_states_shape=None crashes" note no longer applies. MAMBA_STRAT=none skips.
 [ "${MAMBA_STRAT:-extra_buffer}" != "none" ] && COMMON="$COMMON --mamba-scheduler-strategy ${MAMBA_STRAT:-extra_buffer}"
 # reasoning-parser is model-specific (qwen3's </think> token); non-Qwen models
 # (e.g. Kimi-Linear) tokenize it differently and the reasoner grammar backend
@@ -39,6 +39,9 @@ COMMON="--model-path $MODEL --host 127.0.0.1 --port $PORT \
 [ "${REASONING:-qwen3}" != "none" ] && COMMON="$COMMON --reasoning-parser ${REASONING:-qwen3}"
 # MEMFRAC + RATIO are conditional (small-pool / static-best experiments).
 [ -n "${MEMFRAC:-}" ] && COMMON="$COMMON --mem-fraction-static $MEMFRAC"
+# Over-context inputs (t12/composite carry a handful of >1M-token prompts) get
+# server-side truncation instead of an error; applied to BOTH arms (fair).
+[ -n "${ALLOW_TRUNC:-}" ] && COMMON="$COMMON --allow-auto-truncate"
 # Optional boot split knob (the design's own --mamba-full-memory-ratio, NOT the
 # forbidden --max-mamba-cache-size). A LOW ratio shrinks the mamba pool so
 # max_running binds first (mamba-bound regime, for the k2m case2 win); unset =
@@ -71,6 +74,10 @@ else
   export SGLANG_HIMA=1 SGLANG_HIMA_TICK_S=1.0 \
          SGLANG_XPOOL_QUEUE_WAIT_US="${QW:-100}" SGLANG_XPOOL_COOLDOWN_S="${COOL:-1.0}" \
          SGLANG_HIMA_LOG="$OUTDIR/budgeter.jsonl"
+  # Kimi-Linear MLA: per-token KV bytes (576 x bf16 = 1152 B) do not divide the
+  # 2 MiB native chunk; 18 MiB = lcm(2 MiB, 1152 B) divides KV AND the KDA
+  # temporal state at TP1/2/4 (dev/interlayer/5_mla_arena).
+  [[ "$MODEL" == *Kimi* ]] && export SGLANG_ARENA_CHUNK_BYTES=18874368
   # Calibrated single-curve cost model (dev/eval/cost_model/kappa_fit.json,
   # Qwen3.5-9B/H200): c_M=0 (mamba recompute folded into c_KV). Without this the
   # builtin 35B default has non-zero c_M, which drives wrong-direction k2m fires
