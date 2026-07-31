@@ -136,7 +136,9 @@ for i in $(seq 1 60); do
   sleep 2
 done
 
-CUDA_VISIBLE_DEVICES=$GPUS HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+# setsid: own process group, so teardown can kill the WHOLE tree (detokenizer
+# + multiprocessing helpers outlive a parent-only kill and leak per run).
+setsid env CUDA_VISIBLE_DEVICES=$GPUS HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   $VENV -m sglang.launch_server $COMMON $FLAGS > "$OUTDIR/server_${ARM}.log" 2>&1 &
 SVPID=$!
 
@@ -147,7 +149,7 @@ for i in $(seq 1 ${BOOT_TRIES:-200}); do
   if ! kill -0 $SVPID 2>/dev/null; then echo "[$ARM] SERVER DIED"; tail -25 "$OUTDIR/server_${ARM}.log"; exit 1; fi
   sleep 5
 done
-[ "$ready" = "1" ] || { echo "[$ARM] BOOT TIMEOUT"; tail -25 "$OUTDIR/server_${ARM}.log"; kill $SVPID 2>/dev/null; for _ in $(seq 1 30); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done; kill -9 $SVPID 2>/dev/null; exit 2; }
+[ "$ready" = "1" ] || { echo "[$ARM] BOOT TIMEOUT"; tail -25 "$OUTDIR/server_${ARM}.log"; kill -- -$SVPID 2>/dev/null; for _ in $(seq 1 90); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done; kill -9 -- -$SVPID 2>/dev/null; exit 2; }
 
 LIMARG=""; [ "$LIMIT" != "-" ] && LIMARG="--limit $LIMIT"
 # STAGGER=- omits --stagger so root arrival uses the trace's own absolute t
@@ -165,7 +167,7 @@ done
 
 # Graceful teardown: SIGTERM drains CUDA contexts cleanly; kill -9 on a live
 # CUDA process poisons the driver for the next boot (unkillable R-zombies).
-kill $SVPID 2>/dev/null
-for _ in $(seq 1 30); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done
-kill -9 $SVPID 2>/dev/null
+kill -- -$SVPID 2>/dev/null
+for _ in $(seq 1 90); do kill -0 $SVPID 2>/dev/null || break; sleep 2; done
+kill -9 -- -$SVPID 2>/dev/null
 echo "[$ARM] DONE -> $OUTDIR"
