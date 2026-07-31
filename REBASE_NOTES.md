@@ -185,3 +185,10 @@ graph set (warm after); kill -9 on booting CUDA procs still poisons the driver
 (use graceful SIGTERM teardown + quiet gates); run_arm VENV is now
 env-overridable; --mamba-scheduler-strategy is deprecated upstream (alias
 still works).
+
+## DECISION (user, 2026-07-31)
+Mamba admission gating: adopt upstream #29678 (rem_mamba_slots +
+mamba_gap_reserve) wholesale going forward. The #339-343 schedule_policy
+refinements (COW discount, per-pass offset) are retired — do NOT re-port.
+The running swarm A/B is validation only (crash-guard + sane shape), not a
+re-port trigger.
