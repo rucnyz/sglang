@@ -119,8 +119,15 @@ UnifiedMambaTokenToKVPoolAllocator path vs our arena (double-virtualization).
 Later-commit resolutions:
 - 959461d2e8: common.py took upstream (file gutted upstream); factor logic in
   allocation.py unified onto HybridReqToTokenPool.mamba_slots_per_req (#338).
-- 9e3c4fdddf: schedule_policy took HEAD — OUR #339-343 machinery was UPSTREAMED
-  verbatim (rem_mamba_slots/_mamba_slots_needed) and evolved (mamba_gap_reserve);
+- 9e3c4fdddf: schedule_policy took HEAD. CORRECTION (2026-07-30 late): the
+  "upstreamed verbatim" reading was WRONG — a grep of the still-conflicted file
+  picked up OUR hunk side. Reality: upstream PR #29678 (Cheng Wan, Jul 1)
+  independently built a parallel gate (rem_mamba_slots attr + mamba_gap_reserve
+  + no_token). checkout --ours therefore DROPPED our #339-343 refinements
+  (COW-destination discount, per-pass mamba_slot_offset, mamba_slots param).
+  Crash-guard coverage survives via upstream's gate + our alloc_req_slots
+  pre-evict port; the finer accounting is pending a swarm A/B verdict —
+  re-port onto upstream's machinery if t12 shows regressions.
   mamba_radix kept our LPB-loss cumulative fields + wide assert.
 - 0c8ea1ccae: bench_one_batch is a deprecation shim now; SSU-init ported to
   python/sglang/benchmark/one_batch.py (import from
