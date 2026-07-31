@@ -4824,6 +4824,118 @@ class MLATokenToKVPool(KVCache):
             self._finalize_allocation_log(size)
 
     def _create_buffers(self):
+        # Optional ChunkArena-backed allocation, mirroring
+        # MHATokenToKVPool._create_buffers_normal: gated by SGLANG_KV_ARENA=1
+        # (SGLANG_ARENA_SHARED=1 implies it and routes onto the
+        # process-singleton SharedHandlePool for cross-pool KV<->mamba
+        # transfer). MLA is a single uniform kind per layer
+        # (kv_lora_rank + qk_rope per token), so n_kinds=1. DSA variants and
+        # custom mem pools fall through to the torch.zeros path;
+        # MLATokenToKVPoolFP4 overrides _create_buffers and never gets here.
+        # NOTE: MLA per-token bytes (e.g. Kimi-Linear: 576 * bf16 = 1152 B)
+        # need not divide the 2 MiB native chunk — launch with
+        # SGLANG_ARENA_CHUNK_BYTES=lcm(2 MiB, per-token) (18 MiB for Kimi);
+        # MultiTensorArena fails fast otherwise (see dev/interlayer/5_mla_arena).
+        shared_arena = os.environ.get("SGLANG_ARENA_SHARED") == "1"
+        use_arena = (
+            (os.environ.get("SGLANG_KV_ARENA") == "1" or shared_arena)
+            and not self.custom_mem_pool
+            and not self.use_dsa
+        )
+        logger.info(
+            "MLATokenToKVPool buffers: backend=%s (SGLANG_KV_ARENA=%s, "
+            "SGLANG_ARENA_SHARED=%s, use_dsa=%s, custom_mem_pool=%s), "
+            "size=%d, page_size=%d, layer_num=%d, kv_cache_dim=%d",
+            "arena" if use_arena else "torch.zeros",
+            os.environ.get("SGLANG_KV_ARENA", "<unset>"),
+            os.environ.get("SGLANG_ARENA_SHARED", "<unset>"),
+            self.use_dsa, self.custom_mem_pool is not None,
+            self.size, self.page_size, self.layer_num, self.kv_cache_dim,
+        )
+        if use_arena:
+            from sglang.srt.arena.multi_tensor_arena import MultiTensorArena
+
+            with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                tot = self.size + self.page_size
+                chunk_bytes = int(os.environ.get(
+                    "SGLANG_ARENA_CHUNK_BYTES", str(2 * 1024 * 1024)
+                ))
+                per_token_bytes = (
+                    self.kv_cache_dim
+                    * torch.tensor([], dtype=self.store_dtype).element_size()
+                )
+                tokens_per_chunk = _arena_tokens_per_chunk(
+                    chunk_bytes, per_token_bytes
+                )
+                tot_aligned = (
+                    (tot + tokens_per_chunk - 1) // tokens_per_chunk
+                ) * tokens_per_chunk
+
+                # Grow headroom: same policy/envs as the MHA path (default
+                # 80 GiB VA reserve when the shared pool is on, so KV can
+                # grow into peer-released mamba budget).
+                kv_headroom_bytes_env = os.environ.get(
+                    "SGLANG_ARENA_KV_HEADROOM_BYTES"
+                )
+                if shared_arena and kv_headroom_bytes_env is not None:
+                    kv_growth_chunks = int(kv_headroom_bytes_env) // chunk_bytes
+                elif shared_arena:
+                    legacy_chunks_env = os.environ.get(
+                        "SGLANG_ARENA_KV_HEADROOM_CHUNKS"
+                    )
+                    if legacy_chunks_env is not None:
+                        kv_growth_chunks = int(legacy_chunks_env)
+                    else:
+                        kv_growth_chunks = (
+                            (80 * 1024 * 1024 * 1024) // chunk_bytes
+                        )
+                else:
+                    kv_growth_chunks = 0
+                kv_max_tokens = tot_aligned + kv_growth_chunks * tokens_per_chunk
+
+                shared_pool = None
+                if shared_arena:
+                    from sglang.srt.arena.shared_pool import (
+                        get_or_create_shared_handle_pool,
+                    )
+
+                    shared_pool = get_or_create_shared_handle_pool(
+                        device_id=torch.cuda.current_device(),
+                        chunk_bytes=chunk_bytes,
+                    )
+
+                init_chunks = tot_aligned // tokens_per_chunk
+                kv_static_min_chunks = 1 if shared_arena else init_chunks
+                kv_static_min_tokens = kv_static_min_chunks * tokens_per_chunk
+                self._kv_arena = MultiTensorArena(
+                    device_id=torch.cuda.current_device(),
+                    n_layers=self.layer_num,
+                    n_kinds=1,
+                    per_token_shape=(1, self.kv_cache_dim),
+                    dtype=self.store_dtype,
+                    max_tokens=kv_max_tokens,
+                    init_tokens=tot_aligned,
+                    static_min_tokens=kv_static_min_tokens,
+                    chunk_bytes=chunk_bytes,
+                    external_handle_pool=shared_pool,
+                )
+                logger.info(
+                    "MLATokenToKVPool arena: tot_tokens=%d (tot_aligned=%d), "
+                    "tokens_per_chunk=%d, chunk_bytes=%d, per_token_bytes=%d, "
+                    "shared=%s, subpool_offset=%d, n_subpools=%d",
+                    tot, tot_aligned, tokens_per_chunk, chunk_bytes,
+                    per_token_bytes, shared_arena,
+                    self._kv_arena._subpool_offset,
+                    self.layer_num,
+                )
+            self.kv_buffer = [
+                self._kv_arena.tensor(i, 0) for i in range(self.layer_num)
+            ]
+            # Match torch.zeros semantics for the padded slot at index 0.
+            for buf in self.kv_buffer:
+                buf[: self.page_size].zero_()
+            return
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)

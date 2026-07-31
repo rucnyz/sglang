@@ -259,6 +259,57 @@ class BudgetAgent:
             from sglang.srt.budgeter import _set_budget_agent_singleton
             _set_budget_agent_singleton(self)
 
+        self._assert_pools_arena_capable_or_die()
+
+    def _assert_pools_arena_capable_or_die(self) -> None:
+        """Boot-time loud-inert guard (dev/interlayer/5_mla_arena).
+
+        Under SGLANG_HIMA=1 on a hybrid model, a KV or mamba pool that is
+        not arena-backed makes the actuator chain PERMANENTLY unavailable:
+        the server still boots, logs "HiMA enabled", runs LPB + telemetry,
+        and silently never does any cross-pool work (audited failure mode
+        on MLA-hybrid models before MLATokenToKVPool grew an arena branch).
+        Fail at boot instead; SGLANG_HIMA_ALLOW_INERT=1 opts a deliberate
+        partial-stack ablation back into the old behavior.
+        """
+        if os.environ.get("SGLANG_HIMA") != "1":
+            return  # observation-mode agent on a stock server: no claim made
+        req_pool = self.scheduler.req_to_token_pool
+        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            # KV-only model: HiMA has no second pool; chain build will log
+            # "no mamba_pool" per tick-path. Not an arena-capability bug.
+            logger.warning(
+                "SGLANG_HIMA=1 on a KV-only model (%s has no mamba_pool): "
+                "no cross-pool control is possible.",
+                type(req_pool).__name__,
+            )
+            return
+        kv_pool = self.scheduler.token_to_kv_pool_allocator.get_kvcache()
+        inner_kv = getattr(kv_pool, "full_kv_pool", kv_pool)
+        kv_arena = inner_kv._kv_arena
+        mamba_arena = mamba_pool._mamba_temporal_arena
+        if kv_arena is not None and mamba_arena is not None:
+            return
+        msg = (
+            "SGLANG_HIMA=1 but the pools are not arena-backed "
+            f"(kv pool {type(inner_kv).__name__}._kv_arena="
+            f"{'ok' if kv_arena is not None else 'None'}, "
+            f"mamba_pool._mamba_temporal_arena="
+            f"{'ok' if mamba_arena is not None else 'None'}). "
+            "The cross-pool actuator chain can NEVER build in this "
+            "configuration — the run would silently degrade to "
+            "LPB+telemetry only. Launch with SGLANG_ARENA_SHARED=1 pool "
+            "construction (and for MLA models a chunk size that divides "
+            "the per-token bytes, e.g. SGLANG_ARENA_CHUNK_BYTES=18874368 "
+            "for Kimi-Linear), or set SGLANG_HIMA_ALLOW_INERT=1 to "
+            "acknowledge an intentionally inert run."
+        )
+        if os.environ.get("SGLANG_HIMA_ALLOW_INERT") == "1":
+            logger.error("BudgetAgent (ALLOW_INERT): %s", msg)
+            return
+        raise RuntimeError(f"BudgetAgent: {msg}")
+
     # ---- Public API used from scheduler.event_loop_* ----
 
     def _do_health_check(self) -> bool:

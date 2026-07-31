@@ -23,7 +23,9 @@ class KVArenaActuator:
         self.allocator = allocator
         if pool._kv_arena is None:
             raise RuntimeError(
-                "KVArenaActuator requires a MHATokenToKVPool created with SGLANG_KV_ARENA=1"
+                "KVArenaActuator requires an arena-backed KV pool "
+                "(MHATokenToKVPool or MLATokenToKVPool) created with "
+                "SGLANG_KV_ARENA=1"
             )
         # Growable ceiling = the ARENA's max_tokens (VA-reserved,
         # physical-on-demand), NOT the boot pool.size. Capping at pool.size
