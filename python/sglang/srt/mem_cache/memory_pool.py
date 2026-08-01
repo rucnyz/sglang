@@ -391,6 +391,14 @@ class ReqToTokenPool:
         torch.cuda.synchronize()
         # Expose the new slot ids.
         self.free_slots.extend(range(self.size + 1, new_size + 1))
+        # Per-slot generation counters must cover the new ids too (upstream
+        # v0.5.16 field; alloc() bumps req_generation[idx] for every handed-out
+        # slot, so a grow without this resize IndexErrors on the first
+        # above-boot allocation). CPU tensor; carry old counters verbatim.
+        if self.req_generation.numel() < new_size + 1:
+            grown = torch.zeros(new_size + 1, dtype=torch.int64)
+            grown[: self.req_generation.numel()] = self.req_generation
+            self.req_generation = grown
         self.size = new_size
         self._alloc_size = new_size + 1
         return self.size

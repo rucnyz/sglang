@@ -441,7 +441,12 @@ class BudgetAgent:
         from sglang.srt.server_args import get_global_server_args
 
         pp_size = max(1, int(self.scheduler.ps.pp_size))
-        get_global_server_args().pp_max_micro_batch_size = max(new_cap // pp_size, 1)
+        # v0.5.16: resolved server_args is read-only; override() is the
+        # audited post-resolution mutation point (plain setattr raises).
+        get_global_server_args().override(
+            "hima-admission-cap",
+            pp_max_micro_batch_size=max(new_cap // pp_size, 1),
+        )
 
     def _maybe_update_admission_cap(self) -> None:
         """Resize per-req arrays so admission can follow actuator-driven
