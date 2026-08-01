@@ -68,6 +68,22 @@ def model_block(name, official_tag, camp_prefix):
             cell(f"{c} sys", s)
 
 
+def kimi_block():
+    """Kimi-Linear-48B (branch HiMA-latest, 2026-08-01 campaign): different
+    layout — figures/data/kimi48b/<wl>/{base,sys,static_r*,vllm}/*.json."""
+    K = "/data/yuzhou/projects/hybrid-inference/figures/data/kimi48b"
+    for wl, label in (("lh", "long-horizon"), ("swarm", "agent swarm"),
+                      ("shift", "shifting")):
+        print(f"\n=== Kimi-Linear-48B-A3B — {label} ===")
+        cell("default(base)", load(f"{K}/{wl}/base/base_r*.json"))
+        cell("sys",           load(f"{K}/{wl}/sys/sys_r*.json"))
+        cell("vLLM",          load(f"{K}/{wl}/vllm/vllm_r*.json"))
+        for r in ("0.7", "0.8", "0.95"):
+            cell(f"static R{r}", load(f"{K}/{wl}/static_r{r}/base_r*.json"))
+        print("  (static-best = best of default mean / clean sweep singles; "
+              "shift R0.95 has 1 pool-truncation err -> ineligible)")
+
+
 model_block("Qwen3.5-9B", "official", "9b")
 model_block("Qwen3.5-35B-A3B", "official_35b", "35b")
-print("\n48B Kimi-Linear: sys BLOCKED (upstream MambaRadixCache unsupported).")
+kimi_block()
