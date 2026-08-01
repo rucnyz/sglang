@@ -51,3 +51,13 @@ Cross-model sanity: α within [4.9e-08 (Nemotron), 1.3e-07 (35B)];
 hybrids (recompute folded into c_KV).
 
 Exported in `run_arm.sh`'s `*Kimi*` branch.
+
+## lh -6.3% decomposition (2026-08-01)
+
+lh@64 N3: base(Unified) 1510.8±4.1 / sys(HiMA,MambaTree) 1415.1±9.1.
+Isolation single-rep with SGLANG_FORCE_MAMBA_RADIX_TREE=1 (tree only, no
+HiMA): 1488.3 (P50 139). So Unified->Mamba tree costs −1.5%; HiMA's control
+plane on the same tree costs −4.9% in this KV-tree-heavy regime. swarm and
+shifting are cost-neutral or better (sys 866.2 vs 864.6; 1207.7 vs 1201.2,
+P50 −6%). Follow-up engineering candidates: LPB scoring cost on deep trees,
+admitter per-arrival work; not blocking the paper row.
