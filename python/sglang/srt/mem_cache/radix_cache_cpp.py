@@ -41,6 +41,9 @@ class RadixCacheCpp(BasePrefixCache):
     ):
         self.disable = params.disable
         self.enable_write_cancel = enable_write_cancel
+        # Admission-path eviction tally (see unified_radix_cache.py note):
+        # required on every scheduler-hosted tree cache.
+        self._admission_cumulative_evicted_tokens = 0
 
         assert (
             params.enable_kv_cache_events is False

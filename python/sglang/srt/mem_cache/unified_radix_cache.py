@@ -125,6 +125,12 @@ class UnifiedRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.disable = params.disable
+        # Admission-path eviction tally, incremented by
+        # ScheduleBatch.check_decode_mem on the retract path and read by the
+        # Budgeter telemetry. Every tree-cache class the scheduler can host
+        # initializes it (chunk/radix/swa/mamba do); missing it crashes the
+        # FIRST memory-pressure retract with AttributeError.
+        self._admission_cumulative_evicted_tokens = 0
 
         if params.enable_metrics:
             self.init_metrics_collector()
