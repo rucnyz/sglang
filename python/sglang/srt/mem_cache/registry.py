@@ -114,6 +114,18 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     if ctx.is_hybrid_ssm:
         import os
 
+        if os.environ.get("SGLANG_FORCE_MAMBA_RADIX_TREE") == "1":
+            # Diagnostic knob: select the legacy MambaRadixCache WITHOUT any
+            # HiMA machinery, to isolate tree-implementation cost from
+            # cross-pool control cost in base-vs-sys comparisons
+            # (dev/interlayer/5_mla_arena: lh sys -6.3% investigation).
+            from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+            logger.info(
+                "SGLANG_FORCE_MAMBA_RADIX_TREE=1: selecting MambaRadixCache "
+                "(no HiMA) over the UnifiedRadixCache default."
+            )
+            return MambaRadixCache(params)
         if os.environ.get("SGLANG_HIMA") == "1":
             # HiMA's cross-pool arena (Budgeter/Admitter/LPB) lives on the
             # MambaRadixCache path; the unified tree has no per-pool arena to
