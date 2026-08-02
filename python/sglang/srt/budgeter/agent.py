@@ -1385,8 +1385,17 @@ class BudgetAgent:
         # (>> 5 s EWMA tau, so the spike has fully decayed before acting).
         warmup_s = _env_float("SGLANG_HIMA_FIRE_WARMUP_S", 180.0)
         if warmup_s > 0:
+            # Anchor on the first LOADED tick, not boot: the client may start
+            # minutes after the server is ready, and the transient this window
+            # exists to ride out is the initial ADMISSION WAVE (a boot-anchored
+            # window expired 30 s before the wave's eviction spike on gate5).
             if self._first_tick_monotonic is None:
-                self._first_tick_monotonic = time.monotonic()
+                if float(snapshot.get("num_running_reqs", 0) or 0) >= 8:
+                    self._first_tick_monotonic = time.monotonic()
+                else:
+                    snapshot["plan_direction"] = "none"
+                    snapshot["plan_reason"] = "warmup: awaiting first load"
+                    return
             elapsed = time.monotonic() - self._first_tick_monotonic
             if elapsed < warmup_s:
                 # Let the planner observe (EWMA warm-up) but veto any fire.
