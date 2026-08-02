@@ -193,6 +193,9 @@ class BudgetAgent:
         self._kv_prefill_chunk_floor = int(
             _cps if _cps and _cps > 0 else (getattr(_sa, "max_prefill_tokens", 0) or 8192)
         )
+        # Wall-clock of the first planner tick — anchors the warmup
+        # fire-suppression window (SGLANG_HIMA_FIRE_WARMUP_S).
+        self._first_tick_monotonic: Optional[float] = None
         # Latched after the first time _ensure_actuator_chain fails so
         # the WARNING fires once, not on every tick.
         self._chain_unavailable_warned = False
@@ -1370,6 +1373,30 @@ class BudgetAgent:
             snapshot["plan_direction"] = "none"
             snapshot["plan_reason"] = "budgeter disabled (SGLANG_HIMA_NO_BUDGETER)"
             return
+
+        # Warmup fire-suppression window: the first seconds after boot are a
+        # TRANSIENT (the initial admission wave briefly fills the mamba pool
+        # and evicts a burst of deep snapshots), but a fire is IRREVERSIBLE
+        # in practice — the free->free return path can never reclaim pages
+        # from a snapshot-fragmented arena. On Kimi deep gates a single
+        # warmup-priced k2m shrank KV 21.7% for the whole run (see
+        # dev/interlayer/5_mla_arena/CALIBRATION.md). Observe (EWMAs still
+        # update via decide() next tick), don't act. Window default 180 s
+        # (>> 5 s EWMA tau, so the spike has fully decayed before acting).
+        warmup_s = _env_float("SGLANG_HIMA_FIRE_WARMUP_S", 180.0)
+        if warmup_s > 0:
+            if self._first_tick_monotonic is None:
+                self._first_tick_monotonic = time.monotonic()
+            elapsed = time.monotonic() - self._first_tick_monotonic
+            if elapsed < warmup_s:
+                # Let the planner observe (EWMA warm-up) but veto any fire.
+                _ = self._planner.decide(snapshot, float(snapshot.get("ts", 0.0)),
+                                         float(snapshot.get("dt", 1.0)))
+                snapshot["plan_direction"] = "none"
+                snapshot["plan_reason"] = (
+                    f"warmup fire-suppression ({elapsed:.0f}s < {warmup_s:.0f}s)"
+                )
+                return
 
         _p_t0 = time.perf_counter_ns()
         clock_s = float(snapshot.get("ts", 0.0))
