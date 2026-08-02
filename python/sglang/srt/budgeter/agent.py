@@ -1465,10 +1465,24 @@ class BudgetAgent:
         # migrate (no live slot relocation). Non-destructive by construction.
         n_free = self._owner_provider.n_free_source_pages(
             decision.direction) if self._owner_provider else 0
-        # m2k (grow KV from mamba): demand-driven (transfer all free).
+        # m2k (grow KV from mamba): demand-driven (transfer all free). On
+        # snapshot-heavy pools free WHOLE chunks are rare (every chunk holds
+        # some cached snapshot), so free-only m2k starves exactly when KV is
+        # hungriest — Kimi mid-pressure gate: 62/62 m2k decisions aborted
+        # "no free source pages" while 30 GB of mamba sat cold. With
+        # SGLANG_XPOOL_M2K_DRAIN=1 (default) the plan may also DRAIN cold
+        # cached snapshots (loss-aware LRU/LPB victim order via Stage-0
+        # evict_pages; live slots are never touched) to complete chunks.
         # k2m (grow mamba from KV): 1 LCM per fire for gradual convergence.
+        m2k_drain = _env_flag("SGLANG_XPOOL_M2K_DRAIN", True)
         if decision.direction == "mamba_to_kv":
             n_pages_target = n_free
+            if m2k_drain and mamba_pool is not None:
+                arena = mamba_pool._mamba_temporal_arena
+                spp = int(arena.tokens_per_chunk) if arena is not None else 0
+                if spp > 0:
+                    drainable = int(self._tree_cache.mamba_evictable_size()) // spp
+                    n_pages_target = n_free + max(0, drainable)
         else:
             lcm = getattr(self._actuator, "lcm_pages", 48) if self._actuator else 48
             n_pages_target = min(n_free, lcm)
@@ -1503,6 +1517,9 @@ class BudgetAgent:
         plan = self._fire_planner.build(
             direction=decision.direction,
             n_pages_target=n_pages_target,
+            allow_drain=(
+                decision.direction == "mamba_to_kv" and m2k_drain
+            ),
         )
         _p_t_build_done = time.perf_counter_ns()
         snapshot["_probe_build_us"] = (_p_t_build_done - _p_t_build_start) // 1000
