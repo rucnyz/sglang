@@ -81,3 +81,15 @@ mispriced spike the ruinous k2m never fires. OPEN (tracked, not blocking):
 (a) planner/actuator page-unit contract (n_src multiplication), (b) k2m
 irreversibility on fragmented mamba arenas, (c) mamba eviction accounting
 blind spot (churn bypasses LPB tally so R_m=0 under load).
+
+## Async-fire deadlock (2026-08-02, open item)
+
+gate5b hung 4 min into replay: scheduler's LAST line was "[admission-cap]
+grew pool.size 302 -> 378" one second after "async fire worker started";
+TP workers spun at 100% GPU/CPU with zero batch output (driver-level
+deadlock between the fire worker's cuMemMap/Unmap and the scheduler
+thread's ReqTokenVAArena grow — SharedHandlePool is lock-free by design
+and the two threads raced). Mitigation: SGLANG_HIMA_FIRE_ASYNC=0
+(serialize fires on the scheduler thread) for the Kimi campaign. Proper
+fix (open): arena-level mutex around cuMem ops or defer cap-grow while a
+fire is in flight.
