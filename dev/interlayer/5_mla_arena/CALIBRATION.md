@@ -61,3 +61,23 @@ plane on the same tree costs −4.9% in this KV-tree-heavy regime. swarm and
 shifting are cost-neutral or better (sys 866.2 vs 864.6; 1207.7 vs 1201.2,
 P50 −6%). Follow-up engineering candidates: LPB scoring cost on deep trees,
 admitter per-arrival work; not blocking the paper row.
+
+## Deep-gate regression root cause + fix (2026-08-02)
+
+Gates 3 (deep-long@256) and 4 (deep-shifting@128) had sys LOSING to base
+(-12%/-15%). Forensics (wf_41514793): a single warmup k2m fire, priced off a
+~1000x-physical R_m spike (mamba momentarily full at boot; LPB loss n_b
+multiplier over-counts), shrank the KV pool 21.7% (planner asked 140 pages,
+actuator granted 420 chunks — a separate planner/actuator unit-contract
+mismatch, amplified by Kimi's asymmetric 7/20 subpools, lcm=140) and the
+free->free-only return path could never reclaim it (mamba chunks fragmented
+by snapshots; 7,770 correct m2k decisions, 99% "no free source pages").
+Control-plane overhead, admitter churn, retract storms all REFUTED
+(0.007% thread time, zero retractions).
+
+Fix (minimal): clamp the mamba loss signal at planner intake to
+slots_evicted x c_kv(pool_max) — the physical rebuild ceiling. Without the
+mispriced spike the ruinous k2m never fires. OPEN (tracked, not blocking):
+(a) planner/actuator page-unit contract (n_src multiplication), (b) k2m
+irreversibility on fragmented mamba arenas, (c) mamba eviction accounting
+blind spot (churn bypasses LPB tally so R_m=0 under load).

@@ -123,6 +123,32 @@ class PaybackPlanner:
         # recompute cost, so r_evict IS the EWMA'd loss rate directly.
         kv_evict = float(snapshot.get("kv_evicted_lpb_loss_recent", 0) or 0)
         m_evict = float(snapshot.get("mamba_evicted_lpb_loss_recent", 0) or 0)
+        # Physical ceiling on the mamba loss signal: rebuilding one evicted
+        # snapshot costs AT MOST one full re-prefill of the longest prefix the
+        # KV pool can even hold — c_kv(max_total_num_tokens). The raw LPB loss
+        # multiplies by n_b (hits-in-window), which over-counts when one
+        # rebuild serves every waiter: a warmup eviction burst on a
+        # physically-full mamba pool priced R_m at ~1000x physical
+        # (30-80M us/s) and fired a ruinous, irreversible k2m that shrank KV
+        # 21.7% for the whole run (dev/interlayer/5_mla_arena, Kimi deep
+        # gates 3-4). Clamp at intake; the EWMA then never sees the spike.
+        if self._cost_curves is not None and m_evict > 0:
+            slots_recent = float(
+                snapshot.get("mamba_evicted_slots_recent", 0) or 0
+            )
+            pool_max = float(snapshot.get("max_total_num_tokens", 0) or 0)
+            if slots_recent > 0 and pool_max > 0:
+                phys_cap_us = slots_recent * float(
+                    self._cost_curves.c_kv_us(pool_max)
+                )
+                if m_evict > phys_cap_us:
+                    logger.warning(
+                        "PaybackPlanner: clamping mamba loss signal "
+                        "%.0fus -> physical cap %.0fus (%d slots x "
+                        "c_kv(pool_max)); n_b over-count suppressed.",
+                        m_evict, phys_cap_us, int(slots_recent),
+                    )
+                    m_evict = phys_cap_us
 
         alpha = 1.0 - math.exp(-dt / self.config.ewma_tau_s) if dt > 0 else 0.1
         safe_dt = max(dt, 1e-6)
