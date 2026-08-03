@@ -122,3 +122,43 @@ pressure.
 Box note: after ~36 h of gate iterations the H200 driver on GPUs 1/6 and
 2/4 degraded (probe-pass no longer predicts boot survival; unwind windows
 stretched to 2 h+). Reboot recommended before further GPU work.
+
+## Gate 10: k2m tick-path starvation — the m2k twin (2026-08-03)
+
+Mamba-bound swarm probe (swarmdense@64, `--max-mamba-cache-size 320`, the
+paper's recurrent-cache sizing precedent) exposed that the **tick-path k2m
+fire had never moved a page on Kimi**. Two compounding defects in
+`BudgetAgent._maybe_fire`:
+
+1. **Unit confusion**: the k2m branch sized plans as `min(n_free,
+   lcm_pages)`. `lcm_pages` counts SUBPOOL-chunks (Kimi: lcm(7,20)=140),
+   but the plan's unit is source lockstep pages (1 KV page = 7 subpool
+   chunks), so one atomic LCM unit is 140/7 = **20 KV pages**. The
+   actuator floors each fire to an LCM multiple — any plan below 20 pages
+   moves zero.
+2. **Free-only supply**: at steady state the radix cache owns all
+   nominally-idle KV, so genuinely-free pages hover at ~4-5 — the same
+   starvation m2k had before `SGLANG_XPOOL_M2K_DRAIN`, mirrored.
+
+Observed signature (gate10 sys, first run): ~960 k2m fires per rank at
+~1/s, every one `unmapped=0 granted=0` (~110-150us pure overhead each),
+mamba pinned at 320 slots / usage 0.80 with KV at 0.20 — the exact
+supply-side thrash the gate was built to relieve, unrelieved.
+
+Fix (mirrors m2k):
+- `SGLANG_XPOOL_K2M_DRAIN` (default on): tick k2m passes
+  `allow_drain=True`; Stage-2 completes the unit from cold cached KV in
+  loss-aware victim order. Free pages are still taken first (Stage-1),
+  so models whose free supply already reaches one LCM are unchanged.
+- Sizing: `min(max(n_free, lcm_pages // n_kv_subpools), lcm_pages)` —
+  identical to the old size whenever `n_free >= one LCM unit` (all Qwen
+  gates), floored up to exactly one unit otherwise.
+- Sub-LCM refuse guard (both directions): after the working-set floor
+  clamps, a target below one LCM unit of source pages aborts with
+  `fire_abort_reason` instead of paying cap-barrier for a guaranteed
+  no-op. This also ends the no-op fire storm.
+
+Per-fire economics on Kimi: one LCM unit converts 20 KV pages = 327,680
+tokens (4.2% of the 7.75M pool) into 7 mamba pages = **+126 slots (+39%
+of CAP=320)** — one to three fires relieve the entire swarm-dense
+snapshot thrash while the KV tree barely notices.

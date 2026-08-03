@@ -1484,6 +1484,7 @@ class BudgetAgent:
         # evict_pages; live slots are never touched) to complete chunks.
         # k2m (grow mamba from KV): 1 LCM per fire for gradual convergence.
         m2k_drain = _env_flag("SGLANG_XPOOL_M2K_DRAIN", True)
+        k2m_drain = _env_flag("SGLANG_XPOOL_K2M_DRAIN", True)
         if decision.direction == "mamba_to_kv":
             n_pages_target = n_free
             if m2k_drain and mamba_pool is not None:
@@ -1493,8 +1494,28 @@ class BudgetAgent:
                     drainable = int(self._tree_cache.mamba_evictable_size()) // spp
                     n_pages_target = n_free + max(0, drainable)
         else:
+            # `lcm_pages` counts SUBPOOL-chunks; the plan's page unit is
+            # source-pool lockstep pages (1 KV page = n_kv_subpools chunks),
+            # so one atomic LCM unit is lcm_pages / n_kv_subpools SOURCE
+            # pages. The actuator floors the fire to a multiple of the LCM:
+            # any sub-LCM plan moves ZERO pages, and at steady state the
+            # radix cache owns all nominally-idle KV, so the free-only
+            # supply undershoots exactly when mamba is starving — the
+            # symmetric twin of the m2k free-only starvation above (Kimi
+            # 7x20 subpools: lcm=140 -> 20-page minimum vs n_free~4; every
+            # tick fire was a no-op). Keep the free-driven size when free
+            # supply reaches one LCM (unchanged on models where it does),
+            # else round up to one LCM and let Stage-2 drain (cold cached
+            # KV, loss-aware victim order) complete the unit.
             lcm = getattr(self._actuator, "lcm_pages", 48) if self._actuator else 48
-            n_pages_target = min(n_free, lcm)
+            n_kv_sub = (
+                getattr(self._actuator, "n_kv_subpools", 1) if self._actuator else 1
+            )
+            lcm_src_pages = max(1, lcm // max(1, n_kv_sub))
+            if k2m_drain:
+                n_pages_target = min(max(n_free, lcm_src_pages), lcm)
+            else:
+                n_pages_target = min(n_free, lcm)
         if decision.direction == "mamba_to_kv" and mamba_pool is not None and n_pages_target > 0:
             live_size = int(mamba_allocator.live_size)
             m_used = max(0, live_size - int(mamba_allocator.available_size()))
@@ -1522,12 +1543,39 @@ class BudgetAgent:
             snapshot["fire_aborted"] = True
             snapshot["fire_abort_reason"] = "no free source pages"
             return
+        # Sub-LCM refuse: after the working-set floor clamps, a target below
+        # one LCM unit of SOURCE pages is guaranteed to round to zero in the
+        # actuator — abort here instead of paying cap-barrier + worker
+        # hand-off for a fire that cannot move anything (the Kimi gate10
+        # no-op storm: ~1 fire/s/rank, all unmapped=0 granted=0).
+        if self._actuator is not None:
+            _lcm = int(getattr(self._actuator, "lcm_pages", 0) or 0)
+            _n_src_sub = int(
+                getattr(
+                    self._actuator,
+                    "n_kv_subpools"
+                    if decision.direction == "kv_to_mamba"
+                    else "n_mamba_subpools",
+                    1,
+                )
+                or 1
+            )
+            _lcm_src_pages = _lcm // max(1, _n_src_sub) if _lcm > 0 else 0
+            if _lcm_src_pages > 0 and n_pages_target < _lcm_src_pages:
+                snapshot["fire_direction"] = decision.direction
+                snapshot["fire_aborted"] = True
+                snapshot["fire_abort_reason"] = (
+                    f"target {n_pages_target} src pages < one LCM unit "
+                    f"({_lcm_src_pages}) — actuator would move zero"
+                )
+                return
         _p_t_build_start = time.perf_counter_ns()
         plan = self._fire_planner.build(
             direction=decision.direction,
             n_pages_target=n_pages_target,
             allow_drain=(
-                decision.direction == "mamba_to_kv" and m2k_drain
+                (decision.direction == "mamba_to_kv" and m2k_drain)
+                or (decision.direction == "kv_to_mamba" and k2m_drain)
             ),
         )
         _p_t_build_done = time.perf_counter_ns()
