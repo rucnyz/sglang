@@ -162,3 +162,24 @@ Per-fire economics on Kimi: one LCM unit converts 20 KV pages = 327,680
 tokens (4.2% of the 7.75M pool) into 7 mamba pages = **+126 slots (+39%
 of CAP=320)** — one to three fires relieve the entire swarm-dense
 snapshot thrash while the KV tree barely notices.
+
+### Gate 10 addendum: the dst-side clamp (bug 8, same afternoon)
+
+The agent-side fix alone still granted zero: `MambaArenaActuator.
+grow_headroom_pages()` = allocator `max_size - live_size`, and the
+`mamba_max_size` branch in `HybridReqToTokenPool` preferred the
+req-pool-keyed formula (`req.max_size*3` REQ slots = 405) over the
+arena factor formula whenever the req pool is in dynamic-cap mode —
+i.e. on every HiMA run. CAP=320: headroom 85 slots = 4 dst pages < one
+7-page LCM unit -> every grant floors to zero; CAP=1692 (all previous
+Kimi sys runs): 405 < live, headroom 0 — **k2m was structurally dead on
+Kimi in every run to date**, independent of the tick-path starvation.
+Fix: when arena-backed, `mamba_max_size = max(mamba_size *
+SGLANG_XPOOL_MAMBA_MAX_FACTOR, req.max_size*3)` (factor default 4; the
+req-keyed value kept only as a floor). CAP=320 -> max_size 1280,
+headroom 960 slots = 53 pages. conv_state (physically allocated at
+max_size) grows ~0.9 GB at this shape — within MEMFRAC 0.80 slack.
+
+Run ledger: `sys_nofix` = pre-fix storm (772.2, cache 0.474, P99 10.5s);
+`sys_lcmfix` = agent-side fix only (fires 1/min, still granted=0 — an
+even cleaner overhead-only control); round-3 sys = both fixes.

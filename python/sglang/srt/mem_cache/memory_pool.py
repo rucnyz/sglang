@@ -1790,13 +1790,24 @@ class HybridReqToTokenPool(ReqToTokenPool):
             os.environ.get("SGLANG_ARENA_SHARED") == "1"
             or os.environ.get("SGLANG_MAMBA_ARENA") == "1"
         )
-        if self.max_size > self.size:
-            mamba_max_size = self.max_size * 3
-        elif _mamba_arena:
+        # Branch order matters: the req-pool-keyed formula (max_size*3,
+        # in REQ slots) is an accident of req-pool numbers and can land
+        # BELOW mamba_size (Kimi CAP=320: req ceiling 135*3=405 slots ->
+        # 85-slot headroom = 4 dst pages < one 7-page LCM unit, so every
+        # k2m grant floors to zero; at the 1692 default it lands below
+        # live entirely, headroom 0). When the pool is arena-backed the
+        # factor formula is the meaningful bound (conv_state is what
+        # physically allocates at max_size); keep the req-keyed value
+        # only as a lower bound for back-compat.
+        if _mamba_arena:
             _factor = max(2, int(
                 os.environ.get("SGLANG_XPOOL_MAMBA_MAX_FACTOR", "4")
             ))
             mamba_max_size = mamba_size * _factor
+            if self.max_size > self.size:
+                mamba_max_size = max(mamba_max_size, self.max_size * 3)
+        elif self.max_size > self.size:
+            mamba_max_size = self.max_size * 3
         else:
             mamba_max_size = None
         self._init_mamba_pool(
