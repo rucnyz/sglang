@@ -241,6 +241,17 @@ class BudgetAgent:
         self._fire_async_enabled = _env_flag(
             "SGLANG_HIMA_FIRE_ASYNC", True
         )
+        # Deterministic one-shot k2m growth (rank-skew-free fire): fire
+        # exactly once, N tick()-calls (= scheduler iterations) after the
+        # first iteration with >=8 running requests. 0 disables. While
+        # enabled, ALL planner-initiated fires are vetoed so the only
+        # cross-pool state change in the run is the iteration-aligned one.
+        self._oneshot_k2m_ticks = int(
+            os.environ.get("SGLANG_HIMA_ONESHOT_K2M_TICKS", "0") or 0
+        )
+        self._iter_seq = 0
+        self._oneshot_k2m_anchor: Optional[int] = None
+        self._oneshot_k2m_done = False
         self._fire_queue: "Optional[queue.Queue]" = None
         self._fire_worker: "Optional[threading.Thread]" = None
         # True while the worker is inside execute_async (the physical
@@ -392,6 +403,25 @@ class BudgetAgent:
                 )
                 return
             self._health_checked = True
+        # Deterministic one-shot k2m (SGLANG_HIMA_ONESHOT_K2M_TICKS>0):
+        # evaluated EVERY scheduler iteration, BEFORE the wall-clock throttle.
+        # tick() is called once per loop iteration at the same loop position
+        # on every TP rank, and request recv is broadcast-synced, so the
+        # iteration counter and every pool-state predicate below are
+        # rank-identical — the fire and its admission-cap application land
+        # on the SAME iteration on all ranks. Wall-clock-triggered fires
+        # landed at rank-skewed iterations (observed 66 s apart, gate10
+        # round 4) and the resulting allocator/cap divergence desynced the
+        # TP batch composition into an NCCL freeze (rounds 3/4/8/9).
+        self._iter_seq += 1
+        if self._oneshot_k2m_ticks > 0 and not self._oneshot_k2m_done:
+            try:
+                self._maybe_oneshot_k2m()
+            except Exception as e:
+                self._oneshot_k2m_done = True  # never retry a half-applied fire
+                logger.warning(
+                    "BudgetAgent one-shot k2m failed: %s", e, exc_info=True
+                )
         now = time.time()
         if now - self._last_tick < self.tick_interval_s:
             return
@@ -1301,6 +1331,90 @@ class BudgetAgent:
             return False
         return True
 
+    def _maybe_oneshot_k2m(self) -> None:
+        """Deterministic one-shot k2m growth (see tick() for the rank-skew
+        rationale). Every predicate here — iteration counter, running-batch
+        size, pool ceilings, free-page counts, working-set floors — is a
+        pure function of state that is identical across TP ranks at the
+        same iteration, so the fire and the admission-cap grow it implies
+        land on the same iteration everywhere. Executes SYNC (inline
+        apply); never touches the async worker."""
+        sched = self.scheduler
+        rb = getattr(sched, "running_batch", None)
+        running_n = len(rb.reqs) if rb is not None and rb.reqs else 0
+        if self._oneshot_k2m_anchor is None:
+            if running_n >= 8:
+                self._oneshot_k2m_anchor = self._iter_seq
+                logger.info(
+                    "[oneshot-k2m] anchored at iter=%d (running=%d); firing "
+                    "after %d iterations",
+                    self._iter_seq, running_n, self._oneshot_k2m_ticks,
+                )
+            return
+        if self._iter_seq - self._oneshot_k2m_anchor < self._oneshot_k2m_ticks:
+            return
+
+        alloc = sched.token_to_kv_pool_allocator
+        kv_pool = alloc.get_kvcache()
+        mamba_pool = getattr(kv_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            self._oneshot_k2m_done = True
+            return
+        scratch: dict = {}
+        if not self._ensure_actuator_chain(alloc, kv_pool, mamba_pool, scratch):
+            self._oneshot_k2m_done = True
+            logger.warning(
+                "[oneshot-k2m] actuator chain unavailable: %s",
+                scratch.get("chain_unavailable_reason"),
+            )
+            return
+        if int(mamba_pool.size) >= int(mamba_pool.max_size):
+            self._oneshot_k2m_done = True
+            logger.info("[oneshot-k2m] mamba already at max_size; nothing to do")
+            return
+
+        # Same sizing/clamps as the tick path, deterministic inputs only.
+        k2m_drain = _env_flag("SGLANG_XPOOL_K2M_DRAIN", True)
+        n_free = self._owner_provider.n_free_source_pages("kv_to_mamba")
+        lcm = int(getattr(self._actuator, "lcm_pages", 48) or 48)
+        n_kv_sub = int(getattr(self._actuator, "n_kv_subpools", 1) or 1)
+        lcm_src_pages = max(1, lcm // max(1, n_kv_sub))
+        if k2m_drain:
+            n_pages_target = min(max(n_free, lcm_src_pages), lcm)
+        else:
+            n_pages_target = min(n_free, lcm)
+        kv_live = int(alloc.live_size)
+        kv_avail = int(alloc.available_size())
+        kv_used = max(0, kv_live - kv_avail)
+        floor_slots = self._kv_working_set_floor_slots(kv_used)
+        n_pages_target = _mamba_drain_floor(
+            kv_live, floor_slots, self._kv_tokens_per_chunk, n_pages_target,
+        )
+        if n_pages_target < lcm_src_pages:
+            # Below one atomic unit: retry next iteration (still
+            # deterministic — both ranks see the same shortfall).
+            return
+        plan = self._fire_planner.build(
+            direction="kv_to_mamba",
+            n_pages_target=n_pages_target,
+            allow_drain=k2m_drain,
+        )
+        if plan is None:
+            return
+        self._oneshot_k2m_done = True
+        result = self._actuator.execute(plan)
+        # Apply the implied admission-cap change on THIS iteration, not at
+        # the next wall-clock-throttled tick — the cap grow is scheduler-
+        # visible state and must move in lockstep across ranks too.
+        self._maybe_update_admission_cap()
+        logger.info(
+            "[oneshot-k2m] fired at iter=%d: granted=%d aborted=%s "
+            "(mamba %d/%d)",
+            self._iter_seq, int(result.granted_pages),
+            bool(result.aborted), int(mamba_pool.size),
+            int(mamba_pool.max_size),
+        )
+
     def _maybe_fire(self, snapshot: dict) -> None:
         """PaybackPlanner decides direction → XPoolFirePlanner builds a
         FirePlan from current ownership state → XPoolActuator executes
@@ -1381,6 +1495,17 @@ class BudgetAgent:
         if self.planner_disabled:
             snapshot["plan_direction"] = "none"
             snapshot["plan_reason"] = "budgeter disabled (SGLANG_HIMA_NO_BUDGETER)"
+            return
+
+        # One-shot mode: the deterministic fire in _maybe_oneshot_k2m is the
+        # ONLY allowed cross-pool state change — wall-clock-triggered planner
+        # fires would reintroduce the rank skew it exists to remove. Let the
+        # planner observe (EWMA continuity) but veto any fire.
+        if self._oneshot_k2m_ticks > 0:
+            _ = self._planner.decide(snapshot, float(snapshot.get("ts", 0.0)),
+                                     float(snapshot.get("dt", 1.0)))
+            snapshot["plan_direction"] = "none"
+            snapshot["plan_reason"] = "oneshot-k2m mode: planner fires vetoed"
             return
 
         # Warmup fire-suppression window: the first seconds after boot are a
