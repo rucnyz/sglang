@@ -58,6 +58,7 @@ class SchedulerInvariantChecker:
     get_running_batch: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
+    _mamba_busy_check_ctr: int = 0
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -301,7 +302,7 @@ class SchedulerInvariantChecker:
         # Every 64th busy iteration is a few checks per second here, early
         # enough to catch a slots-leak minutes before the pool drains.
         mamba_leak, mamba_msg = False, ""
-        self._mamba_busy_check_ctr = getattr(self, "_mamba_busy_check_ctr", 0) + 1
+        self._mamba_busy_check_ctr += 1
         if self._mamba_busy_check_ctr % 64 == 0 and hasattr(
             getattr(self.scheduler.req_to_token_pool, "mamba_pool", None), "size"
         ):
