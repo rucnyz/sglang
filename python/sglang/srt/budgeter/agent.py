@@ -461,7 +461,16 @@ class BudgetAgent:
         between batches — safe with respect to attention backends'
         live tensor reads (per
         `dev/interlayer/dyn_admission_cap/audit_consumers.md`).
+
+        DEFERRED while a fire is in flight: the resize path's cuMem map
+        (ReqTokenVAArena grow) racing the fire worker's cuMemUnmap/Map
+        deadlocks in the driver (observed twice on Kimi deep gates:
+        scheduler's last line is "[admission-cap] grew pool.size", GPU
+        pinned at 100% with no batches). One tick of deferral is harmless —
+        the resize is idempotent and re-checked every tick.
         """
+        if self.has_inflight_fires():
+            return
         sched = self.scheduler
         kv_pool = sched.token_to_kv_pool_allocator.get_kvcache()
         # mamba_pool is the ONE genuinely-conditional attribute here:
