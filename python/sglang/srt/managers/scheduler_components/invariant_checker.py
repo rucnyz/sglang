@@ -304,7 +304,7 @@ class SchedulerInvariantChecker:
         mamba_leak, mamba_msg = False, ""
         self._mamba_busy_check_ctr += 1
         if self._mamba_busy_check_ctr % 64 == 0 and hasattr(
-            getattr(self.scheduler.req_to_token_pool, "mamba_pool", None), "size"
+            getattr(self.req_to_token_pool, "mamba_pool", None), "size"
         ):
             try:
                 mamba_leak, mamba_msg = self._check_mamba_pool(ps)
