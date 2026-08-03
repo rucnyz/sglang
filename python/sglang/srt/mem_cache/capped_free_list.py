@@ -51,7 +51,15 @@ class CappedFreeList:
         headroom). `boot_cap=None` (or `== size`) means fully backed, no tail.
         """
         self.size = int(size)
-        self.device = device
+        # Pin the device INDEX at construction: a bare "cuda" string resolves
+        # to the calling thread's current device at each use site, so a reader
+        # on a non-scheduler thread (the watchdog dump) would build tensors on
+        # cuda:0 while the scheduler thread built `marks` on its own rank
+        # device — the capped_ids() cat then dies cross-device (gate10 TP1).
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        self.device = dev
         self.need_sort = bool(need_sort)
         cap = self.size if boot_cap is None else int(boot_cap)
         self.tail_lo = cap + 1 if cap < self.size else _NO_TAIL

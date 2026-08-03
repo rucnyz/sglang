@@ -292,26 +292,52 @@ class SchedulerInvariantChecker:
         if self.is_hybrid_swa:
             swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
 
+        # Mamba pool: same busy-time visibility as full/swa. The gate10
+        # freeze presented as mamba available≈0 with hundreds evictable —
+        # detectable minutes earlier by this check; the dump-path-only
+        # check surfaced it 300 s late and only if the watchdog fired.
+        # Throttled: unlike the full/swa checks (busy-vetted cost), the mamba
+        # check does set ops over the full-pool page map — dump/idle cost.
+        # Every 64th busy iteration is a few checks per second here, early
+        # enough to catch a slots-leak minutes before the pool drains.
+        mamba_leak, mamba_msg = False, ""
+        self._mamba_busy_check_ctr = getattr(self, "_mamba_busy_check_ctr", 0) + 1
+        if self._mamba_busy_check_ctr % 64 == 0 and hasattr(
+            getattr(self.scheduler.req_to_token_pool, "mamba_pool", None), "size"
+        ):
+            try:
+                mamba_leak, mamba_msg = self._check_mamba_pool(ps)
+            except Exception:
+                logger.exception("[Mem Check (BUSY)] mamba check failed")
+
         level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
         full_line = f"[Mem Check (BUSY)] {full_msg}"
         swa_line = f"[Mem Check (BUSY)] {swa_msg}" if swa_msg else None
+        mamba_line = (
+            f"[Mem Check (BUSY)] {mamba_msg}" if mamba_msg else None
+        )
 
         if level > 1:
             # Verbose: log every iteration.
             logger.info(full_line)
             if swa_line:
                 logger.info(swa_line)
+            if mamba_line:
+                logger.info(mamba_line)
         elif level == 1:
             # Quiet: buffer and stay silent; flush the recent ones only on a leak.
             self.recent_busy_msgs.append(full_line)
             if swa_line:
                 self.recent_busy_msgs.append(swa_line)
-            if full_leak or swa_leak:
+            if mamba_line:
+                self.recent_busy_msgs.append(mamba_line)
+            if full_leak or swa_leak or mamba_leak:
                 for msg in self.recent_busy_msgs:
                     logger.info(msg)
 
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
+        assert not mamba_leak, f"Mamba Pool Mem Leak Detected! {mamba_msg}"
 
         if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
             self._check_kv_page_invariants()
