@@ -146,10 +146,21 @@ class WatchdogRaw:
                     watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
-        if self.dump_info is not None and (info_msg := self.dump_info()):
-            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+        # The dump is best-effort forensics: an exception here (e.g. a
+        # cross-device cat inside a checker) must not kill the watchdog
+        # thread before it delivers SIGQUIT — a hung scheduler would then
+        # zombie forever behind a crashed watchdog (Kimi gate10 round 3:
+        # TP1's watchdog died in dump_info, only TP0's fired).
+        try:
+            if self.dump_info is not None and (info_msg := self.dump_info()):
+                logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+        except Exception:
+            logger.exception(f"{self.debug_name} dump_info failed")
 
-        pyspy_dump_schedulers()
+        try:
+            pyspy_dump_schedulers()
+        except Exception:
+            logger.exception(f"{self.debug_name} pyspy dump failed")
         logger.error(
             f"{self.debug_name} watchdog timeout "
             f"({self.watchdog_timeout=}, {self.soft=})"

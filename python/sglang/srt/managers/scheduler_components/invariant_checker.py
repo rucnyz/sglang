@@ -383,8 +383,11 @@ class SchedulerInvariantChecker:
         def _free_pages(a):
             free = a.free_pages
             release = getattr(a, "release_pages", None)
+            # release_pages can live on a different device than free_pages
+            # (observed cuda:0 vs cuda:1 on TP ranks); normalize before cat
+            # or the watchdog-dump path raises instead of reporting.
             return (
-                torch.cat((free, release))
+                torch.cat((free, release.to(free.device)))
                 if release is not None and len(release) > 0
                 else free
             )
