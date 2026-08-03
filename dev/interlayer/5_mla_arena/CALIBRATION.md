@@ -93,3 +93,32 @@ and the two threads raced). Mitigation: SGLANG_HIMA_FIRE_ASYNC=0
 (serialize fires on the scheduler thread) for the Kimi campaign. Proper
 fix (open): arena-level mutex around cuMem ops or defer cap-grow while a
 fire is in flight.
+
+## Deep-pressure campaign wrap-up (2026-08-03)
+
+Full gate ladder on depth-first real slices (data archived at
+figures/data/kimi48b_deep in the paper repo):
+
+| gate | config | result |
+|---|---|---|
+| 2 | base top100@128 | 1177.6 / P99 4074, KV 0.94, no eviction |
+| 3 | A/B full-deep@256 | base 774 cache 0.66; sys(-12%) — capacity theft |
+| 4 | A/B deepshift@128 | base 787 cache 0.74; sys(-15%) — same theft |
+| 6 | sys@128 (fixes, no drain) | 1184.9 / P99 3602 (-12% vs base) |
+| 7 | sys@128 + m2k drain | 1186.7 / P99 3256 (-20% vs gate2 r1) |
+| fills | base N3 / sys N3 @128 | 1184.7±7.4 P99~3618 vs 1185.8±6.7 P99~3808 |
+
+Net: at mid pressure the fixed sys is PAR with base (single-rep P99 wins do
+not survive N3 averaging); at deep pressure sys still loses (LPB scoring on
+deep trees is the leading suspect; sys@256 with LRU was killed by a boot
+storm before completing). m2k drain works (first real KV growth: live
+4.536M -> 4.606M) but the yield is small because MLA KV is cheap — the
+mamba pool's entire donation is worth ~25% of a pool that already runs at
+0.97 hit. Structural conclusion: Kimi-Linear's MLA+sparse-MoE profile
+leaves little for cross-pool reallocation to win at these scales; the
+row's honest story is cost-neutrality plus tail improvements at mid
+pressure.
+
+Box note: after ~36 h of gate iterations the H200 driver on GPUs 1/6 and
+2/4 degraded (probe-pass no longer predicts boot survival; unwind windows
+stretched to 2 h+). Reboot recommended before further GPU work.
