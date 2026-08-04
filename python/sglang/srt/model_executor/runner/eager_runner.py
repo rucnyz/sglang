@@ -97,6 +97,17 @@ class EagerRunner(BaseRunner):
                 # dLLM runs block_size tokens/request (DLLM_EXTEND).
                 num_tokens_per_req = dllm_config.block_size
         max_bs = mr.max_running_requests
+        # Dynamic admission cap (HiMA): the req pool pre-reserves id-space up
+        # to max_size and the budgeter can raise the live cap past the boot
+        # max_running_requests at runtime. This registry is a boot-time
+        # static allocation, so size it for the CEILING — the first decode
+        # batch of boot_cap+1 requests otherwise dies inside fill_from with
+        # a size-(64)-vs-(65) foreach_copy (gate10 c128 v8, the batch right
+        # after the one-shot grow unlocked admission).
+        _req_pool = getattr(mr, "req_to_token_pool", None)
+        _pool_ceiling = int(getattr(_req_pool, "max_size", 0) or 0)
+        if _pool_ceiling > max_bs:
+            max_bs = _pool_ceiling
         if (
             mr.is_draft_worker
             and mr.spec_algorithm.is_frozen_kv_mtp()
