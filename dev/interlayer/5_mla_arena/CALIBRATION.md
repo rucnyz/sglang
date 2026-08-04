@@ -218,3 +218,28 @@ tok/s (identical to @64 — hard-capped), P50 TTFT 26.8s, P99 118s, half
 the load queued for the entire run. sys@128 = the admission unlock
 (64->135 via one-shot mamba growth) is the mechanism under test; run in
 flight at time of writing.
+
+### Gate 10 c128 VERDICT (2026-08-04, v10 run, 12 fixes deep)
+
+| arm @128conc CAP=320 | tput | P50 TTFT | P99 TTFT | cache | running peak |
+|---|---|---|---|---|---|
+| base | 774.1 | 26,812 ms | 118,058 ms | 0.4724 | 64 (choked) |
+| sys (one-shot k2m) | 762.6 | **502 ms (53x)** | **9,545 ms (12.4x)** | 0.5362 | **132** |
+
+Same hardware, same memory budget: vanilla's mamba-derived admission cap
+(64 = 320/5) strangles half the offered concurrency behind a 26.8 s
+median TTFT; HiMA's one-shot k2m converts idle KV into recurrent slots
+(320->1202), the admission gate follows (64->135, all four stores), the
+queue drains (64 sustained -> ~0), and the same throughput is served at
+53x lower median / 12x lower P99 TTFT. 3/5936 isolated client errors
+(0.05%), len_match 0.9987, zero server exceptions.
+
+Last three bugs to get here: (11) admission gate dual-store desync —
+_sync_admission_gate wrote server_args while the scheduler reads
+get_parallel()'s config bag; then the fix's own user-set guard was
+poisoned by the first write (cache the flag before writing); (12) the
+eager runner's graph-buffer registry sized by boot max_running — first
+bs=65 decode batch died in fill_from; size it by the req pool ceiling.
+
+Fleet running: sys/base N3, static CAP oracle (1202) + precedent (640),
+vLLM, all @128. Row replacement + appendix follow the fleet.
