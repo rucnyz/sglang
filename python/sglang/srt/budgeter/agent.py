@@ -495,6 +495,22 @@ class BudgetAgent:
                 "hima-admission-cap",
                 pp_max_micro_batch_size=gate,
             )
+        # Readback across every store + the actual admission function, so a
+        # frozen gate is visible in the log instead of inferred from queue
+        # behavior (c128 v4: pool 135, running still pinned at 64 with the
+        # config-bag write in place — this line finds the store that won).
+        from sglang.srt.runtime_context import get_parallel
+        try:
+            logger.info(
+                "[admission-cap] gate readback: parallel=%s server_args=%s "
+                "sched.max_running=%s allocatable(bs=60)=%s",
+                get_parallel().pp_max_micro_batch_size,
+                get_global_server_args().pp_max_micro_batch_size,
+                self.scheduler.max_running_requests,
+                self.scheduler.get_num_allocatable_reqs(60),
+            )
+        except Exception:
+            logger.exception("[admission-cap] gate readback failed")
 
     def _maybe_update_admission_cap(self) -> None:
         """Resize per-req arrays so admission can follow actuator-driven
