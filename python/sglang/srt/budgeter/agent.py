@@ -471,15 +471,30 @@ class BudgetAgent:
         concurrency win would be a no-op). Mirror the boot derivation so the
         gate tracks the cap both on grow and shrink.
         """
+        from sglang.srt.runtime_context import get_context
         from sglang.srt.server_args import get_global_server_args
 
         pp_size = max(1, int(self.scheduler.ps.pp_size))
+        gate = max(new_cap // pp_size, 1)
         # v0.5.16: resolved server_args is read-only; override() is the
         # audited post-resolution mutation point (plain setattr raises).
         get_global_server_args().override(
             "hima-admission-cap",
-            pp_max_micro_batch_size=max(new_cap // pp_size, 1),
+            pp_max_micro_batch_size=gate,
         )
+        # The ACTUAL admission read-site is get_parallel()
+        # .pp_max_micro_batch_size (Scheduler.get_num_allocatable_reqs),
+        # which resolves from the config bags — NOT from server_args (no
+        # write-through by design). Writing only server_args left the gate
+        # frozen at the boot value: gate10 c128 grew the pool 64->135 and
+        # running stayed pinned at 64 with 65 queued. Mirror the boot
+        # derivation into the bag the reader actually consults (same call
+        # Scheduler.__init__ uses).
+        if not self.scheduler.server_args.pp_max_micro_batch_size:
+            get_context().override(
+                "hima-admission-cap",
+                pp_max_micro_batch_size=gate,
+            )
 
     def _maybe_update_admission_cap(self) -> None:
         """Resize per-req arrays so admission can follow actuator-driven
