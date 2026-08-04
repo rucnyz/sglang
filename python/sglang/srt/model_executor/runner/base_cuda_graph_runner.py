@@ -69,7 +69,16 @@ def get_batch_sizes_to_capture(
 
     server_args = model_runner.server_args
     capture_bs = list(server_args.cuda_graph_config.decode.bs)
-    num_max_requests = model_runner.req_to_token_pool.size
+    # Capture to the req pool CEILING, not the live boot cap: under HiMA's
+    # dynamic admission cap the live size can grow past boot (64 -> 135 on
+    # gate10 c128), and graphs filtered by the boot value leave the whole
+    # grown regime on the eager decode path (-11.6% throughput vs the
+    # static oracle sized there from boot). A few extra graphs at capture
+    # time; identical behavior when max_size == size.
+    _pool = model_runner.req_to_token_pool
+    num_max_requests = max(
+        int(_pool.size), int(getattr(_pool, "max_size", 0) or 0)
+    )
 
     mul_base = get_cuda_graph_batch_size_alignment(server_args)
     # TBO splits each request's rows across two micro-batches, so the
