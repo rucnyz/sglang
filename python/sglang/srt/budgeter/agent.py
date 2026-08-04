@@ -252,6 +252,10 @@ class BudgetAgent:
         self._iter_seq = 0
         self._oneshot_k2m_anchor: Optional[int] = None
         self._oneshot_k2m_done = False
+        # None until the first _sync_admission_gate call; captured there
+        # BEFORE any budgeter write so our own override can't masquerade
+        # as a user-provided --pp-max-micro-batch-size.
+        self._pp_micro_user_set: Optional[bool] = None
         self._fire_queue: "Optional[queue.Queue]" = None
         self._fire_worker: "Optional[threading.Thread]" = None
         # True while the worker is inside execute_async (the physical
@@ -476,6 +480,16 @@ class BudgetAgent:
 
         pp_size = max(1, int(self.scheduler.ps.pp_size))
         gate = max(new_cap // pp_size, 1)
+        # Capture "did the USER set --pp-max-micro-batch-size" ONCE, before
+        # our own server_args write below poisons the signal: on the second
+        # look server_args holds OUR 135 and reads as user-set, which
+        # silently skipped the config-bag write on every call — the v5
+        # readback showed parallel=64 vs server_args=135 for exactly this
+        # reason.
+        if self._pp_micro_user_set is None:
+            self._pp_micro_user_set = bool(
+                get_global_server_args().pp_max_micro_batch_size
+            )
         # v0.5.16: resolved server_args is read-only; override() is the
         # audited post-resolution mutation point (plain setattr raises).
         get_global_server_args().override(
@@ -490,7 +504,7 @@ class BudgetAgent:
         # running stayed pinned at 64 with 65 queued. Mirror the boot
         # derivation into the bag the reader actually consults (same call
         # Scheduler.__init__ uses).
-        if not self.scheduler.server_args.pp_max_micro_batch_size:
+        if not self._pp_micro_user_set:
             get_context().override(
                 "hima-admission-cap",
                 pp_max_micro_batch_size=gate,
