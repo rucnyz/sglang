@@ -183,3 +183,38 @@ max_size) grows ~0.9 GB at this shape — within MEMFRAC 0.80 slack.
 Run ledger: `sys_nofix` = pre-fix storm (772.2, cache 0.474, P99 10.5s);
 `sys_lcmfix` = agent-side fix only (fires 1/min, still granted=0 — an
 even cleaner overhead-only control); round-3 sys = both fixes.
+
+## Gate 10 full gauntlet: ten rounds to a working k2m (2026-08-03/04)
+
+| round | config | outcome |
+|---|---|---|
+| 1 (nofix) | pre-fix | 772.2, cache 0.474, P99 10.5s — ~960 no-op fires/rank, P99 2x from the storm alone |
+| base | CAP=320 @64 | 774.3, cache 0.4733, P99 5.8s — thrash confirmed (cache halved vs full-CAP swarm) |
+| 2 (lcmfix) | agent-side fix only | crawl: dst clamp still 0-grants; fork-recovery slow path, killed |
+| 3 | + dst headroom fix | fire WORKS (mamba 320->1202, cache hits 16-55K/req) — silent 2-rank freeze at fire+86s |
+| 4 | + watchdog survives | freeze reproduced; dump: mamba available=2/evictable=948; fires 66s APART across ranks |
+| 5-7 | forensics iterations | my own bugs (slots dataclass, self.scheduler ref, census blind spots) — 3 boot tickets burned |
+| 8 | busy-check forensics | unaccounted CONSTANT at 3x running (request-held; no leak); froze at pool-full again |
+| 9 | LRU eviction | froze 2s post-fire at usage 0.16 — kills LPB + pool-full theories |
+| 10 | ONESHOT_K2M_TICKS=2000 | both ranks anchor iter 104393, fire iter 106393 — ZERO freeze, clean run |
+
+Root cause of the freeze family: wall-clock-driven budgeter fires land at
+rank-skewed iterations; a real fire diverges allocator/admission state
+between TP ranks and the next affected scheduling decision desyncs batch
+composition into an NCCL deadlock (2-90s delay = race distribution).
+Request recv is broadcast-synced, so iteration-indexed triggers are
+rank-deterministic — SGLANG_HIMA_ONESHOT_K2M_TICKS fires on the same
+iteration everywhere. Follow-up (recorded, not tonight): generalize to
+a broadcast-synced fire barrier so the full adaptive planner is TP-safe.
+
+### The verdict pair
+
+conc=64 (client never exceeds the 64-slot admission cap — the unlock is
+unused): sys 781.7 vs base 774.3 (+1%), P50 407 vs 505 (-19%), cache
+0.5225 vs 0.4733, P99 worse. Mechanism works; workload can't pay for it.
+
+conc=128 (offered load 2x the vanilla admission cap): base@128 = 774.1
+tok/s (identical to @64 — hard-capped), P50 TTFT 26.8s, P99 118s, half
+the load queued for the entire run. sys@128 = the admission unlock
+(64->135 via one-shot mamba growth) is the mechanism under test; run in
+flight at time of writing.
