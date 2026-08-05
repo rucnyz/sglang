@@ -243,3 +243,21 @@ bs=65 decode batch died in fill_from; size it by the req pool ceiling.
 
 Fleet running: sys/base N3, static CAP oracle (1202) + precedent (640),
 vLLM, all @128. Row replacement + appendix follow the fleet.
+
+### Gate 10 FINAL (2026-08-05): published row, all arms N=3
+
+| arm @128conc | tput | P50 TTFT | P99 TTFT |
+|---|---|---|---|
+| base (CAP=320) | 776.0 ± 1.9 | 26,825 ± 105 | 118,552 ± 433 |
+| static cap640 | 807.0 (N1) | 689 | 16,697 |
+| static cap1202 (oracle) | 859.1 ± 2.5 | 516 ± 6 | 22,081 ± 4,350 |
+| vLLM | 880.4 ± 0.9 | 2,389 ± 129 | 28,286 ± 10,845 |
+| sys (one-shot k2m) | 821.9 ± 3.5 | 577 ± 2 | 37,326 ± 39,224 |
+
+Published to the main table (paper commit f8d1f44) with the appendix
+memory-pressure sizing paragraph. Thirteen engine fixes landed on
+HiMA-latest during the campaign (last: cuda-graph capture to pool
+ceiling, d391d22816, worth +7.7% sys throughput). The sys arms use
+SGLANG_HIMA_ONESHOT_K2M_TICKS=2000 (deterministic iteration-aligned
+fire); generalizing the full adaptive planner to TP-safe fires via a
+broadcast-synced barrier is recorded follow-up work.
