@@ -9,7 +9,7 @@ before the future-buffer stash.
 
 This pins the bookkeeping (which reqs, which token, counter advance) without a
 model: the commit-eligibility filter mirrors ``process_batch_result_*``
-(skip finished / retracted / chunked), the counter indexes
+(skip finished / retracted / the batch's still-chunking req), the counter indexes
 ``forced_output_ids`` and advances once per dispatched token, and it stops at the
 end of the forced sequence.
 
@@ -32,6 +32,7 @@ class FakeReq:
     def __init__(self, forced=None, inflight_middle_chunks=0, finished=False,
                  retracted=False, dispatched=0):
         self.sampling_params = _SP(forced)
+        # Kept only to prove the override no longer consults this lagging counter.
         self.inflight_middle_chunks = inflight_middle_chunks
         self._finished = finished
         self.is_retracted = retracted
@@ -51,11 +52,12 @@ def test_basic_advance_and_index():
 
 
 def test_skips_ineligible_and_keeps_counter():
-    chunked = FakeReq(forced=[10], inflight_middle_chunks=2)
+    chunked = FakeReq(forced=[10])
     fin = FakeReq(forced=[10], finished=True)
     retr = FakeReq(forced=[10], retracted=True)
     noforce = FakeReq(forced=None)
-    assert forced_override_positions([chunked, fin, retr, noforce]) == []
+    reqs = [chunked, fin, retr, noforce]
+    assert forced_override_positions(reqs, chunked) == []
     assert chunked.forced_dispatched == 0 and fin.forced_dispatched == 0
     assert retr.forced_dispatched == 0 and noforce.forced_dispatched == 0
     print("  PASS  skips chunked / finished / retracted / non-forced, no advance")
@@ -63,12 +65,44 @@ def test_skips_ineligible_and_keeps_counter():
 
 def test_mixed_batch_indices():
     a = FakeReq(forced=[100, 101])
-    b = FakeReq(forced=[200], inflight_middle_chunks=1)
+    b = FakeReq(forced=[200])
     c = FakeReq(forced=[300, 301], dispatched=1)
-    out = forced_override_positions([a, b, c])
+    out = forced_override_positions([a, b, c], b)
     assert out == [(0, 100), (2, 301)], out
     assert a.forced_dispatched == 1 and b.forced_dispatched == 0 and c.forced_dispatched == 2
     print("  PASS  mixed batch: correct (index, token), only eligible advance")
+
+
+def test_last_chunk_is_forced_despite_stale_counter():
+    """Regression: the last prefill chunk commits a token, so it must be forced.
+
+    Under overlap the batch-RESULT processor has not yet decremented
+    ``inflight_middle_chunks`` when the last chunk is dispatched, so filtering on
+    that counter dropped forced[0] and leaked the model's own first token.
+    ``batch.chunked_req`` is None for the batch that finishes the prefill.
+    """
+    r = FakeReq(forced=[10, 11], inflight_middle_chunks=1)
+    assert forced_override_positions([r], None) == [(0, 10)]
+    assert r.forced_dispatched == 1
+    print("  PASS  last chunk forced even while inflight_middle_chunks is stale")
+
+
+def test_decode_batch_ignores_stale_chunked_req():
+    """Regression: ``chunked_req`` is meaningless once the batch is decoding.
+
+    When the running batch is empty the scheduler adopts the prefill batch object
+    itself (``running_batch = last_batch``) and nothing clears ``chunked_req``, so
+    the req that was mid-chunk in that batch kept matching ``req is chunked_req``
+    on every later decode step — it was silently skipped and free-ran its entire
+    output while the trace expected 2400 forced tokens.
+    """
+    r = FakeReq(forced=[10, 11, 12], dispatched=1)
+    assert forced_override_positions([r], r, is_extend=False) == [(0, 11)]
+    assert r.forced_dispatched == 2
+    # still honoured while the batch really is prefilling that req
+    assert forced_override_positions([r], r, is_extend=True) == []
+    assert r.forced_dispatched == 2
+    print("  PASS  decode batch ignores a stale chunked_req")
 
 
 def test_retract_resync_semantics():
@@ -101,6 +135,8 @@ def main():
         test_basic_advance_and_index,
         test_skips_ineligible_and_keeps_counter,
         test_mixed_batch_indices,
+        test_last_chunk_is_forced_despite_stale_counter,
+        test_decode_batch_ignores_stale_chunked_req,
         test_retract_resync_semantics,
         test_empty_forced_list,
         test_no_custom_params,

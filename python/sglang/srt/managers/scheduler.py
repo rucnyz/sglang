@@ -3687,10 +3687,17 @@ class Scheduler(
         tracks a dispatch counter (not ``len(output_ids)``), so the 1-step
         commit lag under ``--enable-overlap`` is handled correctly.  A no-op
         when no request in the batch carries ``forced_output_ids``.
+
+        ``batch.chunked_req`` (not ``req.inflight_middle_chunks``) identifies the
+        req that commits nothing this batch, and only on an extend batch: the
+        attribute survives into the decode batch that adopts this object — see
+        ``forced_override_positions``.
         """
         if next_token_ids is None:
             return
-        overrides = forced_override_positions(batch.reqs)
+        overrides = forced_override_positions(
+            batch.reqs, batch.chunked_req, batch.forward_mode.is_extend()
+        )
         if not overrides:
             return
         idx = torch.tensor(
@@ -3728,8 +3735,9 @@ class Scheduler(
             heartbeat_s = getattr(self.server_args, "aginfer_heartbeat_s", 5.0)
             if self._aginfer_driver.should_tick(
                 occ, _time.monotonic(), theta_lo=theta_lo, min_interval_s=heartbeat_s):
-                self._aginfer_driver.tick(self, theta_hi=theta_hi, theta_lo=theta_lo,
+                result = self._aginfer_driver.tick(self, theta_hi=theta_hi, theta_lo=theta_lo,
                                           heartbeat_s=heartbeat_s)
+                logger.info("aginfer in-engine tick occ=%.4f result=%s", occ, result)
         except Exception:
             logger.exception(
                 "aginfer in-engine tick raised — DISABLING aginfer-in-engine for the "
