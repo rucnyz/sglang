@@ -23,10 +23,18 @@ that complete. Knobs: compaction frequency × dropped-span size; session turnove
 footprint; concurrency — pool sized so the dead KV's occupancy actually matters.
 
 ## What our framework does
-On the death event the named units' future `p_hat → 0` → immediate DROP (or
-DISK-sink) candidates → reclaimed at once, ahead of any reactive sweep.
-`SESSION_END` / `SUB_RETURN` are implemented; `CONTEXT_COMPACTED` is the one new
-hook to add.
+On `SESSION_END`, the Dynamo router sends `POST /aginfer/session_end` to every
+worker that served the program. Each worker fans the request to every DP rank;
+the scheduler then waits for in-flight requests, native SGLang session locks,
+and asynchronous HiCache work to drain across the TP/CP cache group. It removes
+the ending program from shared nodes and deletes exclusively-held leaves
+bottom-up, releasing their HBM and DRAM allocations immediately instead of
+waiting for memory pressure or an LRU sweep.
+
+The operation is idempotent and acknowledges completion only after every rank
+has completed the same lifecycle barrier. `SUB_RETURN` can use this path when a
+child is represented as its own terminal session. `CONTEXT_COMPACTED` still
+needs a range-aware lifecycle signal and is not implemented.
 
 ## Why we win
 **Proactive vs reactive timing.** Dead KV is reclaimed the instant it dies, so
@@ -53,17 +61,24 @@ integrated HBM/DRAM held by dead KV (the internal cause). Expected: ours reclaim
 on the event → live work keeps fast tiers → lower TTFT; B/TA hold corpses until
 age-out.
 
-## 4-tier sizing (required)
+## Full 4-tier follow-up
 Cache-pressure mode, **all four tiers live** (HBM, DRAM, DISK enabled; DROP
 reachable). Size HBM+DRAM+DISK below the live+dead working set so an un-reclaimed
 corpse pushes a live reused unit across the **DISK→DROP** frontier (synchronous
 DISK load_back, or recompute). Confirm via B's logs that live units are stranded
 on DISK / recomputed while corpses sit resident in HBM/DRAM.
 
+The current physical lifecycle deletion covers the radix-tree allocations in
+HBM and DRAM. Per-key deletion from an external HiCache storage backend is a
+separate follow-up; until that exists, do not claim that `SESSION_END` deletes
+backing-store bytes.
+
 ## Honest status & falsification
-- **Status:** trigger (b) `SESSION_END`/`SUB_RETURN` demote-drop is **implemented**
-  (the mature half). Trigger (a) needs a `CONTEXT_COMPACTED` proxy hook (not among
-  the 13 events today) — easy to emit from a Claude Code agent.
+- **Status:** trigger (b) `SESSION_END` is implemented end-to-end for PP=1 and
+  HBM+DRAM, including TP/CP synchronization, shared-prefix preservation,
+  deferred in-flight cleanup, and duplicate delivery. Pipeline parallelism,
+  decode-side asynchronous KV offload, external-storage deletion, and trigger
+  (a) `CONTEXT_COMPACTED` remain explicit follow-ups.
 - **Falsifies the win if:** under pressure LRU evicts dead KV about as fast as our
   event-driven drop (it's the least-recent anyway) → negligible gap. The test must
   show LRU actually keeps dead KV ahead of live units, or that the reclaim-latency

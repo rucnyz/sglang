@@ -7,6 +7,9 @@ Workspace for the paper **"Multi-Agent KV Cache Scheduling as an MDP"**
 
 - **Platform**: Dynamo (no standalone sglang experiments)
 - **Scheduling**: in-engine driver (`SGLANG_AGINFER_IN_ENGINE=1`), no external daemon
+- **Lifecycle cleanup**: Dynamo forwards a terminal session signal to
+  `POST /aginfer/session_end`; SGLang waits for in-flight ownership to drain,
+  synchronizes TP/CP ranks, and immediately frees exclusive HBM/DRAM KV
 - **Replay**: agentreplay (`convert` → `replay-dynamo`), real CC traces only
 - **Teacher-forcing**: overlap-compatible GPU scatter (`managers/forced_tokens.py`)
 
