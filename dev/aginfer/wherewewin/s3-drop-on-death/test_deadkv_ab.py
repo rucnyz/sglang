@@ -131,8 +131,13 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "ok": True,
                             "deferred": False,
+                            "status": "completed" if existed else "already_absent",
+                            "matched_nodes": int(existed),
+                            "holders_removed": int(existed),
                             "remaining_nodes": 0,
                             "released_nodes": int(existed),
+                            "released_hbm_tokens": int(existed),
+                            "released_dram_tokens": int(existed),
                         }
                     ],
                 },
@@ -257,7 +262,35 @@ def run_mock_test() -> None:
         bootstrap = json.loads(bootstrap_path.read_text(encoding="utf-8"))
         assert bootstrap["pair_count"] == 2
         assert "dead_kv_reduction_pct" in bootstrap["metrics"]
+
+        verifier_artifacts = pathlib.Path(directory) / "e2e"
+        verified = subprocess.run(
+            [
+                sys.executable,
+                str(pathlib.Path(__file__).with_name("verify_dead_kv_e2e.py")),
+                "--base-url",
+                f"http://127.0.0.1:{server.server_port}",
+                "--shared-repeats",
+                "1",
+                "--tail-repeats",
+                "1",
+                "--artifact-dir",
+                str(verifier_artifacts),
+                "--confirm-dedicated-server",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if verified.returncode:
+            print(verified.stdout)
+            print(verified.stderr, file=sys.stderr)
+            raise SystemExit(verified.returncode)
+        verifier_result = json.loads(
+            (verifier_artifacts / "result.json").read_text(encoding="utf-8")
+        )
+        assert verifier_result["status"] == "PASS"
         print(completed.stdout, end="")
+        print(verified.stdout, end="")
         print("mock smoke test passed")
     server.shutdown()
 

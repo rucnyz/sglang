@@ -127,11 +127,38 @@ python3 dev/aginfer/wherewewin/s3-drop-on-death/analyze_results.py \
 ```
 
 The lightweight mock test exercises ABBA execution, reporting, dead-byte
-accounting, and bootstrap analysis without GPUs:
+accounting, bootstrap analysis, and the direct E2E verifier without GPUs:
 
 ```bash
 python3 dev/aginfer/wherewewin/s3-drop-on-death/test_deadkv_ab.py
 ```
+
+## Direct full-pipeline acceptance test
+
+`verify_dead_kv_e2e.py` is a stricter black-box acceptance test for a live
+SGLang deployment. It verifies that:
+
+- completing a response does not itself end the program's KV lifetime;
+- two programs can share a prefix while retaining distinct tails;
+- `SESSION_END(A)` receives an all-rank ACK and physically releases A-only
+  HBM/DRAM allocations without damaging B's shared or exclusive units;
+- a repeated END is an idempotent `already_absent` no-op;
+- B still gets a cache hit after A is reclaimed; and
+- generation and health checks continue to work after full cleanup.
+
+By default the verifier calls `flush_cache`. Run it only on a dedicated server
+and acknowledge that operation explicitly:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/verify_dead_kv_e2e.py \
+  --base-url http://127.0.0.1:30001 \
+  --artifact-dir /tmp/deadkv-e2e \
+  --confirm-dedicated-server
+```
+
+`--skip-flush` is available for controlled environments where the caller has
+already isolated cache state; the verifier still creates and ends its own
+unique program IDs.
 
 See [RESULTS.md](RESULTS.md) for the current GB300 result and its limitations.
 Raw logs, model weights, runtime archives, credentials, PID files, and
