@@ -161,8 +161,9 @@ already isolated cache state; the verifier still creates and ends its own
 unique program IDs.
 
 See [RESULTS.md](RESULTS.md) or the
-[Chinese report](RESULTS.zh-CN.md) for the current GB300 result and its
-limitations.
+[Chinese report](RESULTS.zh-CN.md) for the controlled synthetic GB300 result.
+The follow-up [real Claude Code AgentReplay report](REALTRACE_RESULTS.zh-CN.md)
+covers Qwen3.8-27B and DeepSeek-V4-Flash.
 Raw logs, model weights, runtime archives, credentials, PID files, and
 machine-specific launch scripts are intentionally not versioned here.
 
@@ -177,8 +178,9 @@ backing-store bytes.
 
 ## Honest status and falsification
 
-The current result validates the `SESSION_END` trigger end-to-end for a
-single-node TP4, PP=1, HBM+DRAM deployment. The implementation includes TP/CP
+The current results validate the `SESSION_END` trigger end-to-end for a
+single-node TP4, PP=1, HBM+DRAM deployment, including a controlled workload and
+a bounded real Claude Code trace. The implementation includes TP/CP
 synchronization, shared-prefix preservation, deferred in-flight cleanup, and
 duplicate delivery. It deliberately fails closed for PP>1 and decode-side
 asynchronous KV offload. It does not yet validate `CONTEXT_COMPACTED`, SSD/NIXL

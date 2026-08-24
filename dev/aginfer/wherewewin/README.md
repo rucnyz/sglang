@@ -66,7 +66,7 @@ into S1/S8 — so there is no standalone S4.)
 |---|---|---|---|---|---|
 | **S1** | [Tool-call predictability (basic)](s1-toolcall-predictability/) | tool call (universal) | demote + predictive promote — **established here** | post-gap TTFT / load_back | promote not yet firing |
 | **S2** | [Shared-prefix retention under scratch churn](s2-shared-prefix-retention/) | fleet-shared system prefix | value eviction | shared-prefix recompute / TTFT | tied on cache-hit once; retest on TTFT |
-| **S3** | [Drop-on-death (compaction + end)](s3-drop-on-death/) | provably-dead KV (compaction; program/sub-agent end) | drop-on-death | arrival/next-prefill TTFT, throughput | SESSION_END A/B passed on TP4 HBM+DRAM; compaction and storage deletion open |
+| **S3** | [Drop-on-death (compaction + end)](s3-drop-on-death/) | provably-dead KV (compaction; program/sub-agent end) | drop-on-death | arrival/next-prefill TTFT, throughput | SESSION_END A/B passed on TP4 HBM+DRAM, including bounded real AgentReplay traces; compaction and storage deletion open |
 | **S5** | [Value-gated pause under overload](s5-overload-pause/) | overload + heterogeneous runtimes | admission pause | goodput / p99 under overload | dormant (pauses=0); needs live overload |
 | **S6** | [Blocking sub-agent](s6-blocking-subagent/) | blocking sub-agent (very long idle + child lifecycle) | *reuses S1* demote+promote, + drop | freed-HBM benefit + parent-resume TTFT | promote not firing |
 | **S7** | [Background fan-out](s7-background-fanout/) | background fan-out (predictable concurrency spike) | proactive demote / pause (event-carried forecast) | spike p99 / no-thrash | forecast term added; needs impl |

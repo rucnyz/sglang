@@ -2,6 +2,10 @@
 
 [English version](RESULTS.md)
 
+真实 Claude Code trace 上的 Qwen3.8-27B / DeepSeek-V4-Flash 后续实验见
+[REALTRACE_RESULTS.zh-CN.md](REALTRACE_RESULTS.zh-CN.md)。该实验确认 Dead KV
+最终清零和 sampled peak KV-pool 下降，但尚未证明稳定的 TTFT/吞吐提升。
+
 ## 结论
 
 在受控的合成 Dead-KV workload 中，显式发送 `SESSION_END` 能回收所有测得的 Dead KV，并保护仍然存活的 working set。默认 LRU 在观察窗口结束时仍保留大量已经不会再被访问的 KV。
@@ -89,8 +93,7 @@
 - decode-side asynchronous KV offload；
 - DP/CP 和多节点 P/D disaggregation；
 - Router 重启后的 lifecycle mapping 恢复；
-- DeepSeek-V4 checkpoint；
-- 真实 AgentReplay/生产 workload；
+- 完整长度的 DeepSeek-V4 / Qwen3.8 AgentReplay session；
 - 更长时间的稳定性与泄漏测试。
 
 原始运行日志和大体积 state artifacts 保存在源码仓库之外，没有提交模型、凭据、PID、runtime archive 或机器专用启动脚本。
