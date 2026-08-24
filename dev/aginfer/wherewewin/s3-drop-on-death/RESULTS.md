@@ -1,5 +1,7 @@
 # S3 SESSION_END result — 2026-08-23
 
+[中文版本](RESULTS.zh-CN.md)
+
 ## Result
 
 On a controlled synthetic Dead-KV workload, explicit `SESSION_END` reclaimed

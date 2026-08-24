@@ -160,7 +160,9 @@ python3 dev/aginfer/wherewewin/s3-drop-on-death/verify_dead_kv_e2e.py \
 already isolated cache state; the verifier still creates and ends its own
 unique program IDs.
 
-See [RESULTS.md](RESULTS.md) for the current GB300 result and its limitations.
+See [RESULTS.md](RESULTS.md) or the
+[Chinese report](RESULTS.zh-CN.md) for the current GB300 result and its
+limitations.
 Raw logs, model weights, runtime archives, credentials, PID files, and
 machine-specific launch scripts are intentionally not versioned here.
 
