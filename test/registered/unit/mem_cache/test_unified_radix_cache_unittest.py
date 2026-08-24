@@ -212,6 +212,51 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
 
 
+class TestUnifiedRadixProgramIdSplit(CustomTestCase):
+    def test_split_tags_shared_prefix_without_claiming_old_exclusive_tail(self):
+        cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL,),
+            kv_size=64,
+            max_context_len=64,
+        )
+        tree, allocator, _ = build_fixture(cfg)
+
+        first = array("q", [1, 2, 3, 4, 5, 6])
+        second = array("q", [1, 2, 3, 9, 10])
+        first_value = allocator.alloc(len(first))
+        second_value = allocator.alloc(len(second))
+        self.assertIsNotNone(first_value)
+        self.assertIsNotNone(second_value)
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey(first),
+                value=first_value,
+                program_id="program-a",
+            )
+        )
+        tree.insert(
+            InsertParams(
+                key=RadixKey(second),
+                value=second_value,
+                program_id="program-b",
+            )
+        )
+
+        shared = next(iter(tree.root_node.children.values()))
+        self.assertEqual(shared.session_ids, {"program-a", "program-b"})
+        self.assertEqual(len(shared.children), 2)
+        holder_sets = {
+            frozenset(child.session_ids) for child in shared.children.values()
+        }
+        self.assertEqual(
+            holder_sets,
+            {frozenset({"program-a"}), frozenset({"program-b"})},
+        )
+        tree.sanity_check()
+
+
 def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     """Create (tree, allocator, req_to_token_pool) from a CacheConfig."""
     server_args = ServerArgs(model_path="dummy", page_size=cfg.page_size)
