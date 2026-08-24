@@ -26,6 +26,7 @@ VOCAB = 1 << 20
 def _recv(rid, input_ids, max_new_tokens=8):
     return SimpleNamespace(
         rid=rid,
+        program_id=None,
         input_ids=array("q", input_ids),
         mm_inputs=None,
         session_params=SimpleNamespace(
