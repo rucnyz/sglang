@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections import deque
-from typing import Deque, Generic, List, Optional, TypeVar
+from typing import Generic, List, Optional, TypeVar
 
 import zmq
 
@@ -22,37 +21,73 @@ class FanOutCommunicator(Generic[T]):
     Only one request is in-flight at any time in either mode.
     """
 
-    def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
+    def __init__(
+        self,
+        sender: zmq.Socket,
+        fan_out: int,
+        mode="queueing",
+        *,
+        correlate_by_rid: bool = False,
+    ):
         self._sender = sender
         self._fan_out = fan_out
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
-        self._ready_queue: Deque[asyncio.Event] = deque()
+        self._queue_lock = asyncio.Lock()
+        self._queueing_broken_reason: Optional[str] = None
+        self._correlate_by_rid = correlate_by_rid
+        self._result_rid = None
 
         assert mode in ["queueing", "watching"]
 
-    async def queueing_call(self, obj: T):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
+    async def queueing_call(self, obj: T, timeout: Optional[float] = None):
+        """Serialize a fan-out call and leave cancellation in a safe state.
+
+        Uncorrelated control messages fail closed after timeout/cancellation,
+        because a late response could otherwise be mistaken for the next
+        request.  Callers that opt into ``correlate_by_rid`` can safely recover:
+        late responses are discarded unless their ``rid`` matches the current
+        request.
+        """
+
+        async with self._queue_lock:
+            if self._queueing_broken_reason is not None:
+                raise RuntimeError(self._queueing_broken_reason)
             assert self._result_event is None
             assert self._result_values is None
 
-        if obj is not None:
-            self._sender.send_pyobj(obj)
+            request_rid = getattr(obj, "rid", None)
+            if self._correlate_by_rid and request_rid is None:
+                raise ValueError("correlated fan-out request must have a rid")
 
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+            event = asyncio.Event()
+            self._result_event = event
+            self._result_values = []
+            self._result_rid = request_rid
+            try:
+                if obj is not None:
+                    self._sender.send_pyobj(obj)
+                if timeout is None:
+                    await event.wait()
+                else:
+                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                return self._result_values
+            except asyncio.TimeoutError:
+                if not self._correlate_by_rid:
+                    self._queueing_broken_reason = (
+                        "fan-out request timed out; communicator requires restart"
+                    )
+                raise
+            except asyncio.CancelledError:
+                if not self._correlate_by_rid:
+                    self._queueing_broken_reason = (
+                        "fan-out request was cancelled; communicator requires restart"
+                    )
+                raise
+            finally:
+                self._result_event = self._result_values = None
+                self._result_rid = None
 
     async def watching_call(self, obj):
         if self._result_event is None:
@@ -74,13 +109,24 @@ class FanOutCommunicator(Generic[T]):
             self._result_event = self._result_values = None
         return result_values
 
-    async def __call__(self, obj):
+    async def __call__(self, obj, timeout: Optional[float] = None):
         if self._mode == "queueing":
-            return await self.queueing_call(obj)
+            return await self.queueing_call(obj, timeout=timeout)
         else:
+            if timeout is not None:
+                raise ValueError("timeout is only supported in queueing mode")
             return await self.watching_call(obj)
 
     def handle_recv(self, recv_obj: T):
+        # A timed-out/cancelled queueing call is intentionally fail-closed.
+        # Its uncorrelated late responses cannot be reused by another call.
+        if self._result_values is None or self._result_event is None:
+            return
+        if (
+            self._correlate_by_rid
+            and getattr(recv_obj, "rid", None) != self._result_rid
+        ):
+            return
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()

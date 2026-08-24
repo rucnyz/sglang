@@ -76,6 +76,7 @@ from sglang.srt.mem_cache.aginfer.cache_policy import (  # aginfer hook (#251)
     _AGINFER_BIRTH_PHAT,  # re-exported: read by verify/t27 via _urc._AGINFER_BIRTH_PHAT
 )
 from sglang.srt.mem_cache.aginfer import cache_hooks as _cache_hooks  # aginfer hook (#251)
+from sglang.srt.mem_cache.aginfer import dead_kv as _dead_kv  # aginfer SESSION_END
 from sglang.srt.mem_cache.aginfer import state_dump as _state_dump  # aginfer hook (#251)
 # ---------------------------------------------------------------------------
 
@@ -1185,11 +1186,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
-            if pid is not None:
-                node.session_ids.add(pid)
             prefix_len = node.key.match(key, page_size=self.page_size)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
+            # Tag only the prefix that this request actually traversed.  When
+            # the match splits an existing leaf, tagging the old child before
+            # the split would incorrectly claim its unmatched suffix too.
+            # That false holder prevents SESSION_END from reclaiming the
+            # original program's exclusive tail.
+            if pid is not None:
+                node.session_ids.add(pid)
             node.priority = max(node.priority, priority)
 
             if node.evicted:
@@ -2584,6 +2590,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     # ---- aginfer daemon migrate (paper §4 action a_t) ----
     def apply_aginfer_migrations(self, *a, **k):
         return _cache_hooks.apply_aginfer_migrations(self, *a, **k)
+
+    def end_aginfer_program(self, *a, **k):
+        """Mark a program ENDED and synchronously reclaim exclusive KV."""
+        return _dead_kv.end_aginfer_program(self, *a, **k)
 
     # ---- aginfer eviction-scoring + hints — logic in aginfer/cache_hooks.py (#251) ----
     def set_aginfer_hints(self, *a, **k):

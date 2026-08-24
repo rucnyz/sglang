@@ -9,6 +9,33 @@ from __future__ import annotations
 import math
 
 
+def validate_session_end_body(body):
+    """Validate ``POST /aginfer/session_end``.
+
+    The canonical wire field is ``program_id``.  ``session_id`` is accepted as
+    an alias when ``program_id`` is absent, and may also be supplied separately
+    to close a corresponding SGLang continual-prompting session safely.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("body must be a JSON object")
+    program_id = body.get("program_id")
+    session_id = body.get("session_id")
+    if program_id is None:
+        program_id = session_id
+    if not isinstance(program_id, str) or not program_id.strip():
+        raise ValueError("program_id must be a non-empty string")
+    program_id = program_id.strip()
+    if len(program_id) > 64:
+        raise ValueError("program_id must be at most 64 characters")
+    if session_id is not None:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string or null")
+        session_id = session_id.strip()
+    else:
+        session_id = program_id
+    return program_id, session_id
+
+
 def validate_program_paused_body(body):
     """T21 (#181) + #186 audit: validate a PUT /aginfer/program_paused body.
     Returns ``(pid, state, pre_pause_state)`` or raises ``ValueError`` with a

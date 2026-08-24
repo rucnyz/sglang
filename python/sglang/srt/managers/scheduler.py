@@ -88,6 +88,8 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AginferSessionEndReq,
+    AginferSessionEndReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -999,6 +1001,17 @@ class Scheduler(
             ipc_channels=self.ipc_channels,
         )
         self.session_controller = SessionController(self.tree_cache)
+        # SESSION_END requests whose physical KV release is waiting for an
+        # in-flight SGLang session or a transient cache lock.  Retried from the
+        # scheduler loop; keyed by program_id for at-least-once idempotency.
+        self._aginfer_pending_session_ends: Dict[str, Optional[str]] = {}
+        # A deferred cleanup may finish in the scheduler loop between two
+        # tokenizer-manager polls.  Preserve that terminal result briefly so
+        # the caller receives the real release counters instead of a lossy
+        # ``already_absent`` acknowledgement.
+        self._aginfer_completed_session_ends: Dict[
+            str, Tuple[float, Dict[str, Any]]
+        ] = {}
         self.forward_sleep_time = None
         self._engine_paused = False
 
@@ -1426,6 +1439,7 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (GetAginferStateReq, self.get_aginfer_state),
+                (AginferSessionEndReq, self.end_aginfer_session),
                 (MigrateAginferReq, self.migrate_aginfer),
                 (UpdateAginferProgramPausedReq, self.update_aginfer_program_paused),
                 (UpdateAginferHintsReq, self.update_aginfer_hints),
@@ -1636,6 +1650,7 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        self._aginfer_retry_pending_session_ends()
         for recv_req in recv_reqs:
             # Skip health check when server is busy — ongoing requests already carry health info.
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
@@ -3780,6 +3795,355 @@ class Scheduler(
             )
         return GetAginferStateReqOutput(state=dump())
 
+    def _aginfer_session_end_output(
+        self,
+        recv_req: AginferSessionEndReq,
+        result: Dict[str, Any],
+        *,
+        deferred: bool = False,
+    ) -> AginferSessionEndReqOutput:
+        return AginferSessionEndReqOutput(
+            rid=recv_req.rid,
+            ok=bool(result.get("ok", False)),
+            program_id=recv_req.program_id,
+            session_id=recv_req.session_id,
+            dp_rank=int(self.ps.dp_rank if self.ps.dp_rank is not None else 0),
+            status=str(result.get("status", "unknown")),
+            reason=str(result.get("reason", "ok")),
+            deferred=deferred,
+            state_changed=int(result.get("state_changed", 0)),
+            matched_nodes=int(result.get("matched_nodes", 0)),
+            holders_removed=int(result.get("holders_removed", 0)),
+            released_nodes=int(result.get("released_nodes", 0)),
+            released_hashes=list(result.get("released_hashes", [])),
+            released_hbm_tokens=int(result.get("released_hbm_tokens", 0)),
+            released_dram_tokens=int(result.get("released_dram_tokens", 0)),
+            remaining_nodes=int(result.get("remaining_nodes", 0)),
+            skipped=list(result.get("skipped", [])),
+        )
+
+    def _aginfer_mark_program_ended(self, program_id: str) -> tuple[bool, str, int]:
+        setter = getattr(self.tree_cache, "set_aginfer_program_state", None)
+        if setter is None:
+            return (
+                False,
+                f"unsupported_tree_cache:{type(self.tree_cache).__name__}",
+                0,
+            )
+        return setter(pid=program_id, state="ENDED", pre_pause_state=None)
+
+    def _aginfer_drop_program(self, program_id: str) -> Dict[str, Any]:
+        drop = getattr(self.tree_cache, "end_aginfer_program", None)
+        if drop is None:
+            return {
+                "ok": False,
+                "reason": f"unsupported_tree_cache:{type(self.tree_cache).__name__}",
+                "status": "unsupported",
+            }
+        return drop(program_id)
+
+    def _aginfer_prune_completed_session_ends(self) -> None:
+        completed = getattr(self, "_aginfer_completed_session_ends", None)
+        if not completed:
+            return
+        cutoff = time.monotonic() - 60.0
+        for program_id, (finished_at, _) in list(completed.items()):
+            if finished_at < cutoff:
+                completed.pop(program_id, None)
+        while len(completed) > 4096:
+            completed.pop(next(iter(completed)))
+
+    def _aginfer_peek_completed_session_end(
+        self, program_id: str
+    ) -> Optional[Dict[str, Any]]:
+        self._aginfer_prune_completed_session_ends()
+        completed = getattr(self, "_aginfer_completed_session_ends", None)
+        if not completed:
+            return None
+        entry = completed.get(program_id)
+        return None if entry is None else entry[1]
+
+    def _aginfer_take_completed_session_end(
+        self, program_id: str
+    ) -> Optional[Dict[str, Any]]:
+        completed = getattr(self, "_aginfer_completed_session_ends", None)
+        if not completed:
+            return None
+        entry = completed.pop(program_id, None)
+        return None if entry is None else entry[1]
+
+    def _aginfer_record_completed_session_end(
+        self, program_id: str, result: Dict[str, Any]
+    ) -> None:
+        completed = getattr(self, "_aginfer_completed_session_ends", None)
+        if completed is None:
+            completed = self._aginfer_completed_session_ends = {}
+        completed[program_id] = (time.monotonic(), dict(result))
+        self._aginfer_prune_completed_session_ends()
+
+    def _aginfer_program_is_inflight(self, program_id: str) -> bool:
+        """Whether an unfinished scheduler request still belongs to a program."""
+        requests = list(getattr(self, "waiting_queue", ()) or ())
+        for batch_name in ("running_batch", "cur_batch", "last_batch"):
+            batch = getattr(self, batch_name, None)
+            requests.extend(getattr(batch, "reqs", ()) or ())
+        chunked_req = getattr(self, "chunked_req", None)
+        if chunked_req is not None:
+            requests.append(chunked_req)
+        requests.extend(getattr(self, "disagg_prefill_inflight_queue", ()) or ())
+        dllm_manager = getattr(self, "dllm_manager", None)
+        if dllm_manager is not None:
+            requests.extend(getattr(dllm_manager, "waiting_queue", ()) or ())
+            requests.extend(getattr(dllm_manager, "staging_queue", ()) or ())
+
+        # Pipeline-parallel microbatches retain request/KV ownership outside
+        # running_batch.  Include every batch slot, de-duplicating below.
+        for batches_name in ("running_mbs", "mbs", "last_mbs"):
+            for batch in getattr(self, batches_name, ()) or ():
+                if batch is not None:
+                    requests.extend(getattr(batch, "reqs", ()) or ())
+
+        # PD disaggregation owns requests in several wrapper queues before or
+        # after they appear in the ordinary scheduler batches.
+        bootstrap_queue = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        requests.extend(getattr(bootstrap_queue, "queue", ()) or ())
+        for queue_name in (
+            "disagg_decode_prealloc_queue",
+            "disagg_decode_transfer_queue",
+        ):
+            queue = getattr(self, queue_name, None)
+            requests.extend(getattr(queue, "queue", ()) or ())
+            requests.extend(getattr(queue, "retracted_queue", ()) or ())
+
+        seen: set[int] = set()
+        for item in requests:
+            req = getattr(item, "req", item)
+            if id(req) in seen:
+                continue
+            seen.add(id(req))
+            if getattr(req, "program_id", None) != program_id:
+                continue
+            finished = getattr(req, "finished", None)
+            if finished is None or not finished():
+                return True
+        return False
+
+    def _aginfer_any_rank(self, value: bool) -> bool:
+        """OR a Dead-KV safety predicate across the TP/CP cache group."""
+        reduce_fn = getattr(self.tree_cache, "_all_reduce", None)
+        if reduce_fn is None:
+            return value
+        flag = torch.tensor(int(value), dtype=torch.int, device="cpu")
+        reduce_fn(flag, torch.distributed.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def _aginfer_local_cache_blockers(self, program_id: str) -> List[Dict[str, Any]]:
+        from sglang.srt.mem_cache.aginfer.dead_kv import aginfer_program_busy
+
+        return aginfer_program_busy(self.tree_cache, program_id)
+
+    def _aginfer_close_session_for_end(self, session_id: str) -> bool:
+        """Close a linked SGLang session, deferring only for this API.
+
+        The stock ``/close_session`` semantics stay untouched.  SESSION_END is
+        stricter: a non-streaming session may also have an unfinished branch,
+        so mark it close-on-finish rather than releasing its locks underneath
+        the request.
+        """
+        session = self.session_controller.get(session_id)
+        if session is None:
+            return False
+        is_inflight = (session.streaming and session._inflight) or not (
+            self.session_controller._all_requests_finished(session)
+        )
+        if is_inflight:
+            session.close_on_finish = True
+            logger.info(
+                "Deferring aginfer SESSION_END for SGLang session %s",
+                session_id,
+            )
+            return True
+        self.session_controller.close(CloseSessionReqInput(session_id=session_id))
+        return False
+
+    def end_aginfer_session(
+        self, recv_req: AginferSessionEndReq
+    ) -> AginferSessionEndReqOutput:
+        """Handle an orchestrator SESSION_END on every scheduler rank.
+
+        This is deliberately independent of memory-pressure policy: ENDED KV
+        has zero future value and is reclaimed immediately.  When a matching
+        SGLang continual-prompting session still owns an in-flight request, its
+        normal close is armed first and the Dead-KV pass is retried after that
+        request completes.
+        """
+        from sglang.srt.mem_cache.aginfer.program_id import sanitize_program_id
+
+        program_id = sanitize_program_id(recv_req.program_id)
+        if program_id is None:
+            recv_req.program_id = ""
+            return self._aginfer_session_end_output(
+                recv_req,
+                {
+                    "ok": False,
+                    "reason": "program_id must be a non-empty scalar",
+                    "status": "invalid",
+                },
+            )
+        recv_req.program_id = program_id
+        if recv_req.session_id is None:
+            # The canonical agent session id normally names both the aginfer
+            # program and SGLang's continual-prompting session.  Looking up a
+            # non-existent native session is a harmless no-op, while defaulting
+            # here prevents an existing session lock from leaking forever.
+            recv_req.session_id = program_id
+
+        # The current scheduler request fan-out is TP/CP-safe but PP stage 0
+        # can answer before later stages have applied a control request.  Fail
+        # closed until the PP control plane has an all-stage acknowledgement.
+        if int(getattr(self.ps, "pp_size", 1) or 1) > 1:
+            return self._aginfer_session_end_output(
+                recv_req,
+                {
+                    "ok": False,
+                    "reason": "pipeline_parallel_session_end_not_supported",
+                    "status": "unsupported",
+                },
+            )
+
+        # Decode-side KV offload can keep asynchronous HBM/host transfers alive
+        # after Req.finished() becomes true. Those transfers are not owned by
+        # the radix-tree blocker registry, so acknowledging a DROP here could
+        # race a late offload write. Fail closed until that manager exposes a
+        # per-program drain/cancel acknowledgement.
+        if getattr(self, "decode_offload_manager", None) is not None:
+            return self._aginfer_session_end_output(
+                recv_req,
+                {
+                    "ok": False,
+                    "reason": "decode_kvcache_offload_session_end_not_supported",
+                    "status": "unsupported",
+                },
+            )
+
+        # A background retry stores the completed DROP counters locally so the
+        # next polling request can receive them. Never take that local fast
+        # path before a collective handshake: TTL pruning can differ slightly
+        # between ranks, and letting only some ranks return would deadlock the
+        # remaining ranks in the next TP/CP collective.
+        completed = self._aginfer_peek_completed_session_end(program_id)
+        any_completed = self._aginfer_any_rank(completed is not None)
+        any_missing_completed = self._aginfer_any_rank(completed is None)
+        if any_completed and not any_missing_completed:
+            completed = self._aginfer_take_completed_session_end(program_id)
+            assert completed is not None
+            return self._aginfer_session_end_output(recv_req, completed)
+        if completed is not None:
+            # A peer already pruned/lost its result. Converge by having every
+            # rank execute the ordinary idempotent DROP path below.
+            self._aginfer_take_completed_session_end(program_id)
+
+        if getattr(self, "_aginfer_driver", None) is not None:
+            self._aginfer_driver.end_program(program_id)
+
+        session_deferred = False
+        if recv_req.session_id is not None:
+            session_deferred = self._aginfer_close_session_for_end(recv_req.session_id)
+
+        program_inflight = self._aginfer_program_is_inflight(program_id)
+        local_blockers = self._aginfer_local_cache_blockers(program_id)
+        globally_deferred = self._aginfer_any_rank(
+            session_deferred or program_inflight or bool(local_blockers)
+        )
+        if globally_deferred:
+            ok, reason, state_changed = self._aginfer_mark_program_ended(program_id)
+            if ok:
+                self._aginfer_pending_session_ends[program_id] = recv_req.session_id
+                if session_deferred:
+                    reason = "inflight_session"
+                elif program_inflight:
+                    reason = "inflight_program"
+                elif local_blockers:
+                    reason = "cache_busy"
+                else:
+                    reason = "peer_rank_busy"
+            return self._aginfer_session_end_output(
+                recv_req,
+                {
+                    "ok": ok,
+                    "reason": reason,
+                    "status": "deferred" if ok else "unsupported",
+                    "state_changed": state_changed,
+                    "skipped": local_blockers,
+                },
+                deferred=ok,
+            )
+
+        result = self._aginfer_drop_program(program_id)
+        # Reconcile the commit result after every shard has attempted the
+        # mutation.  A preflight OR alone is insufficient: one rank can still
+        # discover a local skip while another has already removed its slice.
+        # Keeping the pending marker identical on all ranks both makes the ACK
+        # a true completion barrier and prevents the retry loop from entering
+        # collectives on only a subset of TP/CP ranks.
+        global_error = self._aginfer_any_rank(not bool(result.get("ok", False)))
+        local_incomplete = (
+            bool(result.get("skipped")) or int(result.get("remaining_nodes", 0)) > 0
+        )
+        global_incomplete = self._aginfer_any_rank(local_incomplete)
+        if global_error:
+            self._aginfer_pending_session_ends[program_id] = recv_req.session_id
+            if result.get("ok", False):
+                result = {
+                    **result,
+                    "ok": False,
+                    "status": "error",
+                    "reason": "peer_rank_drop_failed",
+                }
+        elif global_incomplete:
+            self._aginfer_pending_session_ends[program_id] = recv_req.session_id
+            result = {
+                **result,
+                "status": "deferred",
+                "reason": (
+                    result.get("reason", "ok")
+                    if local_incomplete
+                    else "peer_rank_drop_incomplete"
+                ),
+            }
+        else:
+            self._aginfer_pending_session_ends.pop(program_id, None)
+        return self._aginfer_session_end_output(
+            recv_req,
+            result,
+            deferred=global_incomplete and not global_error,
+        )
+
+    def _aginfer_retry_pending_session_ends(self) -> None:
+        """Retry deferred SESSION_END cleanup from the scheduler thread."""
+        pending = getattr(self, "_aginfer_pending_session_ends", None)
+        if not pending:
+            return
+        for program_id, session_id in list(pending.items()):
+            local_deferred = self._aginfer_program_is_inflight(program_id)
+            if session_id is not None and session_id in self.session_controller:
+                # close_on_finish blocks new turns and maybe_reap() above will
+                # remove the session as soon as its owning request completes.
+                local_deferred |= self._aginfer_close_session_for_end(session_id)
+            local_deferred |= bool(self._aginfer_local_cache_blockers(program_id))
+            if self._aginfer_any_rank(local_deferred):
+                continue
+            result = self._aginfer_drop_program(program_id)
+            global_error = self._aginfer_any_rank(not bool(result.get("ok", False)))
+            local_incomplete = (
+                bool(result.get("skipped"))
+                or int(result.get("remaining_nodes", 0)) > 0
+            )
+            global_incomplete = self._aginfer_any_rank(local_incomplete)
+            if not global_error and not global_incomplete:
+                self._aginfer_record_completed_session_end(program_id, result)
+                pending.pop(program_id, None)
+
     def migrate_aginfer(self, recv_req: MigrateAginferReq) -> MigrateAginferReqOutput:
         """Apply paper §4 (u, τ_target) migrations dispatched by the daemon.
 
@@ -4411,4 +4775,3 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
-

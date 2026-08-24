@@ -890,9 +890,67 @@ async def aginfer_migrate(raw_request: Request):
 # aginfer HTTP request validators live in the self-contained module; the
 # endpoints below call them as thin hooks (#251).
 from sglang.srt.mem_cache.aginfer.http_validators import (  # aginfer hook (#251)
+    validate_session_end_body as _validate_session_end_body,
     validate_program_paused_body as _validate_program_paused_body,
     validate_hints_body as _validate_hints_body,
 )
+
+
+# SESSION_END is a lifecycle signal, not a pressure hint.  It fans out to
+# every DP scheduler and each rank performs deterministic holder release +
+# leaf-to-root HBM/DRAM reclamation.  A matching in-flight SGLang session is
+# closed normally first; the scheduler reports/deals with deferred cleanup.
+@app.post("/aginfer/session_end")
+async def aginfer_session_end(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    try:
+        program_id, session_id = _validate_session_end_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    from sglang.srt.managers.io_struct import AginferSessionEndReq
+
+    try:
+        responses = await _global_state.tokenizer_manager.end_aginfer_session(
+            AginferSessionEndReq(program_id=program_id, session_id=session_id)
+        )
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"SESSION_END timed out for program_id={program_id!r}",
+        ) from exc
+    per_rank = [
+        {
+            "ok": r.ok,
+            "dp_rank": r.dp_rank,
+            "status": r.status,
+            "reason": r.reason,
+            "deferred": r.deferred,
+            "state_changed": r.state_changed,
+            "matched_nodes": r.matched_nodes,
+            "holders_removed": r.holders_removed,
+            "released_nodes": r.released_nodes,
+            "released_hashes": r.released_hashes,
+            "released_hbm_tokens": r.released_hbm_tokens,
+            "released_dram_tokens": r.released_dram_tokens,
+            "remaining_nodes": r.remaining_nodes,
+            "skipped": r.skipped,
+        }
+        for r in responses
+    ]
+    complete = bool(responses) and all(r.ok and not r.deferred for r in responses)
+    return ORJSONResponse(
+        {
+            "ok": complete,
+            "program_id": program_id,
+            "session_id": session_id,
+            "per_rank": per_rank,
+        },
+        status_code=200 if complete else 409,
+    )
 
 
 # T21 (#181): daemon → sglang program-state broadcast.  Body is

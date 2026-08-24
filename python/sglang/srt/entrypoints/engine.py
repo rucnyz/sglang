@@ -61,6 +61,8 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    AginferSessionEndReq,
+    AginferSessionEndReqOutput,
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
@@ -967,6 +969,24 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         obj = CloseSessionReqInput(session_id=session_id)
         self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
+
+    async def async_end_program(
+        self, program_id: str, session_id: Optional[str] = None
+    ) -> List[AginferSessionEndReqOutput]:
+        """End an aginfer program and reclaim exclusive KV on every DP rank."""
+        obj = AginferSessionEndReq(
+            program_id=program_id,
+            session_id=session_id,
+        )
+        return await self.tokenizer_manager.end_aginfer_session(obj)
+
+    def end_program(
+        self, program_id: str, session_id: Optional[str] = None
+    ) -> List[AginferSessionEndReqOutput]:
+        """Synchronous counterpart of :meth:`async_end_program`."""
+        return self.loop.run_until_complete(
+            self.async_end_program(program_id, session_id=session_id)
+        )
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))

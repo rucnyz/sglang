@@ -1779,6 +1779,42 @@ class GetAginferStateReq(BaseReq):
 
 
 @dataclass
+class AginferSessionEndReq(BaseReq):
+    """End one agent program and reclaim its unreachable KV.
+
+    ``session_id`` is optional because most callers use the same identifier
+    for the orchestrator program and the SGLang continual-prompting session.
+    When provided, the scheduler closes that session before reclaiming KV and
+    defers reclamation while a request is still in flight.
+    """
+
+    program_id: str
+    session_id: Optional[str] = None
+
+
+@dataclass
+class AginferSessionEndReqOutput(BaseReq):
+    """Per-DP-rank acknowledgement for :class:`AginferSessionEndReq`."""
+
+    ok: bool
+    program_id: str
+    session_id: Optional[str]
+    dp_rank: int
+    status: str
+    reason: str = "ok"
+    deferred: bool = False
+    state_changed: int = 0
+    matched_nodes: int = 0
+    holders_removed: int = 0
+    released_nodes: int = 0
+    released_hashes: List[str] = field(default_factory=list)
+    released_hbm_tokens: int = 0
+    released_dram_tokens: int = 0
+    remaining_nodes: int = 0
+    skipped: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class MigrateAginferReq(BaseReq):
     """Apply a batch of paper §4 ``(u, τ_target)`` migration actions.
 

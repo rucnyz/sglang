@@ -13,6 +13,8 @@ from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AginferSessionEndReq,
+    AginferSessionEndReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
@@ -120,6 +122,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("get_aginfer_state", GetAginferStateReqOutput),
+    ("aginfer_session_end", AginferSessionEndReqOutput),
     ("migrate_aginfer", MigrateAginferReqOutput),
     ("update_aginfer_program_paused", UpdateAginferProgramPausedReqOutput),
     ("update_aginfer_hints", UpdateAginferHintsReqOutput),
@@ -142,7 +145,12 @@ class TokenizerControlMixin:
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
-            comm = FanOutCommunicator(self.send_to_scheduler, server_args.dp_size, mode)
+            comm = FanOutCommunicator(
+                self.send_to_scheduler,
+                server_args.dp_size,
+                mode,
+                correlate_by_rid=(name == "aginfer_session_end"),
+            )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
@@ -819,6 +827,49 @@ class TokenizerControlMixin:
             await self.get_aginfer_state_communicator(req)
         )
         return responses
+
+    async def end_aginfer_session(
+        self: TokenizerManager, obj: AginferSessionEndReq
+    ) -> List[AginferSessionEndReqOutput]:
+        """Broadcast SESSION_END and wait for physical reclamation on every DP rank.
+
+        A scheduler may initially defer while a request or asynchronous HiCache
+        copy still owns the KV.  Polling here keeps ``Engine.async_end_program``
+        an actual completion acknowledgement instead of merely acknowledging
+        that cleanup was queued.
+        """
+        self.auto_create_handle_loop()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 25.0
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"SESSION_END timed out for program_id={obj.program_id!r}"
+                )
+            # Each attempt has its own correlator.  If a scheduler reply is
+            # delayed past the per-attempt timeout, its late response cannot
+            # satisfy the next retry.
+            obj.regenerate_rid()
+            try:
+                responses: List[AginferSessionEndReqOutput] = (
+                    await self.aginfer_session_end_communicator(
+                        obj, timeout=min(5.0, remaining)
+                    )
+                )
+            except asyncio.TimeoutError:
+                if loop.time() >= deadline:
+                    raise
+                continue
+            if not responses or any(not response.ok for response in responses):
+                return responses
+            if all(not response.deferred for response in responses):
+                return responses
+            if loop.time() >= deadline:
+                raise asyncio.TimeoutError(
+                    f"SESSION_END remained deferred for program_id={obj.program_id!r}"
+                )
+            await asyncio.sleep(0.05)
 
     async def migrate_aginfer(
         self: TokenizerManager, obj: MigrateAginferReq

@@ -111,6 +111,18 @@ class AginferDriver:
         self._policy = None               # OursGreedyPolicy (supplies decide's costs + pi_u)
         self._unknown_tier_log: set = set()
 
+    def end_program(self, program_id: str):
+        """Drive the in-engine lifecycle tracker to its terminal state.
+
+        SESSION_END must work even before the first pressure tick, so initialise
+        only the lightweight tracker here (the policy remains lazy).
+        """
+        if self._tracker is None:
+            from sglang.srt.mem_cache.aginfer.program_tracker import ProgramTracker
+
+            self._tracker = ProgramTracker()
+        return self._tracker.end(program_id)
+
     # -- cadence gate (the #1 hard problem: trigger under never-idle high load) ----
     # on_idle() only fires when the engine is FULLY idle — exactly the low-pressure
     # regime where aginfer has nothing to do; under flood (where the win lives) the loop
@@ -291,12 +303,15 @@ class AginferDriver:
         state_json = dump_fn()  # the engine's own s_t, in-process (no /aginfer/state HTTP)
         if not isinstance(state_json, dict) or "unsupported_tree_cache" in state_json:
             return {"status": "unsupported"}
-        # lazy belief + policy (built once, only when the flag is on and a tick actually fires)
+        # Lazy belief + policy (built once, only when needed). SESSION_END may
+        # have initialised the tracker before the first pressure tick, so keep
+        # these two initialisations independent.
         if self._tracker is None:
             from sglang.srt.mem_cache.aginfer.program_tracker import ProgramTracker
+            self._tracker = ProgramTracker()
+        if self._policy is None:
             from sglang.srt.mem_cache.aginfer.ours_greedy import OursGreedyPolicy
             from sglang.srt.mem_cache.aginfer.costs import default_costs
-            self._tracker = ProgramTracker()
             self._policy = OursGreedyPolicy(default_costs())
         from sglang.srt.mem_cache.aginfer.state_builder import build_paper_state, hints_from_state
         from sglang.srt.mem_cache.aginfer.events import Event, EventKind
