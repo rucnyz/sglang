@@ -1,28 +1,19 @@
 # S3 — Drop-on-death (compaction + program/sub-agent end)
 
-**Distinctive driver:** **KV that is provably dead** — content the agent will
-never reuse — detected from a lifecycle event, not guessed from recency. Two
-triggers, one mechanism:
-- **(a) Context compaction** — a long agent summarises old turns and drops the
-  originals; the dropped span's KV is orphaned and dead.
-- **(b) Program / sub-agent end** — a task finishes (`SESSION_END`) or a
-  sub-agent returns (`SUB_RETURN`); its whole session-scoped KV is dead.
+**Distinctive driver:** KV that is provably dead. The system learns that a
+session will never reuse its cache from a lifecycle event instead of inferring
+death from recency.
 
-(These were two scenarios; they share the lever and the metric, so they are one.)
+Two triggers share this mechanism:
 
-## The situation (workload)
-A churn of dying KV under memory pressure: long agents that periodically compact,
-and/or a high turnover of short programs and sub-agent fan-outs that finish. The
-question is how fast the dead KV is reclaimed and whether holding it forces live
-work to suffer.
+- **Context compaction:** an agent summarizes old turns and discards the source
+  span. This still needs a `CONTEXT_COMPACTED` hook.
+- **Program or sub-agent end:** a task emits `SESSION_END` or `SUB_RETURN` and
+  its session-scoped KV becomes dead. The `SESSION_END` full pipeline is
+  implemented and benchmarked.
 
-Construct with Claude Code: (a) agents that hit a context threshold and emit a
-compaction (proxy surfaces a `CONTEXT_COMPACTED` naming the dropped span); (b) a
-stream of short sessions ending via `/aginfer/session_end` and sub-agent fan-outs
-that complete. Knobs: compaction frequency × dropped-span size; session turnover ×
-footprint; concurrency — pool sized so the dead KV's occupancy actually matters.
+## Implemented lifecycle path
 
-## What our framework does
 On `SESSION_END`, the Dynamo router sends `POST /aginfer/session_end` to every
 worker that served the program. Each worker fans the request to every DP rank;
 the scheduler then waits for in-flight requests, native SGLang session locks,
@@ -36,50 +27,136 @@ has completed the same lifecycle barrier. `SUB_RETURN` can use this path when a
 child is represented as its own terminal session. `CONTEXT_COMPACTED` still
 needs a range-aware lifecycle signal and is not implemented.
 
-## Why we win
-**Proactive vs reactive timing.** Dead KV is reclaimed the instant it dies, so
-live programs keep more HBM/DRAM throughout the window between death and the next
-eviction sweep. Under 4-tier pressure the sharp form is: holding a corpse in
-HBM/DRAM forces a **live** reused unit down to DISK or to DROP+recompute — so the
-corpse's occupancy is paid by someone else's re-prefill.
+## Why explicit reclamation can win
 
-## Why vanilla sglang+HiCache cannot
-HiCache has no notion that the span is *logically* dead — only "not recently
-accessed." LRU **will** age it out (this is its job), so the honest edge is **how
-much sooner**, and that it won't keep a corpse ahead of a live unit in recency
-order. If LRU's age-out is already prompt under pressure, the win shrinks.
+Vanilla SGLang with HiCache has no signal that a session is permanently dead.
+LRU eventually evicts its KV under pressure, but until then those bytes can
+displace a live, reusable prefix into a slower tier or out of the cache. The
+explicit lifecycle path removes session ownership immediately and frees only
+nodes with no remaining live holders. Shared prefixes remain intact.
 
-## Why ThunderAgent cannot
-It does not evict. Dead-KV reclamation is entirely HiCache's job under TA. (TA's
-`/programs/release` frees only its router-side bookkeeping — zero backend call —
-so on the backend the KV stays until LRU.)
+ThunderAgent's program release affects router bookkeeping only; it does not
+issue backend KV deletion. Dead-KV reclamation therefore remains reactive in
+that baseline.
 
-## Measurement plan (lead with the user-visible metric)
-Arms: B / TA / ours (all HiCache, 4-tier). **Headline = arrival/next-prefill TTFT
-and throughput at fixed pool** (the user-visible effect); secondary = time-
-integrated HBM/DRAM held by dead KV (the internal cause). Expected: ours reclaims
-on the event → live work keeps fast tiers → lower TTFT; B/TA hold corpses until
-age-out.
+## Reproducible A/B benchmark
+
+`deadkv_ab.py` is a Python-standard-library-only paired benchmark. It uses one
+running binary for both conditions so that the treatment differs by one action:
+
+- **Baseline:** complete the same sessions without sending `SESSION_END`; the
+  native pressure/LRU path decides when to evict their KV.
+- **Ours:** send `SESSION_END` after every terminal session.
+
+The default order is ABBA. Each arm uses the same model process, allocator
+capacity, prompt IDs, request order, concurrency, and sampling parameters. The
+benchmark flushes the cache and verifies that it is empty before each arm.
+
+The default workload keeps four live programs resident while four epochs each
+create ten terminal programs. Direct mode uses page-aligned `input_ids` with no
+globally shared pages by default. This isolates lifecycle reclamation without
+making the baseline accumulate ever-growing holder sets. Use `--shared-pages`
+for a separate shared-prefix safety experiment.
+
+Run it only against a dedicated benchmark deployment because it calls
+`flush_cache`:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/deadkv_ab.py \
+  --backend direct \
+  --server-url http://127.0.0.1:30001 \
+  --artifact-dir /tmp/deadkv-ab-results \
+  --confirm-dedicated-server
+```
+
+Run a small smoke workload first when validating a new server build:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/deadkv_ab.py \
+  --backend direct \
+  --server-url http://127.0.0.1:30001 \
+  --repeats 1 --live-sessions 2 --epochs 1 --dead-per-epoch 2 \
+  --shared-pages 0 --tail-pages 2 --max-tokens 1 \
+  --retention-seconds 1 \
+  --confirm-dedicated-server
+```
+
+`--repeats 1` produces AB rather than ABBA and is suitable only as a smoke
+test. Use at least three paired comparisons for reported performance results.
+
+An optional Dynamo mode validates the full external path:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/deadkv_ab.py \
+  --backend dynamo \
+  --frontend-url http://127.0.0.1:8000 \
+  --worker-url http://127.0.0.1:8081 \
+  --model deadkv-e2e \
+  --prompt-mode text \
+  --confirm-dedicated-server
+```
+
+Do not use Dynamo-mode performance as the primary isolated comparison: router
+tracking and admission can react to the intentionally accumulating baseline
+sessions. Its purpose is to cross-check the complete control path.
+
+## Metrics and artifacts
+
+Every run writes `summary.json`, one JSON file per arm, and a compact
+`report.md`. With `--save-raw-states`, it also stores unit-level state snapshots.
+
+- **Dead bytes:** physical bytes whose complete holder set consists only of
+  programs declared terminal by the workload.
+- **Dead-byte AUC:** time-integrated dead bytes, separately for HBM, DRAM, and
+  DISK.
+- **Occupancy:** allocator `pool_usage` bytes, not just radix-node accounting.
+- **Reclaim latency:** time from END dispatch until state no longer contains
+  the ended programs. A retained baseline is reported as right-censored.
+- **Cache hit:** response `cached_tokens`, with state `hit_count` retained as
+  supporting evidence.
+- **TTFT:** the first output-token SSE event.
+- **Throughput:** both inference-only throughput and pipeline throughput that
+  includes END RPC time but excludes measurement polling.
+
+Capacity fingerprints must be identical across all arms or the run fails.
+Generate paired bootstrap intervals after a completed run with:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/analyze_results.py \
+  /tmp/deadkv-ab-results/<run-id>/summary.json
+```
+
+The lightweight mock test exercises ABBA execution, reporting, dead-byte
+accounting, and bootstrap analysis without GPUs:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/test_deadkv_ab.py
+```
+
+See [RESULTS.md](RESULTS.md) for the current GB300 result and its limitations.
+Raw logs, model weights, runtime archives, credentials, PID files, and
+machine-specific launch scripts are intentionally not versioned here.
 
 ## Full 4-tier follow-up
-Cache-pressure mode, **all four tiers live** (HBM, DRAM, DISK enabled; DROP
-reachable). Size HBM+DRAM+DISK below the live+dead working set so an un-reclaimed
-corpse pushes a live reused unit across the **DISK→DROP** frontier (synchronous
-DISK load_back, or recompute). Confirm via B's logs that live units are stranded
-on DISK / recomputed while corpses sit resident in HBM/DRAM.
 
-The current physical lifecycle deletion covers the radix-tree allocations in
-HBM and DRAM. Per-key deletion from an external HiCache storage backend is a
+The current physical lifecycle deletion covers radix-tree allocations in HBM
+and DRAM. A complete four-tier experiment must also enable and pressure DISK so
+that an unreclaimed corpse can push reusable live KV across the DISK-to-DROP
+frontier. Per-key deletion from an external HiCache storage backend is a
 separate follow-up; until that exists, do not claim that `SESSION_END` deletes
 backing-store bytes.
 
-## Honest status & falsification
-- **Status:** trigger (b) `SESSION_END` is implemented end-to-end for PP=1 and
-  HBM+DRAM, including TP/CP synchronization, shared-prefix preservation,
-  deferred in-flight cleanup, and duplicate delivery. Pipeline parallelism,
-  decode-side asynchronous KV offload, external-storage deletion, and trigger
-  (a) `CONTEXT_COMPACTED` remain explicit follow-ups.
-- **Falsifies the win if:** under pressure LRU evicts dead KV about as fast as our
-  event-driven drop (it's the least-recent anyway) → negligible gap. The test must
-  show LRU actually keeps dead KV ahead of live units, or that the reclaim-latency
-  gap moves the user-visible metric (TTFT / throughput).
+## Honest status and falsification
+
+The current result validates the `SESSION_END` trigger end-to-end for a
+single-node TP4, PP=1, HBM+DRAM deployment. The implementation includes TP/CP
+synchronization, shared-prefix preservation, deferred in-flight cleanup, and
+duplicate delivery. It deliberately fails closed for PP>1 and decode-side
+asynchronous KV offload. It does not yet validate `CONTEXT_COMPACTED`, SSD/NIXL
+per-key deletion, multi-node disaggregation, or a production trace.
+
+The claimed win is falsified for a workload if native LRU reclaims dead KV at
+roughly the same time, or if earlier reclamation does not preserve a live cache
+entry or improve a user-visible metric under controlled pressure. Low-pressure
+runs should be reported too: they establish whether explicit END introduces a
+regression when there is no eviction contention.
