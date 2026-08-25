@@ -351,11 +351,28 @@ therefore be much longer than p99 request latency; warmup and cooldown provide
 boundary guard bands.  The runner stores no prompt or token IDs, but the input
 trace itself remains private.  It flushes the cache before and after every arm.
 
+After at least three paired runs, generate aggregate JSON and Markdown without
+opening the private trace, request rows, or telemetry stream:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/analyze_agentreplay_steady.py \
+  /path/to/private/runs/qwen \
+  --out-dir /path/to/shareable/steady-analysis
+```
+
+The analyzer rejects an arm or pair when `valid` is false, cleanup failed, the
+measurement window lacks live revisits or sufficient state coverage, or the
+trace, manifest, workload, salt fingerprint, and configuration differ within a
+pair.  Paired metrics receive a deterministic percentile-bootstrap confidence
+interval with at least three pairs.  END latency, queue delay, and retries are
+Ours-only metrics and receive an Ours-mean interval instead.
+
 The pure scheduling/accounting tests do not need AgentReplay, a model, or GPUs:
 
 ```bash
 python3 -m unittest \
-  dev/aginfer/wherewewin/s3-drop-on-death/test_agentreplay_steady.py
+  dev/aginfer/wherewewin/s3-drop-on-death/test_agentreplay_steady.py \
+  dev/aginfer/wherewewin/s3-drop-on-death/test_analyze_agentreplay_steady.py
 ```
 
 ## Direct full-pipeline acceptance test
