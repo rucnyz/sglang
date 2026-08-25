@@ -145,6 +145,10 @@ SGLang deployment exposing `/generate`, `/aginfer/state`,
 `/aginfer/session_end`, and `/flush_cache`. Configure the deployment separately
 so that the baseline arm reaches roughly 80%--90% HBM-pool utilization before
 the live probe. Machine-specific model launchers are intentionally not included.
+Pool utilization is the maximum `used_bytes / cap_bytes` across ranks and
+subpools, which prevents a constrained subpool from being hidden by aggregate
+free capacity. Backend-reported per-tier `token_usage` is retained as supporting
+telemetry.
 
 First split a private four-step token trace into two reusable live roots and a
 terminal churn set:

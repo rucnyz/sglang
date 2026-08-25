@@ -22,7 +22,13 @@ STATE = {
     "per_rank": [
         {
             "pool_usage": {
-                "HBM": {"subpools": {"kv": {"used_bytes": 100, "cap_bytes": 1000}}},
+                "HBM": {
+                    "subpools": {
+                        "full": {"used_bytes": 100, "cap_bytes": 1000},
+                        "swa": {"used_bytes": 90, "cap_bytes": 100},
+                    },
+                    "token_usage": 0.9,
+                },
                 "DRAM": {"subpools": {"kv": {"used_bytes": 50, "cap_bytes": 2000}}},
                 "DISK": {"subpools": {}},
             },
@@ -60,12 +66,60 @@ class TelemetryTests(unittest.TestCase):
     def test_state_analysis(self):
         observed = MODULE.analyze_state(STATE, {"p1#s", "p2#s"}, {"p1#s"})
         self.assertEqual(
-            observed["pool_used_bytes"], {"HBM": 100, "DRAM": 50, "DISK": 0}
+            observed["pool_used_bytes"], {"HBM": 190, "DRAM": 50, "DISK": 0}
         )
+        self.assertEqual(observed["pool_max_subpool_utilization"]["HBM"], 0.9)
+        self.assertEqual(observed["pool_reported_token_usage"]["HBM"], 0.9)
         self.assertEqual(observed["residual_holder_bytes"]["HBM"], 90)
         self.assertEqual(observed["tracked_physical_bytes"]["HBM"], 90)
         self.assertEqual(observed["dead_physical_bytes"]["HBM"], 60)
         self.assertEqual(observed["dead_unit_count"], 1)
+
+    def test_pool_utilization_uses_max_across_ranks_and_subpools(self):
+        payload = {
+            "per_rank": [
+                {
+                    "pool_usage": {
+                        "HBM": {
+                            "subpools": {
+                                "full": {"used_bytes": 80, "cap_bytes": 100},
+                                "swa": {"used_bytes": 10, "cap_bytes": 100},
+                            },
+                            "token_usage": 0.77,
+                        },
+                        "DRAM": {"subpools": {}},
+                        "DISK": {"subpools": {}},
+                    },
+                    "per_program_usage": {},
+                    "units": [],
+                },
+                {
+                    "pool_usage": {
+                        "HBM": {
+                            "subpools": {"full": {"used_bytes": 9, "cap_bytes": 10}},
+                            "token_usage": 0.88,
+                        },
+                        "DRAM": {
+                            "subpools": {
+                                "full": {"used_bytes": 50, "cap_bytes": 100},
+                                "small": {"used_bytes": 1, "cap_bytes": 4},
+                            },
+                            "token_usage": 0.45,
+                        },
+                        "DISK": {"subpools": {}},
+                    },
+                    "per_program_usage": {},
+                    "units": [],
+                },
+            ]
+        }
+        observed = MODULE.analyze_state(payload, None, None)
+        self.assertEqual(observed["pool_max_subpool_utilization"]["HBM"], 0.9)
+        self.assertEqual(observed["pool_max_subpool_utilization"]["DRAM"], 0.5)
+        self.assertEqual(observed["pool_reported_token_usage"]["HBM"], 0.88)
+        self.assertEqual(observed["pool_reported_token_usage"]["DRAM"], 0.45)
+        self.assertIsNone(observed["pool_max_subpool_utilization"]["DISK"])
+        self.assertIsNone(observed["pool_reported_token_usage"]["DISK"])
 
     def test_gpu_parsers(self):
         smi = MODULE.parse_nvidia_smi("0, 1024, 2048\n1, 512, 2048\n")

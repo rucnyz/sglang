@@ -21,6 +21,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import pathlib
 import re
@@ -193,6 +194,10 @@ def analyze_state(
     states = direct_states(payload)
     pool_used = {tier: 0 for tier in TIERS}
     pool_cap = {tier: 0 for tier in TIERS}
+    pool_max_subpool_utilization: dict[str, float | None] = {
+        tier: None for tier in TIERS
+    }
+    pool_reported_token_usage: dict[str, float | None] = {tier: None for tier in TIERS}
     radix_bytes = {tier: 0 for tier in TIERS}
     residual_holder_bytes = {tier: 0 for tier in TIERS}
     tracked_bytes = {tier: 0 for tier in TIERS}
@@ -221,11 +226,30 @@ def analyze_state(
             subpools = (
                 tier_entry.get("subpools") if isinstance(tier_entry, Mapping) else None
             )
+            if isinstance(tier_entry, Mapping):
+                reported_usage = tier_entry.get("token_usage")
+                if (
+                    isinstance(reported_usage, (int, float))
+                    and not isinstance(reported_usage, bool)
+                    and math.isfinite(float(reported_usage))
+                ):
+                    current = pool_reported_token_usage[tier]
+                    pool_reported_token_usage[tier] = max(
+                        float(reported_usage), current if current is not None else 0.0
+                    )
             if isinstance(subpools, Mapping):
                 for fields in subpools.values():
                     if isinstance(fields, Mapping):
-                        pool_used[tier] += numeric_int(fields.get("used_bytes"))
-                        pool_cap[tier] += numeric_int(fields.get("cap_bytes"))
+                        used_bytes = numeric_int(fields.get("used_bytes"))
+                        cap_bytes = numeric_int(fields.get("cap_bytes"))
+                        pool_used[tier] += used_bytes
+                        pool_cap[tier] += cap_bytes
+                        if cap_bytes > 0:
+                            utilization = used_bytes / cap_bytes
+                            current = pool_max_subpool_utilization[tier]
+                            pool_max_subpool_utilization[tier] = max(
+                                utilization, current if current is not None else 0.0
+                            )
         unit_count += len(units)
         for unit in units:
             if not isinstance(unit, Mapping):
@@ -269,6 +293,8 @@ def analyze_state(
         ),
         "pool_used_bytes": pool_used,
         "pool_cap_bytes": pool_cap,
+        "pool_max_subpool_utilization": pool_max_subpool_utilization,
+        "pool_reported_token_usage": pool_reported_token_usage,
         "radix_physical_bytes": radix_bytes,
         "residual_holder_bytes": residual_holder_bytes,
         "tracked_physical_bytes": (

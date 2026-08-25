@@ -114,6 +114,10 @@ def summary(arm: str, pair_number: int) -> dict:
                 "dead_physical_bytes": {"HBM": dead, "DRAM": dead * 2},
                 "pool_used_bytes": {"HBM": used_hbm, "DRAM": used_dram},
                 "pool_cap_bytes": {"HBM": 1000, "DRAM": 1000},
+                "pool_max_subpool_utilization": {
+                    "HBM": 0.83 if arm == "ours" else 0.91,
+                    "DRAM": 0.62 if arm == "ours" else 0.74,
+                },
             }
         },
         "agentreplay_result": terminal,
@@ -175,7 +179,7 @@ class PressureAnalyzerTests(unittest.TestCase):
             )
             self.assertAlmostEqual(
                 first["pre_probe_pool_hbm_utilization"]["delta_ours_minus_baseline"],
-                -0.1,
+                -0.08,
             )
             aggregate = report["models"][0]["metrics"]
             self.assertIsNotNone(
@@ -197,6 +201,8 @@ class PressureAnalyzerTests(unittest.TestCase):
             model_dir = root / "deployment-b"
             baseline = summary("baseline", 1)
             ours = summary("ours", 1)
+            del baseline["states"]["before_live_probe"]["pool_max_subpool_utilization"]
+            del ours["states"]["before_live_probe"]["pool_max_subpool_utilization"]
             ours["run_salt"] = "different-salt"
             ours["phase_manifest"]["traces"]["live_probe"]["sha256"] = "different"
             ours["configuration"]["max_concurrency"] = 8
@@ -219,6 +225,9 @@ class PressureAnalyzerTests(unittest.TestCase):
             self.assertIn("run salt fingerprint mismatch", issues)
             self.assertIn("configuration mismatch: max_concurrency", issues)
             self.assertIn("failed validation", issues)
+            utilization = pair["metrics"]["pre_probe_pool_hbm_utilization"]
+            self.assertEqual(utilization["baseline"], 0.9)
+            self.assertEqual(utilization["ours"], 0.8)
 
 
 if __name__ == "__main__":

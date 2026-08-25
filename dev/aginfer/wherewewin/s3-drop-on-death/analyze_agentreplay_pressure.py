@@ -176,11 +176,19 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
         ),
     }
     if name == "pre_probe_pool_hbm_utilization":
+        constrained = number(get_path(pre_probe, "pool_max_subpool_utilization", "HBM"))
+        if constrained is not None:
+            return constrained
         return ratio(
             get_path(pre_probe, "pool_used_bytes", "HBM"),
             get_path(pre_probe, "pool_cap_bytes", "HBM"),
         )
     if name == "pre_probe_pool_dram_utilization":
+        constrained = number(
+            get_path(pre_probe, "pool_max_subpool_utilization", "DRAM")
+        )
+        if constrained is not None:
+            return constrained
         return ratio(
             get_path(pre_probe, "pool_used_bytes", "DRAM"),
             get_path(pre_probe, "pool_cap_bytes", "DRAM"),
