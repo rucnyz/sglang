@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze paired three-phase AgentReplay Dead-KV pressure campaigns.
+"""Analyze paired single- or multi-wave AgentReplay Dead-KV pressure campaigns.
 
 Each positional input is one model directory containing::
 
@@ -43,7 +43,49 @@ METRICS: tuple[tuple[str, str, str, bool, bool], ...] = (
         False,
         True,
     ),
+    (
+        "pre_probe_live_retention",
+        "Pre-probe live programs retained",
+        "ratio",
+        True,
+        True,
+    ),
+    (
+        "pre_probe_live_hbm_bytes",
+        "Pre-probe live KV (HBM)",
+        "bytes",
+        True,
+        True,
+    ),
+    (
+        "pre_probe_live_dram_bytes",
+        "Pre-probe live KV (DRAM)",
+        "bytes",
+        True,
+        True,
+    ),
     ("live_probe_cache_hit", "Live-probe cache hit", "ratio", True, True),
+    (
+        "live_probe_device_cache_hit",
+        "Live-probe device cache hit",
+        "ratio",
+        True,
+        True,
+    ),
+    (
+        "live_probe_host_cache_hit",
+        "Live-probe host cache hit",
+        "ratio",
+        True,
+        True,
+    ),
+    (
+        "live_probe_storage_cache_hit",
+        "Live-probe storage cache hit",
+        "ratio",
+        True,
+        True,
+    ),
     ("live_probe_ttft_mean_ms", "Live-probe TTFT mean", "ms", False, True),
     ("live_probe_ttft_p50_ms", "Live-probe TTFT p50", "ms", False, True),
     ("live_probe_ttft_p90_ms", "Live-probe TTFT p90", "ms", False, True),
@@ -126,6 +168,44 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
         probe = {}
     if not isinstance(terminal, Mapping):
         terminal = {}
+
+    if name == "pre_probe_live_retention":
+        live_count = number(get_path(summary, "phase_manifest", "live_program_count"))
+        if live_count is None or live_count <= 0:
+            return None
+        pre_probe_live = get_path(
+            summary,
+            "states",
+            "live_before_live_probe",
+            "tracked_programs_present_count",
+        )
+        return ratio(pre_probe_live, live_count)
+
+    live_tiers = {
+        "pre_probe_live_hbm_bytes": "HBM",
+        "pre_probe_live_dram_bytes": "DRAM",
+    }
+    if name in live_tiers:
+        return number(
+            get_path(
+                summary,
+                "states",
+                "live_before_live_probe",
+                "tracked_physical_bytes",
+                live_tiers[name],
+            )
+        )
+
+    cache_tiers = {
+        "live_probe_device_cache_hit": "device",
+        "live_probe_host_cache_hit": "host",
+        "live_probe_storage_cache_hit": "storage",
+    }
+    if name in cache_tiers:
+        return ratio(
+            get_path(probe, "cached_tokens_details", cache_tiers[name]),
+            probe.get("total_prompt_tokens"),
+        )
 
     if (
         name.startswith("terminal_end_")
@@ -270,8 +350,8 @@ def run_issues(summary: Mapping[str, Any], arm: str) -> list[str]:
         live_count = len(live_ids)
     if terminal_count is None and isinstance(terminal_ids, list):
         terminal_count = len(terminal_ids)
-    if live_count != 2:
-        issues.append(f"phase manifest has {live_count!r} live programs, expected 2")
+    if live_count is None or live_count <= 0:
+        issues.append("phase manifest has no live programs")
     if terminal_count is None or terminal_count <= 0:
         issues.append("phase manifest has no terminal programs")
     for field in (
@@ -332,6 +412,86 @@ def run_issues(summary: Mapping[str, Any], arm: str) -> list[str]:
         if number(terminal_telemetry.get("state_error_count")) != 0:
             issues.append("terminal: state telemetry errors present")
 
+    wave_specs = get_path(manifest, "traces", "terminal_churn", "waves")
+    wave_runs = get_path(summary, "phases", "terminal_waves")
+    wave_count = number(manifest.get("terminal_wave_count"))
+    if isinstance(wave_specs, list):
+        if wave_count != len(wave_specs):
+            issues.append("terminal wave manifest count mismatch")
+        wave_hashes = [
+            spec.get("sha256") for spec in wave_specs if isinstance(spec, Mapping)
+        ]
+        payload_hashes = [
+            spec.get("token_payload_sha256")
+            for spec in wave_specs
+            if isinstance(spec, Mapping)
+        ]
+        if any(not isinstance(value, str) or not value for value in wave_hashes):
+            issues.append("terminal wave manifest has an invalid trace hash")
+        elif len(set(wave_hashes)) != len(wave_hashes):
+            issues.append("terminal wave manifest repeats a trace hash")
+        if any(not isinstance(value, str) or not value for value in payload_hashes):
+            issues.append("terminal wave manifest has an invalid token-payload hash")
+        elif len(set(payload_hashes)) != len(payload_hashes):
+            issues.append("terminal wave manifest repeats a token payload")
+        if not isinstance(wave_runs, list) or len(wave_runs) != len(wave_specs):
+            issues.append("terminal wave run count mismatch")
+        else:
+            for index, (spec, wave) in enumerate(zip(wave_specs, wave_runs), 1):
+                if not isinstance(spec, Mapping) or not isinstance(wave, Mapping):
+                    issues.append(f"terminal wave {index}: invalid summary")
+                    continue
+                issues.extend(
+                    result_issues(
+                        wave.get("result"),
+                        phase=f"terminal wave {index}",
+                        expected_requests=(
+                            int(value)
+                            if (value := number(spec.get("requests"))) is not None
+                            else None
+                        ),
+                        expected_programs=(
+                            int(value)
+                            if (value := number(spec.get("programs"))) is not None
+                            else None
+                        ),
+                        expect_end=arm == "ours",
+                    )
+                )
+                wave_telemetry = wave.get("telemetry_summary")
+                if not isinstance(wave_telemetry, Mapping):
+                    issues.append(f"terminal wave {index}: missing telemetry summary")
+                elif (
+                    number(wave_telemetry.get("child_returncode")) != 0
+                    or number(wave_telemetry.get("state_error_count")) != 0
+                ):
+                    issues.append(f"terminal wave {index}: telemetry errors present")
+                live_state = get_path(
+                    summary,
+                    "states",
+                    f"after_terminal_wave_{index:03d}",
+                    "live",
+                )
+                retained = get_path(live_state, "tracked_programs_present_count")
+                if (
+                    not isinstance(live_state, Mapping)
+                    or number(retained) is None
+                    or float(retained) < 0
+                    or (live_count is not None and float(retained) > float(live_count))
+                ):
+                    issues.append(
+                        f"terminal wave {index}: invalid live-retention state"
+                    )
+        pre_probe_live = get_path(summary, "states", "live_before_live_probe")
+        retained = get_path(pre_probe_live, "tracked_programs_present_count")
+        if (
+            not isinstance(pre_probe_live, Mapping)
+            or number(retained) is None
+            or float(retained) < 0
+            or (live_count is not None and float(retained) > float(live_count))
+        ):
+            issues.append("invalid pre-probe live-retention state")
+
     pre_probe = get_path(summary, "states", "before_live_probe")
     if not isinstance(pre_probe, Mapping):
         issues.append("missing pre-probe state")
@@ -381,16 +541,20 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
     )
     metrics = {name: metric_value(summary, name) for name, *_ in METRICS}
     issues = run_issues(summary, arm)
+    optional_metrics = {
+        "pre_probe_live_retention",
+        "pre_probe_live_hbm_bytes",
+        "pre_probe_live_dram_bytes",
+        "live_probe_device_cache_hit",
+        "live_probe_host_cache_hit",
+        "live_probe_storage_cache_hit",
+        "terminal_end_latency_mean_ms",
+        "terminal_end_latency_p50_ms",
+        "terminal_end_latency_p90_ms",
+        "terminal_end_retry_attempts",
+    }
     required_metrics = [
-        name
-        for name, *_rest in METRICS
-        if name
-        not in {
-            "terminal_end_latency_mean_ms",
-            "terminal_end_latency_p50_ms",
-            "terminal_end_latency_p90_ms",
-            "terminal_end_retry_attempts",
-        }
+        name for name, *_rest in METRICS if name not in optional_metrics
     ]
     if arm == "ours":
         required_metrics += [
@@ -405,7 +569,11 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
     for name in (
         "pre_probe_pool_hbm_utilization",
         "pre_probe_pool_dram_utilization",
+        "pre_probe_live_retention",
         "live_probe_cache_hit",
+        "live_probe_device_cache_hit",
+        "live_probe_host_cache_hit",
+        "live_probe_storage_cache_hit",
     ):
         value = number(metrics.get(name))
         if value is not None and not 0.0 <= float(value) <= 1.0:
@@ -432,6 +600,35 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
     if terminal_sha != trace_hashes["terminal_churn"]:
         issues.append("top-level terminal trace SHA does not match phase manifest")
     terminal_end = get_path(summary, "phases", "terminal", "result", "session_end")
+    wave_count_value = number(
+        manifest.get("terminal_wave_count") if isinstance(manifest, Mapping) else None
+    )
+    wave_count = int(wave_count_value) if wave_count_value is not None else 0
+    live_count_value = number(
+        manifest.get("live_program_count") if isinstance(manifest, Mapping) else None
+    )
+    live_retention_by_wave = []
+    for wave_number in range(1, wave_count + 1):
+        live_state = get_path(
+            summary,
+            "states",
+            f"after_terminal_wave_{wave_number:03d}",
+            "live",
+        )
+        present = number(get_path(live_state, "tracked_programs_present_count"))
+        live_retention_by_wave.append(
+            {
+                "wave_number": wave_number,
+                "programs_present": present,
+                "retention": ratio(present, live_count_value),
+                "hbm_bytes": number(
+                    get_path(live_state, "tracked_physical_bytes", "HBM")
+                ),
+                "dram_bytes": number(
+                    get_path(live_state, "tracked_physical_bytes", "DRAM")
+                ),
+            }
+        )
     return {
         "model": model_dir.name,
         "pair_id": pair_id,
@@ -456,6 +653,8 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
         "terminal_end_attempted": (
             terminal_end.get("n") if isinstance(terminal_end, Mapping) else None
         ),
+        "terminal_wave_count": wave_count,
+        "live_retention_by_wave": live_retention_by_wave,
         "metrics": metrics,
     }
 
@@ -744,8 +943,8 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         lines += [
             f"### {model}",
             "",
-            "| Pair | Arm | Dead HBM | Dead DRAM | HBM pool | DRAM pool | Probe hit | Probe TTFT mean | p50 | p90 | Terminal tok/s | END mean | END p50 | END p90 | END retries |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Pair | Arm | Dead HBM | Dead DRAM | HBM pool | DRAM pool | Live retained | Live HBM | Live DRAM | Probe hit | Device hit | Host hit | Storage hit | Probe TTFT mean | p50 | p90 | Terminal tok/s | END mean | END p50 | END p90 | END retries |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for run in report["runs"]:
             if run["model"] != model:
@@ -756,7 +955,13 @@ def markdown_report(report: Mapping[str, Any]) -> str:
                 ("pre_probe_dead_dram_bytes", "bytes"),
                 ("pre_probe_pool_hbm_utilization", "ratio"),
                 ("pre_probe_pool_dram_utilization", "ratio"),
+                ("pre_probe_live_retention", "ratio"),
+                ("pre_probe_live_hbm_bytes", "bytes"),
+                ("pre_probe_live_dram_bytes", "bytes"),
                 ("live_probe_cache_hit", "ratio"),
+                ("live_probe_device_cache_hit", "ratio"),
+                ("live_probe_host_cache_hit", "ratio"),
+                ("live_probe_storage_cache_hit", "ratio"),
                 ("live_probe_ttft_mean_ms", "ms"),
                 ("live_probe_ttft_p50_ms", "ms"),
                 ("live_probe_ttft_p90_ms", "ms"),
@@ -771,6 +976,29 @@ def markdown_report(report: Mapping[str, Any]) -> str:
                 "| "
                 + " | ".join([str(run["pair_id"]), str(run["arm"]), *values])
                 + " |"
+            )
+        lines.append("")
+
+    wave_rows = [
+        (run, wave)
+        for run in report["runs"]
+        for wave in run.get("live_retention_by_wave", [])
+    ]
+    if wave_rows:
+        lines += [
+            "## Live retention by terminal wave",
+            "",
+            "| Model | Pair | Arm | Wave | Programs present | Retention | Live HBM | Live DRAM |",
+            "|---|---:|---|---:|---:|---:|---:|---:|",
+        ]
+        for run, wave in wave_rows:
+            lines.append(
+                f"| {run['model']} | {run['pair_id']} | {run['arm']} | "
+                f"{wave['wave_number']} | "
+                f"{format_value(wave['programs_present'], 'count')} | "
+                f"{format_value(wave['retention'], 'ratio')} | "
+                f"{format_value(wave['hbm_bytes'], 'bytes')} | "
+                f"{format_value(wave['dram_bytes'], 'bytes')} |"
             )
         lines.append("")
 

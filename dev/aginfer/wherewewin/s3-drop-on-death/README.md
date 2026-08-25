@@ -153,48 +153,74 @@ subpools, which prevents a constrained subpool from being hidden by aggregate
 free capacity. Backend-reported per-tier `token_usage` is retained as supporting
 telemetry.
 
-First split a private four-step token trace into two reusable live roots and a
-terminal churn set:
+First split a private four-step token trace into reusable live roots and one or
+more terminal churn waves. A wave owns complete, distinct root/descendant
+closures; records are never copied between waves:
 
 ```bash
 python3 dev/aginfer/wherewewin/s3-drop-on-death/split_agentreplay_pressure_trace.py \
   --trace /path/to/private/source.jsonl \
-  --out-dir /path/to/private/phases
+  --out-dir /path/to/private/phases \
+  --live-roots 8 \
+  --terminal-waves 3
 ```
 
-The three generated JSONL files contain token and program IDs and must remain
-private. The generated `manifest.json` contains only counts, lengths, and
-hashes.
+The generated JSONL files contain token and program IDs and must remain private.
+With multiple waves, terminal files are named
+`terminal-churn-wave-001.jsonl`, etc. The generated `manifest.json` contains
+only counts, lengths, and hashes.
+
+Do not create extra waves by replaying the same terminal JSONL with a different
+salt or renamed program IDs. Radix entries are keyed by token sequence, so that
+only adds holder metadata and does not add unique physical KV pressure. The
+runner rejects repeated paths, overlapping program IDs, and byte-identical token
+payloads. The splitter assigns distinct real root closures to each wave.
 
 Run both arms with the same phase files, server configuration, and salt. The
 baseline retains terminal sessions through the fixed barrier; Ours emits
-`SESSION_END` for them. Both arms then probe the two still-live step-4 turns.
-The runner flushes the cache during cleanup, so do not point it at a shared
-deployment.
+`SESSION_END` for them after each wave. Both arms then probe the still-live
+step-4 turns. Every terminal wave is run in a distinct derived session namespace
+and each wave records both full-workload and live-only state. This shows the
+first wave at which the baseline displaces reusable live KV. The runner flushes
+the cache during cleanup, so do not point it at a shared deployment.
 
 ```bash
 python3 dev/aginfer/wherewewin/s3-drop-on-death/run_agentreplay_pressure_arm.py \
   --mode baseline \
   --live-seed /path/to/private/phases/live-seed.jsonl \
-  --terminal-churn /path/to/private/phases/terminal-churn.jsonl \
+  --terminal-churn /path/to/private/phases/terminal-churn-wave-001.jsonl \
+  --terminal-churn /path/to/private/phases/terminal-churn-wave-002.jsonl \
+  --terminal-churn /path/to/private/phases/terminal-churn-wave-003.jsonl \
   --live-probe /path/to/private/phases/live-probe.jsonl \
   --out-dir /path/to/private/runs/deployment-a/baseline-r1 \
   --salt pair-01 --label baseline-r1 \
   --agentreplay-root /path/to/AgentReplay \
   --url http://127.0.0.1:30001/generate \
+  --seed-concurrency 4 --terminal-concurrency 8 --probe-concurrency 4 \
   --barrier-seconds 30
 
 python3 dev/aginfer/wherewewin/s3-drop-on-death/run_agentreplay_pressure_arm.py \
   --mode ours \
   --live-seed /path/to/private/phases/live-seed.jsonl \
-  --terminal-churn /path/to/private/phases/terminal-churn.jsonl \
+  --terminal-churn /path/to/private/phases/terminal-churn-wave-001.jsonl \
+  --terminal-churn /path/to/private/phases/terminal-churn-wave-002.jsonl \
+  --terminal-churn /path/to/private/phases/terminal-churn-wave-003.jsonl \
   --live-probe /path/to/private/phases/live-probe.jsonl \
   --out-dir /path/to/private/runs/deployment-a/ours-r1 \
   --salt pair-01 --label ours-r1 \
   --agentreplay-root /path/to/AgentReplay \
   --url http://127.0.0.1:30001/generate \
+  --seed-concurrency 4 --terminal-concurrency 8 --probe-concurrency 4 \
   --barrier-seconds 30
 ```
+
+For a concurrency sweep, keep seed/probe concurrency fixed and vary only
+`--terminal-concurrency`, placing each level in a separate model directory such
+as `deployment-c4`, `deployment-c8`, and `deployment-c16`. A concurrency value
+above the number of independently runnable roots in a wave does not create more
+parallelism; each wave should therefore contain at least as many roots as the
+largest tested concurrency. Keep each wave's marginal unique-KV budget similar
+when comparing concurrency levels.
 
 Use at least three pairs and alternate arm order, for example AB, BA, AB. Keep
 each pair's salt identical between arms but use a fresh salt for the next pair.
@@ -215,7 +241,10 @@ The analyzer opens only `baseline-rN/summary.json` and
 configuration equality, cleanup, and paired salts; reports dead HBM/DRAM,
 pool utilization, live-probe cache hit and TTFT, terminal throughput, and END
 latency; and emits bootstrap intervals once at least three comparable pairs are
-available.
+available. Multi-wave summaries additionally expose live-program retention after
+the final wave. If AgentReplay emits `cached_tokens_details`, the telemetry
+sanitizer and analyzer retain aggregate device/host/storage hit ratios; otherwise
+the total hit rate cannot distinguish HBM hits from DRAM hits.
 
 The standard-library-only mock tests do not require a GPU or real trace:
 

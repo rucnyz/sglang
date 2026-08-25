@@ -49,6 +49,16 @@ def phase_result(
         "cache_hit": (
             0.90 + (0.03 if arm == "ours" else 0.0) if phase == "probe" else 0.8
         ),
+        "total_prompt_tokens": requests * 100,
+        "cached_tokens_details": (
+            {
+                "device": requests * (80 if arm == "ours" else 70),
+                "host": requests * (13 if arm == "ours" else 20),
+                "storage": 0,
+            }
+            if phase == "probe"
+            else {"device": requests * 80, "host": 0, "storage": 0}
+        ),
         "ttft_ms": {
             "mean": 20.0 + pair_number - (2.0 if arm == "ours" else 0.0),
             "p50": 18.0 + pair_number - (2.0 if arm == "ours" else 0.0),
@@ -65,6 +75,10 @@ def summary(arm: str, pair_number: int) -> dict:
     seed = phase_result("seed", arm, pair_number, 6, 2)
     terminal = phase_result("terminal", arm, pair_number, 12, 3)
     probe = phase_result("probe", arm, pair_number, 2, 2)
+    terminal_waves = [
+        phase_result("terminal", arm, pair_number, 5, 1),
+        phase_result("terminal", arm, pair_number, 7, 2),
+    ]
     dead = 0 if arm == "ours" else 100 + pair_number * 10
     used_hbm = 800 if arm == "ours" else 900
     used_dram = 600 if arm == "ours" else 700
@@ -80,6 +94,7 @@ def summary(arm: str, pair_number: int) -> dict:
         "configuration": {
             "url": "http://127.0.0.1:30001/generate",
             "max_concurrency": 4,
+            "terminal_wave_count": 2,
             "barrier_seconds": 30.0,
             "private_note": "must-not-leak-config",
         },
@@ -90,9 +105,29 @@ def summary(arm: str, pair_number: int) -> dict:
             "live_seed_requests": 6,
             "terminal_requests": 12,
             "live_probe_requests": 2,
+            "terminal_wave_count": 2,
             "traces": {
                 "live_seed": {"sha256": f"seed-{pair_number}"},
-                "terminal_churn": {"sha256": f"terminal-{pair_number}"},
+                "terminal_churn": {
+                    "sha256": f"terminal-{pair_number}",
+                    "wave_count": 2,
+                    "waves": [
+                        {
+                            "wave_number": 1,
+                            "sha256": f"terminal-{pair_number}-wave-1",
+                            "token_payload_sha256": f"payload-{pair_number}-wave-1",
+                            "requests": 5,
+                            "programs": 1,
+                        },
+                        {
+                            "wave_number": 2,
+                            "sha256": f"terminal-{pair_number}-wave-2",
+                            "token_payload_sha256": f"payload-{pair_number}-wave-2",
+                            "requests": 7,
+                            "programs": 2,
+                        },
+                    ],
+                },
                 "live_probe": {"sha256": f"probe-{pair_number}"},
             },
         },
@@ -107,9 +142,37 @@ def summary(arm: str, pair_number: int) -> dict:
                     "state_error_count": 0,
                 },
             },
+            "terminal_waves": [
+                {
+                    "returncode": 0,
+                    "issues": [],
+                    "result": wave,
+                    "telemetry_summary": {
+                        "child_returncode": 0,
+                        "state_error_count": 0,
+                    },
+                }
+                for wave in terminal_waves
+            ],
             "probe": {"returncode": 0, "issues": [], "result": probe},
         },
         "states": {
+            "after_terminal_wave_001": {
+                "live": {
+                    "tracked_programs_present_count": 2,
+                    "tracked_physical_bytes": {"HBM": 520, "DRAM": 260},
+                }
+            },
+            "after_terminal_wave_002": {
+                "live": {
+                    "tracked_programs_present_count": 2,
+                    "tracked_physical_bytes": {"HBM": 500, "DRAM": 250},
+                }
+            },
+            "live_before_live_probe": {
+                "tracked_programs_present_count": 2,
+                "tracked_physical_bytes": {"HBM": 500, "DRAM": 250},
+            },
             "before_live_probe": {
                 "dead_physical_bytes": {"HBM": dead, "DRAM": dead * 2},
                 "pool_used_bytes": {"HBM": used_hbm, "DRAM": used_dram},
@@ -118,7 +181,7 @@ def summary(arm: str, pair_number: int) -> dict:
                     "HBM": 0.83 if arm == "ours" else 0.91,
                     "DRAM": 0.62 if arm == "ours" else 0.74,
                 },
-            }
+            },
         },
         "agentreplay_result": terminal,
         "live_probe_result": probe,
@@ -181,6 +244,10 @@ class PressureAnalyzerTests(unittest.TestCase):
                 first["pre_probe_pool_hbm_utilization"]["delta_ours_minus_baseline"],
                 -0.08,
             )
+            self.assertEqual(first["pre_probe_live_retention"]["baseline"], 1.0)
+            self.assertEqual(first["pre_probe_live_hbm_bytes"]["baseline"], 500)
+            self.assertEqual(first["live_probe_device_cache_hit"]["baseline"], 0.7)
+            self.assertEqual(first["live_probe_host_cache_hit"]["ours"], 0.13)
             aggregate = report["models"][0]["metrics"]
             self.assertIsNotNone(
                 aggregate["pre_probe_dead_hbm_bytes"]["mean_paired_delta_ci95"]
@@ -194,6 +261,7 @@ class PressureAnalyzerTests(unittest.TestCase):
             markdown = (output / "pressure-analysis.md").read_text(encoding="utf-8")
             self.assertIn("Pre-probe dead HBM", markdown)
             self.assertIn("95% bootstrap CI", markdown)
+            self.assertIn("Live retention by terminal wave", markdown)
 
     def test_mismatched_pair_is_nonzero_and_not_comparable(self):
         with tempfile.TemporaryDirectory() as temporary:

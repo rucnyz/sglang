@@ -476,6 +476,30 @@ def safe_result(result: Any) -> dict[str, Any] | None:
         "program_e2e_s",
     }
     sanitized = {key: result[key] for key in allowed if key in result}
+    cached_details = result.get("cached_tokens_details")
+    if isinstance(cached_details, Mapping):
+        rows = [cached_details]
+    elif isinstance(cached_details, list):
+        rows = [row for row in cached_details if isinstance(row, Mapping)]
+    else:
+        rows = []
+    if rows:
+        aggregate_details = {
+            tier: sum(
+                int(row.get(tier) or 0)
+                for row in rows
+                if isinstance(row.get(tier), (int, float))
+                and not isinstance(row.get(tier), bool)
+            )
+            for tier in ("device", "host", "storage")
+        }
+        if any(
+            isinstance(row.get(tier), (int, float))
+            and not isinstance(row.get(tier), bool)
+            for row in rows
+            for tier in aggregate_details
+        ):
+            sanitized["cached_tokens_details"] = aggregate_details
     session_end = result.get("session_end")
     if isinstance(session_end, Mapping):
         end_allowed = {

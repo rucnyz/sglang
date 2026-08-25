@@ -79,7 +79,11 @@ for program_id in runtime_ids:
 if args.emit_session_end:
     for program_id in runtime_ids:
         post(base_url + "/aginfer/session_end", {"program_id": program_id})
-phase = args.label.rsplit("-", 1)[-1]
+phase = (
+    "terminal"
+    if "-terminal-wave-" in args.label
+    else args.label.rsplit("-", 1)[-1]
+)
 cache_hit = {"seed": 0.5, "terminal": 0.8, "probe": 0.95}[phase]
 session_end = {
     "enabled": args.emit_session_end,
@@ -101,6 +105,13 @@ result = {
     "force_exact_failures": 0,
     "force_exact_missing": 0,
     "cache_hit": cache_hit,
+    "total_prompt_tokens": len(records) * 100,
+    "total_cached_tokens": int(len(records) * 100 * cache_hit),
+    "cached_tokens_details": {
+        "device": int(len(records) * 100 * cache_hit) - len(records),
+        "host": len(records),
+        "storage": 0,
+    },
     "total_out_tokens": len(records),
     "inference_makespan_s": 1.0,
     "pipeline_makespan_s": 1.1,
@@ -229,7 +240,7 @@ class PressureArmTests(unittest.TestCase):
         self.server.server_close()
 
     def run_arm(
-        self, root: pathlib.Path, mode: str
+        self, root: pathlib.Path, mode: str, *, terminal_waves: int = 1
     ) -> tuple[subprocess.CompletedProcess, dict]:
         fake_root = root / "fake-agentreplay"
         package = fake_root / "agentreplay"
@@ -244,7 +255,7 @@ class PressureArmTests(unittest.TestCase):
         nvidia_smi.chmod(0o755)
 
         seed = root / "live-seed.jsonl"
-        terminal = root / "terminal-churn.jsonl"
+        terminals = []
         probe = root / "live-probe.jsonl"
         write_jsonl(
             seed,
@@ -253,10 +264,17 @@ class PressureArmTests(unittest.TestCase):
                 *rows("live-b", range(1, 4), 271828182),
             ],
         )
-        write_jsonl(
-            terminal,
-            rows("ended-program-sentinel", range(1, 5), 161803398),
-        )
+        for wave_number in range(1, terminal_waves + 1):
+            terminal = root / f"terminal-churn-{wave_number:03d}.jsonl"
+            write_jsonl(
+                terminal,
+                rows(
+                    f"ended-program-sentinel-{wave_number}",
+                    range(1, 5),
+                    161803398 + wave_number * 100,
+                ),
+            )
+            terminals.append(terminal)
         write_jsonl(
             probe,
             [
@@ -273,8 +291,6 @@ class PressureArmTests(unittest.TestCase):
             mode,
             "--live-seed",
             str(seed),
-            "--terminal-churn",
-            str(terminal),
             "--live-probe",
             str(probe),
             "--out-dir",
@@ -296,6 +312,8 @@ class PressureArmTests(unittest.TestCase):
             "--state-poll-interval-s",
             "0.01",
         ]
+        for terminal in terminals:
+            command.extend(["--terminal-churn", str(terminal)])
         environment = dict(os.environ)
         environment["PATH"] = str(fake_bin) + os.pathsep + environment.get("PATH", "")
         completed = subprocess.run(
@@ -331,6 +349,112 @@ class PressureArmTests(unittest.TestCase):
             self.assertNotIn("pair-r1", serialized)
             self.assertNotIn("live-a", serialized)
             self.assertNotIn("ended-program-sentinel", serialized)
+
+    def test_distinct_terminal_waves_accumulate_only_in_baseline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, summary = self.run_arm(
+                pathlib.Path(temporary), "baseline", terminal_waves=2
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(summary["valid"])
+            self.assertEqual(summary["configuration"]["terminal_wave_count"], 2)
+            self.assertEqual(summary["phase_manifest"]["terminal_wave_count"], 2)
+            self.assertEqual(summary["phase_manifest"]["terminal_program_count"], 2)
+            self.assertEqual(summary["phases"]["terminal"]["result"]["n_requests"], 8)
+            self.assertEqual(len(summary["phases"]["terminal_waves"]), 2)
+            self.assertEqual(
+                summary["states"]["after_terminal_wave_001"]["live"][
+                    "tracked_programs_present_count"
+                ],
+                2,
+            )
+            self.assertEqual(
+                summary["states"]["before_live_probe"]["dead_physical_bytes"]["HBM"],
+                200,
+            )
+            self.assertEqual(summary["cleanup"]["programs_ok"], 4)
+            serialized = json.dumps(summary)
+            self.assertNotIn("pair-r1", serialized)
+            self.assertNotIn("ended-program-sentinel", serialized)
+
+    def test_rejects_duplicate_token_payload_waves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            fake_root = root / "fake-agentreplay"
+            fake_root.mkdir()
+            seed = root / "live-seed.jsonl"
+            probe = root / "live-probe.jsonl"
+            first = root / "first.jsonl"
+            second = root / "second.jsonl"
+            write_jsonl(
+                seed,
+                [
+                    *rows("live-a", range(1, 4), 314159265),
+                    *rows("live-b", range(1, 4), 271828182),
+                ],
+            )
+            write_jsonl(
+                probe,
+                [
+                    *rows("live-a", range(4, 5), 314159265),
+                    *rows("live-b", range(4, 5), 271828182),
+                ],
+            )
+            payload = rows("terminal-a", range(1, 5), 161803398)
+            write_jsonl(first, payload)
+            renamed = [dict(row, program_id="terminal-b") for row in payload]
+            write_jsonl(second, renamed)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--mode",
+                    "baseline",
+                    "--live-seed",
+                    str(seed),
+                    "--terminal-churn",
+                    str(first),
+                    "--terminal-churn",
+                    str(second),
+                    "--live-probe",
+                    str(probe),
+                    "--out-dir",
+                    str(root / "out"),
+                    "--salt",
+                    "private-salt",
+                    "--label",
+                    "duplicate",
+                    "--agentreplay-root",
+                    str(fake_root),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("duplicates an earlier token payload", completed.stderr)
+
+    def test_ours_reclaims_each_distinct_terminal_wave(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            completed, summary = self.run_arm(
+                pathlib.Path(temporary), "ours", terminal_waves=2
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(summary["valid"])
+            terminal = summary["phases"]["terminal"]["result"]
+            self.assertEqual(terminal["n_programs"], 2)
+            self.assertEqual(terminal["session_end"]["n_ok"], 2)
+            self.assertEqual(
+                terminal["session_end"]["latency_ms"]["percentile_aggregation"],
+                "maximum_across_waves",
+            )
+            for wave_number in (1, 2):
+                state = summary["states"][f"after_terminal_wave_{wave_number:03d}"][
+                    "workload"
+                ]
+                self.assertEqual(state["dead_physical_bytes"]["HBM"], 0)
+            self.assertFalse(summary["cleanup"]["explicit_end_attempted"])
+            self.assertFalse(self.cache.holders)
 
     def test_ours_ends_terminal_and_live_programs(self):
         with tempfile.TemporaryDirectory() as temporary:

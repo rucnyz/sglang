@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Split a token trace into live-seed, terminal-churn, and live-probe phases.
 
-Two childless root programs are selected deterministically, preferring the
-largest step-4 input. Their first three turns form ``live-seed.jsonl`` and their
-fourth/final turn forms ``live-probe.jsonl``. Every other root and its complete
-descendant closure form ``terminal-churn.jsonl``.
+A configurable number of childless root programs are selected deterministically,
+preferring the largest step-4 input. Their first three turns form
+``live-seed.jsonl`` and their fourth/final turn forms ``live-probe.jsonl``. Every
+other root and its complete descendant closure forms terminal churn. With
+``--terminal-waves N``, distinct root closures are deterministically balanced
+across N mutually exclusive ``terminal-churn-wave-NNN.jsonl`` files. No trace is
+duplicated between waves.
 
 The phase traces necessarily contain private program and token IDs. Keep them in
 a private artifact directory. ``manifest.json`` contains only counts, lengths,
@@ -26,7 +29,6 @@ from typing import Any
 SCHEMA_VERSION = 1
 TRACE_NAMES = {
     "live_seed": "live-seed.jsonl",
-    "terminal_churn": "terminal-churn.jsonl",
     "live_probe": "live-probe.jsonl",
 }
 
@@ -214,6 +216,82 @@ def write_trace(path: pathlib.Path, records: Sequence[Mapping[str, Any]]) -> Non
     )
 
 
+def terminal_wave_path(
+    out_dir: pathlib.Path, wave_number: int, wave_count: int
+) -> pathlib.Path:
+    if wave_count == 1:
+        return out_dir / "terminal-churn.jsonl"
+    return out_dir / f"terminal-churn-wave-{wave_number:03d}.jsonl"
+
+
+def terminal_program_weight(rows: Sequence[Mapping[str, Any]]) -> int:
+    """Approximate resident KV using the largest request in one program."""
+    return max(len(row["input_ids"]) + len(row["forced_output_ids"]) for row in rows)
+
+
+def split_terminal_waves(
+    records: Sequence[dict[str, Any]], wave_count: int
+) -> tuple[list[list[dict[str, Any]]], list[dict[str, int]]]:
+    """Partition distinct root closures without splitting a program DAG."""
+    programs = program_index(records)
+    parents, children = graph(programs)
+    roots = sorted(
+        program_id for program_id, parent in parents.items() if parent is None
+    )
+    if wave_count <= 0:
+        raise ValueError("terminal wave count must be positive")
+    if wave_count > len(roots):
+        raise ValueError(
+            f"need at least {wave_count} terminal roots for distinct waves, found {len(roots)}"
+        )
+
+    def closure(root: str) -> set[str]:
+        result: set[str] = set()
+        pending = [root]
+        while pending:
+            program_id = pending.pop()
+            if program_id in result:
+                continue
+            result.add(program_id)
+            pending.extend(sorted(children.get(program_id, set()), reverse=True))
+        return result
+
+    components = []
+    for root in roots:
+        program_ids = closure(root)
+        weight = sum(terminal_program_weight(programs[pid]) for pid in program_ids)
+        requests = sum(len(programs[pid]) for pid in program_ids)
+        components.append((weight, root, program_ids, requests))
+    components.sort(key=lambda item: (-item[0], item[1]))
+
+    bins = [
+        {"weight": 0, "program_ids": set(), "root_count": 0, "requests": 0}
+        for _ in range(wave_count)
+    ]
+    for weight, _root, program_ids, requests in components:
+        index = min(range(wave_count), key=lambda item: (bins[item]["weight"], item))
+        bins[index]["weight"] += weight
+        bins[index]["program_ids"].update(program_ids)
+        bins[index]["root_count"] += 1
+        bins[index]["requests"] += requests
+
+    waves = [
+        [record for record in records if record["program_id"] in bucket["program_ids"]]
+        for bucket in bins
+    ]
+    metadata = [
+        {
+            "wave_number": index,
+            "root_count": int(bucket["root_count"]),
+            "program_count": len(bucket["program_ids"]),
+            "requests": int(bucket["requests"]),
+            "estimated_resident_tokens": int(bucket["weight"]),
+        }
+        for index, bucket in enumerate(bins, 1)
+    ]
+    return waves, metadata
+
+
 def split_trace(
     records: Sequence[dict[str, Any]], live_root_count: int
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
@@ -305,9 +383,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trace", type=pathlib.Path, required=True)
     parser.add_argument("--out-dir", type=pathlib.Path, required=True)
     parser.add_argument("--live-roots", type=int, default=2)
+    parser.add_argument("--terminal-waves", type=int, default=1)
     args = parser.parse_args(argv)
     if args.live_roots <= 0:
         parser.error("--live-roots must be positive")
+    if args.terminal_waves <= 0:
+        parser.error("--terminal-waves must be positive")
     return args
 
 
@@ -315,18 +396,60 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     trace = args.trace.expanduser().resolve()
     out_dir = args.out_dir.expanduser().resolve()
+    records = load_trace(trace)
+    phases, metadata = split_trace(records, args.live_roots)
+    terminal_waves, terminal_wave_metadata = split_terminal_waves(
+        phases["terminal_churn"], args.terminal_waves
+    )
     outputs = {name: out_dir / filename for name, filename in TRACE_NAMES.items()}
+    wave_paths = [
+        terminal_wave_path(out_dir, index, args.terminal_waves)
+        for index in range(1, args.terminal_waves + 1)
+    ]
     manifest_path = out_dir / "manifest.json"
-    existing = [path for path in (*outputs.values(), manifest_path) if path.exists()]
+    existing = [
+        path
+        for path in (*outputs.values(), *wave_paths, manifest_path)
+        if path.exists()
+    ]
     if existing:
         raise SystemExit(
             "refusing to overwrite output files: " + ", ".join(map(str, existing))
         )
-    records = load_trace(trace)
-    phases, metadata = split_trace(records, args.live_roots)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for name, phase_records in phases.items():
-        write_trace(outputs[name], phase_records)
+    for name in ("live_seed", "live_probe"):
+        write_trace(outputs[name], phases[name])
+    for path, wave_records in zip(wave_paths, terminal_waves):
+        write_trace(path, wave_records)
+    wave_stats = []
+    for metadata_row, path, wave_records in zip(
+        terminal_wave_metadata, wave_paths, terminal_waves
+    ):
+        stats = phase_stats(wave_records, path)
+        wave_stats.append({**metadata_row, **stats})
+    terminal_hash = (
+        wave_stats[0]["sha256"]
+        if len(wave_stats) == 1
+        else hashlib.sha256(
+            json.dumps(
+                [stats["sha256"] for stats in wave_stats], separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+    )
+    terminal_stats = {
+        "wave_count": args.terminal_waves,
+        "sha256": terminal_hash,
+        "requests": len(phases["terminal_churn"]),
+        "programs": len({record["program_id"] for record in phases["terminal_churn"]}),
+        "roots": sum(stats["roots"] for stats in wave_stats),
+        "prompt_tokens_sum": sum(stats["prompt_tokens_sum"] for stats in wave_stats),
+        "prompt_tokens_max": max(stats["prompt_tokens_max"] for stats in wave_stats),
+        "output_tokens_sum": sum(stats["output_tokens_sum"] for stats in wave_stats),
+        "output_tokens_max": max(stats["output_tokens_max"] for stats in wave_stats),
+        "max_request_tokens": max(stats["max_request_tokens"] for stats in wave_stats),
+        "topology_sha256": topology_hash(phases["terminal_churn"]),
+        "waves": wave_stats,
+    }
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "source": {
@@ -337,7 +460,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         **metadata,
         "phases": {
-            name: phase_stats(phases[name], outputs[name]) for name in TRACE_NAMES
+            "live_seed": phase_stats(phases["live_seed"], outputs["live_seed"]),
+            "terminal_churn": terminal_stats,
+            "live_probe": phase_stats(phases["live_probe"], outputs["live_probe"]),
         },
     }
     serialized = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -345,7 +470,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise AssertionError("manifest unexpectedly contains token-array field names")
     atomic_write_text(manifest_path, serialized)
     print(
-        f"selected {args.live_roots} live roots; wrote "
+        f"selected {args.live_roots} live roots; wrote {args.terminal_waves} "
+        "distinct terminal waves with "
         f"{len(phases['live_seed'])}/{len(phases['terminal_churn'])}/"
         f"{len(phases['live_probe'])} seed/churn/probe requests to {out_dir}"
     )

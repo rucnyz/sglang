@@ -135,6 +135,22 @@ class TelemetryTests(unittest.TestCase):
         self.assertLessEqual(len(value), 64)
         self.assertEqual(value, MODULE.runtime_program_id("p" * 100, "salt"))
 
+    def test_safe_result_aggregates_cache_source_breakdown(self):
+        safe = MODULE.safe_result(
+            {
+                "n_requests": 2,
+                "cached_tokens_details": [
+                    {"device": 10, "host": 2, "storage": 1, "private": "x"},
+                    {"device": 20, "host": 3, "storage": 0},
+                ],
+            }
+        )
+        self.assertEqual(
+            safe["cached_tokens_details"],
+            {"device": 30, "host": 5, "storage": 1},
+        )
+        self.assertNotIn("private", json.dumps(safe))
+
     def test_integration_preserves_child_rc_and_redacts_trace(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), StateHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -203,7 +219,7 @@ class TelemetryTests(unittest.TestCase):
                 self.assertFalse(summary["ended_program_ids_known"])
                 telemetry = (out_dir / "telemetry.jsonl").read_text()
                 self.assertNotIn("input_ids", telemetry)
-                self.assertNotIn("111", telemetry)
+                self.assertNotIn('"program_id"', telemetry)
                 self.assertTrue((out_dir / "start.json").is_file())
                 self.assertTrue((out_dir / "end.json").is_file())
         finally:

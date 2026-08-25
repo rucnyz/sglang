@@ -117,6 +117,69 @@ class PressureSplitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "prefix continuity"):
             MODULE.split_trace(records, 1)
 
+    def test_multiple_terminal_waves_are_disjoint_and_preserve_root_closures(self):
+        records = [
+            *program("live-a", 100),
+            *program("live-b", 90),
+            *program("terminal-a", 8),
+            *program("terminal-b", 6),
+            *program("terminal-c", 4),
+            *program("parent", 2),
+            *program("child", 3, parent="parent", spawned_at_step=2),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            trace = root / "source.jsonl"
+            trace.write_text(
+                "".join(json.dumps(row) + "\n" for row in records), encoding="utf-8"
+            )
+            out_dir = root / "split"
+            self.assertEqual(
+                MODULE.main(
+                    [
+                        "--trace",
+                        str(trace),
+                        "--out-dir",
+                        str(out_dir),
+                        "--terminal-waves",
+                        "3",
+                    ]
+                ),
+                0,
+            )
+            waves = [
+                MODULE.load_trace(out_dir / f"terminal-churn-wave-{index:03d}.jsonl")
+                for index in range(1, 4)
+            ]
+            program_sets = [{row["program_id"] for row in wave} for wave in waves]
+            self.assertTrue(all(program_sets))
+            self.assertFalse(program_sets[0] & program_sets[1])
+            self.assertFalse(program_sets[0] & program_sets[2])
+            self.assertFalse(program_sets[1] & program_sets[2])
+            self.assertEqual(
+                set().union(*program_sets),
+                {"terminal-a", "terminal-b", "terminal-c", "parent", "child"},
+            )
+            parent_wave = next(group for group in program_sets if "parent" in group)
+            self.assertIn("child", parent_wave)
+            manifest_text = (out_dir / "manifest.json").read_text(encoding="utf-8")
+            manifest = json.loads(manifest_text)
+            terminal = manifest["phases"]["terminal_churn"]
+            self.assertEqual(terminal["wave_count"], 3)
+            self.assertEqual(len(terminal["waves"]), 3)
+            self.assertEqual(sum(row["requests"] for row in terminal["waves"]), 20)
+            self.assertNotIn("terminal-a", manifest_text)
+            self.assertNotIn("input_ids", manifest_text)
+
+    def test_rejects_more_waves_than_distinct_terminal_roots(self):
+        records = [
+            *program("live-a", 100),
+            *program("terminal-a", 1),
+        ]
+        phases, _metadata = MODULE.split_trace(records, 1)
+        with self.assertRaisesRegex(ValueError, "distinct waves"):
+            MODULE.split_terminal_waves(phases["terminal_churn"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
