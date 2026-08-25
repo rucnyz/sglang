@@ -135,6 +135,9 @@ python3 dev/aginfer/wherewewin/s3-drop-on-death/test_deadkv_ab.py
 
 ## AgentReplay high-pressure paired experiment
 
+The completed d5 study and its Chinese interpretation are in
+[`PRESSURE_RESULTS.zh-CN.md`](PRESSURE_RESULTS.zh-CN.md).
+
 The synthetic A/B harness above is the first acceptance gate. The
 AgentReplay tools in this directory provide a separate real-trace experiment
 that asks whether early reclamation preserves a reusable live prefix under
