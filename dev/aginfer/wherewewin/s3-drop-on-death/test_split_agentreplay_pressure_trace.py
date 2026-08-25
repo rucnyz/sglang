@@ -180,6 +180,21 @@ class PressureSplitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "distinct waves"):
             MODULE.split_terminal_waves(phases["terminal_churn"], 2)
 
+    def test_terminal_weight_sums_context_epoch_high_water_marks(self):
+        records = program("reset", 0)
+        records[2]["context_reset"] = True
+        records[2]["input_ids"] = [900, 901]
+        records[3]["input_ids"] = [900, 901, records[2]["forced_output_ids"][0]]
+        first_epoch = max(
+            len(row["input_ids"]) + len(row["forced_output_ids"]) for row in records[:2]
+        )
+        second_epoch = max(
+            len(row["input_ids"]) + len(row["forced_output_ids"]) for row in records[2:]
+        )
+        self.assertEqual(
+            MODULE.terminal_program_weight(records), first_epoch + second_epoch
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

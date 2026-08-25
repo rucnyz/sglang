@@ -37,6 +37,7 @@ def phase_result(
             else {"n": 0}
         ),
     }
+    cache_hit = 0.90 + (0.03 if arm == "ours" else 0.0) if phase == "probe" else 0.8
     return {
         "n_requests": requests,
         "n_ok": requests,
@@ -46,18 +47,29 @@ def phase_result(
         "force_exact_rate": 1.0,
         "force_exact_failures": 0,
         "force_exact_missing": 0,
-        "cache_hit": (
-            0.90 + (0.03 if arm == "ours" else 0.0) if phase == "probe" else 0.8
-        ),
+        "cache_hit": cache_hit,
         "total_prompt_tokens": requests * 100,
+        "total_cached_tokens": int(requests * 100 * cache_hit),
         "cached_tokens_details": (
             {
                 "device": requests * (80 if arm == "ours" else 70),
                 "host": requests * (13 if arm == "ours" else 20),
                 "storage": 0,
+                "total": int(requests * 100 * cache_hit),
+                "coverage_requests": requests,
+                "total_requests": requests,
+                "coverage_complete": True,
             }
             if phase == "probe"
-            else {"device": requests * 80, "host": 0, "storage": 0}
+            else {
+                "device": requests * 80,
+                "host": 0,
+                "storage": 0,
+                "total": requests * 80,
+                "coverage_requests": requests,
+                "total_requests": requests,
+                "coverage_complete": True,
+            }
         ),
         "ttft_ms": {
             "mean": 20.0 + pair_number - (2.0 if arm == "ours" else 0.0),
@@ -67,6 +79,9 @@ def phase_result(
         "inference_throughput_tok_s": (
             100.0 + pair_number + (10.0 if arm == "ours" else 0.0)
         ),
+        "pipeline_throughput_tok_s": (
+            98.0 + pair_number + (5.0 if arm == "ours" else 0.0)
+        ),
         "session_end": session_end,
     }
 
@@ -74,6 +89,16 @@ def phase_result(
 def summary(arm: str, pair_number: int) -> dict:
     seed = phase_result("seed", arm, pair_number, 6, 2)
     terminal = phase_result("terminal", arm, pair_number, 12, 3)
+    if arm == "ours":
+        terminal["session_end"]["latency_ms"] = {
+            "mean": 4.0 + pair_number,
+            "aggregation": "weighted_by_completed_calls",
+        }
+        terminal["session_end"]["worst_wave_latency_ms"] = {
+            "p50": 3.0 + pair_number,
+            "p90": 7.0 + pair_number,
+            "p99": 9.0 + pair_number,
+        }
     probe = phase_result("probe", arm, pair_number, 2, 2)
     terminal_waves = [
         phase_result("terminal", arm, pair_number, 5, 1),
@@ -157,6 +182,7 @@ def summary(arm: str, pair_number: int) -> dict:
             "probe": {"returncode": 0, "issues": [], "result": probe},
         },
         "states": {
+            "after_seed": {"tracked_physical_bytes": {"HBM": 625, "DRAM": 250}},
             "after_terminal_wave_001": {
                 "live": {
                     "tracked_programs_present_count": 2,
@@ -244,7 +270,7 @@ class PressureAnalyzerTests(unittest.TestCase):
                 first["pre_probe_pool_hbm_utilization"]["delta_ours_minus_baseline"],
                 -0.08,
             )
-            self.assertEqual(first["pre_probe_live_retention"]["baseline"], 1.0)
+            self.assertEqual(first["pre_probe_live_program_presence"]["baseline"], 1.0)
             self.assertEqual(first["pre_probe_live_hbm_bytes"]["baseline"], 500)
             self.assertEqual(first["live_probe_device_cache_hit"]["baseline"], 0.7)
             self.assertEqual(first["live_probe_host_cache_hit"]["ours"], 0.13)
@@ -255,6 +281,8 @@ class PressureAnalyzerTests(unittest.TestCase):
             self.assertIsNotNone(
                 aggregate["terminal_end_latency_mean_ms"]["ours_mean_ci95"]
             )
+            self.assertIsNone(first["terminal_end_latency_p90_ms"]["ours"])
+            self.assertEqual(first["terminal_end_worst_wave_p90_ms"]["ours"], 8.0)
             self.assertNotIn("input_ids", report_text)
             self.assertNotIn("must-not-leak", report_text)
             self.assertNotIn("pair-1", report_text)

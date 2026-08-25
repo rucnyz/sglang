@@ -39,7 +39,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import run_agentreplay_with_telemetry as telemetry  # noqa: E402
 import split_agentreplay_pressure_trace as splitter  # noqa: E402
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -98,15 +98,25 @@ def trace_programs(
 
 def token_payload_hash(records: Sequence[Mapping[str, Any]]) -> str:
     """Hash token content while deliberately excluding program identifiers."""
-    payload = [
-        {
-            "step": record["step"],
-            "input_ids": record["input_ids"],
-            "forced_output_ids": record["forced_output_ids"],
-            "context_reset": bool(record.get("context_reset")),
-        }
-        for record in records
-    ]
+    programs: dict[str, list[Mapping[str, Any]]] = {}
+    for record in records:
+        programs.setdefault(str(record["program_id"]), []).append(record)
+    payload = sorted(
+        json.dumps(
+            [
+                {
+                    "step": record["step"],
+                    "input_ids": record["input_ids"],
+                    "forced_output_ids": record["forced_output_ids"],
+                    "context_reset": bool(record.get("context_reset")),
+                }
+                for record in sorted(rows, key=lambda row: int(row["step"]))
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for rows in programs.values()
+    )
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
@@ -204,6 +214,13 @@ def validate_phase_traces(
             ).encode()
         ).hexdigest()
     )
+    terminal_trace = {
+        "sha256": aggregate_terminal_hash,
+        "wave_count": len(terminal_paths),
+        "waves": terminal_wave_stats,
+    }
+    if len(terminal_paths) == 1:
+        terminal_trace["basename"] = terminal_paths[0].name
     return {
         "_live_program_ids": sorted(live_ids),
         "_terminal_program_ids": sorted(terminal_programs),
@@ -224,11 +241,7 @@ def validate_phase_traces(
                 "basename": seed_path.name,
                 "sha256": telemetry.sha256_file(seed_path),
             },
-            "terminal_churn": {
-                "sha256": aggregate_terminal_hash,
-                "wave_count": len(terminal_paths),
-                "waves": terminal_wave_stats,
-            },
+            "terminal_churn": terminal_trace,
             "live_probe": {
                 "basename": probe_path.name,
                 "sha256": telemetry.sha256_file(probe_path),
@@ -394,8 +407,8 @@ def aggregate_terminal_results(results: Sequence[Mapping[str, Any]]) -> dict[str
 
     Throughput is recomputed from summed output tokens and inference spans.
     END means are weighted by completed calls. Since per-call latency samples
-    are intentionally not copied into aggregate artifacts, aggregate p50/p90/
-    p99 are the worst per-wave quantiles and are labelled as such.
+    are intentionally not copied into aggregate artifacts, per-wave p50/p90/
+    p99 values are kept separately and never presented as aggregate percentiles.
     """
     if not results:
         raise ValueError("cannot aggregate zero terminal-wave results")
@@ -490,6 +503,8 @@ def aggregate_terminal_results(results: Sequence[Mapping[str, Any]]) -> dict[str
         if isinstance(stats, Mapping) and isinstance(stats.get("mean"), (int, float))
     ]
     latency["mean"] = weighted_mean(mean_values)
+    latency["aggregation"] = "weighted_by_completed_calls"
+    worst_wave_latency = {}
     for percentile in ("p50", "p90", "p99"):
         values = [
             float(stats[percentile])
@@ -497,8 +512,9 @@ def aggregate_terminal_results(results: Sequence[Mapping[str, Any]]) -> dict[str
             if isinstance(stats, Mapping)
             and isinstance(stats.get(percentile), (int, float))
         ]
-        latency[percentile] = max(values) if values else None
-    latency["percentile_aggregation"] = "maximum_across_waves"
+        worst_wave_latency[percentile] = max(values) if values else None
+        if len(results) == 1:
+            latency[percentile] = worst_wave_latency[percentile]
     aggregate["session_end"] = {
         "enabled": enabled,
         "n": end_count,
@@ -509,6 +525,9 @@ def aggregate_terminal_results(results: Sequence[Mapping[str, Any]]) -> dict[str
         ),
         "retry_attempts": sum(int(end.get("retry_attempts") or 0) for end in end_rows),
         "latency_ms": latency if enabled and end_count > 0 else {"n": 0},
+        "worst_wave_latency_ms": (
+            worst_wave_latency if enabled and end_count > 0 else {"n": 0}
+        ),
     }
     for field in (
         "freed_units",
@@ -799,10 +818,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     state_url = base_url + "/aginfer/state"
     end_url = base_url + "/aginfer/session_end"
     live_runtime = {telemetry.runtime_program_id(pid, args.salt) for pid in source_live}
-    terminal_wave_salts = [
-        terminal_wave_salt(args.salt, wave_number)
-        for wave_number in range(1, len(args.terminal_churn) + 1)
-    ]
+    terminal_wave_salts = (
+        [args.salt]
+        if len(args.terminal_churn) == 1
+        else [
+            terminal_wave_salt(args.salt, wave_number)
+            for wave_number in range(1, len(args.terminal_churn) + 1)
+        ]
+    )
     terminal_runtime_by_wave = [
         {
             telemetry.runtime_program_id(program_id, wave_salt)
@@ -917,7 +940,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             1,
         ):
-            wave_name = f"terminal-wave-{wave_number:03d}"
+            wave_name = (
+                "terminal"
+                if len(args.terminal_churn) == 1
+                else f"terminal-wave-{wave_number:03d}"
+            )
             terminal_dir = out_dir / wave_name
             terminal_result_path = terminal_dir / "result.json"
             terminal_replay = replay_command(
@@ -1012,28 +1039,45 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             save()
 
-        terminal_result = aggregate_terminal_results(terminal_results)
-        terminal_summary = aggregate_terminal_telemetry(terminal_summaries)
+        if len(terminal_results) == 1:
+            terminal_result = terminal_results[0]
+            terminal_summary = terminal_summaries[0]
+        else:
+            terminal_result = aggregate_terminal_results(terminal_results)
+            terminal_summary = aggregate_terminal_telemetry(terminal_summaries)
         terminal_issues = verify_replay_result(
             terminal_result,
             expected_requests=phase_manifest["terminal_requests"],
             expected_programs=len(source_terminal),
             expect_end=args.mode == "ours",
         )
-        aggregate_run = {
-            "returncode": max(
-                int(run.get("returncode") or 0) for run in terminal_wave_runs
-            ),
-            "elapsed_seconds": sum(
-                float(run.get("elapsed_seconds") or 0.0) for run in terminal_wave_runs
-            ),
-            "command_sha256": hashlib.sha256(
-                json.dumps(
-                    [run.get("command_sha256") for run in terminal_wave_runs],
-                    separators=(",", ":"),
-                ).encode()
-            ).hexdigest(),
-        }
+        if len(terminal_wave_runs) == 1:
+            aggregate_run = {
+                key: terminal_wave_runs[0][key]
+                for key in (
+                    "returncode",
+                    "elapsed_seconds",
+                    "stdout",
+                    "stderr",
+                    "command_sha256",
+                )
+            }
+        else:
+            aggregate_run = {
+                "returncode": max(
+                    int(run.get("returncode") or 0) for run in terminal_wave_runs
+                ),
+                "elapsed_seconds": sum(
+                    float(run.get("elapsed_seconds") or 0.0)
+                    for run in terminal_wave_runs
+                ),
+                "command_sha256": hashlib.sha256(
+                    json.dumps(
+                        [run.get("command_sha256") for run in terminal_wave_runs],
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            }
         summary["phases"]["terminal"] = {
             **aggregate_run,
             "result": telemetry.safe_result(terminal_result),
@@ -1109,8 +1153,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.mode == "ours" and post_probe["tracked_programs_present_count"] != 0:
             raise RuntimeError("Ours retained workload holders after probe SESSION_END")
 
-        # Make the terminal telemetry summary the top-level compatibility view
-        # consumed by analyze_agentreplay_realtrace.py.
+        # A single wave preserves the legacy top-level compatibility view used
+        # by analyze_agentreplay_realtrace.py. Multi-wave summaries use the same
+        # aggregate keys, but percentile-only latency fields are intentionally
+        # omitted when they cannot be reconstructed exactly.
         summary["agentreplay_result"] = telemetry.safe_result(terminal_result)
         summary["end_state"] = after_terminal
         for field in (

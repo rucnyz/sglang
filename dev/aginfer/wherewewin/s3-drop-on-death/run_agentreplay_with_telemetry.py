@@ -479,11 +479,23 @@ def safe_result(result: Any) -> dict[str, Any] | None:
     cached_details = result.get("cached_tokens_details")
     if isinstance(cached_details, Mapping):
         rows = [cached_details]
+        details_are_aggregate = True
+        detail_entries_valid = True
     elif isinstance(cached_details, list):
         rows = [row for row in cached_details if isinstance(row, Mapping)]
+        details_are_aggregate = False
+        detail_entries_valid = all(
+            row is None or isinstance(row, Mapping) for row in cached_details
+        )
     else:
         rows = []
-    if rows:
+        details_are_aggregate = False
+        detail_entries_valid = False
+    if rows or (
+        isinstance(cached_details, list)
+        and bool(cached_details)
+        and detail_entries_valid
+    ):
         aggregate_details = {
             tier: sum(
                 int(row.get(tier) or 0)
@@ -493,13 +505,70 @@ def safe_result(result: Any) -> dict[str, Any] | None:
             )
             for tier in ("device", "host", "storage")
         }
-        if any(
-            isinstance(row.get(tier), (int, float))
-            and not isinstance(row.get(tier), bool)
+        covered_rows = sum(
+            any(
+                isinstance(row.get(tier), (int, float))
+                and not isinstance(row.get(tier), bool)
+                for tier in aggregate_details
+            )
             for row in rows
-            for tier in aggregate_details
-        ):
-            sanitized["cached_tokens_details"] = aggregate_details
+        )
+        if covered_rows or not details_are_aggregate:
+            total_cached = result.get("total_cached_tokens")
+            request_count = result.get("n_requests")
+            details_total = sum(aggregate_details.values())
+            totals_match = (
+                isinstance(total_cached, (int, float))
+                and not isinstance(total_cached, bool)
+                and details_total == int(total_cached)
+            )
+            if details_are_aggregate:
+                explicit_complete = cached_details.get("coverage_complete")
+                explicit_coverage = cached_details.get("coverage_requests")
+                coverage = (
+                    int(explicit_coverage)
+                    if isinstance(explicit_coverage, (int, float))
+                    and not isinstance(explicit_coverage, bool)
+                    else (
+                        int(request_count)
+                        if totals_match
+                        and isinstance(request_count, (int, float))
+                        and not isinstance(request_count, bool)
+                        else None
+                    )
+                )
+                coverage_complete = bool(
+                    totals_match
+                    and explicit_complete is not False
+                    and (
+                        coverage is None
+                        or not isinstance(request_count, (int, float))
+                        or isinstance(request_count, bool)
+                        or coverage == int(request_count)
+                    )
+                )
+            else:
+                coverage = len(cached_details)
+                coverage_complete = bool(
+                    totals_match
+                    and isinstance(request_count, (int, float))
+                    and not isinstance(request_count, bool)
+                    and detail_entries_valid
+                    and len(cached_details) == int(request_count)
+                )
+            sanitized["cached_tokens_details"] = {
+                **aggregate_details,
+                "total": details_total,
+                "coverage_requests": coverage,
+                "nonzero_detail_rows": covered_rows,
+                "total_requests": (
+                    int(request_count)
+                    if isinstance(request_count, (int, float))
+                    and not isinstance(request_count, bool)
+                    else None
+                ),
+                "coverage_complete": coverage_complete,
+            }
     session_end = result.get("session_end")
     if isinstance(session_end, Mapping):
         end_allowed = {
@@ -508,6 +577,7 @@ def safe_result(result: Any) -> dict[str, Any] | None:
             "n_ok",
             "n_error",
             "latency_ms",
+            "worst_wave_latency_ms",
             "freed_bytes",
             "freed_units",
             "matched_nodes",

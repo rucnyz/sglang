@@ -445,8 +445,12 @@ class PressureArmTests(unittest.TestCase):
             self.assertEqual(terminal["n_programs"], 2)
             self.assertEqual(terminal["session_end"]["n_ok"], 2)
             self.assertEqual(
-                terminal["session_end"]["latency_ms"]["percentile_aggregation"],
-                "maximum_across_waves",
+                terminal["session_end"]["latency_ms"]["aggregation"],
+                "weighted_by_completed_calls",
+            )
+            self.assertNotIn("p90", terminal["session_end"]["latency_ms"])
+            self.assertEqual(
+                terminal["session_end"]["worst_wave_latency_ms"]["p90"], 3.0
             )
             for wave_number in (1, 2):
                 state = summary["states"][f"after_terminal_wave_{wave_number:03d}"][

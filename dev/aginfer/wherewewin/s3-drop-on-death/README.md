@@ -179,10 +179,12 @@ payloads. The splitter assigns distinct real root closures to each wave.
 Run both arms with the same phase files, server configuration, and salt. The
 baseline retains terminal sessions through the fixed barrier; Ours emits
 `SESSION_END` for them after each wave. Both arms then probe the still-live
-step-4 turns. Every terminal wave is run in a distinct derived session namespace
-and each wave records both full-workload and live-only state. This shows the
-first wave at which the baseline displaces reusable live KV. The runner flushes
-the cache during cleanup, so do not point it at a shared deployment.
+step-4 turns. In a multi-wave run, every terminal wave uses a distinct derived
+session namespace, and each wave records both full-workload and live-only state. This shows the
+first wave at which the baseline reduces live HBM/DRAM bytes. The accompanying
+program count means only “has at least one holder”; it must not be interpreted as
+complete-prefix retention. The runner flushes the cache during cleanup, so do
+not point it at a shared deployment.
 
 ```bash
 python3 dev/aginfer/wherewewin/s3-drop-on-death/run_agentreplay_pressure_arm.py \
@@ -239,12 +241,19 @@ python3 dev/aginfer/wherewewin/s3-drop-on-death/analyze_agentreplay_pressure.py 
 The analyzer opens only `baseline-rN/summary.json` and
 `ours-rN/summary.json`. It validates exact replay completion, phase hashes,
 configuration equality, cleanup, and paired salts; reports dead HBM/DRAM,
-pool utilization, live-probe cache hit and TTFT, terminal throughput, and END
-latency; and emits bootstrap intervals once at least three comparable pairs are
-available. Multi-wave summaries additionally expose live-program retention after
-the final wave. If AgentReplay emits `cached_tokens_details`, the telemetry
-sanitizer and analyzer retain aggregate device/host/storage hit ratios; otherwise
-the total hit rate cannot distinguish HBM hits from DRAM hits.
+pool utilization, live-probe cache hit and TTFT, inference-only and full-pipeline
+terminal throughput, and END latency; and emits bootstrap intervals once at
+least three comparable pairs are available. Multi-wave summaries additionally
+expose live holder presence plus HBM/DRAM byte retention after every wave. The
+aggregate END mean is weighted by completed calls; cross-wave p50/p90 are not
+fabricated, and the report instead labels the maximum observed per-wave p50/p90.
+
+If AgentReplay emits a complete `cached_tokens_details` breakdown, the telemetry
+sanitizer and analyzer retain aggregate device/host/storage hit ratios. The
+current AgentReplay deployment must be configured or extended to request and
+aggregate that field; without it, these columns remain blank and total cache hit
+cannot distinguish HBM hits from DRAM hits. Partial breakdown coverage is
+rejected rather than silently treated as zero.
 
 The standard-library-only mock tests do not require a GPU or real trace:
 

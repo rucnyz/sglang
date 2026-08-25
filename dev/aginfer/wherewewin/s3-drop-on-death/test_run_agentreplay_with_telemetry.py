@@ -139,6 +139,7 @@ class TelemetryTests(unittest.TestCase):
         safe = MODULE.safe_result(
             {
                 "n_requests": 2,
+                "total_cached_tokens": 36,
                 "cached_tokens_details": [
                     {"device": 10, "host": 2, "storage": 1, "private": "x"},
                     {"device": 20, "host": 3, "storage": 0},
@@ -147,9 +148,49 @@ class TelemetryTests(unittest.TestCase):
         )
         self.assertEqual(
             safe["cached_tokens_details"],
-            {"device": 30, "host": 5, "storage": 1},
+            {
+                "device": 30,
+                "host": 5,
+                "storage": 1,
+                "total": 36,
+                "coverage_requests": 2,
+                "nonzero_detail_rows": 2,
+                "total_requests": 2,
+                "coverage_complete": True,
+            },
         )
         self.assertNotIn("private", json.dumps(safe))
+
+        partial = MODULE.safe_result(
+            {
+                "n_requests": 2,
+                "total_cached_tokens": 30,
+                "cached_tokens_details": [{"device": 10}],
+            }
+        )
+        self.assertFalse(partial["cached_tokens_details"]["coverage_complete"])
+
+        with_zero_hit = MODULE.safe_result(
+            {
+                "n_requests": 2,
+                "total_cached_tokens": 10,
+                "cached_tokens_details": [{"device": 10}, None],
+            }
+        )
+        self.assertTrue(with_zero_hit["cached_tokens_details"]["coverage_complete"])
+        self.assertEqual(
+            with_zero_hit["cached_tokens_details"]["nonzero_detail_rows"], 1
+        )
+
+        all_zero_hit = MODULE.safe_result(
+            {
+                "n_requests": 2,
+                "total_cached_tokens": 0,
+                "cached_tokens_details": [None, None],
+            }
+        )
+        self.assertTrue(all_zero_hit["cached_tokens_details"]["coverage_complete"])
+        self.assertEqual(all_zero_hit["cached_tokens_details"]["total"], 0)
 
     def test_integration_preserves_child_rc_and_redacts_trace(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), StateHandler)

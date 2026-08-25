@@ -26,7 +26,7 @@ import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 RUN_RE = re.compile(r"^(baseline|ours)-r(.+)$")
 PHASES = ("seed", "terminal", "probe")
 TRACE_PHASES = ("live_seed", "terminal_churn", "live_probe")
@@ -44,8 +44,8 @@ METRICS: tuple[tuple[str, str, str, bool, bool], ...] = (
         True,
     ),
     (
-        "pre_probe_live_retention",
-        "Pre-probe live programs retained",
+        "pre_probe_live_program_presence",
+        "Pre-probe live programs with any holder",
         "ratio",
         True,
         True,
@@ -96,9 +96,30 @@ METRICS: tuple[tuple[str, str, str, bool, bool], ...] = (
         True,
         True,
     ),
+    (
+        "terminal_pipeline_throughput_tok_s",
+        "Terminal full-pipeline throughput",
+        "tok/s",
+        True,
+        True,
+    ),
     ("terminal_end_latency_mean_ms", "Terminal END latency mean", "ms", False, False),
     ("terminal_end_latency_p50_ms", "Terminal END latency p50", "ms", False, False),
     ("terminal_end_latency_p90_ms", "Terminal END latency p90", "ms", False, False),
+    (
+        "terminal_end_worst_wave_p50_ms",
+        "Terminal END worst-wave p50",
+        "ms",
+        False,
+        False,
+    ),
+    (
+        "terminal_end_worst_wave_p90_ms",
+        "Terminal END worst-wave p90",
+        "ms",
+        False,
+        False,
+    ),
     ("terminal_end_retry_attempts", "Terminal END retries", "count", False, False),
 )
 
@@ -169,7 +190,7 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
     if not isinstance(terminal, Mapping):
         terminal = {}
 
-    if name == "pre_probe_live_retention":
+    if name == "pre_probe_live_program_presence":
         live_count = number(get_path(summary, "phase_manifest", "live_program_count"))
         if live_count is None or live_count <= 0:
             return None
@@ -202,6 +223,8 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
         "live_probe_storage_cache_hit": "storage",
     }
     if name in cache_tiers:
+        if get_path(probe, "cached_tokens_details", "coverage_complete") is not True:
+            return None
         return ratio(
             get_path(probe, "cached_tokens_details", cache_tiers[name]),
             probe.get("total_prompt_tokens"),
@@ -238,6 +261,10 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
             terminal,
             ("inference_throughput_tok_s",),
         ),
+        "terminal_pipeline_throughput_tok_s": (
+            terminal,
+            ("pipeline_throughput_tok_s",),
+        ),
         "terminal_end_latency_mean_ms": (
             terminal,
             ("session_end", "latency_ms", "mean"),
@@ -249,6 +276,14 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
         "terminal_end_latency_p90_ms": (
             terminal,
             ("session_end", "latency_ms", "p90"),
+        ),
+        "terminal_end_worst_wave_p50_ms": (
+            terminal,
+            ("session_end", "worst_wave_latency_ms", "p50"),
+        ),
+        "terminal_end_worst_wave_p90_ms": (
+            terminal,
+            ("session_end", "worst_wave_latency_ms", "p90"),
         ),
         "terminal_end_retry_attempts": (
             terminal,
@@ -495,6 +530,13 @@ def run_issues(summary: Mapping[str, Any], arm: str) -> list[str]:
     pre_probe = get_path(summary, "states", "before_live_probe")
     if not isinstance(pre_probe, Mapping):
         issues.append("missing pre-probe state")
+    probe_result = get_path(summary, "phases", "probe", "result")
+    cache_details = get_path(probe_result, "cached_tokens_details")
+    if (
+        isinstance(cache_details, Mapping)
+        and cache_details.get("coverage_complete") is not True
+    ):
+        issues.append("probe cached-token source breakdown is incomplete")
     cleanup = summary.get("cleanup")
     if not isinstance(cleanup, Mapping):
         issues.append("missing cleanup summary")
@@ -542,7 +584,7 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
     metrics = {name: metric_value(summary, name) for name, *_ in METRICS}
     issues = run_issues(summary, arm)
     optional_metrics = {
-        "pre_probe_live_retention",
+        "pre_probe_live_program_presence",
         "pre_probe_live_hbm_bytes",
         "pre_probe_live_dram_bytes",
         "live_probe_device_cache_hit",
@@ -551,6 +593,8 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
         "terminal_end_latency_mean_ms",
         "terminal_end_latency_p50_ms",
         "terminal_end_latency_p90_ms",
+        "terminal_end_worst_wave_p50_ms",
+        "terminal_end_worst_wave_p90_ms",
         "terminal_end_retry_attempts",
     }
     required_metrics = [
@@ -559,8 +603,6 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
     if arm == "ours":
         required_metrics += [
             "terminal_end_latency_mean_ms",
-            "terminal_end_latency_p50_ms",
-            "terminal_end_latency_p90_ms",
             "terminal_end_retry_attempts",
         ]
     missing = [name for name in required_metrics if metrics.get(name) is None]
@@ -569,7 +611,7 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
     for name in (
         "pre_probe_pool_hbm_utilization",
         "pre_probe_pool_dram_utilization",
-        "pre_probe_live_retention",
+        "pre_probe_live_program_presence",
         "live_probe_cache_hit",
         "live_probe_device_cache_hit",
         "live_probe_host_cache_hit",
@@ -619,13 +661,33 @@ def load_run(path: pathlib.Path, model_dir: pathlib.Path) -> dict[str, Any]:
         live_retention_by_wave.append(
             {
                 "wave_number": wave_number,
-                "programs_present": present,
-                "retention": ratio(present, live_count_value),
+                "programs_with_any_holder": present,
+                "presence_fraction": ratio(present, live_count_value),
                 "hbm_bytes": number(
                     get_path(live_state, "tracked_physical_bytes", "HBM")
                 ),
                 "dram_bytes": number(
                     get_path(live_state, "tracked_physical_bytes", "DRAM")
+                ),
+                "hbm_bytes_vs_seed": ratio(
+                    get_path(live_state, "tracked_physical_bytes", "HBM"),
+                    get_path(
+                        summary,
+                        "states",
+                        "after_seed",
+                        "tracked_physical_bytes",
+                        "HBM",
+                    ),
+                ),
+                "dram_bytes_vs_seed": ratio(
+                    get_path(live_state, "tracked_physical_bytes", "DRAM"),
+                    get_path(
+                        summary,
+                        "states",
+                        "after_seed",
+                        "tracked_physical_bytes",
+                        "DRAM",
+                    ),
                 ),
             }
         )
@@ -923,6 +985,9 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         "immediately before the live step-4 probe. Positive improvement means Ours "
         "moved in the desired direction. Only aggregate summaries were read; raw "
         "prompts, token arrays, telemetry JSONL, and logs are excluded.",
+        "For multi-wave runs, END mean is weighted by completed calls. Exact "
+        "cross-wave percentiles cannot be reconstructed from aggregate-only inputs, "
+        "so p50/p90 are left blank and worst-wave p50/p90 are labelled separately.",
         "",
         "## Validation",
         "",
@@ -943,8 +1008,8 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         lines += [
             f"### {model}",
             "",
-            "| Pair | Arm | Dead HBM | Dead DRAM | HBM pool | DRAM pool | Live retained | Live HBM | Live DRAM | Probe hit | Device hit | Host hit | Storage hit | Probe TTFT mean | p50 | p90 | Terminal tok/s | END mean | END p50 | END p90 | END retries |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Pair | Arm | Dead HBM | Dead DRAM | HBM pool | DRAM pool | Live holders | Live HBM | Live DRAM | Probe hit | Device hit | Host hit | Storage hit | Probe TTFT mean | p50 | p90 | Inference tok/s | Pipeline tok/s | END mean | END p50 | END p90 | Worst-wave END p50 | Worst-wave END p90 | END retries |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for run in report["runs"]:
             if run["model"] != model:
@@ -955,7 +1020,7 @@ def markdown_report(report: Mapping[str, Any]) -> str:
                 ("pre_probe_dead_dram_bytes", "bytes"),
                 ("pre_probe_pool_hbm_utilization", "ratio"),
                 ("pre_probe_pool_dram_utilization", "ratio"),
-                ("pre_probe_live_retention", "ratio"),
+                ("pre_probe_live_program_presence", "ratio"),
                 ("pre_probe_live_hbm_bytes", "bytes"),
                 ("pre_probe_live_dram_bytes", "bytes"),
                 ("live_probe_cache_hit", "ratio"),
@@ -966,9 +1031,12 @@ def markdown_report(report: Mapping[str, Any]) -> str:
                 ("live_probe_ttft_p50_ms", "ms"),
                 ("live_probe_ttft_p90_ms", "ms"),
                 ("terminal_inference_throughput_tok_s", "tok/s"),
+                ("terminal_pipeline_throughput_tok_s", "tok/s"),
                 ("terminal_end_latency_mean_ms", "ms"),
                 ("terminal_end_latency_p50_ms", "ms"),
                 ("terminal_end_latency_p90_ms", "ms"),
+                ("terminal_end_worst_wave_p50_ms", "ms"),
+                ("terminal_end_worst_wave_p90_ms", "ms"),
                 ("terminal_end_retry_attempts", "count"),
             ]
             values = [format_value(metrics[name], unit) for name, unit in ordered]
@@ -988,17 +1056,19 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         lines += [
             "## Live retention by terminal wave",
             "",
-            "| Model | Pair | Arm | Wave | Programs present | Retention | Live HBM | Live DRAM |",
-            "|---|---:|---|---:|---:|---:|---:|---:|",
+            "| Model | Pair | Arm | Wave | Programs with any holder | Presence | Live HBM | HBM bytes / seed | Live DRAM | DRAM bytes / seed |",
+            "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for run, wave in wave_rows:
             lines.append(
                 f"| {run['model']} | {run['pair_id']} | {run['arm']} | "
                 f"{wave['wave_number']} | "
-                f"{format_value(wave['programs_present'], 'count')} | "
-                f"{format_value(wave['retention'], 'ratio')} | "
+                f"{format_value(wave['programs_with_any_holder'], 'count')} | "
+                f"{format_value(wave['presence_fraction'], 'ratio')} | "
                 f"{format_value(wave['hbm_bytes'], 'bytes')} | "
-                f"{format_value(wave['dram_bytes'], 'bytes')} |"
+                f"{format_value(wave['hbm_bytes_vs_seed'], 'ratio')} | "
+                f"{format_value(wave['dram_bytes'], 'bytes')} | "
+                f"{format_value(wave['dram_bytes_vs_seed'], 'ratio')} |"
             )
         lines.append("")
 

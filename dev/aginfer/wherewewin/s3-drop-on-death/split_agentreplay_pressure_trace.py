@@ -26,7 +26,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TRACE_NAMES = {
     "live_seed": "live-seed.jsonl",
     "live_probe": "live-probe.jsonl",
@@ -225,8 +225,17 @@ def terminal_wave_path(
 
 
 def terminal_program_weight(rows: Sequence[Mapping[str, Any]]) -> int:
-    """Approximate resident KV using the largest request in one program."""
-    return max(len(row["input_ids"]) + len(row["forced_output_ids"]) for row in rows)
+    """Approximate resident KV as the sum of context-epoch high-water marks."""
+    total = 0
+    epoch_max = 0
+    for row in sorted(rows, key=lambda item: int(item["step"])):
+        if row.get("context_reset") and epoch_max:
+            total += epoch_max
+            epoch_max = 0
+        epoch_max = max(
+            epoch_max, len(row["input_ids"]) + len(row["forced_output_ids"])
+        )
+    return total + epoch_max
 
 
 def split_terminal_waves(
@@ -450,6 +459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "topology_sha256": topology_hash(phases["terminal_churn"]),
         "waves": wave_stats,
     }
+    if len(wave_paths) == 1:
+        terminal_stats["file"] = wave_paths[0].name
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "source": {
