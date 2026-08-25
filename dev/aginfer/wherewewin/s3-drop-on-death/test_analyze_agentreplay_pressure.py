@@ -274,6 +274,18 @@ class PressureAnalyzerTests(unittest.TestCase):
             self.assertEqual(first["pre_probe_live_hbm_bytes"]["baseline"], 500)
             self.assertEqual(first["live_probe_device_cache_hit"]["baseline"], 0.7)
             self.assertEqual(first["live_probe_host_cache_hit"]["ours"], 0.13)
+            self.assertEqual(
+                first["live_probe_inference_throughput_tok_s"][
+                    "delta_ours_minus_baseline"
+                ],
+                10.0,
+            )
+            self.assertEqual(
+                first["live_probe_pipeline_throughput_tok_s"][
+                    "delta_ours_minus_baseline"
+                ],
+                5.0,
+            )
             aggregate = report["models"][0]["metrics"]
             self.assertIsNotNone(
                 aggregate["pre_probe_dead_hbm_bytes"]["mean_paired_delta_ci95"]
@@ -290,6 +302,7 @@ class PressureAnalyzerTests(unittest.TestCase):
             self.assertIn("Pre-probe dead HBM", markdown)
             self.assertIn("95% bootstrap CI", markdown)
             self.assertIn("Live retention by terminal wave", markdown)
+            self.assertIn("Probe inf tok/s", markdown)
 
     def test_mismatched_pair_is_nonzero_and_not_comparable(self):
         with tempfile.TemporaryDirectory() as temporary:

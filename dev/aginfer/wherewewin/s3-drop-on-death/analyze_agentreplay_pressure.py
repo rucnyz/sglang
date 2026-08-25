@@ -90,6 +90,20 @@ METRICS: tuple[tuple[str, str, str, bool, bool], ...] = (
     ("live_probe_ttft_p50_ms", "Live-probe TTFT p50", "ms", False, True),
     ("live_probe_ttft_p90_ms", "Live-probe TTFT p90", "ms", False, True),
     (
+        "live_probe_inference_throughput_tok_s",
+        "Live-probe inference throughput",
+        "tok/s",
+        True,
+        True,
+    ),
+    (
+        "live_probe_pipeline_throughput_tok_s",
+        "Live-probe full-pipeline throughput",
+        "tok/s",
+        True,
+        True,
+    ),
+    (
         "terminal_inference_throughput_tok_s",
         "Terminal inference throughput",
         "tok/s",
@@ -257,6 +271,14 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
         "live_probe_ttft_mean_ms": (probe, ("ttft_ms", "mean")),
         "live_probe_ttft_p50_ms": (probe, ("ttft_ms", "p50")),
         "live_probe_ttft_p90_ms": (probe, ("ttft_ms", "p90")),
+        "live_probe_inference_throughput_tok_s": (
+            probe,
+            ("inference_throughput_tok_s",),
+        ),
+        "live_probe_pipeline_throughput_tok_s": (
+            probe,
+            ("pipeline_throughput_tok_s",),
+        ),
         "terminal_inference_throughput_tok_s": (
             terminal,
             ("inference_throughput_tok_s",),
@@ -1008,8 +1030,8 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         lines += [
             f"### {model}",
             "",
-            "| Pair | Arm | Dead HBM | Dead DRAM | HBM pool | DRAM pool | Live holders | Live HBM | Live DRAM | Probe hit | Device hit | Host hit | Storage hit | Probe TTFT mean | p50 | p90 | Inference tok/s | Pipeline tok/s | END mean | END p50 | END p90 | Worst-wave END p50 | Worst-wave END p90 | END retries |",
-            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| Pair | Arm | Dead HBM | Dead DRAM | HBM pool | DRAM pool | Live holders | Live HBM | Live DRAM | Probe hit | Device hit | Host hit | Storage hit | Probe TTFT mean | p50 | p90 | Probe inf tok/s | Probe pipe tok/s | Terminal inf tok/s | Terminal pipe tok/s | END mean | END p50 | END p90 | Worst-wave END p50 | Worst-wave END p90 | END retries |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
         for run in report["runs"]:
             if run["model"] != model:
@@ -1030,6 +1052,8 @@ def markdown_report(report: Mapping[str, Any]) -> str:
                 ("live_probe_ttft_mean_ms", "ms"),
                 ("live_probe_ttft_p50_ms", "ms"),
                 ("live_probe_ttft_p90_ms", "ms"),
+                ("live_probe_inference_throughput_tok_s", "tok/s"),
+                ("live_probe_pipeline_throughput_tok_s", "tok/s"),
                 ("terminal_inference_throughput_tok_s", "tok/s"),
                 ("terminal_pipeline_throughput_tok_s", "tok/s"),
                 ("terminal_end_latency_mean_ms", "ms"),
