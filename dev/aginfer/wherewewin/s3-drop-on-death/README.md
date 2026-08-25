@@ -133,6 +133,93 @@ accounting, bootstrap analysis, and the direct E2E verifier without GPUs:
 python3 dev/aginfer/wherewewin/s3-drop-on-death/test_deadkv_ab.py
 ```
 
+## AgentReplay high-pressure paired experiment
+
+The synthetic A/B harness above is the first acceptance gate. The
+AgentReplay tools in this directory provide a separate real-trace experiment
+that asks whether early reclamation preserves a reusable live prefix under
+allocator pressure.
+
+This workflow requires an external AgentReplay checkout and a dedicated direct
+SGLang deployment exposing `/generate`, `/aginfer/state`,
+`/aginfer/session_end`, and `/flush_cache`. Configure the deployment separately
+so that the baseline arm reaches roughly 80%--90% HBM-pool utilization before
+the live probe. Machine-specific model launchers are intentionally not included.
+
+First split a private four-step token trace into two reusable live roots and a
+terminal churn set:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/split_agentreplay_pressure_trace.py \
+  --trace /path/to/private/source.jsonl \
+  --out-dir /path/to/private/phases
+```
+
+The three generated JSONL files contain token and program IDs and must remain
+private. The generated `manifest.json` contains only counts, lengths, and
+hashes.
+
+Run both arms with the same phase files, server configuration, and salt. The
+baseline retains terminal sessions through the fixed barrier; Ours emits
+`SESSION_END` for them. Both arms then probe the two still-live step-4 turns.
+The runner flushes the cache during cleanup, so do not point it at a shared
+deployment.
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/run_agentreplay_pressure_arm.py \
+  --mode baseline \
+  --live-seed /path/to/private/phases/live-seed.jsonl \
+  --terminal-churn /path/to/private/phases/terminal-churn.jsonl \
+  --live-probe /path/to/private/phases/live-probe.jsonl \
+  --out-dir /path/to/private/runs/deployment-a/baseline-r1 \
+  --salt pair-01 --label baseline-r1 \
+  --agentreplay-root /path/to/AgentReplay \
+  --url http://127.0.0.1:30001/generate \
+  --barrier-seconds 30
+
+python3 dev/aginfer/wherewewin/s3-drop-on-death/run_agentreplay_pressure_arm.py \
+  --mode ours \
+  --live-seed /path/to/private/phases/live-seed.jsonl \
+  --terminal-churn /path/to/private/phases/terminal-churn.jsonl \
+  --live-probe /path/to/private/phases/live-probe.jsonl \
+  --out-dir /path/to/private/runs/deployment-a/ours-r1 \
+  --salt pair-01 --label ours-r1 \
+  --agentreplay-root /path/to/AgentReplay \
+  --url http://127.0.0.1:30001/generate \
+  --barrier-seconds 30
+```
+
+Use at least three pairs and alternate arm order, for example AB, BA, AB. Keep
+each pair's salt identical between arms but use a fresh salt for the next pair.
+The per-arm directories contain child logs and replay artifacts and therefore
+remain private. `summary.json` is aggregate-only and stores a salt fingerprint,
+not the salt or program IDs.
+
+Generate a shareable aggregate report from the per-arm summaries:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/analyze_agentreplay_pressure.py \
+  /path/to/private/runs/deployment-a \
+  --out-dir /path/to/shareable/pressure-analysis
+```
+
+The analyzer opens only `baseline-rN/summary.json` and
+`ours-rN/summary.json`. It validates exact replay completion, phase hashes,
+configuration equality, cleanup, and paired salts; reports dead HBM/DRAM,
+pool utilization, live-probe cache hit and TTFT, terminal throughput, and END
+latency; and emits bootstrap intervals once at least three comparable pairs are
+available.
+
+The standard-library-only mock tests do not require a GPU or real trace:
+
+```bash
+python3 -m unittest \
+  dev/aginfer/wherewewin/s3-drop-on-death/test_run_agentreplay_with_telemetry.py \
+  dev/aginfer/wherewewin/s3-drop-on-death/test_split_agentreplay_pressure_trace.py \
+  dev/aginfer/wherewewin/s3-drop-on-death/test_run_agentreplay_pressure_arm.py \
+  dev/aginfer/wherewewin/s3-drop-on-death/test_analyze_agentreplay_pressure.py
+```
+
 ## Direct full-pipeline acceptance test
 
 `verify_dead_kv_e2e.py` is a stricter black-box acceptance test for a live
