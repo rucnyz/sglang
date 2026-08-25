@@ -298,6 +298,8 @@ delayed turns unambiguously represent one reusable session.  Omit
 `--identity-insert-offset` to use the exact common-prefix length detected from
 the source; when the model trace has a known fixed system prefix, an explicit
 offset (for example 16K tokens) makes the intended sharing boundary auditable.
+The live fraction is an exact rounded quota distributed evenly through the
+arrival sequence with a seeded phase; it is not a noisy per-session coin flip.
 
 Run paired arms on a dedicated direct-SGLang deployment.  The root-session
 arrival process is open-loop; `--max-concurrency` is the common inference

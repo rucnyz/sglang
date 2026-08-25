@@ -273,13 +273,28 @@ def run_issues(summary: Mapping[str, Any], arm: str) -> list[str]:
             "telemetry_interval_s",
         ):
             value = number(configuration.get(field))
-            if value is None or value <= 0:
+            if value is None:
+                issues.append(
+                    f"missing configuration {field}; rerun this legacy arm "
+                    "with the current steady runner"
+                )
+            elif value <= 0:
                 issues.append(f"invalid configuration {field}")
         retries = number(configuration.get("session_end_retries"))
         retry_delay = number(configuration.get("session_end_retry_delay_s"))
-        if retries is None or retries < 0:
+        if retries is None:
+            issues.append(
+                "missing configuration session_end_retries; rerun this legacy "
+                "arm with the current steady runner"
+            )
+        elif retries < 0:
             issues.append("invalid configuration session_end_retries")
-        if retry_delay is None or retry_delay < 0:
+        if retry_delay is None:
+            issues.append(
+                "missing configuration session_end_retry_delay_s; rerun this "
+                "legacy arm with the current steady runner"
+            )
+        elif retry_delay < 0:
             issues.append("invalid configuration session_end_retry_delay_s")
 
     workload = summary.get("workload")

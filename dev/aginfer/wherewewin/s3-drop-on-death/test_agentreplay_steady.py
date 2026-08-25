@@ -73,6 +73,8 @@ class SteadyTraceBuilderTests(unittest.TestCase):
         self.assertEqual(manifest, second_manifest)
         self.assertEqual(manifest["session_count"], 10)
         self.assertEqual(sum(manifest["role_session_counts"].values()), 10)
+        self.assertEqual(manifest["role_session_counts"], {"live": 5, "churn": 5})
+        self.assertEqual(manifest["live_fraction_actual"], 0.5)
         by_program = runner.source_programs(first)
         first_inputs = [
             tuple(records[0]["input_ids"]) for records in by_program.values()

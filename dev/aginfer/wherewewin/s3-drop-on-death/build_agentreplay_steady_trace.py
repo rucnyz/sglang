@@ -187,6 +187,25 @@ def identity_tokens(index: int, width: int, alphabet: tuple[int, int]) -> list[i
     return [one if index & (1 << bit) else zero for bit in reversed(range(width))]
 
 
+def evenly_spaced_live_indices(
+    session_count: int, live_fraction: float, rng: random.Random
+) -> set[int]:
+    """Return an exact, evenly distributed live-session quota with a seeded phase."""
+    if session_count < 2:
+        raise ValueError("steady workload needs at least two root sessions")
+    live_count = int(math.floor(session_count * live_fraction + 0.5))
+    live_count = min(max(live_count, 1), session_count - 1)
+    phase = rng.randrange(session_count)
+    indices = {
+        (phase + int(math.floor((index + 0.5) * session_count / live_count)))
+        % session_count
+        for index in range(live_count)
+    }
+    if len(indices) != live_count:
+        raise AssertionError("live-session spacing produced duplicate indices")
+    return indices
+
+
 def clone_bundle(
     programs: Mapping[str, Sequence[Mapping[str, Any]]],
     *,
@@ -342,6 +361,7 @@ def build_schedule(
         )
 
     rng = random.Random(seed)
+    live_indices = evenly_spaced_live_indices(session_count, live_fraction, rng)
     records: list[dict[str, Any]] = []
     role_counts = {"live": 0, "churn": 0}
     role_program_counts = {"live": 0, "churn": 0}
@@ -352,7 +372,7 @@ def build_schedule(
         arrival = index * interval
         if arrival >= total_seconds:
             break
-        role = "live" if rng.random() < live_fraction else "churn"
+        role = "live" if index in live_indices else "churn"
         templates = live_templates if role == "live" else churn_templates
         source_root_id = templates[rng.randrange(len(templates))]
         source_ids = (
@@ -386,6 +406,7 @@ def build_schedule(
         "arrival_interval_seconds": interval,
         "arrival_duration_seconds": total_seconds,
         "live_fraction_requested": live_fraction,
+        "live_fraction_actual": role_counts["live"] / sum(role_counts.values()),
         "live_revisit_seconds": revisit_seconds,
         "live_steps": live_steps,
         "churn_gap_seconds": churn_gap_seconds,

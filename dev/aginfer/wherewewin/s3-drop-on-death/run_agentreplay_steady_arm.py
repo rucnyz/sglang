@@ -829,6 +829,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "arrival_interval_seconds",
                 "arrival_duration_seconds",
                 "live_fraction_requested",
+                "live_fraction_actual",
                 "live_revisit_seconds",
                 "live_steps",
                 "churn_gap_seconds",

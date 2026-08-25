@@ -201,6 +201,20 @@ class SteadyAnalyzerTests(unittest.TestCase):
                 )
             )
 
+    def test_legacy_summary_without_timeout_fields_is_invalid(self):
+        value = summary("baseline", 1)
+        for field in (
+            "request_timeout_s",
+            "session_end_timeout_s",
+            "session_end_retries",
+            "session_end_retry_delay_s",
+        ):
+            del value["configuration"][field]
+
+        issues = analyzer.run_issues(value, "baseline")
+
+        self.assertTrue(any("legacy arm" in issue for issue in issues))
+
     def test_three_pairs_produce_paired_and_ours_only_bootstrap_ci(self):
         with tempfile.TemporaryDirectory() as temporary:
             model_dir = pathlib.Path(temporary) / "qwen"
