@@ -134,6 +134,19 @@ class SteadyTraceBuilderTests(unittest.TestCase):
 
 
 class SteadyMetricTests(unittest.TestCase):
+    def test_admission_delay_metrics_report_growth_and_slope(self):
+        metrics = runner.admission_delay_metrics(
+            [(2, 0.1), (4, 0.2), (6, 1.1), (8, 1.2)], 0, 10
+        )
+
+        self.assertEqual(metrics["scheduled_roots"], 4)
+        self.assertAlmostEqual(metrics["early_half"]["mean"], 0.15)
+        self.assertAlmostEqual(metrics["late_half"]["mean"], 1.15)
+        self.assertAlmostEqual(metrics["late_minus_early_mean_seconds"], 1.0)
+        self.assertGreater(
+            metrics["linear_slope_delay_seconds_per_scheduled_second"], 0
+        )
+
     def test_request_metrics_use_fixed_window_and_separate_roles(self):
         rows = [
             {

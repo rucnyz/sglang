@@ -443,6 +443,43 @@ def end_metrics(
     }
 
 
+def admission_delay_metrics(
+    scheduled_and_delay: Sequence[tuple[float, float]],
+    measurement_start: float,
+    measurement_end: float,
+) -> dict[str, Any]:
+    ordered = sorted(scheduled_and_delay)
+    midpoint = (measurement_start + measurement_end) / 2
+    early = [delay for scheduled, delay in ordered if scheduled < midpoint]
+    late = [delay for scheduled, delay in ordered if scheduled >= midpoint]
+    early_summary = summarize(early)
+    late_summary = summarize(late)
+    early_mean = early_summary.get("mean")
+    late_mean = late_summary.get("mean")
+    slope = None
+    if len(ordered) >= 2:
+        mean_x = statistics.fmean(scheduled for scheduled, _delay in ordered)
+        mean_y = statistics.fmean(delay for _scheduled, delay in ordered)
+        denominator = sum((scheduled - mean_x) ** 2 for scheduled, _ in ordered)
+        if denominator > 0:
+            slope = sum(
+                (scheduled - mean_x) * (delay - mean_y)
+                for scheduled, delay in ordered
+            ) / denominator
+    return {
+        **summarize([delay for _scheduled, delay in ordered]),
+        "scheduled_roots": len(ordered),
+        "early_half": early_summary,
+        "late_half": late_summary,
+        "late_minus_early_mean_seconds": (
+            float(late_mean) - float(early_mean)
+            if late_mean is not None and early_mean is not None
+            else None
+        ),
+        "linear_slope_delay_seconds_per_scheduled_second": slope,
+    }
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("baseline", "ours"), required=True)
@@ -700,10 +737,13 @@ async def execute(
         ):
             first_by_program[digest] = row
     arrival_delays = [
-        max(
-            0.0,
-            float(row["started_elapsed_seconds"])
-            - float(row["scheduled_session_arrival_s"]),
+        (
+            float(row["scheduled_session_arrival_s"]),
+            max(
+                0.0,
+                float(row["started_elapsed_seconds"])
+                - float(row["scheduled_session_arrival_s"]),
+            ),
         )
         for row in first_by_program.values()
         if row.get("is_root")
@@ -751,7 +791,9 @@ async def execute(
             "session_end": end_metrics(
                 end_rows, measurement_start, measurement_end
             ),
-            "session_arrival_admission_delay_seconds": summarize(arrival_delays),
+            "session_arrival_admission_delay_seconds": admission_delay_metrics(
+                arrival_delays, measurement_start, measurement_end
+            ),
         },
         "logical_ended_count": len(logical_ended),
         "end_acked_count": len(end_acked),

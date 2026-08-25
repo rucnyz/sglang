@@ -66,6 +66,10 @@ def summary(arm: str, pair: int, offset: float = 0.0) -> dict:
                 "measurement_end_seconds": 2100,
             },
         },
+        "timings": {
+            "inference_makespan_s": 2800 + offset - (100 if ours else 0),
+            "pipeline_makespan_s": 2810 + offset - (100 if ours else 0),
+        },
         "measurement": {
             "requests": {
                 "completion_accounted_goodput_tok_s": goodput,
@@ -130,6 +134,10 @@ def summary(arm: str, pair: int, offset: float = 0.0) -> dict:
                 "n": 180,
                 "mean": 0.1 + offset / 100,
                 "p90": 0.2 + offset / 100,
+                "late_minus_early_mean_seconds": 0.05 + offset / 100,
+                "linear_slope_delay_seconds_per_scheduled_second": (
+                    0.001 + offset / 10000
+                ),
             },
         },
         "logical_ended_count": 260,

@@ -348,6 +348,13 @@ three alternating pairs.
 - root-session admission delay, which reveals overload or a growing queue; and
 - SESSION_END latency, control-queue delay, retry count, and sampled backlog.
 
+Admission delay includes early-half and late-half summaries plus a linear slope,
+so a saturated campaign can require sustained queue growth rather than merely a
+large isolated delay.  The paired analyzer also reports inference makespan,
+full-pipeline makespan, and inference drain after the final scheduled root
+arrival.  Do not use top-level runner duration for performance: it includes
+cache flush and cleanup.
+
 Output tokens are charged at request completion.  The measurement window should
 therefore be much longer than p99 request latency; warmup and cooldown provide
 boundary guard bands.  The runner stores no prompt or token IDs, but the input

@@ -30,6 +30,9 @@ RUN_RE = re.compile(r"^(baseline|ours)-r(.+)$")
 METRICS: tuple[tuple[str, str, str, bool, bool], ...] = (
     ("completion_goodput", "Completion goodput", "tok/s", True, True),
     ("completion_request_rate", "Completion request rate", "req/s", True, True),
+    ("inference_makespan", "Final inference makespan", "s", False, True),
+    ("pipeline_makespan", "Final pipeline makespan", "s", False, True),
+    ("inference_drain", "Inference drain after final root arrival", "s", False, True),
     ("live_revisit_cache_hit", "Live-revisit cache hit", "ratio", True, True),
     ("live_revisit_ttft_mean", "Live-revisit TTFT mean", "ms", False, True),
     ("live_revisit_ttft_p90", "Live-revisit TTFT p90", "ms", False, True),
@@ -51,6 +54,20 @@ METRICS: tuple[tuple[str, str, str, bool, bool], ...] = (
     ("end_backlog_peak", "Unreclaimed/END backlog peak", "count", False, True),
     ("arrival_delay_mean", "Root admission delay mean", "s", False, True),
     ("arrival_delay_p90", "Root admission delay p90", "s", False, True),
+    (
+        "arrival_delay_growth",
+        "Root admission delay late-half minus early-half",
+        "s",
+        False,
+        True,
+    ),
+    (
+        "arrival_delay_slope",
+        "Root admission delay linear slope",
+        "s/s",
+        False,
+        True,
+    ),
     ("end_latency_mean", "SESSION_END latency mean", "ms", False, False),
     ("end_latency_p90", "SESSION_END latency p90", "ms", False, False),
     ("end_queue_delay_mean", "SESSION_END queue delay mean", "ms", False, False),
@@ -100,6 +117,14 @@ def canonical_hash(value: Any) -> str:
 
 
 def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
+    if name == "inference_drain":
+        makespan = number(get_path(summary, "timings", "inference_makespan_s"))
+        interval = number(get_path(summary, "workload", "arrival_interval_seconds"))
+        sessions = number(get_path(summary, "workload", "session_count"))
+        if makespan is None or interval is None or sessions is None or sessions <= 0:
+            return None
+        final_arrival = (float(sessions) - 1) * float(interval)
+        return max(0.0, float(makespan) - final_arrival)
     paths = {
         "completion_goodput": (
             "measurement",
@@ -111,6 +136,8 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
             "requests",
             "completion_request_rate_per_second",
         ),
+        "inference_makespan": ("timings", "inference_makespan_s"),
+        "pipeline_makespan": ("timings", "pipeline_makespan_s"),
         "live_revisit_cache_hit": (
             "measurement",
             "requests",
@@ -213,6 +240,16 @@ def metric_value(summary: Mapping[str, Any], name: str) -> float | int | None:
             "measurement",
             "session_arrival_admission_delay_seconds",
             "p90",
+        ),
+        "arrival_delay_growth": (
+            "measurement",
+            "session_arrival_admission_delay_seconds",
+            "late_minus_early_mean_seconds",
+        ),
+        "arrival_delay_slope": (
+            "measurement",
+            "session_arrival_admission_delay_seconds",
+            "linear_slope_delay_seconds_per_scheduled_second",
         ),
         "end_latency_mean": (
             "measurement",
@@ -371,7 +408,11 @@ def run_issues(summary: Mapping[str, Any], arm: str) -> list[str]:
             issues.append(f"{name} outside [0, 1]")
     for name, value in metrics.items():
         numeric = number(value)
-        if numeric is not None and numeric < 0:
+        if (
+            numeric is not None
+            and numeric < 0
+            and name not in {"arrival_delay_growth", "arrival_delay_slope"}
+        ):
             issues.append(f"{name} is negative")
     return issues
 
@@ -655,6 +696,8 @@ def format_value(value: Any, unit: str) -> str:
         return f"{numeric:.2f} ms"
     if unit == "s":
         return f"{numeric:.3f} s"
+    if unit == "s/s":
+        return f"{numeric:.4f} s/s"
     if unit == "tok/s":
         return f"{numeric:.2f} tok/s"
     if unit == "req/s":
