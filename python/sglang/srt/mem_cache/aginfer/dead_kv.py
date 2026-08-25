@@ -81,7 +81,14 @@ def aginfer_program_busy(cache, program_id: str) -> list[dict[str, Any]]:
     while stack:
         node = stack.pop()
         stack.extend(getattr(node, "children", {}).values())
-        if program_id not in getattr(node, "session_ids", ()):
+        holders = getattr(node, "session_ids", ())
+        if program_id not in holders:
+            continue
+        # Shared nodes remain reachable through another live holder.  Ending
+        # this program only removes its holder metadata, which does not touch
+        # the node's KV allocation and is safe even while that allocation is
+        # locked or participating in asynchronous cache work.
+        if len(holders) > 1:
             continue
         reason = _busy_reason(cache, node)
         if reason is not None:

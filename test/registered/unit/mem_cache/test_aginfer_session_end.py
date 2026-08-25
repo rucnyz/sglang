@@ -207,6 +207,52 @@ class AginferSessionEndCacheTest(unittest.TestCase):
         self.assertEqual(leaf.session_ids, {"p"})
         self.assertIn("leaf", cache.root_node.children)
 
+    def test_busy_probe_ignores_shared_locked_and_pending_nodes(self):
+        for busy_kind in ("locked", "write_through"):
+            with self.subTest(busy_kind=busy_kind):
+                cache = _Cache()
+                shared = _Node(holders={"p", "q"}, device_tokens=3)
+                if busy_kind == "locked":
+                    shared.component_data[0].lock_ref = 1
+                else:
+                    shared.write_through_pending_id = shared.id
+                cache.attach(cache.root_node, shared, "shared")
+
+                self.assertEqual(aginfer_program_busy(cache, "p"), [])
+
+                result = end_aginfer_program(cache, "p")
+                self.assertEqual(result["status"], "applied")
+                self.assertEqual(result["holders_removed"], 1)
+                self.assertEqual(result["released_nodes"], 0)
+                self.assertEqual(result["remaining_nodes"], 0)
+                self.assertEqual(shared.session_ids, {"q"})
+                self.assertIs(cache.root_node.children["shared"], shared)
+
+    def test_shared_busy_parent_does_not_mask_exclusive_child(self):
+        cache = _Cache()
+        shared = _Node(holders={"p", "q"}, device_tokens=2)
+        shared.component_data[0].lock_ref = 1
+        child = _Node(holders={"p"}, device_tokens=3)
+        child.component_data[0].lock_ref = 1
+        cache.attach(cache.root_node, shared, "shared")
+        cache.attach(shared, child, "child")
+
+        blockers = aginfer_program_busy(cache, "p")
+        self.assertEqual(
+            [(entry["node_id"], entry["reason"]) for entry in blockers],
+            [(child.id, "locked")],
+        )
+
+        child.component_data[0].lock_ref = 0
+        self.assertEqual(aginfer_program_busy(cache, "p"), [])
+        result = end_aginfer_program(cache, "p")
+        self.assertEqual(result["released_nodes"], 1)
+        self.assertEqual(result["released_hbm_tokens"], 3)
+        self.assertEqual(result["holders_removed"], 2)
+        self.assertEqual(result["remaining_nodes"], 0)
+        self.assertEqual(shared.session_ids, {"q"})
+        self.assertNotIn("child", shared.children)
+
 
 class AginferSessionEndControlPlaneTest(unittest.TestCase):
     def test_driver_can_end_before_first_pressure_tick(self):
