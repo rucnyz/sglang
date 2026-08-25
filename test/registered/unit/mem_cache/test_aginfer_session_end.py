@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import time
 import unittest
@@ -24,6 +25,7 @@ from sglang.srt.mem_cache.aginfer.http_validators import validate_session_end_bo
 from sglang.srt.mem_cache.aginfer.program_tracker import State
 from sglang.srt.mem_cache.aginfer.scheduler_driver import AginferDriver
 from sglang.srt.mem_cache.unified_cache_components import EvictLayer
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.session_controller import Session, SessionController
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -256,6 +258,7 @@ class AginferSessionEndControlPlaneTest(unittest.TestCase):
         manager = SimpleNamespace(
             auto_create_handle_loop=lambda: None,
             aginfer_session_end_communicator=_Communicator(),
+            server_args=SimpleNamespace(aginfer_session_end_timeout_s=25.0),
         )
         request = AginferSessionEndReq(program_id="p")
         result = asyncio.run(
@@ -294,6 +297,7 @@ class AginferSessionEndControlPlaneTest(unittest.TestCase):
         manager = SimpleNamespace(
             auto_create_handle_loop=lambda: None,
             aginfer_session_end_communicator=communicator,
+            server_args=SimpleNamespace(aginfer_session_end_timeout_s=25.0),
         )
         result = asyncio.run(
             TokenizerControlMixin.end_aginfer_session(
@@ -327,6 +331,7 @@ class AginferSessionEndControlPlaneTest(unittest.TestCase):
         manager = SimpleNamespace(
             auto_create_handle_loop=lambda: None,
             aginfer_session_end_communicator=communicator,
+            server_args=SimpleNamespace(aginfer_session_end_timeout_s=25.0),
         )
         result = asyncio.run(
             TokenizerControlMixin.end_aginfer_session(
@@ -336,6 +341,72 @@ class AginferSessionEndControlPlaneTest(unittest.TestCase):
         self.assertEqual(result, [complete])
         self.assertEqual(len(communicator.rids), 2)
         self.assertNotEqual(communicator.rids[0], communicator.rids[1])
+
+    def test_tokenizer_control_uses_configured_session_end_timeout(self):
+        complete = AginferSessionEndReqOutput(
+            ok=True,
+            program_id="p",
+            session_id="p",
+            dp_rank=0,
+            status="applied",
+        )
+
+        class _Communicator:
+            async def __call__(self, obj, timeout=None):
+                self.timeout = timeout
+                return [complete]
+
+        communicator = _Communicator()
+        manager = SimpleNamespace(
+            auto_create_handle_loop=lambda: None,
+            aginfer_session_end_communicator=communicator,
+            server_args=SimpleNamespace(aginfer_session_end_timeout_s=3.0),
+        )
+        result = asyncio.run(
+            TokenizerControlMixin.end_aginfer_session(
+                manager, AginferSessionEndReq(program_id="p")
+            )
+        )
+        self.assertEqual(result, [complete])
+        self.assertGreater(communicator.timeout, 2.9)
+        self.assertLessEqual(communicator.timeout, 3.0)
+
+    def test_session_end_timeout_server_arg_validation(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parsed = parser.parse_args(
+            ["--model-path", "dummy", "--aginfer-session-end-timeout-s", "60"]
+        )
+        self.assertEqual(parsed.aginfer_session_end_timeout_s, 60.0)
+
+        self.assertEqual(
+            ServerArgs(model_path="dummy").aginfer_session_end_timeout_s,
+            25.0,
+        )
+        for timeout_s in (60.0, 90.0):
+            self.assertEqual(
+                ServerArgs(
+                    model_path="dummy",
+                    aginfer_session_end_timeout_s=timeout_s,
+                ).aginfer_session_end_timeout_s,
+                timeout_s,
+            )
+        for timeout_s in (
+            0.0,
+            -1.0,
+            float("nan"),
+            float("inf"),
+            None,
+            "60",
+            True,
+        ):
+            with self.subTest(timeout_s=timeout_s), self.assertRaisesRegex(
+                ValueError, "positive finite"
+            ):
+                ServerArgs(
+                    model_path="dummy",
+                    aginfer_session_end_timeout_s=timeout_s,
+                )
 
     def test_scheduler_defers_for_inflight_sglang_session(self):
         cache = _Cache()

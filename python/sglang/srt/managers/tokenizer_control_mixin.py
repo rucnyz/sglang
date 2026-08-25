@@ -840,7 +840,7 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + 25.0
+        deadline = loop.time() + self.server_args.aginfer_session_end_timeout_s
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -888,7 +888,8 @@ class TokenizerControlMixin:
         return responses
 
     async def update_aginfer_program_paused(
-        self: TokenizerManager, obj: UpdateAginferProgramPausedReq,
+        self: TokenizerManager,
+        obj: UpdateAginferProgramPausedReq,
     ) -> List[UpdateAginferProgramPausedReqOutput]:
         """T21 (#181): daemon → sglang PUT /aginfer/program_paused.
 
@@ -903,7 +904,8 @@ class TokenizerControlMixin:
         return responses
 
     async def update_aginfer_hints(
-        self: TokenizerManager, obj: UpdateAginferHintsReq,
+        self: TokenizerManager,
+        obj: UpdateAginferHintsReq,
     ) -> List[UpdateAginferHintsReqOutput]:
         """T40 (#184): daemon → sglang PUT /aginfer/hints.
 

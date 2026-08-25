@@ -22,6 +22,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -441,6 +442,7 @@ class ServerArgs:
     aginfer_heartbeat_s: float = 5.0
     aginfer_theta_hi: float = 0.7
     aginfer_theta_lo: float = 0.55
+    aginfer_session_end_timeout_s: float = 25.0
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
@@ -945,6 +947,9 @@ class ServerArgs:
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args (model-independent).
         self._handle_asr_validation()
+        # Validate aginfer control-plane timeouts before the dummy-model early
+        # return so CLI/config mistakes fail consistently in tests and tools.
+        self._handle_aginfer_validation()
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
@@ -4408,6 +4413,21 @@ class ServerArgs:
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
+    def _handle_aginfer_validation(self):
+        timeout_s = self.aginfer_session_end_timeout_s
+        try:
+            valid = (
+                not isinstance(timeout_s, bool)
+                and math.isfinite(timeout_s)
+                and timeout_s > 0
+            )
+        except TypeError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                "--aginfer-session-end-timeout-s must be a positive finite number."
+            )
+
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -5072,6 +5092,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.aginfer_theta_lo,
             help="aginfer: HBM occupancy threshold for pressure relief (default 0.55).",
+        )
+        parser.add_argument(
+            "--aginfer-session-end-timeout-s",
+            type=float,
+            default=ServerArgs.aginfer_session_end_timeout_s,
+            help="aginfer: maximum seconds to wait for SESSION_END physical reclamation (default 25.0).",
         )
         parser.add_argument(
             "--chunked-prefill-size",
