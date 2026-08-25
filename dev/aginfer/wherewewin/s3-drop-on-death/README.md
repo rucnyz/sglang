@@ -265,6 +265,99 @@ python3 -m unittest \
   dev/aginfer/wherewewin/s3-drop-on-death/test_analyze_agentreplay_pressure.py
 ```
 
+## AgentReplay steady-state experiment
+
+The phased pressure experiment proves that terminal KV can evict a later live
+probe, but its two probe requests are too sparse to establish sustained
+throughput.  The steady-state harness continuously admits new root sessions
+through warmup, measurement, and cooldown.  Short sessions create terminal
+churn; long-lived sessions revisit a still-live prefix at a fixed think time.
+The same generated trace, salt, arrival schedule, and concurrency limit are used
+for Baseline and Ours.
+
+Generate the private steady trace once.  Cloned sessions receive a deterministic
+token-space identity immediately after the source trace's real common prefix.
+This prevents repeated templates from aliasing the same physical radix entries
+while retaining genuine shared-prefix behavior:
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/build_agentreplay_steady_trace.py \
+  --source-trace /path/to/private/source.jsonl \
+  --out-trace /path/to/private/steady.jsonl \
+  --manifest /path/to/private/steady-manifest.json \
+  --arrival-rate <sessions-per-second> \
+  --warmup-seconds 300 --measurement-seconds 1800 --cooldown-seconds 300 \
+  --live-fraction 0.25 --live-steps 4 --live-revisit-seconds 60 \
+  --churn-gap-seconds 0 --identity-insert-offset 16384 \
+  --max-request-tokens 64000 --seed 1
+```
+
+Churn replicas preserve each selected root's complete sub-agent closure and
+parent/child blocking topology.  Live templates are childless roots so their
+delayed turns unambiguously represent one reusable session.  Omit
+`--identity-insert-offset` to use the exact common-prefix length detected from
+the source; when the model trace has a known fixed system prefix, an explicit
+offset (for example 16K tokens) makes the intended sharing boundary auditable.
+
+Run paired arms on a dedicated direct-SGLang deployment.  The root-session
+arrival process is open-loop; `--max-concurrency` is the common inference
+admission cap.  A live session's later turns remain closed-loop after the prior
+response plus its configured think time, matching agent behavior.  END control
+requests have their own semaphore and never consume an inference slot.
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/run_agentreplay_steady_arm.py \
+  --mode baseline \
+  --trace /path/to/private/steady.jsonl \
+  --manifest /path/to/private/steady-manifest.json \
+  --out-dir /path/to/private/runs/baseline-r1 \
+  --agentreplay-root /path/to/AgentReplay \
+  --salt pair-01 --label baseline-r1 \
+  --url http://127.0.0.1:30001/generate \
+  --max-concurrency 8 --session-end-max-concurrency 1 \
+  --confirm-dedicated-server
+
+python3 dev/aginfer/wherewewin/s3-drop-on-death/run_agentreplay_steady_arm.py \
+  --mode ours \
+  --trace /path/to/private/steady.jsonl \
+  --manifest /path/to/private/steady-manifest.json \
+  --out-dir /path/to/private/runs/ours-r1 \
+  --agentreplay-root /path/to/AgentReplay \
+  --salt pair-01 --label ours-r1 \
+  --url http://127.0.0.1:30001/generate \
+  --max-concurrency 8 --session-end-max-concurrency 1 \
+  --confirm-dedicated-server
+```
+
+Use a pilot to choose an offered rate that holds Baseline near the intended
+80%--90% KV-pool pressure without unbounded admission delay, then freeze that
+rate for every pair.  The generated manifest reports both scheduled request
+rate and forced-output-token rate to make calibration explicit.  Use at least
+three alternating pairs.
+
+`summary.json` reports the fixed measurement-window metrics:
+
+- completion-accounted output goodput and request rate, using the configured
+  window rather than total drain time;
+- start-cohort cache hit, TTFT, and E2E, separately for live-initial,
+  live-revisit, and churn traffic;
+- time-weighted Dead-HBM/DRAM bytes, dead-byte-seconds, allocator occupancy, and
+  maximum subpool utilization sampled throughout the window;
+- root-session admission delay, which reveals overload or a growing queue; and
+- SESSION_END latency, control-queue delay, retry count, and sampled backlog.
+
+Output tokens are charged at request completion.  The measurement window should
+therefore be much longer than p99 request latency; warmup and cooldown provide
+boundary guard bands.  The runner stores no prompt or token IDs, but the input
+trace itself remains private.  It flushes the cache before and after every arm.
+
+The pure scheduling/accounting tests do not need AgentReplay, a model, or GPUs:
+
+```bash
+python3 -m unittest \
+  dev/aginfer/wherewewin/s3-drop-on-death/test_agentreplay_steady.py
+```
+
 ## Direct full-pipeline acceptance test
 
 `verify_dead_kv_e2e.py` is a stricter black-box acceptance test for a live
