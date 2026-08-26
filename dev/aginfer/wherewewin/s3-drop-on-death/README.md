@@ -384,6 +384,52 @@ python3 -m unittest \
   dev/aginfer/wherewewin/s3-drop-on-death/test_analyze_agentreplay_steady.py
 ```
 
+## Fixed-playlist saturated mode
+
+`run_agentreplay_saturated_arm.py` reuses a generated steady trace as a fixed
+playlist but replaces open-loop wall-clock arrivals with closed-loop dispatch.
+All programs' first requests enter one deterministic ready queue.  Exactly C
+workers consume requests; when one finishes, its worker immediately takes the
+next ready request.  Churn programs advance turn by turn.  Live programs seed
+early, then their later turns are released at evenly staggered churn-program
+completion thresholds.  Root-bundle parent metadata does not constrain this
+capacity scheduler, but every individual program retains its exact turn order,
+program ID, growing token prefix, and forced output.
+
+```bash
+python3 dev/aginfer/wherewewin/s3-drop-on-death/run_agentreplay_saturated_arm.py \
+  --mode baseline \
+  --trace /path/to/private/steady.jsonl \
+  --manifest /path/to/private/steady-manifest.json \
+  --out-dir /path/to/private/saturated/qwen-c8/baseline-r1 \
+  --agentreplay-root /path/to/AgentReplay \
+  --salt saturated-qwen-c8-r1 --label baseline-r1 \
+  --url http://127.0.0.1:30001/generate \
+  --max-concurrency 8 --session-end-max-concurrency 1 \
+  --confirm-dedicated-server
+```
+
+Run Ours by changing only `--mode`, `--label`, and `--out-dir`.  Use the same
+trace, manifest, salt, concurrency, and all other options within a pair.  For a
+C16 experiment, reuse the same playlist and change `--max-concurrency` to 16 in
+both arms.  By default the revisit interval is
+`churn_program_count // max_live_steps`; override it with
+`--live-revisit-every-churn` only if both arms and every repeated pair use the
+same value.
+
+The headline result is fixed-workload inference throughput: exact output tokens
+divided by time from dispatch start until the final inference response.  The
+summary additionally reports END-inclusive pipeline makespan/throughput,
+live-revisit hit and TTFT, inference- and pipeline-window dead-byte AUC, active
+inference mean/peak, full-C fraction, peak ready-queue depth, and peak live wait
+set.  `dispatch_mode`, zero effective root stagger, playlist hash, and effective
+churn-count revisit interval are recorded for paired validation.
+
+```bash
+python3 -m unittest \
+  dev/aginfer/wherewewin/s3-drop-on-death/test_run_agentreplay_saturated_arm.py
+```
+
 ## Direct full-pipeline acceptance test
 
 `verify_dead_kv_e2e.py` is a stricter black-box acceptance test for a live
