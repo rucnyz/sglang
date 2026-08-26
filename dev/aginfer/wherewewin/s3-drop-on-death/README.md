@@ -267,6 +267,9 @@ python3 -m unittest \
 
 ## AgentReplay steady-state experiment
 
+The completed d3 steady-state and fixed-playlist capacity study is summarized
+in [`STEADY_RESULTS.zh-CN.md`](STEADY_RESULTS.zh-CN.md).
+
 The phased pressure experiment proves that terminal KV can evict a later live
 probe, but its two probe requests are too sparse to establish sustained
 throughput.  The steady-state harness continuously admits new root sessions
