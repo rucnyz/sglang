@@ -71,7 +71,11 @@ side).
 | `write_through_declined:<sub_reason>` | `write_backup` returned 0 / raised |
 | `promote_load_back_declined:<category>` | `load_back` returned False |
 | `promote_raised:<Exc>:<loc>:<msg>` | `load_back` raised |
-| `disk_tier_not_yet_wired` | `DISK` in `add_tiers` |
+| `disk_remove_unsupported_upstream` | `DISK` in `remove_tiers` (no delete API on any storage backend) |
+| `disk_add_declined:no_storage_backend` \| `:not_host_backed` | `DISK` in `add_tiers`, storage unavailable / node not DRAM-backed |
+| `disk_backup_raised:<Exc>:<loc>:<msg>` | `write_backup_storage` raised |
+| `disk_add_conflicts_with_dram_add` | `DISK` and `DRAM` both in `add_tiers` of the SAME action (would race `write_backup`'s async D→H copy against `write_backup_storage`'s read of the same host buffer) |
+| `disk_add_conflicts_with_dram_remove` | `DISK` in `add_tiers` and `DRAM` in `remove_tiers` of the SAME action (would race the DRAM removal freeing the host buffer against `write_backup_storage`'s in-flight read of it) |
 
 Every skip entry carries the action's `action_id` so the daemon's
 `APPLY_FAILED` event handler (T37) can correlate to the originating
@@ -87,7 +91,10 @@ returns 200 with `applied=0` and the per-action skip reason
 |---|---|---|---|
 | Race: tree mutated mid-batch | Send a hash, then `flush_cache`, then send another action against same hash | second action → `not_in_tree` | Stage 7 |
 | Duplicate hash in same batch | Same hash appears twice in actions[] | first applies, second → `already_acted_this_batch` | Stage 5 |
-| DISK in add_tiers | `add_tiers=["DISK"]` | `disk_tier_not_yet_wired` | Stage 8 |
+| DISK in add_tiers | `add_tiers=["DISK"]` | applies, or `disk_add_declined:<sub_reason>` | Stage 8 |
+| DISK in remove_tiers | `remove_tiers=["DISK"]` | `disk_remove_unsupported_upstream` | Stage 12 |
+| DISK+DRAM added together | `add_tiers=["DRAM","DISK"]` | `disk_add_conflicts_with_dram_add` | Stage 13 |
+| DISK added, DRAM removed together | `add=["DISK"], remove=["DRAM"]` | `disk_add_conflicts_with_dram_remove` | Stage 13 |
 | Idempotency | Apply `add=[DRAM]` twice on the same node | second → `add_already_present:DRAM` | Stage 6 |
 | DROP a non-leaf | `remove=[HBM, DRAM]` on internal node | `remove_not_leaf` | Stage 3b |
 | Add HBM on host-only node | `add=[HBM]` on `{DRAM}` residence | calls `load_back`; applies or returns `promote_load_back_declined:<cat>` (no crash) | Stage 4 |
@@ -144,6 +151,19 @@ Stage 8  DISK in add_tiers
 Stage 9  action_id echo
          Send 3 actions with distinct action_ids; assert each
          skip's action_id == the originating action's.
+
+Stage 12 remove=[DISK]
+         POST remove=[DISK] on a real unit; expect
+         `disk_remove_unsupported_upstream` and the unit
+         untouched (still present, same residence).
+
+Stage 13 DISK add-side conflicts
+         POST add=[DRAM,DISK] on a nonexistent hash; expect
+         `disk_add_conflicts_with_dram_add`.  POST
+         add=[DISK],remove=[DRAM] on a nonexistent hash; expect
+         `disk_add_conflicts_with_dram_remove`.  Both reject on
+         tier-set shape alone, before hash resolution (review
+         PR #4, discussion_r3921269467).
 ```
 
 ## REPRODUCING

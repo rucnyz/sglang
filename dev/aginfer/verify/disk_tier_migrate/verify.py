@@ -16,6 +16,15 @@ sglang's storage backends (HiCacheFile / nixl / mooncake) don't expose):
                        upstream); pre-this-task it silently "succeeded"
                        (applied=1, transition="other") while doing NOTHING.
 
+Also covers two same-action combinations rejected up front (review PR #4,
+discussion_r3921269467) to avoid racing ``write_backup_storage``'s async
+H->Storage read against a same-batch host-buffer mutation that nothing in
+this code path (``writing_check`` only drains D->H acks) would otherwise
+block:
+
+  * ``add=[DRAM, DISK]``       -> ``disk_add_conflicts_with_dram_add``
+  * ``add=[DISK], remove=[DRAM]`` -> ``disk_add_conflicts_with_dram_remove``
+
 Uses a minimal duck-typed fake cache/tree (same pattern as verify/t27),
 NOT a real ``UnifiedRadixCache`` -- these two branches don't touch device
 pools, HiCache, or any GPU state, so a full server is unnecessary weight
@@ -255,25 +264,51 @@ def stage_6_add_disk_success_on_host_backed_node() -> None:
             f"counters={cache._aginfer_migrate_counters!r}")
 
 
-def stage_7_add_disk_after_add_dram_same_action() -> None:
-    """add=[DRAM, DISK] in ONE action on an HBM-only node: DRAM must apply
-    FIRST (making the node host-backed) so the DISK branch's `node.backuped`
-    gate sees the just-established host copy and actually fires --
-    the ordering this whole feature depends on ('adds applied first', and
-    within adds, DRAM before DISK in source order)."""
+def stage_7_add_disk_with_add_dram_same_action_rejected() -> None:
+    """add=[DRAM, DISK] in ONE action -> disk_add_conflicts_with_dram_add,
+    rejected up front (review PR #4, discussion_r3921269467). `write_backup`
+    (DRAM)'s device->host byte copy is itself async (drained later by
+    `writing_check`), so calling `write_backup_storage` (DISK) against that
+    same host buffer immediately afterward -- in the SAME action, no
+    intervening drain -- could read a copy that hasn't finished landing.
+    Neither write_backup nor write_backup_storage may be called at all: the
+    whole action is rejected before ANY add in it is applied."""
     cache = _FakeCache(enable_storage=True, cache_controller=object())
     n = _Node(hash_value=["u7"], device=True, host=None, backuped=False)
     cache.add_leaf(n)
     resp = _run(cache, [_action("u7", ["DRAM", "DISK"], [], "a7")])
-    if resp["applied"] != 1:
+    if resp["applied"] != 0:
         raise StageFail(
-            f"combined add=[DRAM,DISK] on HBM-only node should apply "
-            f"(DRAM add makes it host-backed before the DISK check); "
+            f"combined add=[DRAM,DISK] must be rejected, not applied; "
             f"resp={resp!r}")
-    if cache.write_backup_calls != [n]:
-        raise StageFail("write_backup (DRAM) should have been called")
-    if cache.write_backup_storage_calls != [n]:
-        raise StageFail("write_backup_storage (DISK) should have been called after DRAM")
+    reason = _skip_reason(resp, "a7")
+    if reason != "disk_add_conflicts_with_dram_add":
+        raise StageFail(f"expected disk_add_conflicts_with_dram_add; got {reason!r}")
+    if cache.write_backup_calls:
+        raise StageFail("write_backup (DRAM) must NOT be called; whole action rejected up front")
+    if cache.write_backup_storage_calls:
+        raise StageFail("write_backup_storage (DISK) must NOT be called; whole action rejected up front")
+
+
+def stage_7b_add_disk_with_remove_dram_same_action_rejected() -> None:
+    """add=[DISK], remove=[DRAM] in ONE action -> disk_add_conflicts_with_dram_remove,
+    rejected up front (review PR #4, discussion_r3921269467). Without this
+    guard, `write_backup_storage` would start an async H->Storage read of
+    `host_value` while the same action's DRAM removal frees that exact
+    buffer a few lines later -- `writing_check()` only awaits D->H
+    write-through acks, never H->Storage backup acks, so nothing in this
+    code path would otherwise block that free. Rejected purely on the
+    tier-set shape (before hash resolution), so a nonexistent hash also
+    hits this -- same pattern as remove=[DISK] alone (stage 1)."""
+    cache = _FakeCache(enable_storage=True, cache_controller=object())
+    resp = _run(cache, [_action("nonexistent", ["DISK"], ["DRAM"], "a7b")])
+    if resp["applied"] != 0:
+        raise StageFail(f"combined add=[DISK],remove=[DRAM] must be rejected; resp={resp!r}")
+    reason = _skip_reason(resp, "a7b")
+    if reason != "disk_add_conflicts_with_dram_remove":
+        raise StageFail(f"expected disk_add_conflicts_with_dram_remove; got {reason!r}")
+    if cache.write_backup_storage_calls:
+        raise StageFail("write_backup_storage must NOT be called; whole action rejected up front")
 
 
 def stage_8_add_disk_raises_is_caught_and_skipped() -> None:
@@ -327,7 +362,8 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("4 add=[DISK] no cache_controller -> declined",              stage_4_add_disk_declined_no_cache_controller),
     ("5 add=[DISK] not host-backed -> declined",                  stage_5_add_disk_declined_not_host_backed),
     ("6 add=[DISK] host-backed -> applied (happy path)",          stage_6_add_disk_success_on_host_backed_node),
-    ("7 add=[DRAM,DISK] combined, HBM-only start -> applied",     stage_7_add_disk_after_add_dram_same_action),
+    ("7 add=[DRAM,DISK] combined -> conflicts_with_dram_add",     stage_7_add_disk_with_add_dram_same_action_rejected),
+    ("7b add=[DISK],remove=[DRAM] -> conflicts_with_dram_remove", stage_7b_add_disk_with_remove_dram_same_action_rejected),
     ("8 write_backup_storage raises -> caught + skipped",         stage_8_add_disk_raises_is_caught_and_skipped),
     ("9 repeat add=[DISK] never add_already_present",             stage_9_disk_never_blocks_readd_already_present),
 ]

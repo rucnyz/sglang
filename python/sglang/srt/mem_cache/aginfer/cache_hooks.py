@@ -231,8 +231,8 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
       add DISK  → ``write_backup_storage`` (P5 safe-subset: reuses stock
                   sglang's own async host→storage write-through path;
                   ADDITIVE ONLY, best-effort, requires the node to
-                  already be DRAM-backed — see the "Apply adds first"
-                  section below for the full rationale)
+                  already be DRAM-backed from a PRIOR action — see the
+                  "Apply adds first" section below for the full rationale)
       remove HBM   → ``evict_component(target=DEVICE)``
       remove DRAM  → ``evict_component(target=HOST)``
       remove DISK  → rejected up front (``disk_remove_unsupported_upstream``):
@@ -241,6 +241,13 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
                   removal request — reporting a fake "applied" success
                   while doing nothing would be worse than an honest skip.
       remove all current tiers → DROP (full evict + tree leaf removal)
+
+    Two more combinations are rejected up front for the same
+    "no fake success" reason, this time to avoid racing the async
+    storage write against a host-buffer mutation in the SAME batch
+    (``disk_add_conflicts_with_dram_remove`` / ``_dram_add``) — see the
+    inline comment where they're checked, a few lines below the
+    ``remove DISK`` rejection.
     """
     # Build hash → node lookup with one DFS (O(N), same cost as
     # state walk).  Two hash schemes: HiCache-finalised nodes have
@@ -399,6 +406,46 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
             _skip(h, action_id, "disk_remove_unsupported_upstream")
             continue
 
+        # Review (PR #4, discussion_r3921269467): reject two same-action
+        # combinations that would race the async storage backup against a
+        # host-buffer mutation, rather than silently risking a use-after-
+        # free / stale read on the storage backend's transfer thread:
+        #
+        #   add=[DISK], remove=[DRAM]: `write_backup_storage()` (below)
+        #   starts an async H->Storage read AND `inc_host_lock_ref`s the
+        #   node, but that lock is only drained by the non-blocking
+        #   `drain_storage_control_queues` (a later scheduler tick) --
+        #   `writing_check()` (the "drain pending write_through before
+        #   removes" call a few lines down) only awaits D->H
+        #   `ongoing_write_through` acks, NOT H->Storage `ongoing_backup`
+        #   ones. Since the leaf-invariant check above (`_is_host_leaf`)
+        #   runs BEFORE this action's adds, it sees host_lock_ref==0 and
+        #   passes, then `evict_component(target=HOST)` (in "Apply
+        #   removes") unconditionally frees `host_value` while the storage
+        #   read may still be in flight against that same buffer.
+        #
+        #   add=[DRAM, DISK] together: `write_backup(node)` (device->host)
+        #   returns as soon as the host buffer is ALLOCATED and the tree
+        #   is committed (`node.backuped` becomes true synchronously), but
+        #   the actual byte copy is async (drained by `writing_check`,
+        #   which only runs later, gated on `remove_tiers` being
+        #   non-empty). Starting `write_backup_storage()` immediately
+        #   after would read a host buffer whose D->H copy has not
+        #   necessarily finished yet.
+        #
+        # Both are same-batch ordering hazards, not something a per-node
+        # leaf/lock check can catch with the primitives sglang exposes
+        # today (no synchronous "await this node's backup ack" API) --
+        # reject rather than risk silent corruption; the daemon can just
+        # re-request `add DISK` alone in a LATER action once the DRAM leg
+        # has actually landed (state_dump's next snapshot will show it).
+        if "DISK" in add_tiers and "DRAM" in remove_tiers:
+            _skip(h, action_id, "disk_add_conflicts_with_dram_remove")
+            continue
+        if "DISK" in add_tiers and "DRAM" in add_tiers:
+            _skip(h, action_id, "disk_add_conflicts_with_dram_add")
+            continue
+
         # Resolve hash.
         node = hash_to_node.get(h)
         if node is None:
@@ -526,8 +573,13 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
             #     writing_check tick — same machinery sglang's own
             #     write-through-to-storage already relies on);
             #   - it requires the node to ALREADY be DRAM-backed
-            #     (`node.backuped`), which the "DRAM" add above (if also
-            #     present in this same action) just established;
+            #     (`node.backuped`) from a PRIOR action — never from a
+            #     "DRAM" add earlier in THIS SAME action, which is
+            #     rejected up front (`disk_add_conflicts_with_dram_add`,
+            #     see above): `write_backup`'s device→host byte copy is
+            #     itself async, so reading that host buffer immediately
+            #     via `write_backup_storage` here could race an
+            #     unfinished D→H copy (review PR #4, discussion_r3921269467);
             #   - it introduces ZERO new data-loss risk: at this point in
             #     the batch the bytes still live independently in
             #     HBM and/or DRAM (adds are applied before removes, see
@@ -544,8 +596,9 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
                 _skip(h, action_id, "disk_add_declined:no_storage_backend")
                 skip_this = True
             elif not node.backuped:
-                # Only reachable if this action had no "DRAM" add above
-                # AND the node had no pre-existing DRAM residence —
+                # Reachable whenever the node has no pre-existing DRAM
+                # residence (an in-batch "DRAM" add can no longer race
+                # this — see disk_add_conflicts_with_dram_add above).
                 # write_backup_storage would silently no-op on a
                 # HBM-only node, so catch it here with a clear reason
                 # instead of a fake "applied" success.

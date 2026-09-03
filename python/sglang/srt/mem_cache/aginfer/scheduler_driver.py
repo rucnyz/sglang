@@ -158,20 +158,35 @@ class AginferDriver:
                 continue
             kind = ev.get("kind")
             session = ev.get("session")
-            if not kind or not session:
+            # Review (PR #4, discussion_r3921269733): the in-process Dynamo
+            # path reaches this method WITHOUT going through
+            # ``http_validators.validate_events_body`` (that guards only the
+            # HTTP ``PUT /aginfer/events`` boundary), so ``kind``/``session``
+            # here are untrusted wire values -- e.g. ``{"kind": [1]}`` is
+            # truthy but unhashable, and ``kind in self._ARRIVAL_KINDS``
+            # (a frozenset membership test) would raise ``TypeError`` on it.
+            # A raised exception here has NO catch anywhere between this
+            # call and the scheduler's request-dispatch loop (see
+            # ``update_aginfer_events`` in scheduler.py), so it would crash
+            # the whole engine, not just this one RPC. Require both fields
+            # to be non-empty strings before any set lookup / tracker call.
+            if not isinstance(kind, str) or not kind or not isinstance(session, str) or not session:
                 skipped += 1
                 continue
-            if kind in self._ARRIVAL_KINDS:
-                self._tracker.observe_arrival(session)
-                applied += 1
-            elif kind in self._COMPLETION_KINDS:
-                self._tracker.observe_completion(session)
-                applied += 1
-            else:
-                # session_end / memory_pressure / etc. are not delivered this
-                # way (session_end has its own end_program() path; pressure
-                # events are synthetic, tick()-local) -- not an error, just
-                # nothing to apply here.
+            try:
+                if kind in self._ARRIVAL_KINDS:
+                    self._tracker.observe_arrival(session)
+                    applied += 1
+                elif kind in self._COMPLETION_KINDS:
+                    self._tracker.observe_completion(session)
+                    applied += 1
+                else:
+                    # session_end / memory_pressure / etc. are not delivered
+                    # this way (session_end has its own end_program() path;
+                    # pressure events are synthetic, tick()-local) -- not an
+                    # error, just nothing to apply here.
+                    skipped += 1
+            except Exception:  # noqa: BLE001 -- best-effort, see docstring
                 skipped += 1
         return {"applied": applied, "skipped": skipped}
 

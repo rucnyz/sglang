@@ -403,6 +403,37 @@ def stage_12_disk_in_remove() -> None:
            f"residence unchanged={u['residence']!r}")
 
 
+def stage_13_disk_add_conflicts() -> None:
+    """add=[DRAM,DISK] and add=[DISK],remove=[DRAM] are both rejected up
+    front (review PR #4, discussion_r3921269467): letting `write_backup`'s
+    async device->host copy or a same-action host-buffer free race against
+    `write_backup_storage`'s async host->storage read would risk reading a
+    stale/freed host buffer, and nothing on this path (`writing_check` only
+    drains device->host acks) would otherwise block it. Rejected purely on
+    tier-set shape before hash resolution, so a nonexistent hash also hits
+    this — same pattern as remove=[DISK] alone (stage 12); see
+    dev/aginfer/verify/disk_tier_migrate/ for the offline unit tests."""
+    aid_a = "stage13-add-dram-disk"
+    resp_a = post_migrate([_action("node-99999993", ["DRAM", "DISK"], [], aid_a)])
+    assert_envelope_shape(resp_a)
+    if resp_a["applied"] != 0:
+        raise SchemaMissing(
+            f"stage 13a: expected applied=0, got {resp_a['applied']}; "
+            f"skipped={resp_a['skipped']!r}")
+    assert_skip_reason(resp_a, "disk_add_conflicts_with_dram_add", action_id=aid_a)
+
+    aid_b = "stage13-add-disk-remove-dram"
+    resp_b = post_migrate([_action("node-99999994", ["DISK"], ["DRAM"], aid_b)])
+    assert_envelope_shape(resp_b)
+    if resp_b["applied"] != 0:
+        raise SchemaMissing(
+            f"stage 13b: expected applied=0, got {resp_b['applied']}; "
+            f"skipped={resp_b['skipped']!r}")
+    assert_skip_reason(resp_b, "disk_add_conflicts_with_dram_remove", action_id=aid_b)
+    _print("Stage 13", True,
+           "add=[DRAM,DISK] and add=[DISK],remove=[DRAM] both rejected up front")
+
+
 def stage_9_action_id_echo() -> None:
     """3 distinct action_ids; each skip echoes its origin."""
     h_known = _seed_unit("9")
@@ -549,6 +580,7 @@ def main() -> int:
         stage_10_malformed_action_fails_loud()
         stage_11_combined_add_remove_no_scheduler_crash()
         stage_12_disk_in_remove()
+        stage_13_disk_add_conflicts()
     except Exception as exc:
         print()
         print(f"=== T20 FAILED: {type(exc).__name__}: {exc} ===")
