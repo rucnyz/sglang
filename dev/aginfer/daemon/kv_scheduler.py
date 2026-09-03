@@ -82,6 +82,8 @@ from sglang.srt.mem_cache.aginfer.state_builder import (  # noqa: E402,F401
     _DEFAULT_LAMBDA_ACTING,
     _CONST_VU,
     _PHAT_REUSE_ALPHA,
+    _PHAT_BOOTSTRAP_DT,
+    _p_access_holder,
     _DEFAULT_MEMORY_PRESSURE_TOPK,
     _PROMOTE_FALLBACK_BW_BPS,
     LINK_IDLE_SECONDS,

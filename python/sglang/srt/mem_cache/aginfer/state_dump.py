@@ -11,6 +11,7 @@ are still initialised in the cache class; the functions here only read/write the
 """
 from __future__ import annotations
 
+import shutil
 import time
 from typing import Optional
 
@@ -502,12 +503,39 @@ def _aginfer_pool_usage(cache) -> dict:
         "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
     }
 
-    # DISK — Mooncake/SSD spill not yet wired (apply_aginfer_migrations
-    # returns "disk_tier_not_yet_wired"); emit a single placeholder
-    # subpool so the schema's tier+subpool key set is consistent.
+    # DISK — P5 safe-subset: "add DISK" now really writes to sglang's
+    # storage backend (write_backup_storage, cache_hooks.
+    # apply_aginfer_migrations), but there is still no cross-backend
+    # capacity API (HiCacheStorage.get_stats() returns None by default)
+    # and no delete path, so we can only report a REAL cap_bytes for a
+    # backend whose shape we recognise.  Today that's HiCacheFile (local
+    # filesystem spill dir) via shutil.disk_usage() on its file_path;
+    # nixl/mooncake and any other backend fall back to the 0/0 placeholder
+    # (means "unknown", NOT "zero capacity") until they grow their own
+    # accessor.  evictable_bytes stays 0 regardless — with no delete API
+    # upstream, aginfer cannot reclaim DISK bytes even in principle.
+    disk_cap = 0
+    disk_avail = 0
+    storage_backend = (
+        getattr(cache.cache_controller, "storage_backend", None)
+        if cache.cache_controller is not None
+        else None
+    )
+    if storage_backend is not None:
+        file_path = getattr(storage_backend, "file_path", None)
+        if file_path is not None:
+            try:
+                usage = shutil.disk_usage(file_path)
+            except OSError:
+                pass
+            else:
+                disk_cap = int(usage.total)
+                disk_avail = int(usage.free)
     disk_subpools = {full_sp: {
-        "used_bytes": 0, "cap_bytes": 0,
-        "available_bytes": 0, "evictable_bytes": 0,
+        "used_bytes": max(0, disk_cap - disk_avail),
+        "cap_bytes": disk_cap,
+        "available_bytes": disk_avail,
+        "evictable_bytes": 0,
         "page_bytes": page_bytes_default,
         "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
     }}

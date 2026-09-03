@@ -244,65 +244,86 @@ def stage_a1_only_shared_empty_dt() -> None:
 
 def stage_b0_ended_holder_low_p_hat() -> None:
     """The anchor: a unit held ONLY by an explicitly end()-ed program
-    must fall back to the workload-prior p_hat (< 1.0).  Pre-#187 this
-    was 1.0 (State.ENDED != None → any_alive True), which would keep
-    the unit in HBM forever after its program ended."""
+    must NOT be p_hat=1.0.  Pre-#187 this was 1.0 (State.ENDED != None
+    → any_alive True), which would keep the unit in HBM forever after
+    its program ended.
+
+    Post-T11 (DESIGN §7 holder-product): an ENDED holder's own
+    ``p_access`` contributes EXACTLY 0 (not a softened hits/age prior
+    — #187's compromise, superseded in place).  A unit held ONLY by
+    ENDED holders therefore has p_hat EXACTLY 0.0 — the product's own
+    math, no separate branch needed."""
     tracker = ProgramTracker()
     tracker.observe_arrival("p")
     tracker.end("p")  # State.ENDED
     sj = _state_json(units=[
         _unit(uhash="u", residence=["HBM"], holders=["p"],
-              hit_count=1, last_access_time=1),  # age=99 → prior ≈ 0.01
+              hit_count=1, last_access_time=1),
     ])
     s = _build(sj, Event(EventKind.LLM_PREFILL, session=None), tracker)
     p = s.units["u"].p_hat
-    if not (0.0 < p < 0.1):
+    if p != 0.0:
         raise StageFail(
-            f"unit held only by an ENDED program must use the workload-"
-            f"prior p_hat (< 0.1), NOT 1.0; got {p}"
+            f"unit held only by an ENDED program must have p_hat EXACTLY "
+            f"0.0 (T11 holder-product), NOT 1.0; got {p}"
         )
 
 
 def stage_b1_ended_plus_live_survives() -> None:
+    """T11 holder-product: the ENDED co-holder contributes the identity
+    factor (1-0)=1, so p_hat collapses to EXACTLY the live holder's own
+    reuse-based term — "no ad-hoc dilution" (DESIGN §7).  hit_count=2 so
+    the live holder's term is non-trivially positive (hit_count=1 would
+    give reuse(1)=0 for EITHER state, which cannot distinguish "survives"
+    from "diluted to 0")."""
     tracker = ProgramTracker()
     tracker.observe_arrival("p_live")     # alive
     tracker.observe_arrival("p_end")
     tracker.end("p_end")                  # ENDED
     sj = _state_json(units=[
         _unit(uhash="u", residence=["HBM"], holders=["p_end", "p_live"],
-              hit_count=1, last_access_time=1),
+              hit_count=2, last_access_time=1),
     ])
     s = _build(sj, Event(EventKind.LLM_PREFILL, session=None), tracker)
     p = s.units["u"].p_hat
-    if abs(p - 1.0) > 1e-9:
+    import math as _math
+    expected = 1.0 - _math.exp(-kvs._PHAT_REUSE_ALPHA * 1)  # reuse(2)
+    if abs(p - expected) > 1e-9:
         raise StageFail(
-            f"a live co-holder must keep p_hat=1.0 (unit survives the "
-            f"ended program); got {p}"
+            f"a live co-holder must keep p_hat at its OWN reuse-based term "
+            f"{expected:.4f} (unit survives the ended program, undiluted); "
+            f"got {p}"
         )
 
 
 def stage_b2_never_seen_still_prior() -> None:
     """Regression: a never-seen holder (None) is unchanged by the
-    ENDED carve-out — still workload-prior."""
+    ENDED carve-out — still the reuse-based estimate (#250), not
+    forced to 0/1 by liveness alone.  hit_count=2 so the estimate is
+    non-trivially positive (see stage_b1 rationale)."""
     tracker = ProgramTracker()
     sj = _state_json(units=[
         _unit(uhash="u", residence=["HBM"], holders=["ghost"],
-              hit_count=1, last_access_time=1),
+              hit_count=2, last_access_time=1),
     ])
     s = _build(sj, Event(EventKind.LLM_PREFILL, session=None), tracker)
     p = s.units["u"].p_hat
-    if not (0.0 < p < 0.1):
-        raise StageFail(f"never-seen holder should be workload-prior; got {p}")
+    import math as _math
+    expected = 1.0 - _math.exp(-kvs._PHAT_REUSE_ALPHA * 1)  # reuse(2)
+    if abs(p - expected) > 1e-9:
+        raise StageFail(
+            f"never-seen holder should be the reuse-based estimate "
+            f"{expected:.4f}; got {p}")
 
 
 def stage_b3_carve_out_is_event_agnostic() -> None:
     """audit G2 (blast radius): the ENDED p_hat carve-out fires on
     EVERY event, not just SESSION_END.  On a MEMORY_PRESSURE event
     triggered by an unrelated live program, a leftover unit held only
-    by an ENDED program scores the workload-prior p_hat (so it's a
-    demote candidate) — this is the intended latent-bug fix (pre-#187
-    it was pinned at 1.0 forever).  Guards against a future refactor
-    re-pinning ENDED only outside the SESSION_END path."""
+    by an ENDED program scores p_hat EXACTLY 0 (T11 holder-product; so
+    it's a demote candidate) — this is the intended latent-bug fix
+    (pre-#187 it was pinned at 1.0 forever).  Guards against a future
+    refactor re-pinning ENDED only outside the SESSION_END path."""
     tracker = ProgramTracker()
     tracker.observe_arrival("p_end")
     tracker.end("p_end")
@@ -314,10 +335,10 @@ def stage_b3_carve_out_is_event_agnostic() -> None:
     # apply during pressure-driven scoring.
     s = _build(sj, Event(EventKind.MEMORY_PRESSURE, session=None), tracker)
     p = s.units["u-ended"].p_hat
-    if not (0.0 < p < 0.1):
+    if p != 0.0:
         raise StageFail(
             f"ENDED carve-out must apply on MEMORY_PRESSURE too (event-"
-            f"agnostic); got p_hat={p}"
+            f"agnostic); got p_hat={p} (want exactly 0.0)"
         )
     # and the unit is a top-k regret candidate (in D_t for pressure)
     if "u-ended" not in s.decision_set:
@@ -496,22 +517,29 @@ def stage_e0_real_policy_keep_value_lower_for_ended() -> None:
     has ENDED than to the one whose holder is still live (p_hat=1.0).
 
     This is the direct, cost-model-robust consequence of #187's p_hat
-    carve-out: V_u(keep) = p_hat·[R(DROP) − R(HBM)] − holding, and
-    R(DROP) > R(HBM), so a lower p_hat ⇒ lower keep-value ⇒ the ending
-    program's units are demoted/dropped FIRST under pressure.  (The
-    absolute keep-vs-demote threshold is a value-rule property tested
-    in kv_scheduler_value_rule; here we pin the COMPARATIVE effect,
-    which is exactly what SESSION_END relies on.)  We also confirm the
-    policy actually puts the ENDED unit in its demote plan."""
+    carve-out (T11 holder-product: ENDED contributes exactly 0):
+    V_u(keep) = p_hat·[R(DROP) − R(HBM)] − holding, and R(DROP) >
+    R(HBM), so a lower p_hat ⇒ lower keep-value ⇒ the ending program's
+    units are demoted/dropped FIRST under pressure.  (The absolute
+    keep-vs-demote threshold is a value-rule property tested in
+    kv_scheduler_value_rule; here we pin the COMPARATIVE effect, which
+    is exactly what SESSION_END relies on.)  We also confirm the
+    policy actually puts the ENDED unit in its demote plan.
+
+    hit_count=2 (not 1): hit_count=1 collapses the REASONING/untracked
+    reuse-based term to reuse(1)=0 regardless of state, which cannot
+    distinguish "ENDED (p_hat=0, holder-product's own zero)" from "live
+    (p_hat=reuse(hits), incidentally also 0 at hits=1)" — exactly the
+    tie this stage used to hit pre-T11."""
     tracker = ProgramTracker()
     tracker.observe_arrival("p_live")
     tracker.observe_arrival("p_end")
     tracker.end("p_end")
     sj = _state_json(units=[
         _unit(uhash="u-ended", residence=["HBM"], holders=["p_end"],
-              hit_count=1, last_access_time=1),   # ENDED → low p_hat
+              hit_count=2, last_access_time=1),   # ENDED → p_hat=0 exactly
         _unit(uhash="u-live", residence=["HBM"], holders=["p_live"],
-              hit_count=1, last_access_time=1),    # live  → p_hat 1.0
+              hit_count=2, last_access_time=1),    # live  → reuse(2) > 0
     ])
     s = _build(sj, Event(EventKind.LLM_PREFILL, session=None), tracker)
     policy = _real_policy()
@@ -610,9 +638,9 @@ def stage_g0_handle_gcs_ended_no_units() -> None:
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A0 SESSION_END D_t = session_scoped (exclusive) units", stage_a0_session_end_is_session_scoped),
     ("A1 SESSION_END with only-shared units → empty D_t", stage_a1_only_shared_empty_dt),
-    ("B0 ENDED-only holder → workload-prior p_hat (< 1.0)", stage_b0_ended_holder_low_p_hat),
-    ("B1 ENDED + live holder → p_hat 1.0 (survives)", stage_b1_ended_plus_live_survives),
-    ("B2 never-seen holder → workload-prior (regression)", stage_b2_never_seen_still_prior),
+    ("B0 ENDED-only holder → p_hat EXACTLY 0 (T11 holder-product)", stage_b0_ended_holder_low_p_hat),
+    ("B1 ENDED + live holder → p_hat = live's own term (undiluted)", stage_b1_ended_plus_live_survives),
+    ("B2 never-seen holder → reuse-based estimate (regression)", stage_b2_never_seen_still_prior),
     ("B3 ENDED carve-out is event-agnostic (MEMORY_PRESSURE)", stage_b3_carve_out_is_event_agnostic),
     ("C0 handler: end → migrate(session_scoped) → PUT", stage_c0_handler_ends_migrates_puts),
     ("C1 handler kv_scheduler=None → pure F5", stage_c1_no_scheduler_pure_f5),

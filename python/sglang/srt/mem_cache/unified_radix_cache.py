@@ -541,6 +541,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # separately (T27 / T28 / #177); this is the storage + the
         # overwrite-by-stamp contract only.
         self._aginfer_hints: dict[str, dict] = {}
+        # P1 (engine-side observability): cumulative counters for eviction
+        # decisions and migrate applications, exposed via get_aginfer_metrics.
+        # Incremented at the two eviction choke points (_evict_device_leaf /
+        # _evict_host_leaf, shared by both the stock LRU heap and the
+        # value-aware aginfer scorer -- see full_component._evict_keyfn) and
+        # inside apply_aginfer_migrations. Process-lifetime counters, reset
+        # only on process restart (no persistence, matches every other
+        # aginfer counter in this module).
+        self._aginfer_evict_counters: dict[str, int] = {
+            "hbm_demote_to_dram": 0,
+            "hbm_drop": 0,
+            "dram_drop": 0,
+        }
+        self._aginfer_migrate_counters: dict[str, int] = {}
+        self._aginfer_migrate_skipped_counters: dict[str, int] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -1580,6 +1595,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
+                self._aginfer_evict_counters["hbm_demote_to_dram"] += 1
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
@@ -1593,8 +1609,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._remove_leaf_from_parent(node)
                 self._update_evictable_leaf_sets(parent)
                 self._iteratively_delete_tombstone_leaf(node, tracker)
+                self._aginfer_evict_counters["hbm_drop"] += 1
                 return
         self._evict_to_host(node, tracker)
+        self._aginfer_evict_counters["hbm_demote_to_dram"] += 1
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -1610,6 +1628,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node, comp, target=EvictLayer.ALL, tracker=None
             )
             tracker[comp.component_type] += hf
+        self._aginfer_evict_counters["dram_drop"] += 1
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker)

@@ -118,3 +118,63 @@ def validate_hints_body(body):
             "n_holders": int(n_holders),
         })
     return out
+
+
+# Cap matches agentreplay's per-request event batch size in practice (a
+# handful of lifecycle events per turn). Keeps a malformed remote proxy
+# from flooding the in-engine ProgramTracker.
+_MAX_EVENTS = 256
+_MAX_EVENT_SESSION_LEN = 64
+_MAX_EVENT_KIND_LEN = 64
+
+
+def validate_events_body(body):
+    """Validate ``PUT /aginfer/events``.
+
+    Wire shape matches ``UpdateAginferEventsReq`` / agentreplay's
+    ``driver._emit``::
+
+        {"events": [{"kind": str, "session": str, "payload": dict?}, ...]}
+
+    Returns the normalized list. Unknown kinds are allowed through (the
+    in-engine ``AginferDriver.apply_events`` skips them); we only reject
+    schema-level garbage here so the HTTP door stays a safety boundary.
+    """
+    if not isinstance(body, dict):
+        raise ValueError("body must be a JSON object")
+    events = body.get("events")
+    if not isinstance(events, list):
+        raise ValueError("'events' must be a list")
+    if len(events) > _MAX_EVENTS:
+        raise ValueError(
+            f"'events' has {len(events)} entries; max is {_MAX_EVENTS}"
+        )
+    out = []
+    for i, ev in enumerate(events):
+        if not isinstance(ev, dict):
+            raise ValueError(f"events[{i}] must be an object")
+        kind = ev.get("kind")
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError(f"events[{i}].kind must be a non-empty string")
+        kind = kind.strip()
+        if len(kind) > _MAX_EVENT_KIND_LEN:
+            raise ValueError(
+                f"events[{i}].kind must be at most {_MAX_EVENT_KIND_LEN} characters"
+            )
+        session = ev.get("session")
+        if not isinstance(session, str) or not session.strip():
+            raise ValueError(f"events[{i}].session must be a non-empty string")
+        session = session.strip()
+        if len(session) > _MAX_EVENT_SESSION_LEN:
+            raise ValueError(
+                f"events[{i}].session must be at most "
+                f"{_MAX_EVENT_SESSION_LEN} characters"
+            )
+        payload = ev.get("payload", {})
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"events[{i}].payload must be an object or null")
+        # Drop unknown top-level keys; keep the three fields the driver reads.
+        out.append({"kind": kind, "session": session, "payload": dict(payload)})
+    return out

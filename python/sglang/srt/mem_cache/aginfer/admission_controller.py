@@ -530,12 +530,20 @@ def resume_candidates(
       gain   = V_u_program_if_active(p, pre_pause_state)   # counterfactual (s)
       re_use = expected_peak_hbm_after_resume(p)           # HBM bytes (flat sp dict)
 
-    The counterfactual ``gain`` overrides p's state to its
-    ``pre_pause_state``; under §7's binary p_hat a PAUSED holder already
-    counts as alive (only ENDED zeroes p_hat in ``build_paper_state``),
-    so the override is a no-op today and ``gain`` is the same shared-aware
-    aggregate as the Pause cost.  It becomes a true counterfactual once
-    T11's conditional p_hat zeroes paused holders' contribution (#126).
+    The counterfactual ``gain`` is SUPPOSED to override p's state to its
+    ``pre_pause_state`` before scoring.  T11 (DESIGN §7 holder-product,
+    ``state_builder._p_access_holder``) now correctly zeroes a PAUSED
+    holder's OWN contribution to p_hat — so ``vprog[pid]`` (below) is the
+    program's AS-PAUSED value, not the counterfactual-if-resumed one the
+    docstring above promises.  The actual state→pre_pause_state
+    substitution (re-scoring p's units as if the tracker already said
+    ``pre_pause_state``) is still NOT implemented (#126 remains open) —
+    this reads ``vprog`` as-is and relies on ``_RESUME_LIVENESS_FLOOR``
+    below to keep a legitimately-near-zero-scored paused program
+    resumable rather than starving it.  A unit EXCLUSIVELY held by p
+    therefore always floors today (PAUSED contributes exactly 0 to its
+    own p_hat with no other holder to keep it up); a unit p SHARES with
+    a still-active co-holder keeps that co-holder's non-zero share.
     ``re_use`` is the flat ``{sp: bytes}`` shape; ``joint_decide``
     normalises it to ``{"HBM": {...}}``.
     """

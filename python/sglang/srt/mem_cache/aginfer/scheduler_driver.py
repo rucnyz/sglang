@@ -111,6 +111,70 @@ class AginferDriver:
         self._policy = None               # OursGreedyPolicy (supplies decide's costs + pi_u)
         self._unknown_tier_log: set = set()
 
+    # P2c (EXP_PLAN.md): belief-plane transitions driven by REAL agent
+    # lifecycle events (agentreplay -> Dynamo extra_args.aginfer_events ->
+    # update_aginfer_events RPC -> here), replacing the tick()'s synthetic
+    # MEMORY_PRESSURE-only view of the tracker. Mirrors the daemon's
+    # `KvScheduler._apply_belief_transition` (kv_scheduler.py) so the SAME
+    # program_tracker.state() lookups `state_builder.build_paper_state`
+    # already makes (any_alive / any_acting -> lambda_acting -> p_hat) start
+    # seeing real REASONING/ACTING transitions in-engine instead of every
+    # holder reading as "never-seen" (see tick()'s KNOWN DEGRADATION note).
+    #
+    # SUB_DISPATCH_BLOCKING/ASYNC and SUB_RETURN are NOT paper §4 kinds (the
+    # daemon never had them -- they exist because agentreplay's traces carry
+    # an explicit parent/child call graph a live HTTP proxy doesn't need to
+    # reconstruct). Mapped onto the tracker's existing two-transition surface
+    # by the belief they carry, not by name:
+    #   sub_dispatch_* (session=child)  -> observe_arrival:   child about to reason
+    #   sub_return      (session=parent) -> observe_arrival:   parent resumes reasoning
+    #   tool_call_end   (session)        -> observe_arrival:   REASONING (paper §4 table)
+    #   tool_call_start (session)        -> observe_completion: REASONING->ACTING
+    _ARRIVAL_KINDS = frozenset((
+        "session_arrival", "llm_prefill", "tool_call_end",
+        "sub_dispatch_blocking", "sub_dispatch_async", "sub_return",
+    ))
+    _COMPLETION_KINDS = frozenset(("tool_call_start",))
+
+    def apply_events(self, events: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Apply a batch of wire-shape events (``{"kind", "session", "payload"}``,
+        agentreplay's ``driver._emit`` shape) to the belief tracker.
+
+        Builds the tracker lazily (same lazy-init as ``end_program``/``tick``,
+        independent of the policy which stays tick-only). Unknown/malformed
+        entries are skipped rather than raising -- this is best-effort
+        observability piggybacked on the request path (see
+        ``update_aginfer_events`` in scheduler.py); a bad event must never
+        break generation. Returns ``{"applied": n, "skipped": n}``."""
+        if self._tracker is None:
+            from sglang.srt.mem_cache.aginfer.program_tracker import ProgramTracker
+
+            self._tracker = ProgramTracker()
+        applied = 0
+        skipped = 0
+        for ev in events:
+            if not isinstance(ev, dict):
+                skipped += 1
+                continue
+            kind = ev.get("kind")
+            session = ev.get("session")
+            if not kind or not session:
+                skipped += 1
+                continue
+            if kind in self._ARRIVAL_KINDS:
+                self._tracker.observe_arrival(session)
+                applied += 1
+            elif kind in self._COMPLETION_KINDS:
+                self._tracker.observe_completion(session)
+                applied += 1
+            else:
+                # session_end / memory_pressure / etc. are not delivered this
+                # way (session_end has its own end_program() path; pressure
+                # events are synthetic, tick()-local) -- not an error, just
+                # nothing to apply here.
+                skipped += 1
+        return {"applied": applied, "skipped": skipped}
+
     def end_program(self, program_id: str):
         """Drive the in-engine lifecycle tracker to its terminal state.
 

@@ -80,6 +80,18 @@ _CONST_VU = bool(os.environ.get("AGINFER_CONST_VU"))
 _PHAT_REUSE_ALPHA = _env_float("AGINFER_PHAT_REUSE_ALPHA", "0.5")
 
 
+# T11 (DESIGN §7 "Δt" estimator priority #3, bootstrap/cold-start): the
+# look-ahead window used for an ACTING holder's p_access when no sharper
+# per-event ETA is available (i.e. this holder isn't the event's own
+# session, or the event carries no tool_eta_s).  DESIGN §7 quotes "average
+# inter-event spacing (10ms-1s range on agent workloads)" for this
+# fallback; 1.0s (the busy end of that range) is the conservative choice —
+# a smaller Δt would UNDERSTATE p_access for an ACTING holder we have no
+# sharper signal for, biasing the holder-product toward demoting units
+# that are, in fact, likely to be reused soon.
+_PHAT_BOOTSTRAP_DT = _env_float("AGINFER_PHAT_BOOTSTRAP_DT", "1.0")
+
+
 _DEFAULT_MEMORY_PRESSURE_TOPK = _env_int("AGINFER_MEMORY_PRESSURE_TOPK", "256")
 
 
@@ -115,6 +127,59 @@ _TIER_LABEL_MAP: Dict[str, Tier] = {
 
 def _clamp_lambda_acting(lam: float) -> float:
     return max(_LAMBDA_ACTING_FLOOR, min(_LAMBDA_ACTING_CEIL, lam))
+
+
+def _p_access_holder(
+    st: Optional[State],
+    hits: int,
+    sid: str,
+    event: Event,
+    program_lambda: Dict[str, float],
+) -> float:
+    """T11 (DESIGN §7): one holder's contribution to a unit's holder-product
+    ``p_hat``, ``p_access(u, s, Δt)`` conditioned on ``s``'s OWN observable
+    ``program_tracker`` state (the state-as-feature design the old single
+    branch-selected p_hat — any_alive / any_ended / untracked — collapsed
+    away):
+
+      PAUSED / ENDED  -> 0.  DESIGN §7 is explicit: no access until
+        admission resume (PAUSED) / the program terminated and issues no
+        more requests against this unit (ENDED).
+
+      ACTING  -> P(``sid``'s tool returns within Δt).  When ``sid`` IS the
+        triggering event's own session AND that TOOL_CALL_START carries a
+        real ``tool_eta_s``, Δt is BY DEFINITION that ETA (estimator
+        priority #1: "the access we care about is the one that fires when
+        the tool returns") -> the access is a near-certainty within its
+        own window -> p_access ~= 1.  Otherwise (a co-holder we have no
+        per-holder ETA for, or no payload ETA) fall back to the calibrated
+        ACTING-floor rate under the bootstrap Δt (priority #3).
+
+      REASONING / untracked (``st is None``)  -> the SAME recency-
+        DECOUPLED reuse-probability proxy used pre-holder-product
+        (#249/#250): one-shot (hits<=1) -> 0, demonstrated reuse -> ->1.
+        We have no per-holder turn-distance signal for "in s's recent
+        prefix tail" (DESIGN §7's REASONING case), so this unit-level
+        hit_count stands in for it; an untracked holder (no aginfer
+        TOOL_CALL protocol in play) gets the identical treatment because
+        session-state is a FEATURE layered on TOP of the base estimator,
+        not a fallback to a DIFFERENT one — the
+        [[feedback-workload-agnostic-phat]] rule this supersedes-in-place.
+    """
+    if st is State.PAUSED or st is State.ENDED:
+        return 0.0
+    if st is State.ACTING:
+        if event.kind == EventKind.TOOL_CALL_START and event.session == sid:
+            eta_raw = event.payload.get("tool_eta_s")
+            try:
+                eta = float(eta_raw) if eta_raw is not None else 0.0
+            except (TypeError, ValueError):
+                eta = 0.0
+            if eta > 0.0:
+                return 1.0
+        lam = program_lambda.get(sid, 0.0)
+        return 1.0 - math.exp(-lam * _PHAT_BOOTSTRAP_DT)
+    return 1.0 - math.exp(-_PHAT_REUSE_ALPHA * max(0, hits - 1))
 
 
 def _estimate_load_back_s(state: SchedulerState, total_bytes: int) -> float:
@@ -727,26 +792,12 @@ def build_paper_state(
         hits = int(raw["hit_count"])
         age = max(1, now_counter - last_access)
         lam = max(1e-3, hits / age)
-        # Iterate holders to compute λ floor + p_hat (program-alive rule
-        # — see prior comments in commit history for §7 justification).
+        # Iterate holders to compute λ floor (unchanged — hold_time is a
+        # SEPARATE quantity from p_hat's Δt, DESIGN §7 "hold_time" section).
         session_ids = raw["session_ids"]
         any_acting = False
-        any_alive = False
-        any_ended = False
         for sid in session_ids:
             st = tracker.state(sid)
-            # T187 (#187, DESIGN §4 SESSION_END / §7): an ENDED holder
-            # contributes 0 to future p_hat — the program terminated,
-            # it will issue no more requests against this unit.  So
-            # ENDED does NOT count as "alive" (a unit held ONLY by
-            # ended programs falls back to the workload-prior
-            # hits/age, which makes session_scoped_units of the ending
-            # program demote/drop candidates).  A still-live co-holder
-            # keeps p_hat high (the unit survives the ended program).
-            if st is not None and st is not State.ENDED:
-                any_alive = True
-            if st is State.ENDED:
-                any_ended = True
             if sid not in program_lambda:
                 program_lambda[sid] = (
                     _clamp_lambda_acting(lambda_acting)
@@ -759,32 +810,31 @@ def build_paper_state(
             lam = program_lambda[
                 next(sid for sid in session_ids if program_lambda[sid] > 0)
             ]
-        if any_alive:
-            # §7 FIX: a LIVE holder no longer forces p_hat=1.0 (that binary
-            # liveness flag threw away the reuse count, so a one-shot prefix held
-            # by a live session tied a heavily-reused one at 1.0 and V_u collapsed
-            # to size).  Estimate the reuse PROBABILITY from demonstrated reuse:
-            # one-shot (hits<=1) -> 0, reused -> ->1.  Monotone, recency-decoupled.
-            p_hat = 1.0 - math.exp(-_PHAT_REUSE_ALPHA * max(0, hits - 1))
-        elif any_ended:
-            # Held ONLY by genuinely-ENDED programs (#187 / DESIGN §4 SESSION_END):
-            # the program terminated, so its demonstrated reuse no longer predicts
-            # FUTURE reuse — a demote/drop candidate, keep the low recency-decayed
-            # workload-prior (unchanged).  The demote itself is the explicit
-            # SESSION_END migrate; this is just the eviction-scorer fallback value.
-            p_hat = min(1.0, hits / age)
+        # T11 (DESIGN §7): p_hat is the holder-PRODUCT —
+        #   p_hat(u, Δt) = 1 - Π_{s in u.session_ids} (1 - p_access(u, s, Δt))
+        # — replacing the old single branch-selected estimate (any_alive /
+        # any_ended / untracked, one formula for the WHOLE unit) with a real
+        # per-holder aggregation.  This is what makes a shared prefix held by
+        # N concurrent programs aggregate correctly (any one holder being
+        # likely-to-access is enough to keep p_hat high) with NO ad-hoc 1/N
+        # weighting, and what makes PAUSED/ENDED holders contribute EXACTLY
+        # zero (not a softened prior) per the DESIGN §7 contract.
+        if session_ids:
+            p_not_access = 1.0
+            for sid in session_ids:
+                st = tracker.state(sid)
+                p_not_access *= 1.0 - _p_access_holder(
+                    st, hits, sid, event, program_lambda
+                )
+            p_hat = 1.0 - p_not_access
         else:
-            # No tracked holder at all (raw inference / no aginfer TOOL_CALL
-            # program protocol in play): use the SAME recency-DECOUPLED reuse
-            # estimate as the any_alive arm and the engine-local scorer
-            # (sglang_adapter._node_to_unit).  Demonstrated reuse must NOT be
-            # recency-penalised just because no program events exist — else a
-            # flood-advanced time counter decays a reused prefix's p_hat below a
-            # one-shot flood, and the pushed hint nibbles it (the do-no-harm
-            # regression root-caused on the Dynamo baseline A/B, 2026-06-13;
-            # completes #249, which fixed only the any_alive arm).  This is the
-            # [[feedback-workload-agnostic-phat]] rule: session-state is a FEATURE
-            # (the any_alive / any_ended arms), the base estimator is uniform.
+            # Holder-product's empty-Π convention (Π over ∅ = 1) would zero
+            # p_hat for a unit with NO current holders — but a shared
+            # platform/tool_def prefix genuinely sits briefly unheld between
+            # sessions while remaining highly likely to be re-referenced
+            # (§7.1's memory_pressure regret proxy singles these out).  With
+            # no live holder to condition on, fall back to the same
+            # demonstrated-reuse estimate an untracked holder would get.
             p_hat = 1.0 - math.exp(-_PHAT_REUSE_ALPHA * max(0, hits - 1))
         if _CONST_VU:
             # #208 const-V_u isolation arm: neutralise the reuse-prediction
