@@ -358,17 +358,80 @@ def stage_7_unknown_hash() -> None:
 
 
 def stage_8_disk_in_add() -> None:
-    """add=[DISK] → disk_tier_not_yet_wired."""
+    """add=[DISK] (P5 safe-subset, superseding the old blanket
+    ``disk_tier_not_yet_wired``): with NO ``--hicache-storage-backend``
+    configured (this stage's own launch recipe below has none), the guard
+    declines with ``disk_add_declined:no_storage_backend`` — a real
+    storage-backed run would instead either apply (host-backed unit) or
+    decline with ``disk_add_declined:not_host_backed`` (see
+    ``dev/aginfer/verify/disk_tier_migrate/`` for the offline unit tests
+    covering all four add=[DISK] branches without needing a live
+    storage backend)."""
     h = _seed_unit("8")
     aid = "stage8-disk"
     resp = post_migrate([_action(h, ["DISK"], [], aid)])
     assert_envelope_shape(resp)
+    if resp["applied"] == 1:
+        _print("Stage 8", True,
+               "add=[DISK] applied (server launched with a storage backend)")
+        return
+    entry = assert_skip_reason(resp, "disk_add_declined:", action_id=aid)
+    _print("Stage 8", True, f"add=[DISK] gracefully declined: {entry['reason']!r}")
+
+
+def stage_12_disk_in_remove() -> None:
+    """remove=[DISK] → disk_remove_unsupported_upstream (P5 safe-subset):
+    sglang's storage backends expose no delete API, so aginfer must not
+    report a fake success for a DISK removal request.  Applies regardless
+    of whether a storage backend is configured — the rejection is
+    unconditional (see cache_hooks.apply_aginfer_migrations)."""
+    h = _seed_unit("12")
+    aid = "stage12-disk-remove"
+    resp = post_migrate([_action(h, [], ["DISK"], aid)])
+    assert_envelope_shape(resp)
     if resp["applied"] != 0:
         raise SchemaMissing(
-            f"stage 8: expected applied=0, got {resp['applied']}; "
+            f"stage 12: expected applied=0, got {resp['applied']}; "
             f"skipped={resp['skipped']!r}")
-    assert_skip_reason(resp, "disk_tier_not_yet_wired", action_id=aid)
-    _print("Stage 8", True, "add=[DISK] → disk_tier_not_yet_wired")
+    assert_skip_reason(resp, "disk_remove_unsupported_upstream", action_id=aid)
+    # The unit itself must be untouched (still present, same residence).
+    u = find_unit(fetch_state(), h)
+    if u is None:
+        raise WrongResidence(f"stage 12: unit {h} vanished after rejected remove=[DISK]")
+    _print("Stage 12", True,
+           f"remove=[DISK] → disk_remove_unsupported_upstream; "
+           f"residence unchanged={u['residence']!r}")
+
+
+def stage_13_disk_add_conflicts() -> None:
+    """add=[DRAM,DISK] and add=[DISK],remove=[DRAM] are both rejected up
+    front (review PR #4, discussion_r3921269467): letting `write_backup`'s
+    async device->host copy or a same-action host-buffer free race against
+    `write_backup_storage`'s async host->storage read would risk reading a
+    stale/freed host buffer, and nothing on this path (`writing_check` only
+    drains device->host acks) would otherwise block it. Rejected purely on
+    tier-set shape before hash resolution, so a nonexistent hash also hits
+    this — same pattern as remove=[DISK] alone (stage 12); see
+    dev/aginfer/verify/disk_tier_migrate/ for the offline unit tests."""
+    aid_a = "stage13-add-dram-disk"
+    resp_a = post_migrate([_action("node-99999993", ["DRAM", "DISK"], [], aid_a)])
+    assert_envelope_shape(resp_a)
+    if resp_a["applied"] != 0:
+        raise SchemaMissing(
+            f"stage 13a: expected applied=0, got {resp_a['applied']}; "
+            f"skipped={resp_a['skipped']!r}")
+    assert_skip_reason(resp_a, "disk_add_conflicts_with_dram_add", action_id=aid_a)
+
+    aid_b = "stage13-add-disk-remove-dram"
+    resp_b = post_migrate([_action("node-99999994", ["DISK"], ["DRAM"], aid_b)])
+    assert_envelope_shape(resp_b)
+    if resp_b["applied"] != 0:
+        raise SchemaMissing(
+            f"stage 13b: expected applied=0, got {resp_b['applied']}; "
+            f"skipped={resp_b['skipped']!r}")
+    assert_skip_reason(resp_b, "disk_add_conflicts_with_dram_remove", action_id=aid_b)
+    _print("Stage 13", True,
+           "add=[DRAM,DISK] and add=[DISK],remove=[DRAM] both rejected up front")
 
 
 def stage_9_action_id_echo() -> None:
@@ -516,6 +579,8 @@ def main() -> int:
         stage_9_action_id_echo()
         stage_10_malformed_action_fails_loud()
         stage_11_combined_add_remove_no_scheduler_crash()
+        stage_12_disk_in_remove()
+        stage_13_disk_add_conflicts()
     except Exception as exc:
         print()
         print(f"=== T20 FAILED: {type(exc).__name__}: {exc} ===")

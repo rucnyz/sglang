@@ -33,6 +33,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetAginferMetricsReq,
+    GetAginferMetricsReqOutput,
     GetAginferStateReq,
     GetAginferStateReqOutput,
     GetInternalStateReq,
@@ -43,6 +45,8 @@ from sglang.srt.managers.io_struct import (
     UpdateAginferProgramPausedReqOutput,
     UpdateAginferHintsReq,
     UpdateAginferHintsReqOutput,
+    UpdateAginferEventsReq,
+    UpdateAginferEventsReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
@@ -122,10 +126,12 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("get_aginfer_state", GetAginferStateReqOutput),
+    ("get_aginfer_metrics", GetAginferMetricsReqOutput),
     ("aginfer_session_end", AginferSessionEndReqOutput),
     ("migrate_aginfer", MigrateAginferReqOutput),
     ("update_aginfer_program_paused", UpdateAginferProgramPausedReqOutput),
     ("update_aginfer_hints", UpdateAginferHintsReqOutput),
+    ("update_aginfer_events", UpdateAginferEventsReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
@@ -828,6 +834,23 @@ class TokenizerControlMixin:
         )
         return responses
 
+    async def get_aginfer_metrics(
+        self: TokenizerManager,
+    ) -> List[GetAginferMetricsReqOutput]:
+        """P1: cumulative eviction/migrate counters, one entry per DP rank.
+
+        Unlike ``get_aginfer_state`` (current-tree snapshot), this is meant to
+        be polled before/after a replay window and diffed -- see
+        ``agentreplay``'s ``dynamo_native`` backend, which snapshots this at
+        run start/end and writes the delta into the run's metrics JSON.
+        """
+        self.auto_create_handle_loop()
+        req = GetAginferMetricsReq()
+        responses: List[GetAginferMetricsReqOutput] = (
+            await self.get_aginfer_metrics_communicator(req)
+        )
+        return responses
+
     async def end_aginfer_session(
         self: TokenizerManager, obj: AginferSessionEndReq
     ) -> List[AginferSessionEndReqOutput]:
@@ -917,6 +940,23 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         responses: List[UpdateAginferHintsReqOutput] = (
             await self.update_aginfer_hints_communicator(obj)
+        )
+        return responses
+
+    async def update_aginfer_events(
+        self: TokenizerManager, obj: UpdateAginferEventsReq,
+    ) -> List[UpdateAginferEventsReqOutput]:
+        """P2b (EXP_PLAN.md): Dynamo worker -> sglang push of agent lifecycle
+        events (from a generate request's ``extra_args.aginfer_events``).
+
+        Fans out to every rank's scheduler; each rank's in-engine driver
+        applies the belief transitions to its OWN ``ProgramTracker`` (per-rank,
+        like the hint table). Best-effort by design -- see
+        ``dynamo`` ``DecodeWorkerHandler.generate`` for the fire-and-forget
+        call site; a failure here must never delay or fail generation."""
+        self.auto_create_handle_loop()
+        responses: List[UpdateAginferEventsReqOutput] = (
+            await self.update_aginfer_events_communicator(obj)
         )
         return responses
 

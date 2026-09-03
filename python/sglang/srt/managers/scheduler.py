@@ -110,6 +110,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetAginferMetricsReq,
+    GetAginferMetricsReqOutput,
     GetAginferStateReq,
     GetAginferStateReqOutput,
     GetInternalStateReq,
@@ -120,6 +122,8 @@ from sglang.srt.managers.io_struct import (
     UpdateAginferProgramPausedReqOutput,
     UpdateAginferHintsReq,
     UpdateAginferHintsReqOutput,
+    UpdateAginferEventsReq,
+    UpdateAginferEventsReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -1439,10 +1443,12 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (GetAginferStateReq, self.get_aginfer_state),
+                (GetAginferMetricsReq, self.get_aginfer_metrics),
                 (AginferSessionEndReq, self.end_aginfer_session),
                 (MigrateAginferReq, self.migrate_aginfer),
                 (UpdateAginferProgramPausedReq, self.update_aginfer_program_paused),
                 (UpdateAginferHintsReq, self.update_aginfer_hints),
+                (UpdateAginferEventsReq, self.update_aginfer_events),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -3803,6 +3809,40 @@ class Scheduler(
             )
         return GetAginferStateReqOutput(state=dump())
 
+    def get_aginfer_metrics(
+        self, recv_req: GetAginferMetricsReq
+    ) -> GetAginferMetricsReqOutput:
+        """P1: cumulative eviction/migrate counters, distinct from the
+        current-tree snapshot ``get_aginfer_state`` returns.
+
+        Unlike ``get_aginfer_state``, this degrades gracefully (empty dicts,
+        ``value_aware=False``) rather than an "unsupported" marker when the
+        tree cache predates the counters, since a caller diffing two polls
+        just wants "no evictions observed" rather than a hard failure.
+        """
+        cache = self.tree_cache
+        try:
+            from sglang.srt.mem_cache.aginfer.state_dump import _aginfer_pool_usage
+
+            pool_usage = _aginfer_pool_usage(cache)
+        except Exception:  # noqa: BLE001
+            # Non-Unified tree cache (e.g. plain RadixCache): no aginfer
+            # accounting to report, same "degrade gracefully" contract as
+            # the rest of this method.
+            pool_usage = {}
+        return GetAginferMetricsReqOutput(
+            evict=dict(getattr(cache, "_aginfer_evict_counters", {}) or {}),
+            migrate_applied=dict(
+                getattr(cache, "_aginfer_migrate_counters", {}) or {}
+            ),
+            migrate_skipped=dict(
+                getattr(cache, "_aginfer_migrate_skipped_counters", {}) or {}
+            ),
+            hash_collisions=len(getattr(cache, "_aginfer_collision_seen", ()) or ()),
+            pool_usage=pool_usage,
+            value_aware=bool(getattr(cache, "_aginfer_value_aware", False)),
+        )
+
     def _aginfer_session_end_output(
         self,
         recv_req: AginferSessionEndReq,
@@ -4246,6 +4286,28 @@ class Scheduler(
             )
         ok, reason, applied = setter(recv_req.hints)
         return UpdateAginferHintsReqOutput(ok=ok, reason=reason, applied=applied)
+
+    def update_aginfer_events(
+        self, recv_req: UpdateAginferEventsReq,
+    ) -> UpdateAginferEventsReqOutput:
+        """P2b (EXP_PLAN.md): Dynamo -> sglang push of agent lifecycle events,
+        forwarded from a generate request's ``extra_args.aginfer_events``.
+
+        Requires the in-engine driver (``SGLANG_AGINFER_IN_ENGINE=1``); a
+        normal launch rejects the RPC the same way ``update_aginfer_hints``
+        rejects a legacy tree cache, so a caller can tell "not applicable"
+        from "applied 0 events". See ``AginferDriver.apply_events`` for the
+        belief-transition mapping.
+        """
+        if self._aginfer_driver is None:
+            return UpdateAginferEventsReqOutput(
+                ok=False,
+                reason="in-engine driver not armed; set SGLANG_AGINFER_IN_ENGINE=1",
+            )
+        result = self._aginfer_driver.apply_events(recv_req.events)
+        return UpdateAginferEventsReqOutput(
+            ok=True, applied=result["applied"], skipped=result["skipped"],
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

@@ -793,6 +793,37 @@ async def aginfer_state():
     return Response(content=body, media_type=media)
 
 
+# GET /aginfer/metrics -- P1 cumulative counters (eviction / migrate), as
+# opposed to /aginfer/state's current-tree snapshot. Uncached: this is a
+# handful of dict-sums per rank, orders of magnitude cheaper than the
+# full radix-tree walk /aginfer/state does, so it doesn't need the same
+# refresh-interval cache. Callers (e.g. agentreplay) poll once before and
+# once after a run and diff.
+@app.get("/aginfer/metrics")
+async def aginfer_metrics():
+    responses = await _global_state.tokenizer_manager.get_aginfer_metrics()
+
+    def _merge_counts(dicts):
+        out: dict = {}
+        for d in dicts:
+            for k, v in d.items():
+                out[k] = out.get(k, 0) + v
+        return out
+
+    return ORJSONResponse({
+        "ranks": len(responses),
+        "evict": _merge_counts(r.evict for r in responses),
+        "migrate_applied": _merge_counts(r.migrate_applied for r in responses),
+        "migrate_skipped": _merge_counts(r.migrate_skipped for r in responses),
+        "hash_collisions": sum(r.hash_collisions for r in responses),
+        # Occupancy is not additive in a meaningful way across DP ranks
+        # (each rank has its own HBM/DRAM pool); report per-rank list
+        # rather than summing bytes across independent pools.
+        "pool_usage_by_rank": [r.pool_usage for r in responses],
+        "value_aware": any(r.value_aware for r in responses),
+    })
+
+
 # POST /aginfer/migrate -- apply paper §6 residence-set transitions.
 # Body: {"actions": [{"hash": str,
 #                     "add_tiers":    ["HBM"|"DRAM"|"DISK", ...],
@@ -893,6 +924,7 @@ from sglang.srt.mem_cache.aginfer.http_validators import (  # aginfer hook (#251
     validate_session_end_body as _validate_session_end_body,
     validate_program_paused_body as _validate_program_paused_body,
     validate_hints_body as _validate_hints_body,
+    validate_events_body as _validate_events_body,
 )
 
 
@@ -1030,6 +1062,41 @@ async def aginfer_hints_put(raw_request: Request):
         "ok": True,
         "ranks": len(responses),
         "applied": sum(int(r.applied) for r in responses),
+    })
+
+
+# Remote Dynamo proxy (sglang_remote) → sglang push of agent lifecycle
+# belief events.  In the in-process ``dynamo.sglang`` stack these ride
+# ``extra_args.aginfer_events`` on generate and call
+# ``tokenizer_manager.update_aginfer_events`` directly; the standalone
+# HTTP path needs an explicit control-plane route.  Body is
+# ``{events: [{kind, session, payload?}]}``.  Requires
+# ``SGLANG_AGINFER_IN_ENGINE=1`` (same contract as the in-process RPC).
+@app.put("/aginfer/events")
+async def aginfer_events_put(raw_request: Request):
+    try:
+        body = await raw_request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    from sglang.srt.managers.io_struct import UpdateAginferEventsReq
+    try:
+        events = _validate_events_body(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    req = UpdateAginferEventsReq(events=events)
+    responses = (
+        await _global_state.tokenizer_manager.update_aginfer_events(req)
+    )
+    # Driver-not-armed is a soft failure the proxy treats as best-effort
+    # (same as fire-and-forget in decode_handler._forward_aginfer_events):
+    # return 200 with ok=False so the generate path is never blocked.
+    all_ok = bool(responses) and all(r.ok for r in responses)
+    return ORJSONResponse({
+        "ok": all_ok,
+        "ranks": len(responses),
+        "applied": sum(int(getattr(r, "applied", 0) or 0) for r in responses),
+        "skipped": sum(int(getattr(r, "skipped", 0) or 0) for r in responses),
+        "reasons": [getattr(r, "reason", "ok") for r in responses],
     })
 
 

@@ -492,6 +492,62 @@ def stage_I_engine_hook_real_body():
            bad2._aginfer_in_engine is False)
 
 
+def stage_K_apply_events_malformed_input():
+    print("[K] apply_events: malformed wire values never raise (review PR #4, "
+          "discussion_r3921269733)")
+    d = AginferDriver()
+
+    # well-formed: an ARRIVAL kind + a COMPLETION kind both apply.
+    r = d.apply_events([
+        {"kind": "session_arrival", "session": "s1"},
+        {"kind": "tool_call_start", "session": "s1"},
+    ])
+    _check("well-formed events: both applied", r == {"applied": 2, "skipped": 0})
+
+    # unknown kind (not arrival/completion) -> skipped, not an error.
+    r = d.apply_events([{"kind": "session_end", "session": "s1"}])
+    _check("unknown-but-well-typed kind: skipped, no crash", r == {"applied": 0, "skipped": 1})
+
+    # THE regression this stage exists for: `kind` is an unhashable type (list).
+    # Pre-fix, `kind in self._ARRIVAL_KINDS` (a frozenset membership test) would
+    # raise TypeError here -- and this call has NO exception boundary between
+    # it and the scheduler's request-dispatch loop (scheduler.py's
+    # update_aginfer_events has no try/except), so an unhandled raise would
+    # have crashed the WHOLE engine, not just this one RPC.
+    r = d.apply_events([{"kind": ["session_arrival"], "session": "s1"}])
+    _check("list-valued kind (unhashable): skipped, no TypeError", r == {"applied": 0, "skipped": 1})
+
+    # non-string session with a valid kind: must not blow up even if the
+    # tracker's internals assume a hashable/string session key.
+    r = d.apply_events([{"kind": "session_arrival", "session": {"nested": "obj"}}])
+    _check("dict-valued session: skipped, no crash", r == {"applied": 0, "skipped": 1})
+
+    # falsy-but-wrong-type edge cases: empty string / 0 / None / missing.
+    r = d.apply_events([
+        {"kind": "", "session": "s1"},
+        {"kind": "session_arrival", "session": ""},
+        {"kind": 0, "session": "s1"},
+        {"kind": "session_arrival"},          # missing session
+        {"session": "s1"},                    # missing kind
+        "not-a-dict",                         # malformed entry itself
+    ])
+    _check("all falsy/wrong-type/malformed entries skipped, none crash",
+           r == {"applied": 0, "skipped": 6})
+
+    # a tracker that raises mid-call (defensive belt-and-suspenders) must still
+    # not propagate -- apply_events wraps each event's dispatch in try/except.
+    d2 = AginferDriver()
+    from sglang.srt.mem_cache.aginfer.program_tracker import ProgramTracker
+    d2._tracker = ProgramTracker()
+
+    def _boom(session):
+        raise RuntimeError("tracker exploded")
+    d2._tracker.observe_arrival = _boom
+    r2 = d2.apply_events([{"kind": "session_arrival", "session": "s1"}])
+    _check("tracker raising mid-dispatch is caught, not propagated",
+           r2 == {"applied": 0, "skipped": 1})
+
+
 if __name__ == "__main__":
     stage_A_apply_rate_ema()
     stage_B_postprocess_plan()
@@ -503,4 +559,5 @@ if __name__ == "__main__":
     stage_H_tick_activated()
     stage_I_engine_hook_real_body()
     stage_J_single_source_invariant()
+    stage_K_apply_events_malformed_input()
     print("verify/scheduler_driver: ALL STAGES PASSED")

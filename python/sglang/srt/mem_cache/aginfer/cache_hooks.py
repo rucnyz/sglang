@@ -228,11 +228,26 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
     Per-tier dispatch:
       add HBM   → ``load_back`` (host→device promote)
       add DRAM  → ``write_backup`` (device→host backup)
-      add DISK  → ``disk_tier_not_yet_wired`` (Mooncake L3 future-task)
+      add DISK  → ``write_backup_storage`` (P5 safe-subset: reuses stock
+                  sglang's own async host→storage write-through path;
+                  ADDITIVE ONLY, best-effort, requires the node to
+                  already be DRAM-backed from a PRIOR action — see the
+                  "Apply adds first" section below for the full rationale)
       remove HBM   → ``evict_component(target=DEVICE)``
       remove DRAM  → ``evict_component(target=HOST)``
-      remove DISK  → noop (DISK currently never populated)
+      remove DISK  → rejected up front (``disk_remove_unsupported_upstream``):
+                  none of sglang's storage backends (file/nixl/mooncake)
+                  expose a delete API, so aginfer cannot honour a DISK
+                  removal request — reporting a fake "applied" success
+                  while doing nothing would be worse than an honest skip.
       remove all current tiers → DROP (full evict + tree leaf removal)
+
+    Two more combinations are rejected up front for the same
+    "no fake success" reason, this time to avoid racing the async
+    storage write against a host-buffer mutation in the SAME batch
+    (``disk_add_conflicts_with_dram_remove`` / ``_dram_add``) — see the
+    inline comment where they're checked, a few lines below the
+    ``remove DISK`` rejection.
     """
     # Build hash → node lookup with one DFS (O(N), same cost as
     # state walk).  Two hash schemes: HiCache-finalised nodes have
@@ -353,6 +368,12 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
 
     def _skip(h, action_id, reason):
         skipped.append({"hash": h, "action_id": action_id, "reason": reason})
+        # P1 metrics: bucket by the reason's first ':'-delimited token so a
+        # detail-bearing reason (e.g. "promote_raised:ValueError:...:msg")
+        # doesn't explode into a distinct counter key per exception message.
+        bucket = reason.split(":", 1)[0]
+        counters = cache._aginfer_migrate_skipped_counters
+        counters[bucket] = counters.get(bucket, 0) + 1
 
     for action in actions:
         # Direct subscript: every action is contractually
@@ -370,6 +391,59 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
         if unknown_tiers:
             _skip(h, action_id,
                   f"unknown_tier:{','.join(sorted(unknown_tiers))}")
+            continue
+
+        # remove DISK → reject up front (P5 safe-subset).  None of
+        # sglang's storage backends (HiCacheFile / nixl / mooncake)
+        # expose a delete API from the radix cache's perspective, so
+        # aginfer cannot make this happen.  Pre-#252 this action would
+        # silently pass every downstream check (DISK is never in
+        # `current`, so `remove_tiers - current` treated it as
+        # already-absent) and get counted as `applied=1`/
+        # `transition="other"` while doing NOTHING — an honest skip is
+        # strictly better than that fake success.
+        if "DISK" in remove_tiers:
+            _skip(h, action_id, "disk_remove_unsupported_upstream")
+            continue
+
+        # Review (PR #4, discussion_r3921269467): reject two same-action
+        # combinations that would race the async storage backup against a
+        # host-buffer mutation, rather than silently risking a use-after-
+        # free / stale read on the storage backend's transfer thread:
+        #
+        #   add=[DISK], remove=[DRAM]: `write_backup_storage()` (below)
+        #   starts an async H->Storage read AND `inc_host_lock_ref`s the
+        #   node, but that lock is only drained by the non-blocking
+        #   `drain_storage_control_queues` (a later scheduler tick) --
+        #   `writing_check()` (the "drain pending write_through before
+        #   removes" call a few lines down) only awaits D->H
+        #   `ongoing_write_through` acks, NOT H->Storage `ongoing_backup`
+        #   ones. Since the leaf-invariant check above (`_is_host_leaf`)
+        #   runs BEFORE this action's adds, it sees host_lock_ref==0 and
+        #   passes, then `evict_component(target=HOST)` (in "Apply
+        #   removes") unconditionally frees `host_value` while the storage
+        #   read may still be in flight against that same buffer.
+        #
+        #   add=[DRAM, DISK] together: `write_backup(node)` (device->host)
+        #   returns as soon as the host buffer is ALLOCATED and the tree
+        #   is committed (`node.backuped` becomes true synchronously), but
+        #   the actual byte copy is async (drained by `writing_check`,
+        #   which only runs later, gated on `remove_tiers` being
+        #   non-empty). Starting `write_backup_storage()` immediately
+        #   after would read a host buffer whose D->H copy has not
+        #   necessarily finished yet.
+        #
+        # Both are same-batch ordering hazards, not something a per-node
+        # leaf/lock check can catch with the primitives sglang exposes
+        # today (no synchronous "await this node's backup ack" API) --
+        # reject rather than risk silent corruption; the daemon can just
+        # re-request `add DISK` alone in a LATER action once the DRAM leg
+        # has actually landed (state_dump's next snapshot will show it).
+        if "DISK" in add_tiers and "DRAM" in remove_tiers:
+            _skip(h, action_id, "disk_add_conflicts_with_dram_remove")
+            continue
+        if "DISK" in add_tiers and "DRAM" in add_tiers:
+            _skip(h, action_id, "disk_add_conflicts_with_dram_add")
             continue
 
         # Resolve hash.
@@ -395,7 +469,14 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
             current.add("HBM")
         if has_host:
             current.add("DRAM")
-        # DISK is never in current_residence — Mooncake L3 not wired.
+        # DISK is deliberately NEVER added to current_residence: sglang's
+        # write_backup_storage is a fire-and-forget async write with no
+        # synchronous confirmation and no delete API on any backend, so
+        # aginfer has no basis to claim a residence GUARANTEE for it (see
+        # the "add DISK" handling below for the full rationale). This also
+        # means a re-requested "add DISK" is never blocked by
+        # `add_already_present` — harmless, since write_backup_storage is
+        # idempotent-ish (re-keys the same hash on the same backend).
 
         # Validate add: tiers must not already be in residence.
         already_in = add_tiers & current
@@ -405,19 +486,11 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
             continue
 
         # Validate remove: tiers must be in current residence.
-        # (DISK in remove is always 'absent' since current never
-        # has DISK; we allow it as a noop so the daemon can
-        # speculatively remove DISK during a transition without
-        # tripping this check.)
-        missing = remove_tiers - current - {"DISK"}
+        # (DISK can no longer reach here — rejected above.)
+        missing = remove_tiers - current
         if missing:
             _skip(h, action_id,
                   f"remove_already_absent:{','.join(sorted(missing))}")
-            continue
-
-        # DISK in add → not implemented.
-        if "DISK" in add_tiers:
-            _skip(h, action_id, "disk_tier_not_yet_wired")
             continue
 
         # Will the unit be fully removed (post-add residence ⊆ remove)?
@@ -483,6 +556,71 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
                         _skip(h, action_id,
                               "write_through_declined:zero_tokens")
                         skip_this = True
+        if skip_this:
+            continue
+
+        if "DISK" in add_tiers:
+            # P5 (safe subset, per user confirmation): reuse sglang's OWN
+            # host→storage write-through path (write_backup_storage)
+            # rather than inventing a new aginfer-side storage writer or a
+            # storage-only radix node state (stock sglang has neither a
+            # "node lives only on DISK" tree state nor a delete API on any
+            # storage backend — see the module + function docstrings).
+            # This is strictly ADDITIVE and best-effort:
+            #   - it only starts an async background write (the actual
+            #     disk I/O + ack happens on cache_controller's storage
+            #     thread, drained by the regular check_hicache_events /
+            #     writing_check tick — same machinery sglang's own
+            #     write-through-to-storage already relies on);
+            #   - it requires the node to ALREADY be DRAM-backed
+            #     (`node.backuped`) from a PRIOR action — never from a
+            #     "DRAM" add earlier in THIS SAME action, which is
+            #     rejected up front (`disk_add_conflicts_with_dram_add`,
+            #     see above): `write_backup`'s device→host byte copy is
+            #     itself async, so reading that host buffer immediately
+            #     via `write_backup_storage` here could race an
+            #     unfinished D→H copy (review PR #4, discussion_r3921269467);
+            #   - it introduces ZERO new data-loss risk: at this point in
+            #     the batch the bytes still live independently in
+            #     HBM and/or DRAM (adds are applied before removes, see
+            #     the docstring above), so this is purely an extra durable
+            #     copy, never the only copy;
+            #   - "applied" here means "write started", NOT "confirmed on
+            #     disk" — there is no synchronous ack, and since no
+            #     backend exposes delete, aginfer offers no DISK-residence
+            #     GUARANTEE, only a best-effort extra backup (hence DISK
+            #     is still deliberately never added to `current` residence
+            #     above — a future action re-requesting `add DISK` on the
+            #     same node will just re-fire this, which is harmless).
+            if not cache.enable_storage or cache.cache_controller is None:
+                _skip(h, action_id, "disk_add_declined:no_storage_backend")
+                skip_this = True
+            elif not node.backuped:
+                # Reachable whenever the node has no pre-existing DRAM
+                # residence (an in-batch "DRAM" add can no longer race
+                # this — see disk_add_conflicts_with_dram_add above).
+                # write_backup_storage would silently no-op on a
+                # HBM-only node, so catch it here with a clear reason
+                # instead of a fake "applied" success.
+                _skip(h, action_id, "disk_add_declined:not_host_backed")
+                skip_this = True
+            else:
+                try:
+                    cache.write_backup_storage(node)
+                except Exception as exc:  # noqa: BLE001
+                    import traceback as _tb
+                    msg = str(exc) or "<empty>"
+                    loc = "?"
+                    st = _tb.extract_tb(exc.__traceback__)
+                    if st:
+                        last = st[-1]
+                        fname = last.filename.rsplit("/", 1)[-1]
+                        loc = f"{fname}:{last.lineno}:{last.name}"
+                    short = "_".join(msg.split())[:60]
+                    _skip(h, action_id,
+                          f"disk_backup_raised:"
+                          f"{type(exc).__name__}:{loc}:{short}")
+                    skip_this = True
         if skip_this:
             continue
 
@@ -585,12 +723,29 @@ def apply_aginfer_migrations(cache, actions: list[dict]) -> dict:
                     tracker=tracker)
                 cache._cascade_evict(
                     node, base_comp, tracker, target=EvictLayer.HOST)
-            # DISK in remove is a noop (never populated).
+            # (DISK can't appear in remove_tiers here — rejected up front.)
             cache._update_evictable_leaf_sets(node)
 
         applied += 1
         applied_hashes.append(h)
         acted_node_ids.add(node.id)
+        # P1 metrics: tag by tier transition so get_aginfer_metrics can
+        # report a HBM->DRAM / DRAM->HBM / *->DROP breakdown, not just a
+        # single "applied" total.
+        if is_full_drop:
+            transition = "drop"
+        elif "HBM" in add_tiers:
+            transition = "dram_to_hbm"
+        elif "HBM" in remove_tiers:
+            transition = "hbm_to_dram"
+        elif "DRAM" in remove_tiers:
+            transition = "dram_drop_partial"
+        elif "DISK" in add_tiers:
+            transition = "disk_backup"
+        else:
+            transition = "other"
+        migrate_counters = cache._aginfer_migrate_counters
+        migrate_counters[transition] = migrate_counters.get(transition, 0) + 1
 
     return {"applied": applied, "applied_hashes": applied_hashes,
             "skipped": skipped,

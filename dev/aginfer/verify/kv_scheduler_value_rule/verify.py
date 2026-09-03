@@ -704,22 +704,26 @@ def stage_c1_paused_lambda_also_clamped() -> None:
 
 
 def stage_c2_p_hat_alive_vs_ended() -> None:
-    """p_hat estimator (DESIGN §7 / #249 / #250) — a recency-DECOUPLED reuse base,
-    with session-state as a FEATURE (the holder arms), NOT a branch to a different
-    formula ([[feedback-workload-agnostic-phat]]):
+    """p_hat estimator (T11, DESIGN §7 holder-PRODUCT) — replaces the old
+    branch-selected single p_hat (#249/#250/#187) with a real per-holder
+    aggregation: ``p_hat = 1 - Π_s (1 - p_access(u, s, Δt))``.  A REASONING
+    or untracked holder's ``p_access`` is the same recency-DECOUPLED reuse
+    base as before (#249/#250 still hold — this is a per-holder refinement
+    of that estimator, not a reversion of it); PAUSED/ENDED holders now
+    contribute EXACTLY zero per the DESIGN §7 contract (superseding #187's
+    softened hits/age prior — the product's own math already makes an
+    ended-only unit's p_hat 0, no separate branch needed).
 
-      * ALIVE holder (tracked, not ENDED)      -> reuse-based 1-exp(-a*(hits-1))
-        (#249: a live holder no longer forces p_hat=1.0 — that binary flag threw
-        away the reuse count).
-      * GENUINELY-ENDED holder (observe+end())  -> low hits/age demote-prior (#187:
-        the program terminated, its tail won't be reused; the demote itself is the
-        explicit SESSION_END migrate).
-      * NEVER-SEEN / untracked holder           -> reuse-based, NOT hits/age (#250
-        fix: raw inference / no TOOL_CALL protocol must NOT recency-penalise
-        demonstrated reuse, else a flood-advanced counter decays a reused prefix
-        below a one-shot flood and the pushed hint nibbles it — the Dynamo baseline
-        regression).  This is the arm #249 missed.
-      * MIXED alive+other                       -> alive dominates -> reuse-based.
+      * ALIVE (REASONING, tracked) holder        -> reuse-based 1-exp(-a*(hits-1))
+      * GENUINELY-ENDED holder (observe+end())    -> contributes 0 (not a prior)
+      * NEVER-SEEN / untracked holder             -> reuse-based, NOT hits/age
+        (#250: raw inference / no TOOL_CALL protocol must NOT recency-penalise
+        demonstrated reuse).
+      * MIXED alive+ended (shared prefix)         -> the alive holder's
+        contribution SURVIVES the product (the ended co-holder contributes 0,
+        i.e. the identity factor (1-0)=1, so it cannot pull p_hat down) —
+        this is the holder-product "no ad-hoc 1/N" property DESIGN §7 calls
+        out explicitly.
     """
     import math as _math
     A = kvs._PHAT_REUSE_ALPHA
@@ -735,26 +739,29 @@ def stage_c2_p_hat_alive_vs_ended() -> None:
         _unit(uhash="u-alive", residence=["HBM"], holders=["p_alive"],
               hit_count=2, last_access_time=99),
         _unit(uhash="u-ended", residence=["HBM"], holders=["p_done"],
-              hit_count=1, last_access_time=1),     # genuinely ENDED -> hits/age
+              hit_count=1, last_access_time=1),     # genuinely ENDED -> 0
         _unit(uhash="u-untracked-oneshot", residence=["HBM"], holders=["p_never"],
               hit_count=1, last_access_time=1),      # never-seen flood -> reuse(1)=0
         _unit(uhash="u-untracked-reused", residence=["HBM"], holders=["p_never2"],
               hit_count=5, last_access_time=1),       # never-seen REUSED + idle
         _unit(uhash="u-mixed", residence=["HBM"], holders=["p_alive", "p_never"],
               hit_count=2, last_access_time=99),
+        _unit(uhash="u-mixed-ended", residence=["HBM"], holders=["p_alive", "p_done"],
+              hit_count=2, last_access_time=99),
     ]
     s = _build_state(_state_json(units=units),
                      Event(EventKind.LLM_PREFILL, session=None), tracker)
 
-    # alive -> reuse-based (#249)
+    # alive -> reuse-based (single holder -> product collapses to its own term)
     got = s.units["u-alive"].p_hat
     if abs(got - reuse(2)) > 1e-9:
         raise StageFail(f"alive p_hat should be reuse-based {reuse(2):.4f}; got {got}")
 
-    # genuinely ENDED -> small hits/age demote-prior (#187). age=99, 1/99≈0.0101
+    # genuinely-ENDED-ONLY -> holder-product gives EXACTLY 0 (DESIGN §7 contract;
+    # supersedes #187's softened hits/age prior in place).
     got = s.units["u-ended"].p_hat
-    if not (0.0 < got < 0.1):
-        raise StageFail(f"genuinely-ENDED p_hat should be small hits/age (<0.1); got {got}")
+    if got != 0.0:
+        raise StageFail(f"genuinely-ENDED-only p_hat should be exactly 0.0; got {got}")
 
     # never-seen one-shot flood -> reuse(1)=0 (evict-first), NOT hits/age
     got = s.units["u-untracked-oneshot"].p_hat
@@ -773,10 +780,107 @@ def stage_c2_p_hat_alive_vs_ended() -> None:
     if got < 0.8:
         raise StageFail(f"untracked reused (hits=5) p_hat must be high (>0.8); got {got}")
 
-    # mixed alive+untracked -> alive dominates -> reuse-based
+    # mixed alive+untracked -> both holders contribute the SAME reuse(2) term
+    # (untracked gets the identical treatment as alive, per #250) -> the
+    # product is 1-(1-reuse(2))^2, STRICTLY GREATER than either term alone —
+    # the holder-product aggregation, not a single-branch passthrough.
     got = s.units["u-mixed"].p_hat
+    single = reuse(2)
+    expected = 1.0 - (1.0 - single) ** 2
+    if abs(got - expected) > 1e-9:
+        raise StageFail(
+            f"mixed alive+untracked should be the holder-PRODUCT {expected:.4f} "
+            f"(two non-zero terms combine); got {got}")
+    if got <= single + 1e-9:
+        raise StageFail(
+            f"two-holder product must exceed either holder's solo term "
+            f"({single:.4f}); got {got}")
+
+    # mixed alive+ENDED (shared prefix, one co-holder terminated) -> the ended
+    # co-holder contributes the identity factor (1-0)=1, so p_hat collapses to
+    # EXACTLY the alive holder's own term — "no ad-hoc 1/N weighting" (DESIGN §7).
+    got = s.units["u-mixed-ended"].p_hat
     if abs(got - reuse(2)) > 1e-9:
-        raise StageFail(f"mixed alive+untracked should be reuse-based {reuse(2):.4f}; got {got}")
+        raise StageFail(
+            f"alive+ended shared prefix should equal the alive holder's solo "
+            f"term {reuse(2):.4f} (ended contributes 0, no ad-hoc dilution); "
+            f"got {got}")
+
+
+def stage_c3_p_hat_acting_and_paused() -> None:
+    """T11 (DESIGN §7): the ACTING / PAUSED holder-product branches
+    ``stage_c2`` doesn't exercise (it only covers REASONING/ENDED/untracked).
+
+      * PAUSED holder            -> contributes 0 (same as ENDED; no access
+        until admission resume).
+      * ACTING holder, event IS this holder's own TOOL_CALL_START WITH a
+        real ``tool_eta_s`` payload -> p_access ~= 1 (Δt is BY DEFINITION
+        that ETA — estimator priority #1, "the access we care about is the
+        one that fires when the tool returns").
+      * ACTING holder with NO per-holder ETA available (a co-holder that
+        ISN'T the triggering event's session) -> bootstrap fallback
+        ``1 - exp(-lambda_acting * AGINFER_PHAT_BOOTSTRAP_DT)`` (priority #3).
+    """
+    tracker = ProgramTracker()
+    tracker.observe_arrival("p_paused"); tracker.pause("p_paused")
+    tracker.observe_arrival("p_eta"); tracker.observe_completion("p_eta")   # ACTING
+    tracker.observe_arrival("p_noeta"); tracker.observe_completion("p_noeta")  # ACTING
+    if tracker.state("p_paused") is not State.PAUSED:
+        raise StageFail("setup: p_paused should be PAUSED")
+    if tracker.state("p_eta") is not State.ACTING:
+        raise StageFail("setup: p_eta should be ACTING")
+
+    units = [
+        _unit(uhash="u-paused", residence=["HBM"], holders=["p_paused"],
+              hit_count=1000, last_access_time=99),   # high hits/age -- must NOT leak in
+        _unit(uhash="u-eta", residence=["HBM"], holders=["p_eta"],
+              hit_count=1, last_access_time=99),        # one-shot -- ETA branch must dominate
+        _unit(uhash="u-noeta", residence=["HBM"], holders=["p_noeta"],
+              hit_count=1, last_access_time=99),
+    ]
+    sj = _state_json(units=units)
+
+    # PAUSED holder -> p_hat exactly 0, regardless of hit_count.
+    s_paused = kvs.build_paper_state(
+        sj, event=Event(EventKind.LLM_PREFILL, session=None),
+        tracker=tracker, unknown_tier_log=set(),
+    )
+    got = s_paused.units["u-paused"].p_hat
+    if got != 0.0:
+        raise StageFail(f"PAUSED-only holder p_hat should be exactly 0.0; got {got}")
+
+    # ACTING + this event IS p_eta's own TOOL_CALL_START with tool_eta_s -> ~1.0,
+    # even though hit_count=1 would give reuse(1)=0 under the untracked/REASONING
+    # branch -- the ETA branch must be the one that fires.
+    s_eta = kvs.build_paper_state(
+        sj, event=Event(EventKind.TOOL_CALL_START, session="p_eta",
+                        payload={"tool_eta_s": 5.0}),
+        tracker=tracker, unknown_tier_log=set(),
+    )
+    got = s_eta.units["u-eta"].p_hat
+    if abs(got - 1.0) > 1e-9:
+        raise StageFail(
+            f"ACTING holder w/ own TOOL_CALL_START tool_eta_s should give "
+            f"p_access~=1.0 (Δt:=eta); got {got}")
+
+    # ACTING but this event is a DIFFERENT session's TOOL_CALL_START (p_noeta
+    # has no per-holder ETA of its own available here) -> bootstrap fallback,
+    # a function of the ACTING-floor lambda, NOT 1.0 and NOT reuse(1)=0.
+    s_noeta = kvs.build_paper_state(
+        sj, event=Event(EventKind.TOOL_CALL_START, session="p_eta",
+                        payload={"tool_eta_s": 5.0}),
+        tracker=tracker, unknown_tier_log=set(), lambda_acting=0.2,
+    )
+    import math as _math
+    lam = kvs._clamp_lambda_acting(0.2)
+    expected = 1.0 - _math.exp(-lam * kvs._PHAT_BOOTSTRAP_DT)
+    got = s_noeta.units["u-noeta"].p_hat
+    if abs(got - expected) > 1e-9:
+        raise StageFail(
+            f"ACTING co-holder w/ no per-holder ETA should use the bootstrap "
+            f"fallback {expected:.4f}; got {got}")
+    if got in (0.0, 1.0):
+        raise StageFail(f"bootstrap fallback should be strictly between 0 and 1; got {got}")
 
 
 # ============================================================ D. action / dispatch
@@ -1200,8 +1304,10 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
                               stage_c0_acting_lambda_floor_clamp),
     ("C1 PAUSED program also gets ACTING-floor λ",
                               stage_c1_paused_lambda_also_clamped),
-    ("C2 p_hat: alive/untracked=reuse-based, genuinely-ENDED=hits/age (#249/#250)",
+    ("C2 p_hat: T11 holder-product (alive/untracked=reuse-based, ENDED=0)",
                               stage_c2_p_hat_alive_vs_ended),
+    ("C3 p_hat: T11 holder-product ACTING (own-eta~=1, bootstrap) / PAUSED=0",
+                              stage_c3_p_hat_acting_and_paused),
     ("D0 Action.assignments is 3-tuple (uid, add, remove)",
                               stage_d0_action_assignments_3tuple_shape),
     ("D1 assignments_to_wire → hash/add/remove/action_id envelope",

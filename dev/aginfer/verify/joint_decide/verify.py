@@ -568,9 +568,23 @@ def stage_c_program_candidates() -> None:
     if rp.re_use.get("kv", 0) <= 0:
         raise StageFail(f"C: P re_use should be >0 (uP not HBM-resident): "
                         f"{rp.re_use}")
-    if abs(rp.gain - vprog["P"]) > 1e-12:
-        raise StageFail(f"C: P resume gain should equal V_u_program: "
-                        f"{rp.gain} vs {vprog['P']}")
+    # T11 (DESIGN §7 holder-product): PAUSED now correctly contributes
+    # EXACTLY 0 to p_hat for a unit it exclusively holds (uP's only
+    # holder is P) — the #126 counterfactual re-score under
+    # pre_pause_state is still NOT implemented (admission_controller.py
+    # resume_candidates docstring), so vprog["P"] is P's AS-PAUSED
+    # (near-zero/negative) value, and #211's _RESUME_LIVENESS_FLOOR is
+    # what actually keeps this Resume candidate alive.
+    if vprog["P"] >= 0.0:
+        raise StageFail(
+            f"C: with T11 holder-product, P's exclusively-held uP should "
+            f"score p_hat=0 -> a non-positive V_u_program (pure holding "
+            f"cost, no save-prefill term); got vprog['P']={vprog['P']}")
+    if abs(rp.gain - adm._RESUME_LIVENESS_FLOOR) > 1e-15:
+        raise StageFail(
+            f"C: P resume gain should be the #211 liveness floor "
+            f"{adm._RESUME_LIVENESS_FLOOR} (vprog['P']={vprog['P']} < 0 "
+            f"is below it); got {rp.gain}")
 
     # capacity_fits gate: HBM near cap → Resume omitted (would overflow).
     sj_full = _state_json(
