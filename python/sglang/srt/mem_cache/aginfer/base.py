@@ -6,10 +6,11 @@ Mapping to paper symbols (post-round-9):
     SchedulerState  <-> s_t = ({u}, {g_i}, pool_usage, bw_free, ...)            [§3]
     Action          <-> a_t = {(u, add_tiers, remove_tiers) : u in D_t}         [§6 migrate]
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import IntEnum, Enum
+from enum import Enum, IntEnum
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 
@@ -42,6 +43,7 @@ class ReuseUnit:
     of tiers the unit currently has bytes in; `n_bytes_by_tier` is the
     per-(tier, subpool) byte breakdown that §9's multi-axis DP indexes.
     """
+
     id: str
     type: UnitType
     scope: Scope
@@ -103,8 +105,9 @@ class ReuseUnit:
     def n_bytes(self) -> int:
         """Total bytes across all (tier, subpool).  Convenience for
         callers that just need the memory footprint."""
-        return sum(b for sp_dict in self.n_bytes_by_tier.values()
-                   for b in sp_dict.values())
+        return sum(
+            b for sp_dict in self.n_bytes_by_tier.values() for b in sp_dict.values()
+        )
 
     @property
     def authoritative_tier(self) -> Tier:
@@ -121,7 +124,8 @@ class ReuseUnit:
                 return t
         raise ValueError(
             f"ReuseUnit {self.id!r}: empty residence — "
-            f"unit should have been dropped from units[]")
+            f"unit should have been dropped from units[]"
+        )
 
     def bytes_in_tier(self, tier: Tier) -> int:
         """Sum of n_bytes across subpools for a given tier."""
@@ -140,6 +144,7 @@ class TierUsage:
     derived from DESIGN §5 `link_stats` (peak_bw_bps - recent_throughput
     on cold links, peak on idle).
     """
+
     pool_used: Dict[Tier, Dict[str, int]] = field(default_factory=dict)
     pool_cap: Dict[Tier, Dict[str, int]] = field(default_factory=dict)
     pool_available: Dict[Tier, Dict[str, int]] = field(default_factory=dict)
@@ -150,8 +155,7 @@ class TierUsage:
     # Sourced from sglang's pool_usage[*].decode_bytes_per_token; the
     # daemon's forecast_inflight_demand multiplies decode-token growth by
     # this.  Defaults to {} (≡ 0) when an older sglang omits the field.
-    decode_bytes_per_token: Dict[Tier, Dict[str, int]] = field(
-        default_factory=dict)
+    decode_bytes_per_token: Dict[Tier, Dict[str, int]] = field(default_factory=dict)
     bw_free: Dict[Tuple[Tier, Tier], float] = field(default_factory=dict)
 
     def occupancy_ratio(self, tier: Tier) -> float:
@@ -188,6 +192,7 @@ class SchedulerState:
     is nested accordingly.  The aggregate-by-tier view is derivable
     via `tier_usage.occupancy_ratio(tier)`.
     """
+
     t: float
     units: Dict[str, ReuseUnit]
     tier_usage: TierUsage
@@ -227,8 +232,8 @@ class Action:
       {DRAM}       → {}             (DROP)
       {DISK}       → {DRAM, DISK}   (Mooncake load)
     """
-    assignments: List[Tuple[str, List[Tier], List[Tier]]] = field(
-        default_factory=list)
+
+    assignments: List[Tuple[str, List[Tier], List[Tier]]] = field(default_factory=list)
 
 
 class Policy(Protocol):
@@ -242,8 +247,9 @@ class Policy(Protocol):
 
     def decide(self, state: SchedulerState) -> Action: ...
 
-    def update_after_step(self, state: SchedulerState, action: Action,
-                          hits: List[str]) -> None:
+    def update_after_step(
+        self, state: SchedulerState, action: Action, hits: List[str]
+    ) -> None:
         """Optional hook for policies that need to update internal state
         (e.g. LRU recency table). Default no-op."""
         return None

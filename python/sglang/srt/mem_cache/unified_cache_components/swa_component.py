@@ -448,9 +448,7 @@ class SWAComponent(TreeComponent):
         # __iter__; .cache.values() is the canonical O(1)-indexed enumeration).
         # The n.id tiebreaker is load-bearing: it stops heapq from comparing two
         # UnifiedTreeNodes on equal scores (const-V_u / V_u=0 ties).
-        heap = [
-            (score_fn(n, EvictLayer.DEVICE), n.id, n) for n in lru.cache.values()
-        ]
+        heap = [(score_fn(n, EvictLayer.DEVICE), n.id, n) for n in lru.cache.values()]
         heapq.heapify(heap)
         while tracker[ct] < request and heap:
             _, _, x = heapq.heappop(heap)

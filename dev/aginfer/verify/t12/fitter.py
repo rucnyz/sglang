@@ -21,6 +21,7 @@ This module is workload-agnostic: no benchmark-specific assumptions
 baked in.  Feed it ``(occ, marginal_V_u)`` pairs from any source
 (real scenario logs OR synthetic ground-truth for testing).
 """
+
 from __future__ import annotations
 
 import math
@@ -29,7 +30,6 @@ from typing import Callable, Dict, List, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import curve_fit
-
 
 # ---------------------------------------------------------- bounds
 
@@ -70,14 +70,15 @@ class FitResult:
     callers can downgrade saturated picks or widen the bound and
     re-fit.
     """
-    shape: str                  # "linear" / "power" / "hyperbolic"
-    params: Tuple[float, ...]   # alpha, [gamma]
+
+    shape: str  # "linear" / "power" / "hyperbolic"
+    params: Tuple[float, ...]  # alpha, [gamma]
     n_samples: int
     rmse: float
     mae: float
     r_squared: float
-    aic: float                  # lower = better; comparable across nested models
-    saturated: bool = False     # any bounded param at its boundary
+    aic: float  # lower = better; comparable across nested models
+    saturated: bool = False  # any bounded param at its boundary
 
 
 def _aic(n: int, rss: float, k: int) -> float:
@@ -119,8 +120,11 @@ def fit_one(
     saturated = False
     if shape == "linear":
         params, _ = curve_fit(
-            _linear, occ_arr, y_arr,
-            p0=[1.0], bounds=([-np.inf], [np.inf]),
+            _linear,
+            occ_arr,
+            y_arr,
+            p0=[1.0],
+            bounds=([-np.inf], [np.inf]),
         )
         y_pred = _linear(occ_arr, *params)
         k = 1
@@ -130,7 +134,9 @@ def fit_one(
         # so downstream picker can downgrade or widen + re-fit.
         gamma_lo, gamma_hi = _POWER_GAMMA_LO, _POWER_GAMMA_HI
         params, _ = curve_fit(
-            _power, occ_arr, y_arr,
+            _power,
+            occ_arr,
+            y_arr,
             p0=[1.0, 1.5],
             bounds=([-np.inf, gamma_lo], [np.inf, gamma_hi]),
             maxfev=5000,
@@ -145,13 +151,15 @@ def fit_one(
         # tolerance flagged — audit #175-round2).
         gamma_fit = float(params[1])
         atol = 1e-6
-        if (abs(gamma_fit - gamma_lo) < atol
-                or abs(gamma_fit - gamma_hi) < atol):
+        if abs(gamma_fit - gamma_lo) < atol or abs(gamma_fit - gamma_hi) < atol:
             saturated = True
     elif shape == "hyperbolic":
         params, _ = curve_fit(
-            _hyperbolic, occ_arr, y_arr,
-            p0=[1.0], bounds=([-np.inf], [np.inf]),
+            _hyperbolic,
+            occ_arr,
+            y_arr,
+            p0=[1.0],
+            bounds=([-np.inf], [np.inf]),
         )
         y_pred = _hyperbolic(occ_arr, *params)
         k = 1
@@ -159,14 +167,15 @@ def fit_one(
         raise ValueError(f"unknown shape {shape!r}")
 
     resid = y_arr - y_pred
-    rss = float(np.sum(resid ** 2))
+    rss = float(np.sum(resid**2))
     rmse = float(np.sqrt(rss / n))
     mae = float(np.mean(np.abs(resid)))
     return FitResult(
         shape=shape,
         params=tuple(float(p) for p in params),
         n_samples=n,
-        rmse=rmse, mae=mae,
+        rmse=rmse,
+        mae=mae,
         r_squared=_r_squared(y_arr, y_pred),
         aic=_aic(n, rss, k),
         saturated=saturated,
@@ -174,7 +183,8 @@ def fit_one(
 
 
 def fit_all(
-    occ: Sequence[float], y: Sequence[float],
+    occ: Sequence[float],
+    y: Sequence[float],
 ) -> Dict[str, FitResult]:
     """Fit all 3 candidate shapes; return keyed by shape name.
 
@@ -200,18 +210,16 @@ def best_by_aic(fits: Dict[str, FitResult]) -> str:
         raise ValueError("no fits to choose from")
     # AIC alone handles the parameter-count penalty, but if AICs
     # are within ε (numerical tie), prefer simpler.
-    ranked = sorted(fits.items(),
-                    key=lambda kv: (kv[1].aic,
-                                    len(kv[1].params)))
+    ranked = sorted(fits.items(), key=lambda kv: (kv[1].aic, len(kv[1].params)))
     return ranked[0][0]
 
 
 # ---------------------------------------------------------- log-line parser
 
 
-def parse_t12_log_lines(lines: Sequence[str]) -> Dict[
-    Tuple[str, str], List[Tuple[float, float]]
-]:
+def parse_t12_log_lines(
+    lines: Sequence[str],
+) -> Dict[Tuple[str, str], List[Tuple[float, float]]]:
     """Parse structured aginfer log lines into per-(tier, subpool)
     buckets of ``(occ, marginal_v_u)`` pairs.
 
@@ -251,6 +259,8 @@ def parse_t12_log_lines(lines: Sequence[str]) -> Dict[
 
 __all__ = [
     "FitResult",
-    "fit_one", "fit_all", "best_by_aic",
+    "fit_one",
+    "fit_all",
+    "best_by_aic",
     "parse_t12_log_lines",
 ]

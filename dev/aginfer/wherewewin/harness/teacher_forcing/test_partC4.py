@@ -14,6 +14,7 @@ nested under extra_body) and accept whichever the server honors.
 proxy (:9100) — run it against both to cover C4 fully.
 Run: server up (override in-code; no special flag). See run_partC4.sh.
 """
+
 import argparse
 import json
 import sys
@@ -21,12 +22,17 @@ import sys
 import requests
 
 MESSAGES = [{"role": "user", "content": "Write one paragraph about caching."}]
-F = list(range(2000, 2000 + 48))   # forced seq, valid non-special ids
+F = list(range(2000, 2000 + 48))  # forced seq, valid non-special ids
 
 
 def chat(base, *, forced=None, nest=False):
-    body = {"model": "deepseek-ai/DeepSeek-V4-Flash", "messages": MESSAGES,
-            "temperature": 0.0, "max_tokens": len(F), "stream": False}
+    body = {
+        "model": "deepseek-ai/DeepSeek-V4-Flash",
+        "messages": MESSAGES,
+        "temperature": 0.0,
+        "max_tokens": len(F),
+        "stream": False,
+    }
     body["ignore_eos"] = True
     if forced is not None:
         cp = {"forced_output_ids": list(forced)}
@@ -69,18 +75,31 @@ def main():
         print(f"[C4] forced (nest={nest}): n={n} changed={t != nat_txt} — not honored")
     print("\n=== Part C4 result ===")
     if used is None:
-        print("forcing did NOT take effect via the chat API on EITHER custom_params "
-              "placement → the OpenAI path does not plumb forced_output_ids to the "
-              "override. FAIL — must fix the chat→SamplingParams.custom_params hop.")
+        print(
+            "forcing did NOT take effect via the chat API on EITHER custom_params "
+            "placement → the OpenAI path does not plumb forced_output_ids to the "
+            "override. FAIL — must fix the chat→SamplingParams.custom_params hop."
+        )
         print(json.dumps({"endpoint": base, "honored": False}))
         return 1
-    print(f"forcing honored via chat `{used}` custom_params: n={forced_n}=={len(F)}, "
-          f"output changed from natural → custom_params.forced_output_ids reaches the "
-          f"override through the OpenAI chat path. PASS")
+    print(
+        f"forcing honored via chat `{used}` custom_params: n={forced_n}=={len(F)}, "
+        f"output changed from natural → custom_params.forced_output_ids reaches the "
+        f"override through the OpenAI chat path. PASS"
+    )
     print(f"  natural text[:50]={nat_txt[:50]!r}")
     print(f"  forced  text[:50]={forced_txt[:50]!r}")
-    print(json.dumps({"endpoint": base, "honored": True, "placement": used,
-                      "forced_n": forced_n, "F_len": len(F)}))
+    print(
+        json.dumps(
+            {
+                "endpoint": base,
+                "honored": True,
+                "placement": used,
+                "forced_n": forced_n,
+                "F_len": len(F),
+            }
+        )
+    )
     return 0
 
 

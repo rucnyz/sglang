@@ -23,6 +23,7 @@ Covers the capture half of the deterministic replay benchmark:
 
 Usage:  python dev/aginfer/verify/replay_capture/verify.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -59,9 +60,11 @@ def check(cond: bool, msg: str) -> None:
 
 
 def _sse(content: str) -> bytes:
-    return b"data: " + json.dumps(
-        {"choices": [{"delta": {"content": content}}]}
-    ).encode() + b"\n\n"
+    return (
+        b"data: "
+        + json.dumps({"choices": [{"delta": {"content": content}}]}).encode()
+        + b"\n\n"
+    )
 
 
 # ----------------------------------------------------------------- A. helpers
@@ -93,22 +96,33 @@ def test_helpers() -> None:
 
     # A1b — CRLF line endings + multiple events in one chunk.
     carry = {}
-    crlf = (b"data: " + json.dumps({"choices": [{"delta": {"content": "x"}}]}).encode()
-            + b"\r\n\r\n"
-            + b"data: " + json.dumps({"choices": [{"delta": {"content": "y"}}]}).encode()
-            + b"\r\n\r\n")
-    check(count_sse_content_tokens(crlf, carry) == 2, "A1b CRLF + multi-event-per-chunk == 2")
+    crlf = (
+        b"data: "
+        + json.dumps({"choices": [{"delta": {"content": "x"}}]}).encode()
+        + b"\r\n\r\n"
+        + b"data: "
+        + json.dumps({"choices": [{"delta": {"content": "y"}}]}).encode()
+        + b"\r\n\r\n"
+    )
+    check(
+        count_sse_content_tokens(crlf, carry) == 2,
+        "A1b CRLF + multi-event-per-chunk == 2",
+    )
 
     # A1c — reasoning_content deltas count as tokens (reasoning models split
     # the chain-of-thought into reasoning_content; they are real decode
     # tokens occupying KV).  Mix of reasoning + content + a [DONE].
     carry = {}
-    rc = (b'data: {"choices":[{"delta":{"reasoning_content":"think1"}}]}\n\n'
-          + b'data: {"choices":[{"delta":{"reasoning_content":"think2"}}]}\n\n'
-          + _sse("answer")
-          + b"data: [DONE]\n\n")
-    check(count_sse_content_tokens(rc, carry) == 3,
-          "A1c reasoning_content + content both counted (2+1=3)")
+    rc = (
+        b'data: {"choices":[{"delta":{"reasoning_content":"think1"}}]}\n\n'
+        + b'data: {"choices":[{"delta":{"reasoning_content":"think2"}}]}\n\n'
+        + _sse("answer")
+        + b"data: [DONE]\n\n"
+    )
+    check(
+        count_sse_content_tokens(rc, carry) == 3,
+        "A1c reasoning_content + content both counted (2+1=3)",
+    )
 
     # A2 — usage parse.
     body = json.dumps({"usage": {"completion_tokens": 42}}).encode()
@@ -146,8 +160,8 @@ def test_recorder() -> None:
                 "messages": [{"role": "user", "content": "hi"}],
                 "model": "m",
                 "temperature": 0.0,
-                "stream": True,            # dropped (not a sampling key)
-                "extra_body": {"x": 1},    # dropped
+                "stream": True,  # dropped (not a sampling key)
+                "extra_body": {"x": 1},  # dropped
             },
             output_len=5,
             ref_e2e_ms=123.4,
@@ -157,21 +171,30 @@ def test_recorder() -> None:
         rec.close()
 
         lines = [json.loads(x) for x in open(p) if x.strip()]
-        check(len(lines) == 1, f"B2 non-dict body produced no extra line (n={len(lines)})")
+        check(
+            len(lines) == 1, f"B2 non-dict body produced no extra line (n={len(lines)})"
+        )
         r = lines[0]
         check(r["program_id"] == "prog-7", "B1 program_id captured")
         check(r["output_len"] == 5, "B1 output_len captured")
         check(abs(r["t"] - round(a1, 6)) < 1e-6, "B1 arrival offset captured")
-        check(r["body"].get("messages") == [{"role": "user", "content": "hi"}],
-              "B1 messages captured verbatim")
-        check("temperature" in r["body"] and r["body"]["temperature"] == 0.0,
-              "B1 sampling key kept")
-        check("stream" not in r["body"] and "extra_body" not in r["body"],
-              "B1 bulk/non-sampling keys dropped")
+        check(
+            r["body"].get("messages") == [{"role": "user", "content": "hi"}],
+            "B1 messages captured verbatim",
+        )
+        check(
+            "temperature" in r["body"] and r["body"]["temperature"] == 0.0,
+            "B1 sampling key kept",
+        )
+        check(
+            "stream" not in r["body"] and "extra_body" not in r["body"],
+            "B1 bulk/non-sampling keys dropped",
+        )
         check(abs(r.get("ref_e2e_ms", 0) - 123.4) < 1e-6, "B1 ref_e2e_ms captured")
 
 
 # ------------------------------------------------------------ C. integration
+
 
 def make_stub_sglang() -> FastAPI:
     app = FastAPI()
@@ -180,10 +203,12 @@ def make_stub_sglang() -> FastAPI:
     async def chat(raw: Request) -> Any:
         body = await raw.json()
         if body.get("stream") is True:
+
             async def gen():
                 for tok in ["a", "b", "c", "d"]:
                     yield _sse(tok)
                 yield b"data: [DONE]\n\n"
+
             return StreamingResponse(gen(), media_type="text/event-stream")
         return JSONResponse(
             {
@@ -297,8 +322,10 @@ async def test_integration() -> None:
                 json={"model": "m", "messages": [{"role": "user", "content": "x"}]},
             )
             check(r.status_code == 200, "C2 capture-off request served ok")
-            check(getattr(app2.state, "trace_recorder", "x") is None,
-                  "C2 trace_recorder is None")
+            check(
+                getattr(app2.state, "trace_recorder", "x") is None,
+                "C2 trace_recorder is None",
+            )
 
 
 def main() -> int:

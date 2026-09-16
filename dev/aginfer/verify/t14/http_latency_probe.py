@@ -15,6 +15,7 @@ Usage:
     python dev/aginfer/verify/t14/http_latency_probe.py \\
         --duration 60 --concurrency 4
 """
+
 from __future__ import annotations
 
 import argparse
@@ -35,7 +36,9 @@ def _q(xs: List[float], q: float) -> float:
 
 
 async def _poll_loop(
-    base_url: str, duration_s: float, samples: List[float],
+    base_url: str,
+    duration_s: float,
+    samples: List[float],
 ) -> None:
     deadline = time.time() + duration_s
     async with httpx.AsyncClient(timeout=30.0) as cli:
@@ -64,8 +67,10 @@ async def main_async(args: argparse.Namespace) -> int:
     p99 = _q(all_samples, 0.99)
     mx = max(all_samples)
     n = len(all_samples)
-    print(f"[http_latency] N={n}  p50={p50:.2f}ms  p95={p95:.2f}ms  "
-          f"p99={p99:.2f}ms  max={mx:.2f}ms")
+    print(
+        f"[http_latency] N={n}  p50={p50:.2f}ms  p95={p95:.2f}ms  "
+        f"p99={p99:.2f}ms  max={mx:.2f}ms"
+    )
     return 0 if p99 < args.threshold_ms else 1
 
 

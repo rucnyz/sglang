@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import sys
 import threading
 import time
@@ -15,6 +14,17 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.aginfer import (
+    cache_hooks as _cache_hooks,  # aginfer hook (#251)
+)
+from sglang.srt.mem_cache.aginfer import dead_kv as _dead_kv  # aginfer SESSION_END
+from sglang.srt.mem_cache.aginfer import (
+    state_dump as _state_dump,  # aginfer hook (#251)
+)
+
+# --- aginfer: pluggable eviction scorer + write-through (framework extracted) ---
+# Framework (loaders, default LRU scorer, birth-seed constants) lives in the
+# self-contained aginfer module; this file carries only thin hooks that call it.
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -51,7 +61,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
-    peek_time_counter,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
@@ -65,19 +74,6 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.session.streaming_session import StreamingSession
 
-# --- aginfer: pluggable eviction scorer + write-through (framework extracted) ---
-# Framework (loaders, default LRU scorer, birth-seed constants) lives in the
-# self-contained aginfer module; this file carries only thin hooks that call it.
-from sglang.srt.mem_cache.aginfer.cache_policy import (  # aginfer hook (#251)
-    _default_eviction_score,
-    _default_should_write_through,
-    _load_eviction_scorer,
-    _load_write_through_policy,
-    _AGINFER_BIRTH_PHAT,  # re-exported: read by verify/t27 via _urc._AGINFER_BIRTH_PHAT
-)
-from sglang.srt.mem_cache.aginfer import cache_hooks as _cache_hooks  # aginfer hook (#251)
-from sglang.srt.mem_cache.aginfer import dead_kv as _dead_kv  # aginfer SESSION_END
-from sglang.srt.mem_cache.aginfer import state_dump as _state_dump  # aginfer hook (#251)
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
@@ -541,6 +537,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # separately (T27 / T28 / #177); this is the storage + the
         # overwrite-by-stamp contract only.
         self._aginfer_hints: dict[str, dict] = {}
+        # P1 (engine-side observability): cumulative counters for eviction
+        # decisions and migrate applications, exposed via get_aginfer_metrics.
+        # Incremented at the two eviction choke points (_evict_device_leaf /
+        # _evict_host_leaf, shared by both the stock LRU heap and the
+        # value-aware aginfer scorer -- see full_component._evict_keyfn) and
+        # inside apply_aginfer_migrations. Process-lifetime counters, reset
+        # only on process restart (no persistence, matches every other
+        # aginfer counter in this module).
+        self._aginfer_evict_counters: dict[str, int] = {
+            "hbm_demote_to_dram": 0,
+            "hbm_drop": 0,
+            "dram_drop": 0,
+        }
+        self._aginfer_migrate_counters: dict[str, int] = {}
+        self._aginfer_migrate_skipped_counters: dict[str, int] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -1580,6 +1591,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     return
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)
+                self._aginfer_evict_counters["hbm_demote_to_dram"] += 1
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
@@ -1593,8 +1605,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._remove_leaf_from_parent(node)
                 self._update_evictable_leaf_sets(parent)
                 self._iteratively_delete_tombstone_leaf(node, tracker)
+                self._aginfer_evict_counters["hbm_drop"] += 1
                 return
         self._evict_to_host(node, tracker)
+        self._aginfer_evict_counters["hbm_demote_to_dram"] += 1
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
@@ -1610,6 +1624,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node, comp, target=EvictLayer.ALL, tracker=None
             )
             tracker[comp.component_type] += hf
+        self._aginfer_evict_counters["dram_drop"] += 1
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
         self._iteratively_delete_tombstone_leaf(node, tracker)
@@ -1784,9 +1799,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return False
         if mem_quota is not None and kv_tokens > mem_quota + result.delta:
-            self._last_load_back_decline = (
-                f"exceeds_mem_quota:kv_tokens={kv_tokens}>quota={mem_quota}+delta={result.delta}"
-            )
+            self._last_load_back_decline = f"exceeds_mem_quota:kv_tokens={kv_tokens}>quota={mem_quota}+delta={result.delta}"
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
@@ -1819,12 +1832,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if device_indices is None:
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             sub = (
-                getattr(self.cache_controller, "_last_load_decline", None)
-                or "unknown"
+                getattr(self.cache_controller, "_last_load_decline", None) or "unknown"
             )
-            self._last_load_back_decline = (
-                f"controller_load_returned_none:{sub}"
-            )
+            self._last_load_back_decline = f"controller_load_returned_none:{sub}"
             return False
 
         # Commit: each component gets only its own transfers

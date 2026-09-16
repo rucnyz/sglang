@@ -661,8 +661,8 @@ class ReqLogprob:
 
 
 # aginfer program-id sanitization lives in the self-contained module (#251).
-from sglang.srt.mem_cache.aginfer.program_id import (  # aginfer hook (#251)
-    sanitize_program_id as _sanitize_program_id,
+from sglang.srt.mem_cache.aginfer.program_id import (
+    sanitize_program_id as _sanitize_program_id,  # aginfer hook (#251)
 )
 
 

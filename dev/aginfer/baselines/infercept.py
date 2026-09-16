@@ -17,7 +17,9 @@ elsewhere so the HBM slot can be reused by another session. So:
 
 On every other event, no-op (action set is empty by spec).
 """
+
 from __future__ import annotations
+
 from typing import List
 
 from .base import Action, ReuseUnit, SchedulerState, Tier
@@ -52,10 +54,9 @@ class InferCeptPolicy:
                 plan.append((u.id, Tier.DRAM))
 
         elif state.event_kind == "tool_call_end" and sess:
-            cap_left = (
-                state.tier_usage.capacity_bytes.get(Tier.HBM, 0)
-                - state.tier_usage.used_bytes.get(Tier.HBM, 0)
-            )
+            cap_left = state.tier_usage.capacity_bytes.get(
+                Tier.HBM, 0
+            ) - state.tier_usage.used_bytes.get(Tier.HBM, 0)
             for u in self._units_for_session(state, sess, Tier.DRAM):
                 if cap_left < u.n_bytes:
                     break

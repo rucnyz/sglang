@@ -16,6 +16,7 @@ three flags are (a) present, (b) byte-equal across the two paths, and
 (c) match the node predicates (``_is_device_leaf`` / ``_is_host_leaf`` /
 ``len(children) == 0``).
 """
+
 from __future__ import annotations
 
 import json
@@ -33,8 +34,12 @@ from sglang.srt.mem_cache.unified_radix_cache import (  # noqa: E402
 )
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -46,9 +51,9 @@ class StageFail(AssertionError):
 
 class _CD:
     """One ``component_data[ct]`` slot."""
-    def __init__(self, value=None, host_value=None,
-                 lock_ref=0, host_lock_ref=0):
-        self.value = value            # device (HBM) token ids, or None
+
+    def __init__(self, value=None, host_value=None, lock_ref=0, host_lock_ref=0):
+        self.value = value  # device (HBM) token ids, or None
         self.host_value = host_value  # host (DRAM) token ids, or None
         self.lock_ref = lock_ref
         self.host_lock_ref = host_lock_ref
@@ -56,11 +61,23 @@ class _CD:
 
 class _N:
     """Duck-typed UnifiedTreeNode covering the dump + leaf-predicate reads."""
+
     _next_id = 0
 
-    def __init__(self, *, value=None, host_value=None, children=None,
-                 evicted=False, backuped=True, session_ids=None,
-                 last_access_time=10, hit_count=1, lock_ref=0, host_lock_ref=0):
+    def __init__(
+        self,
+        *,
+        value=None,
+        host_value=None,
+        children=None,
+        evicted=False,
+        backuped=True,
+        session_ids=None,
+        last_access_time=10,
+        hit_count=1,
+        lock_ref=0,
+        host_lock_ref=0,
+    ):
         _N._next_id += 1
         self.id = _N._next_id
         # component_data is a LIST indexed by component type (base only here).
@@ -92,8 +109,10 @@ def _bare_cache(root) -> UnifiedRadixCache:
     # pool-usage assembly is stubbed — the test targets the per-unit leaf
     # flags, not pool accounting.
     c._aginfer_pool_usage = lambda: {
-        "HBM": {"subpools": {}}, "DRAM": {"subpools": {}},
-        "DISK": {"subpools": {}}}
+        "HBM": {"subpools": {}},
+        "DRAM": {"subpools": {}},
+        "DISK": {"subpools": {}},
+    }
     c._aginfer_patch_dram_used = lambda pool_usage, dram_used_by_sp: None
     return c
 
@@ -122,66 +141,92 @@ def stage_roundtrip_leaf_flags() -> None:
     # If the base component type isn't index 0, the single-slot list above
     # would mis-index; assert the contract the fixture relies on.
     if int(base) != 0:
-        raise StageFail(f"fixture assumes BASE_COMPONENT_TYPE indexes 0; "
-                        f"got {base!r} — extend the node component_data list")
+        raise StageFail(
+            f"fixture assumes BASE_COMPONENT_TYPE indexes 0; "
+            f"got {base!r} — extend the node component_data list"
+        )
 
     dict_payload = cache._dump_aginfer_state_dict(bpt, "kv", {})
-    bytes_payload = json.loads(
-        bytes(cache._dump_aginfer_state_bytes(bpt, "kv", {})))
+    bytes_payload = json.loads(bytes(cache._dump_aginfer_state_bytes(bpt, "kv", {})))
 
     du = _units_by_hash(dict_payload)
-    bu = _units_by_hash(bytes_payload)
+    bunits = _units_by_hash(bytes_payload)
 
     # same unit set across the two paths
-    if set(du) != set(bu):
-        raise StageFail(f"unit hashes differ across paths: dict={set(du)} "
-                        f"bytes={set(bu)}")
+    if set(du) != set(bunits):
+        raise StageFail(
+            f"unit hashes differ across paths: dict={set(du)} " f"bytes={set(bunits)}"
+        )
     if not du:
         raise StageFail("no units emitted — fixture produced an empty walk")
 
     LEAF_KEYS = ("is_device_leaf", "is_host_leaf", "is_tree_leaf")
     # ground truth from the real predicates on the live nodes
     truth = {
-        A.hash_value[-1]: (cache._is_device_leaf(A), cache._is_host_leaf(A),
-                           len(A.children) == 0),
-        B.hash_value[-1]: (cache._is_device_leaf(B), cache._is_host_leaf(B),
-                           len(B.children) == 0),
-        C.hash_value[-1]: (cache._is_device_leaf(C), cache._is_host_leaf(C),
-                           len(C.children) == 0),
-        D.hash_value[-1]: (cache._is_device_leaf(D), cache._is_host_leaf(D),
-                           len(D.children) == 0),
+        A.hash_value[-1]: (
+            cache._is_device_leaf(A),
+            cache._is_host_leaf(A),
+            len(A.children) == 0,
+        ),
+        B.hash_value[-1]: (
+            cache._is_device_leaf(B),
+            cache._is_host_leaf(B),
+            len(B.children) == 0,
+        ),
+        C.hash_value[-1]: (
+            cache._is_device_leaf(C),
+            cache._is_host_leaf(C),
+            len(C.children) == 0,
+        ),
+        D.hash_value[-1]: (
+            cache._is_device_leaf(D),
+            cache._is_host_leaf(D),
+            len(D.children) == 0,
+        ),
     }
     # sanity: the fixture really does exercise both True and False on each axis
     dev = {t[0] for t in truth.values()}
     host = {t[1] for t in truth.values()}
     tree = {t[2] for t in truth.values()}
-    if not (dev == {True, False} and host == {True, False}
-            and tree == {True, False}):
-        raise StageFail(f"fixture must vary all three flags; got dev={dev} "
-                        f"host={host} tree={tree}")
+    if not (dev == {True, False} and host == {True, False} and tree == {True, False}):
+        raise StageFail(
+            f"fixture must vary all three flags; got dev={dev} "
+            f"host={host} tree={tree}"
+        )
 
     for h, u_dict in du.items():
-        u_bytes = bu[h]
+        u_bytes = bunits[h]
         for k in LEAF_KEYS:
             if k not in u_dict or k not in u_bytes:
-                raise StageFail(f"unit {h}: leaf key {k!r} missing "
-                                f"(dict={k in u_dict}, bytes={k in u_bytes})")
+                raise StageFail(
+                    f"unit {h}: leaf key {k!r} missing "
+                    f"(dict={k in u_dict}, bytes={k in u_bytes})"
+                )
             if type(u_dict[k]) is not bool or type(u_bytes[k]) is not bool:
-                raise StageFail(f"unit {h}: leaf key {k!r} must be JSON bool; "
-                                f"dict={u_dict[k]!r} bytes={u_bytes[k]!r}")
+                raise StageFail(
+                    f"unit {h}: leaf key {k!r} must be JSON bool; "
+                    f"dict={u_dict[k]!r} bytes={u_bytes[k]!r}"
+                )
             if u_dict[k] != u_bytes[k]:
-                raise StageFail(f"unit {h}: leaf key {k!r} DIFFERS across "
-                                f"paths — dict={u_dict[k]} bytes={u_bytes[k]} "
-                                f"(hand-written bytes-path typo?)")
-        got = (u_dict["is_device_leaf"], u_dict["is_host_leaf"],
-               u_dict["is_tree_leaf"])
+                raise StageFail(
+                    f"unit {h}: leaf key {k!r} DIFFERS across "
+                    f"paths — dict={u_dict[k]} bytes={u_bytes[k]} "
+                    f"(hand-written bytes-path typo?)"
+                )
+        got = (u_dict["is_device_leaf"], u_dict["is_host_leaf"], u_dict["is_tree_leaf"])
         if got != truth[h]:
-            raise StageFail(f"unit {h}: leaf flags {got} != node predicates "
-                            f"{truth[h]} (is_device_leaf/is_host_leaf/tree_leaf)")
+            raise StageFail(
+                f"unit {h}: leaf flags {got} != node predicates "
+                f"{truth[h]} (is_device_leaf/is_host_leaf/tree_leaf)"
+            )
 
-    print(_green("  [leaf-flags] dict ↔ bytes round-trip: all three flags "
-                 "present, bool, byte-equal across paths, match predicates "
-                 "(#212) OK"))
+    print(
+        _green(
+            "  [leaf-flags] dict ↔ bytes round-trip: all three flags "
+            "present, bool, byte-equal across paths, match predicates "
+            "(#212) OK"
+        )
+    )
 
 
 def main() -> int:
@@ -195,6 +240,7 @@ def main() -> int:
         return 1
     except Exception as e:  # noqa: BLE001
         import traceback
+
         print(_red(f"  ERROR: {e}"))
         traceback.print_exc()
         return 1

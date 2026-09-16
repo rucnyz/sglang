@@ -174,7 +174,7 @@ internal timer" rule guarded against.
 3. **Action-timeline plane — temporal execution, belief-validated.** A decided
    action may be **scheduled for a future moment** when that is when it should
    land: a predictive promote at `T_start + tool_ETA − load_back_latency` (§7), a
-   pre-emptive HBM free just before a forecast spike (§8). Scheduled actions live
+   preemptive HBM free just before a forecast spike (§8). Scheduled actions live
    in a small due-action min-heap and are dispatched **when the event stream next
    advances past their due time** — the serialized single-consumer event stream is
    the clock. Under the pressure where anticipation matters the event rate is high

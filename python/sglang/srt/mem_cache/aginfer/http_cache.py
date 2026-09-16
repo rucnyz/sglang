@@ -5,6 +5,7 @@ endpoint is a thin ``.get(tokenizer_manager)`` hook. A background task refreshes
 the serialized dump at the configured cadence (per #160: 50ms @ ~5ms dump cost is
 <1% scheduler overhead), so the hot endpoint serves cached bytes.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -32,8 +33,10 @@ class AginferStateCache:
             if r.state_bytes is not None:
                 return r.state_bytes, "application/json"
             import orjson
+
             return orjson.dumps(r.state), "application/json"
         import orjson
+
         per_rank = [
             orjson.loads(r.state_bytes) if r.state_bytes is not None else r.state
             for r in responses
@@ -65,7 +68,8 @@ class AginferStateCache:
             self._started = True
             await self.refresh_one(tokenizer_manager)
             self._task = asyncio.create_task(
-                self._refresh_loop(tokenizer_manager), name="aginfer-state-refresh",
+                self._refresh_loop(tokenizer_manager),
+                name="aginfer-state-refresh",
             )
         with self._lock:
             body = self._body

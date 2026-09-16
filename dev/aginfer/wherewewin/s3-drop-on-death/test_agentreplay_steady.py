@@ -5,7 +5,6 @@ import importlib.util
 import pathlib
 import unittest
 
-
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 
 
@@ -195,9 +194,7 @@ class SteadyMetricTests(unittest.TestCase):
         self.assertEqual(
             metrics["by_traffic_class"]["live_revisit"]["requests_started"], 1
         )
-        self.assertEqual(
-            metrics["by_traffic_class"]["churn"]["requests_started"], 2
-        )
+        self.assertEqual(metrics["by_traffic_class"]["churn"]["requests_started"], 2)
 
     def test_state_metrics_integrate_dead_bytes_and_occupancy(self):
         def sample(at: float, dead: float, utilization: float) -> dict:
@@ -237,9 +234,7 @@ class SteadyMetricTests(unittest.TestCase):
         self.assertEqual(
             metrics["time_weighted_mean"]["dead_physical_bytes"]["HBM"], 15
         )
-        self.assertEqual(
-            metrics["peak"]["pool_max_subpool_utilization"]["HBM"], 0.8
-        )
+        self.assertEqual(metrics["peak"]["pool_max_subpool_utilization"]["HBM"], 0.8)
         self.assertEqual(
             metrics["lifecycle"]["time_weighted_mean"]["session_end_backlog"],
             15,

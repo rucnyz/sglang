@@ -1900,6 +1900,85 @@ class GetAginferStateReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateAginferEventsReq(BaseReq):
+    """P2b (EXP_PLAN.md): Dynamo worker -> sglang push of agent lifecycle
+    events, forwarded from ``extra_args.aginfer_events`` on a generate
+    request (agentreplay's ``driver._emit`` wire shape -- see
+    ``dynamo_native.build_native_payload``).
+
+    ``events`` is a list of ``{"kind": str, "session": str,
+    "payload": dict}`` -- the same shape as ``aginfer.events.Event``
+    dataclass-asdict'd, so the receiving side (``AginferDriver.apply_events``)
+    can reconstruct belief transitions without a second schema. Piggybacked
+    on the request path rather than a separate control channel (agentreplay
+    has no other way to signal the engine), so this is fired best-effort by
+    the Dynamo handler and must never fail/delay the generate call it rides
+    on -- see ``update_aginfer_events`` in scheduler.py.
+    """
+
+    events: List[Dict[str, Any]]
+
+
+@dataclass
+class UpdateAginferEventsReqOutput(BaseReq):
+    ok: bool
+    reason: str = "ok"
+    applied: int = 0
+    skipped: int = 0
+
+
+@dataclass
+class GetAginferMetricsReq(BaseReq):
+    """P1 (engine-side observability): cumulative eviction/migrate counters
+    for the aginfer daemon / A/B harness, distinct from ``GetAginferStateReq``
+    which snapshots the *current* tree (this is cumulative deltas since
+    process start, cheap to diff across two calls for a "during this replay"
+    window). Read-only; safe to poll frequently.
+    """
+
+    pass
+
+
+@dataclass
+class GetAginferMetricsReqOutput(BaseReq):
+    """Per-DP-rank cumulative counters, aggregated by the caller across ranks.
+
+    ``evict``: ``{"hbm_demote_to_dram", "hbm_drop", "dram_drop"}`` -- counts
+    at the two eviction choke points shared by the stock LRU heap and the
+    value-aware aginfer scorer (see ``full_component._evict_keyfn``), so this
+    is populated even when the in-engine driver is off.
+
+    ``migrate_applied``: transition tag -> count, from
+    ``apply_aginfer_migrations`` (``dram_to_hbm`` / ``hbm_to_dram`` / ``drop``
+    / ``dram_drop_partial`` / ``other``). Empty unless the daemon or in-engine
+    driver actually issues migrate actions.
+
+    ``migrate_skipped``: skip-reason prefix -> count, from the same function's
+    ``_skip`` calls (bucketed by the reason string's leading token, e.g.
+    ``remove_hbm_not_device_leaf``, ``promote_raised``).
+
+    ``hash_collisions``: cumulative count of distinct radix-node id pairs
+    that ever mapped to the same migrate hash key (T24); should stay 0.
+
+    ``pool_usage``: current (not cumulative) per-tier occupancy, reusing the
+    same accounting as the ``/aginfer/state`` dump's ``per_tier_usage`` so a
+    caller does not need both endpoints just to plot occupancy alongside the
+    counters.
+
+    ``value_aware``: whether this rank's cache has the aginfer scorer
+    attached (``SGLANG_AGINFER_IN_ENGINE``), so an A/B harness can tell the
+    baseline (LRU) and treatment (V(u)) arms apart in the same metrics shape.
+    """
+
+    evict: Dict[str, int] = field(default_factory=dict)
+    migrate_applied: Dict[str, int] = field(default_factory=dict)
+    migrate_skipped: Dict[str, int] = field(default_factory=dict)
+    hash_collisions: int = 0
+    pool_usage: Dict[str, Any] = field(default_factory=dict)
+    value_aware: bool = False
+
+
+@dataclass
 class SetInternalStateReq(BaseReq):
     server_args: Dict[str, Any]
 

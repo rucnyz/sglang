@@ -24,6 +24,7 @@ PLAN's F3-revisit conditions for the daemon side:
   * time-in-queue p99 > 100 ms → revisit
 both keyed on this aggregator's summary line.
 """
+
 from __future__ import annotations
 
 import json
@@ -63,8 +64,11 @@ class _DaemonMetricsRing:
                 "n": 0,
                 "n_recorded_total": 0,
                 "capacity": self._capacity,
-                "p50": 0.0, "p95": 0.0, "p99": 0.0,
-                "max": 0.0, "mean": 0.0,
+                "p50": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "max": 0.0,
+                "mean": 0.0,
             }
         sorted_samples = sorted(self._samples)
 
@@ -125,9 +129,7 @@ class DaemonObservability:
             # emit on EVERY event (since 1 >= 0).  Negative is meaningless.
             # Reject at construction so the operator sees the mistake
             # immediately instead of being flooded by per-event summaries.
-            raise ValueError(
-                f"summary_every_n must be >= 1; got {summary_every_n}"
-            )
+            raise ValueError(f"summary_every_n must be >= 1; got {summary_every_n}")
         self.state_fetch_lat_ms = _DaemonMetricsRing(capacity)
         self.queue_depth = _DaemonMetricsRing(capacity)
         self.time_in_queue_ms = _DaemonMetricsRing(capacity)
@@ -163,9 +165,7 @@ class DaemonObservability:
             self.emit_summary()
             self._events_since_summary = 0
 
-    def record_outbound(
-        self, queue_depth: int, oldest_age_ms: float
-    ) -> None:
+    def record_outbound(self, queue_depth: int, oldest_age_ms: float) -> None:
         """T36 audit (#163): sample outbound queue health.
 
         Called once per OutboundQueue worker iteration (cheap: O(1)
@@ -192,22 +192,20 @@ class DaemonObservability:
         short ``snake_case`` slug — the value is logged verbatim in
         the summary line's ``failure_class_counts`` JSON, so spaces
         and equals-signs in reasons would break the metric format."""
-        self.failure_class_counts[reason] = (
-            self.failure_class_counts.get(reason, 0) + 1
-        )
+        self.failure_class_counts[reason] = self.failure_class_counts.get(reason, 0) + 1
 
     # ---- output ------------------------------------------------------
 
     def summary_dict(self) -> Dict[str, object]:
         return {
             "state_fetch_lat_ms": self.state_fetch_lat_ms.summary(),
-            "queue_depth":        self.queue_depth.summary(),
-            "time_in_queue_ms":   self.time_in_queue_ms.summary(),
+            "queue_depth": self.queue_depth.summary(),
+            "time_in_queue_ms": self.time_in_queue_ms.summary(),
             "failure_class_counts": dict(self.failure_class_counts),
             "events_dispatched_total": self.events_dispatched_total,
             # T36 audit (#163) — outbound queue health.
-            "outbound_queue_depth":     self.outbound_queue_depth.summary(),
-            "outbound_oldest_age_ms":   self.outbound_oldest_age_ms.summary(),
+            "outbound_queue_depth": self.outbound_queue_depth.summary(),
+            "outbound_oldest_age_ms": self.outbound_oldest_age_ms.summary(),
         }
 
     def emit_summary(self) -> None:
@@ -218,6 +216,7 @@ class DaemonObservability:
         grep pipeline keys off these flat names.
         """
         from ._metrics import m as _m
+
         sf = self.state_fetch_lat_ms.summary()
         qd = self.queue_depth.summary()
         tiq = self.time_in_queue_ms.summary()

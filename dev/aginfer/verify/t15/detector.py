@@ -26,6 +26,7 @@ the actual hashes.
 This module does NOT depend on the daemon — it's a standalone
 analysis tool a CI job or a debug session can call.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -35,9 +36,10 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 @dataclass(frozen=True)
 class DivergenceReport:
     """One detected divergence window."""
-    window_idx: int                     # which (t, t+1) pair (0-based)
-    time_counter_prev: int              # state.time_counter at S(t)
-    time_counter_curr: int              # state.time_counter at S(t+1)
+
+    window_idx: int  # which (t, t+1) pair (0-based)
+    time_counter_prev: int  # state.time_counter at S(t)
+    time_counter_curr: int  # state.time_counter at S(t+1)
     per_rank_evicted: Dict[int, FrozenSet[str]]
     # ``per_rank_evicted[r]`` = set of hashes rank r dropped this window.
     # Divergence ⇔ at least two ranks have NON-IDENTICAL eviction sets.
@@ -64,9 +66,7 @@ def _ranks_of(state_json: Dict[str, Any]) -> Dict[int, List[Dict[str, Any]]]:
     if "per_rank" in state_json:
         per = state_json["per_rank"]
         if not isinstance(per, list):
-            raise ValueError(
-                f"per_rank must be a list; got {type(per).__name__}"
-            )
+            raise ValueError(f"per_rank must be a list; got {type(per).__name__}")
         return {i: r["units"] for i, r in enumerate(per)}
     return {0: state_json.get("units", [])}
 
@@ -80,10 +80,7 @@ def _time_counter(state_json: Dict[str, Any]) -> int:
     """Time-counter of a state dump; per_rank dumps take MAX across
     ranks (matches ``daemon/kv_scheduler.py:_flatten_per_rank``)."""
     if "per_rank" in state_json:
-        return max(
-            int(r.get("time_counter", 0))
-            for r in state_json["per_rank"]
-        )
+        return max(int(r.get("time_counter", 0)) for r in state_json["per_rank"])
     return int(state_json.get("time_counter", 0))
 
 
@@ -143,9 +140,7 @@ def summarise(reports: Sequence[DivergenceReport]) -> str:
     """Human-readable summary for a debug session / CI log line."""
     if not reports:
         return "T15: no cross-rank eviction divergence observed"
-    lines = [
-        f"T15: {len(reports)} divergence window(s) detected:"
-    ]
+    lines = [f"T15: {len(reports)} divergence window(s) detected:"]
     for r in reports:
         lines.append(
             f"  window {r.window_idx} (t={r.time_counter_prev}→"
@@ -156,8 +151,7 @@ def summarise(reports: Sequence[DivergenceReport]) -> str:
             if len(evicted) > 5:
                 preview += f",…(+{len(evicted) - 5})"
             lines.append(
-                f"    rank {rank} evicted {len(evicted)} hashes: "
-                f"{{{preview}}}"
+                f"    rank {rank} evicted {len(evicted)} hashes: " f"{{{preview}}}"
             )
     return "\n".join(lines)
 

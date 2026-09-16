@@ -20,6 +20,7 @@ re-prefill ~= len(O1) + len(delta) (the artifact TF removes).
 
 Run: sglang up with --enable-cache-report (override needs no flag). See run_partB.sh.
 """
+
 import argparse
 import json
 import sys
@@ -27,9 +28,9 @@ import sys
 import requests
 
 # arbitrary but valid, non-special token ids (content is irrelevant to the cache test)
-P_IDS = list(range(1000, 1000 + 200))      # "context" prefix
-DELTA_IDS = list(range(5000, 5000 + 8))     # "tool result / next-turn delta"
-L = 64                                       # turn-1 output length
+P_IDS = list(range(1000, 1000 + 200))  # "context" prefix
+DELTA_IDS = list(range(5000, 5000 + 8))  # "tool result / next-turn delta"
+L = 64  # turn-1 output length
 
 
 def flush(base):
@@ -41,8 +42,12 @@ def gen_ids(base, input_ids, max_new, forced=None):
     sp = {"temperature": 0.0, "max_new_tokens": max_new, "ignore_eos": True}
     if forced is not None:
         sp["custom_params"] = {"forced_output_ids": list(forced)}
-    body = {"input_ids": input_ids, "sampling_params": sp,
-            "return_logprob": True, "stream": False}
+    body = {
+        "input_ids": input_ids,
+        "sampling_params": sp,
+        "return_logprob": True,
+        "stream": False,
+    }
     r = requests.post(base.rstrip("/") + "/generate", json=body, timeout=600)
     r.raise_for_status()
     mi = r.json()["meta_info"]
@@ -59,8 +64,11 @@ def turn2_reprefill(base, o1_for_input):
     inp = P_IDS + list(o1_for_input) + DELTA_IDS
     _, cached, plen = gen_ids(base, inp, 1)
     if cached is None:
-        print("ERROR: server did not return cached_tokens — launch with "
-              "--enable-cache-report", file=sys.stderr)
+        print(
+            "ERROR: server did not return cached_tokens — launch with "
+            "--enable-cache-report",
+            file=sys.stderr,
+        )
         sys.exit(2)
     return plen - cached, cached, plen
 
@@ -88,24 +96,30 @@ def main():
     # ---- TF: turn1 FORCED to O1_real, then turn2 with the same real O1 ----
     flush(base)
     o1_tf, _, _ = gen_ids(base, P_IDS, len(o1_real), forced=o1_real)
-    tf_forced_ok = (o1_tf == o1_real)
+    tf_forced_ok = o1_tf == o1_real
     rp_tf, c_tf, _ = turn2_reprefill(base, o1_real)
 
     # ---- LENGTH-ONLY: turn1 FORCED to O1_diff, then turn2 with the REAL O1 ----
     flush(base)
     o1_lo, _, _ = gen_ids(base, P_IDS, len(o1_real), forced=o1_diff)
-    lo_forced_ok = (o1_lo == o1_diff)
+    lo_forced_ok = o1_lo == o1_diff
     rp_lo, c_lo, _ = turn2_reprefill(base, o1_real)  # turn2 carries the REAL o1
 
     delta = len(DELTA_IDS)
     print("\n=== Part B result ===")
-    print(f"prompt_len (turn2) = {pl}  (P={len(P_IDS)} + O1={len(o1_real)} + delta={delta})")
-    print(f"forcing worked: TF turn1==O1_real {tf_forced_ok}; "
-          f"LEN-ONLY turn1==O1_diff {lo_forced_ok}")
+    print(
+        f"prompt_len (turn2) = {pl}  (P={len(P_IDS)} + O1={len(o1_real)} + delta={delta})"
+    )
+    print(
+        f"forcing worked: TF turn1==O1_real {tf_forced_ok}; "
+        f"LEN-ONLY turn1==O1_diff {lo_forced_ok}"
+    )
     print(f"turn-2 re-prefilled tokens:")
     print(f"  REAL        = {rp_real:4d}  (cached {c_real})   ~ expect delta≈{delta}")
     print(f"  TF          = {rp_tf:4d}  (cached {c_tf})   ~ expect == REAL")
-    print(f"  LENGTH-ONLY = {rp_lo:4d}  (cached {c_lo})   ~ expect ≈ len(O1)+delta = {len(o1_real)+delta}")
+    print(
+        f"  LENGTH-ONLY = {rp_lo:4d}  (cached {c_lo})   ~ expect ≈ len(O1)+delta = {len(o1_real)+delta}"
+    )
     # NOTE: `*_forced_ok` compares the model's argmax readback (output_token_
     # logprobs) to the forced sequence — but that readback reports the SAMPLED
     # token, not the committed/overridden one (the override runs after the
@@ -116,12 +130,24 @@ def main():
     lo_shows_artifact = (rp_lo - rp_real) >= 0.5 * len(o1_real)
     verdict = tf_matches_real and lo_shows_artifact
     print(f"\nTF reproduces real continuation (rp_tf==rp_real): {tf_matches_real}")
-    print(f"length-only shows the re-prefill artifact (rp_lo >> rp_real): {lo_shows_artifact}")
+    print(
+        f"length-only shows the re-prefill artifact (rp_lo >> rp_real): {lo_shows_artifact}"
+    )
     print(f"PART B: {'PASS' if verdict else 'REVIEW'}")
-    print(json.dumps({"rp_real": rp_real, "rp_tf": rp_tf, "rp_lenonly": rp_lo,
-                      "o1_len": len(o1_real), "delta": delta,
-                      "tf_matches_real": tf_matches_real,
-                      "lenonly_artifact": lo_shows_artifact, "pass": verdict}))
+    print(
+        json.dumps(
+            {
+                "rp_real": rp_real,
+                "rp_tf": rp_tf,
+                "rp_lenonly": rp_lo,
+                "o1_len": len(o1_real),
+                "delta": delta,
+                "tf_matches_real": tf_matches_real,
+                "lenonly_artifact": lo_shows_artifact,
+                "pass": verdict,
+            }
+        )
+    )
     return 0 if verdict else 1
 
 

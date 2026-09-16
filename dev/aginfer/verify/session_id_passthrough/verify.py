@@ -20,6 +20,7 @@ Usage:
     # which a 256-token gen never crosses).
     python dev/aginfer/verify/t3/verify.py
 """
+
 from __future__ import annotations
 
 import os
@@ -67,7 +68,11 @@ def chat(
     # the snapshot (the daemon tolerates this by polling).  For a clean string
     # program_id we settle precisely on its visibility; for None / bogus shapes
     # (whose sanitized form we don't reproduce here) a short fixed wait suffices.
-    if isinstance(program_id, str) and program_id.strip() and len(program_id.strip()) <= 64:
+    if (
+        isinstance(program_id, str)
+        and program_id.strip()
+        and len(program_id.strip()) <= 64
+    ):
         _settle_pid(program_id.strip())
     elif program_id is not None:
         time.sleep(1.0)
@@ -89,8 +94,11 @@ def _settle_pid(pid_str: str, timeout: float = 8.0) -> None:
         except Exception:
             return
         ranks = st.get("per_rank", [st])
-        if any(pid_str in (u.get("session_ids") or [])
-               for rk in ranks for u in rk.get("units", [])):
+        if any(
+            pid_str in (u.get("session_ids") or [])
+            for rk in ranks
+            for u in rk.get("units", [])
+        ):
             return
         time.sleep(0.3)
 
@@ -111,7 +119,9 @@ def main() -> None:
     info = requests.get(f"{BASE}/get_server_info", timeout=10)
     info.raise_for_status()
     info_json = info.json()
-    server_args = info_json.get("server_args", {}) if isinstance(info_json, dict) else {}
+    server_args = (
+        info_json.get("server_args", {}) if isinstance(info_json, dict) else {}
+    )
 
     # chunked_prefill_size: step [9] needs <=64 to actually trigger chunked.
     chunked_size = info_json.get("chunked_prefill_size")
@@ -145,8 +155,14 @@ def main() -> None:
         )
     # DESIGN §5 (post-T17) schema preflight.  Legacy `tier_usage` /
     # `page_size` / `bytes_per_token` top-level keys have been removed.
-    for k in ("units", "pool_usage", "per_program_usage", "link_stats",
-              "tier_holding_cost", "throughput_ema"):
+    for k in (
+        "units",
+        "pool_usage",
+        "per_program_usage",
+        "link_stats",
+        "tier_holding_cost",
+        "throughput_ema",
+    ):
         assert k in state_probe, (
             f"/aginfer/state missing key {k!r}; schema mismatch suggests "
             f"sglang was not launched with SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 "
@@ -166,34 +182,54 @@ def main() -> None:
         f"invariants.  Relaunch sglang fresh or expose /flush_cache."
     )
 
-    SHARED_SYS = (
-        "You are a helpful assistant. Here is a long system prompt: "
-        + ("Lorem ipsum dolor sit amet consectetur adipiscing elit. " * 30)
+    SHARED_SYS = "You are a helpful assistant. Here is a long system prompt: " + (
+        "Lorem ipsum dolor sit amet consectetur adipiscing elit. " * 30
     )
 
     # ---- [1] Two programs share a system prompt; tail diverges ----
     print("\n[1] two programs share a system prompt")
-    chat("Tell me a 1-line fact about prime number 7.",
-         program_id="prog-A", system_text=SHARED_SYS)
-    chat("Tell me a 1-line fact about prime number 11.",
-         program_id="prog-B", system_text=SHARED_SYS)
+    chat(
+        "Tell me a 1-line fact about prime number 7.",
+        program_id="prog-A",
+        system_text=SHARED_SYS,
+    )
+    chat(
+        "Tell me a 1-line fact about prime number 11.",
+        program_id="prog-B",
+        system_text=SHARED_SYS,
+    )
     state = fetch_state()
     n_units = len(state["units"])
     n_with_A = len(units_with(state, "prog-A"))
     n_with_B = len(units_with(state, "prog-B"))
-    n_shared = len([u for u in state["units"]
-                    if "prog-A" in u["session_ids"] and "prog-B" in u["session_ids"]])
-    print(f"    total units: {n_units}, with prog-A: {n_with_A}, with prog-B: {n_with_B}, shared: {n_shared}")
+    n_shared = len(
+        [
+            u
+            for u in state["units"]
+            if "prog-A" in u["session_ids"] and "prog-B" in u["session_ids"]
+        ]
+    )
+    print(
+        f"    total units: {n_units}, with prog-A: {n_with_A}, with prog-B: {n_with_B}, shared: {n_shared}"
+    )
     # Both tags must appear.
     assert n_with_A > 0, "prog-A did not tag any node"
     assert n_with_B > 0, "prog-B did not tag any node"
     # At least one shared-prefix node carries BOTH.
-    assert n_shared > 0, "no node carries both prog-A AND prog-B; shared system prompt not tagged"
+    assert (
+        n_shared > 0
+    ), "no node carries both prog-A AND prog-B; shared system prompt not tagged"
     # A's tail-only nodes (in A but not in B) exist (the diverging suffix).
-    a_only = [u for u in state["units"]
-              if "prog-A" in u["session_ids"] and "prog-B" not in u["session_ids"]]
-    b_only = [u for u in state["units"]
-              if "prog-B" in u["session_ids"] and "prog-A" not in u["session_ids"]]
+    a_only = [
+        u
+        for u in state["units"]
+        if "prog-A" in u["session_ids"] and "prog-B" not in u["session_ids"]
+    ]
+    b_only = [
+        u
+        for u in state["units"]
+        if "prog-B" in u["session_ids"] and "prog-A" not in u["session_ids"]
+    ]
     print(f"    A-only nodes: {len(a_only)}, B-only nodes: {len(b_only)}")
     assert a_only, "no A-only tail nodes — diverging suffix lost the tag?"
     assert b_only, "no B-only tail nodes"
@@ -218,9 +254,9 @@ def main() -> None:
         assert len(sids) == len(set(sids)), f"session_ids has duplicates: {sids}"
         # daemon-weighting sanity: per-node count is bounded -- for this
         # test, no node has touched more than the two expected programs.
-        assert 0 <= len(sids) <= 4, (
-            f"unit {u['hash']} has implausible session_ids count: {len(sids)}"
-        )
+        assert (
+            0 <= len(sids) <= 4
+        ), f"unit {u['hash']} has implausible session_ids count: {len(sids)}"
         extra = set(sids) - expected_tags
         assert not extra, f"unit {u['hash']} has unexpected tags: {extra}"
 
@@ -252,9 +288,9 @@ def main() -> None:
     )
     _settle_pid("prog-EB")  # snapshot lags the client call; settle then read
     state = fetch_state()
-    assert units_with(state, "prog-EB"), (
-        "OpenAI-client extra_body.program_id did not reach the radix tree"
-    )
+    assert units_with(
+        state, "prog-EB"
+    ), "OpenAI-client extra_body.program_id did not reach the radix tree"
     # Negative case: nested extra_body via raw POST must NOT tag the tree.
     # Pydantic doesn't have an `extra_body` field on ChatCompletionRequest;
     # the JSON key is silently ignored, so this proves the server doesn't
@@ -283,8 +319,11 @@ def main() -> None:
     print("\n[4] 32 distinct programs share a long prefix")
     PREFIX_32 = "Common system prompt v2: " + ("foo bar baz quux. " * 50)
     for i in range(32):
-        chat(f"Distinct user query {i}: count to {i}.",
-             program_id=f"p32-{i}", system_text=PREFIX_32)
+        chat(
+            f"Distinct user query {i}: count to {i}.",
+            program_id=f"p32-{i}",
+            system_text=PREFIX_32,
+        )
     state = fetch_state()
     p32_tags = {f"p32-{i}" for i in range(32)}
     # Find the node with the most p32 ids — should have all 32 (the shared
@@ -333,22 +372,24 @@ def main() -> None:
     # ---- [6] WORST CASE: bogus program_id shapes (must NOT crash) ----
     print("\n[6] WORST CASE: bogus program_id shapes (must not 5xx)")
     bogus_cases = [
-        {"oh": "no"},              # dict
-        42,                          # int
-        "x" * 10_000,               # very long string -> truncated to 64
-        ["a", "b"],                 # list
-        True,                        # bool
+        {"oh": "no"},  # dict
+        42,  # int
+        "x" * 10_000,  # very long string -> truncated to 64
+        ["a", "b"],  # list
+        True,  # bool
         # Audit-2 adds (cover README WORST CASE "whitespace-only / empty"
         # + the sanitizer comment "leading None doesn't kill later"):
-        "",                          # empty
-        "   ",                       # whitespace-only
-        [None, "later-valid"],       # list with leading None
-        ("tuple-elem",),             # tuple (schedule_batch.py:637 accepts)
+        "",  # empty
+        "   ",  # whitespace-only
+        [None, "later-valid"],  # list with leading None
+        ("tuple-elem",),  # tuple (schedule_batch.py:637 accepts)
     ]
     for bogus in bogus_cases:
-        chat(f"Bogus pid case {type(bogus).__name__}: hello.",
-             program_id=bogus,
-             system_text=None)
+        chat(
+            f"Bogus pid case {type(bogus).__name__}: hello.",
+            program_id=bogus,
+            system_text=None,
+        )
     state = fetch_state()
     # Sanitizer truncation: assert no session_id exceeds 64 chars.
     for u in state["units"]:
@@ -358,15 +399,19 @@ def main() -> None:
     # `[:64]` to `[-64:]` or `[:32]` would still satisfy "<= 64" but
     # break the daemon's program-id namespace contract.
     from sglang.srt.managers.schedule_batch import _sanitize_program_id
+
     LONG = "abcdefghij" * 10  # 100 chars; ascii so byte-len == char-len
     trunc = _sanitize_program_id(LONG)
     assert isinstance(trunc, str), f"long-string sanitizer returned {trunc!r}"
     assert len(trunc) == 64, f"truncation length wrong: {len(trunc)} != 64"
     assert trunc == LONG[:64], (
         f"truncation slice direction wrong: got {trunc!r}, "
-        f"expected {LONG[:64]!r} (first-64 prefix)")
-    print(f"    {len(bogus_cases)} bogus shapes handled cleanly; "
-          f"all session_ids <= 64 chars; truncation slice [:64] verified")
+        f"expected {LONG[:64]!r} (first-64 prefix)"
+    )
+    print(
+        f"    {len(bogus_cases)} bogus shapes handled cleanly; "
+        f"all session_ids <= 64 chars; truncation slice [:64] verified"
+    )
 
     # ---- [7] Sanitizer microbench: pure _sanitize_program_id cost ----
     #
@@ -381,6 +426,7 @@ def main() -> None:
     # memory:feedback-latency-multi-run.
     print("\n[7] sanitizer microbench: _sanitize_program_id direct cost")
     import statistics
+
     from sglang.srt.managers.schedule_batch import _sanitize_program_id
 
     N_RUNS = 5
@@ -433,8 +479,7 @@ def main() -> None:
     chat("retro tagged after", program_id="prog-RETRO", system_text=RETRO_A)
     state_after = fetch_state()
     retro_a_units = units_with(state_after, "prog-RETRO")
-    assert retro_a_units, ("8a: tagged-after-untagged did NOT tag the "
-                           "shared ancestor")
+    assert retro_a_units, "8a: tagged-after-untagged did NOT tag the " "shared ancestor"
     print(f"    8a (untagged → tagged): {len(retro_a_units)} nodes tagged ✓")
 
     # 8b. tagged first, then untagged — the survival test
@@ -447,9 +492,12 @@ def main() -> None:
     assert post_count >= pre_count, (
         f"8b: untagged-after-tagged STRIPPED the tag — "
         f"pre={pre_count} post={post_count} (set-add must be additive, "
-        f"not overwrite)")
-    print(f"    8b (tagged → untagged): {pre_count} pre / {post_count} "
-          f"post; tag survived ✓")
+        f"not overwrite)"
+    )
+    print(
+        f"    8b (tagged → untagged): {pre_count} pre / {post_count} "
+        f"post; tag survived ✓"
+    )
 
     # ---- [9] Chunked prefill: tagged request whose prompt > 1 chunk ----
     # The request's prompt must EXCEED the server's --chunked-prefill-size
@@ -466,9 +514,8 @@ def main() -> None:
     # segments ≈ 1 K tokens, well above the 32 / 64 / 128 the launcher
     # might use.  At default 8 K we still won't chunk -- README says
     # "launch with --chunked-prefill-size 32"; we proceed regardless.
-    chunked_prompt = (
-        "Recite the following facts verbatim: "
-        + " ".join(f"fact {i}: prime {i} is interesting." for i in range(200))
+    chunked_prompt = "Recite the following facts verbatim: " + " ".join(
+        f"fact {i}: prime {i} is interesting." for i in range(200)
     )
     requests.post(
         f"{BASE}/v1/chat/completions",
@@ -489,9 +536,9 @@ def main() -> None:
     # the tag survived from chunk 0 through to the final insert.
     total_tokens = sum(u["n_tokens"] for u in chunk_units)
     print(f"    total tagged tokens: {total_tokens}")
-    assert total_tokens >= 200, (
-        f"only {total_tokens} tokens tagged; tag lost mid-chunked-prefill"
-    )
+    assert (
+        total_tokens >= 200
+    ), f"only {total_tokens} tokens tagged; tag lost mid-chunked-prefill"
 
     # ---- [10] Single-request batched-broadcast bug guard ----
     # A daemon misusing the wire format might send a list as program_id
@@ -502,9 +549,9 @@ def main() -> None:
     print("\n[10] single-request list program_id sanitizes to first element")
     chat("single-req list pid", program_id=["prog-LIST-FIRST", "prog-LIST-SECOND"])
     state = fetch_state()
-    assert units_with(state, "prog-LIST-FIRST"), (
-        "list[0] did not become the sanitized program_id"
-    )
+    assert units_with(
+        state, "prog-LIST-FIRST"
+    ), "list[0] did not become the sanitized program_id"
     assert not units_with(state, "prog-LIST-SECOND"), (
         "list[1] leaked into the tree -- batched-broadcast misfire on a "
         "single request"
@@ -522,8 +569,12 @@ def main() -> None:
     # endpoint (which DOES propagate session_params) + the
     # /open_session bootstrap so the second turn actually hits
     # Session.create_req.
-    print("\n[11] Session multi-turn via /generate: program_id forwarded via Session.create_req")
-    open_r = requests.post(f"{BASE}/open_session", json={"capacity_of_str_len": 1024}, timeout=30)
+    print(
+        "\n[11] Session multi-turn via /generate: program_id forwarded via Session.create_req"
+    )
+    open_r = requests.post(
+        f"{BASE}/open_session", json={"capacity_of_str_len": 1024}, timeout=30
+    )
     open_r.raise_for_status()
     # /open_session may return a JSON string or (future-proof) a dict.
     # Same forward-compat parsing as regression_probe.py.
@@ -536,9 +587,9 @@ def main() -> None:
             session_id = _parsed.get("session_id") or _parsed.get("id")
     except Exception:
         session_id = open_r.text.strip().strip('"')
-    assert session_id and isinstance(session_id, str), (
-        f"open_session response unparsable: {open_r.text!r}"
-    )
+    assert session_id and isinstance(
+        session_id, str
+    ), f"open_session response unparsable: {open_r.text!r}"
     # Seed (no program_id) so the session is populated.
     requests.post(
         f"{BASE}/generate",
@@ -598,7 +649,9 @@ def main() -> None:
         b'{"text":"recursion-bomb probe"'
         b',"sampling_params":{"max_new_tokens":4,"temperature":0.0}'
         b',"program_id":'
-        + b"[" * depth + b'"should-be-buried-too-deep"' + b"]" * depth
+        + b"[" * depth
+        + b'"should-be-buried-too-deep"'
+        + b"]" * depth
         + b"}"
     )
     bomb_resp = requests.post(
@@ -645,22 +698,30 @@ def main() -> None:
         b',"sampling_params":{"max_new_tokens":4,"temperature":0.0}'
         b',"program_id":'
         + b"[" * depth_boundary
-        + b'"boundary-buried"' + b"]" * depth_boundary
+        + b'"boundary-buried"'
+        + b"]" * depth_boundary
         + b"}"
     )
     bresp = requests.post(
-        f"{BASE}/generate", data=boundary_payload,
-        headers={"Content-Type": "application/json"}, timeout=60)
+        f"{BASE}/generate",
+        data=boundary_payload,
+        headers={"Content-Type": "application/json"},
+        timeout=60,
+    )
     assert bresp.status_code == 200, (
         f"depth-{depth_boundary} request returned "
-        f"{bresp.status_code}; sanitizer not reached")
+        f"{bresp.status_code}; sanitizer not reached"
+    )
     state = fetch_state()
     assert not units_with(state, "boundary-buried"), (
         f"depth-{depth_boundary} (= cap + 1) tag survived — recursion "
         f"cap regressed above {depth_boundary - 1}; this is the precise "
-        f"boundary the test pins")
-    print(f"    depth-{depth_boundary} -> tag dropped (cap == "
-          f"{depth_boundary - 1} confirmed) ✓")
+        f"boundary the test pins"
+    )
+    print(
+        f"    depth-{depth_boundary} -> tag dropped (cap == "
+        f"{depth_boundary - 1} confirmed) ✓"
+    )
 
     # ---- [13] Pydantic regression: model_config.extra must NOT be 'allow' ----
     # Round-3 NIT: the negative ``extra_body`` test in step [3] depends
@@ -672,8 +733,10 @@ def main() -> None:
     from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
     model_config = getattr(ChatCompletionRequest, "model_config", {}) or {}
-    extra = model_config.get("extra") if isinstance(model_config, dict) else (
-        getattr(model_config, "extra", None)
+    extra = (
+        model_config.get("extra")
+        if isinstance(model_config, dict)
+        else (getattr(model_config, "extra", None))
     )
     assert extra != "allow", (
         f"ChatCompletionRequest now has model_config.extra={extra!r}; "

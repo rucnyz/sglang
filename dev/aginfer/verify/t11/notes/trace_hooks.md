@@ -15,10 +15,10 @@ This document identifies every per-cache-node access event in SGLang's unified r
 ## File: `unified_radix_cache.py` (Main Cache Driver)
 
 ### 1. **Cache Hit (Prefix Match)** — Lines 849–854
-**Function**: `_match_post_processor()`  
-**Trigger**: Every successful prefix match (read access)  
-**Frequency**: Per-request (batch-level)  
-**Unit ID**: `best_match_node.id` (the deepest matched node)  
+**Function**: `_match_post_processor()`
+**Trigger**: Every successful prefix match (read access)
+**Frequency**: Per-request (batch-level)
+**Unit ID**: `best_match_node.id` (the deepest matched node)
 **Captured state**:
 - `node.last_access_time` ← `get_and_increase_time_counter()` at line 849
 - Time counter scanned at **line 849**
@@ -52,10 +52,10 @@ _log_access_event(trace_event)
 ---
 
 ### 2. **Cache Insertion (Node Insert or Overlap)** — Lines 1019, 1060
-**Function**: `_insert_helper()`  
-**Trigger**: On every prefix overlap (existing node visited during insert)  
-**Frequency**: Per-node-on-path (multiple per insert)  
-**Unit ID**: `node.id` (the node being overlapped)  
+**Function**: `_insert_helper()`
+**Trigger**: On every prefix overlap (existing node visited during insert)
+**Frequency**: Per-node-on-path (multiple per insert)
+**Unit ID**: `node.id` (the node being overlapped)
 **State at hit**: `node.hit_count` incremented at **line 1019** (before LRU/backup)
 
 ```python
@@ -101,10 +101,10 @@ _log_access_event(trace_event)
 ---
 
 ### 3. **Node Creation (Split)** — Lines 912–913
-**Function**: `_split_node()`  
-**Trigger**: When an existing node key partially matches new insert key (radix tree restructure)  
-**Frequency**: Rare (O(log N) per insert worst case, typically <1%)  
-**Unit ID**: `new_node.id` and `child.id`  
+**Function**: `_split_node()`
+**Trigger**: When an existing node key partially matches new insert key (radix tree restructure)
+**Frequency**: Rare (O(log N) per insert worst case, typically <1%)
+**Unit ID**: `new_node.id` and `child.id`
 **State**: Both get fresh `last_access_time` stamp at **line 913** (child only)
 
 ```python
@@ -140,10 +140,10 @@ _log_access_event(trace_event_child)
 ---
 
 ### 4. **Hit Count Increment (for Write-Through Backup Trigger)** — Lines 1577–1587
-**Function**: `_inc_hit_count()`  
-**Trigger**: On insert overlap for non-evicted, non-chunked nodes (when HiCache enabled)  
-**Frequency**: Per-overlap during inserts  
-**Unit ID**: `node.id`  
+**Function**: `_inc_hit_count()`
+**Trigger**: On insert overlap for non-evicted, non-chunked nodes (when HiCache enabled)
+**Frequency**: Per-overlap during inserts
+**Unit ID**: `node.id`
 **State transition**: `node.hit_count += 1` at **line 1585**; write_backup fired at **line 1587** if threshold crossed
 
 ```python
@@ -180,10 +180,10 @@ if node.hit_count == self.write_through_threshold:
 ---
 
 ### 5. **Device-to-Host Backup (DRAM Write)** — Lines 1383–1444
-**Function**: `write_backup()`  
-**Trigger**: Node being demoted from device to host (write-through or write-back eviction)  
-**Frequency**: Per-evict-or-hit-threshold  
-**Unit ID**: `node.id`  
+**Function**: `write_backup()`
+**Trigger**: Node being demoted from device to host (write-through or write-back eviction)
+**Frequency**: Per-evict-or-hit-threshold
+**Unit ID**: `node.id`
 **State changed**: `node.component_data[BASE_COMPONENT_TYPE].host_value` set at **line 1427** (in commit)
 
 ```python
@@ -211,10 +211,10 @@ if host_indices is not None:
 ---
 
 ### 6. **Host-to-Device Reload (DRAM Read)** — Lines 1500–1529
-**Function**: `load_back()`  
-**Trigger**: Evicted node being reloaded from host to device  
-**Frequency**: Per-prefetch-miss that triggers loadback  
-**Unit ID**: `best_match_node.id`  
+**Function**: `load_back()`
+**Trigger**: Evicted node being reloaded from host to device
+**Frequency**: Per-prefetch-miss that triggers loadback
+**Unit ID**: `best_match_node.id`
 **State changed**: `node.component_data[ct].value` set in `commit_hicache_transfer` (lines 1512–1515)
 
 ```python
@@ -245,10 +245,10 @@ if device_indices is not None:
 ---
 
 ### 7. **Host-to-Storage Backup (L3/Persistent Tier Write)** — Lines 1589–1633
-**Function**: `write_backup_storage()`  
-**Trigger**: Backuped node written to storage (async, post-backup to DRAM)  
-**Frequency**: Per-node when storage enabled and hit_count threshold reached or async triggered  
-**Unit ID**: `node.id`  
+**Function**: `write_backup_storage()`
+**Trigger**: Backuped node written to storage (async, post-backup to DRAM)
+**Frequency**: Per-node when storage enabled and hit_count threshold reached or async triggered
+**Unit ID**: `node.id`
 **State**: Recorded in `self.ongoing_backup` at **line 1630**
 
 ```python
@@ -282,10 +282,10 @@ _log_access_event(trace_event)
 ---
 
 ### 8. **Device Eviction (Leaf Removal)** — Lines 1329–1362
-**Function**: `_evict_device_leaf()`  
-**Trigger**: LRU eviction picks a device leaf and removes it  
-**Frequency**: Per-eviction driven by memory pressure  
-**Unit ID**: `node.id`  
+**Function**: `_evict_device_leaf()`
+**Trigger**: LRU eviction picks a device leaf and removes it
+**Frequency**: Per-eviction driven by memory pressure
+**Unit ID**: `node.id`
 **State**: Before evict at **line 1340**, node is marked evicted (value=None) at **line 1153**
 
 ```python
@@ -318,10 +318,10 @@ _log_access_event(trace_event)
 ---
 
 ### 9. **Host Eviction (Host Leaf Removal)** — Lines 1364–1379
-**Function**: `_evict_host_leaf()`  
-**Trigger**: Host LRU eviction picks a host leaf (evicted, backuped, no children)  
-**Frequency**: Per-host-eviction when host pool fills  
-**Unit ID**: `node.id`  
+**Function**: `_evict_host_leaf()`
+**Trigger**: Host LRU eviction picks a host leaf (evicted, backuped, no children)
+**Frequency**: Per-host-eviction when host pool fills
+**Unit ID**: `node.id`
 **State**: Node is deleted from tree at **line 1378**
 
 **Instrumentation point**: After line 1370, before eviction
@@ -342,10 +342,10 @@ _log_access_event(trace_event)
 ---
 
 ### 10. **Lock Acquisition (Protect from Eviction)** — Lines 531–542
-**Function**: `inc_lock_ref()`  
-**Trigger**: Request pins a node and its ancestors (match_prefix → lock for generation)  
-**Frequency**: Per-request, path-lock (1 per ancestor)  
-**Unit ID**: `node.id` (and each ancestor up to root)  
+**Function**: `inc_lock_ref()`
+**Trigger**: Request pins a node and its ancestors (match_prefix → lock for generation)
+**Frequency**: Per-request, path-lock (1 per ancestor)
+**Unit ID**: `node.id` (and each ancestor up to root)
 **State**: `node.component_data[ct].lock_ref` incremented in `FullComponent.acquire_component_lock()` (lines 169–210)
 
 **Instrumentation point**: In `FullComponent.acquire_component_lock()`, lines 206
@@ -368,10 +368,10 @@ _log_access_event(trace_event)
 ---
 
 ### 11. **Lock Release (Unprotect)** — Lines 212–246
-**Function**: `release_component_lock()` in `FullComponent`  
-**Trigger**: Request finishes, node is no longer needed  
-**Frequency**: Per-request, path-unlock (1 per ancestor)  
-**Unit ID**: `node.id` (each ancestor)  
+**Function**: `release_component_lock()` in `FullComponent`
+**Trigger**: Request finishes, node is no longer needed
+**Frequency**: Per-request, path-unlock (1 per ancestor)
+**Unit ID**: `node.id` (each ancestor)
 **State**: `cd.lock_ref -= 1` at **line 242**
 
 **Instrumentation point**: After line 242
@@ -397,10 +397,10 @@ if cd.lock_ref == 0:
 ## File: `unified_cache_components/full_component.py`
 
 ### 12. **Full Component Data Write (Backup to Host)** — Lines 289–319
-**Function**: `commit_hicache_transfer()` with `CacheTransferPhase.BACKUP_HOST`  
-**Trigger**: After successful device→host transfer  
-**Frequency**: Per-backup operation  
-**Unit ID**: `node.id`  
+**Function**: `commit_hicache_transfer()` with `CacheTransferPhase.BACKUP_HOST`
+**Trigger**: After successful device→host transfer
+**Frequency**: Per-backup operation
+**Unit ID**: `node.id`
 **State changed**: `node.component_data[ct].host_value` set at **line 300**
 
 **Instrumentation point**: After line 300
@@ -423,10 +423,10 @@ if transfers and transfers[0].host_indices is not None:
 ---
 
 ### 13. **Full Component Data Load (Reload from Host)** — Lines 302–319
-**Function**: `commit_hicache_transfer()` with `CacheTransferPhase.LOAD_BACK`  
-**Trigger**: After successful host→device transfer  
-**Frequency**: Per-loadback operation  
-**Unit ID**: Each node in `xfer.nodes_to_load`  
+**Function**: `commit_hicache_transfer()` with `CacheTransferPhase.LOAD_BACK`
+**Trigger**: After successful host→device transfer
+**Frequency**: Per-loadback operation
+**Unit ID**: Each node in `xfer.nodes_to_load`
 **State changed**: `n.component_data[ct].value` set at **line 313** for each node
 
 **Instrumentation point**: Inside loop at line 313
@@ -544,7 +544,7 @@ To reconstruct the reuse pattern (`(n_reuses_at_age, lifetime)` per unit), instr
 4. **Line 206** (`full_component.acquire_component_lock`): LOCK_ACQUIRE — record holder count
 5. **Line 1623** (`write_backup_storage`): BACKUP_STORAGE — record tier transitions (if L3 enabled)
 
-**Total overhead**: ~1.2 µs per request (CACHE_HIT + brief INSERT checks) + ~200 ns per evict.  
+**Total overhead**: ~1.2 µs per request (CACHE_HIT + brief INSERT checks) + ~200 ns per evict.
 **Data volume**: ~200 bytes/event × 10k events/sec = 2 MB/s (acceptable for 1s buffering).
 
 ---
@@ -557,4 +557,3 @@ To reconstruct the reuse pattern (`(n_reuses_at_age, lifetime)` per unit), instr
 - **Backup state**: `node.component_data[BASE_COMPONENT_TYPE].host_value` (set after line 1427, line 300, line 313)
 - **Eviction state**: `node.component_data[ct].value` (set to None at line 1153; cleared on evict)
 - **Lock state**: `node.component_data[ct].lock_ref` (incremented line 206, decremented line 242)
-

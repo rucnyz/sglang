@@ -21,6 +21,7 @@ one target program and forcing its idle tail to demote with a single filler:
 Run against a live small-pool a3 stack (sglang :30000 + daemon :9100):
   python s1_promote_smoke.py --prefix-tokens 6000 --filler-tokens 28000 --eta 15
 """
+
 from __future__ import annotations
 
 import argparse
@@ -34,28 +35,40 @@ import requests
 TGT = "tgtA"
 
 
-def post_event(daemon: str, kind: str, session: str,
-               extra: Optional[Dict[str, Any]] = None) -> None:
+def post_event(
+    daemon: str, kind: str, session: str, extra: Optional[Dict[str, Any]] = None
+) -> None:
     body = {"kind": kind, "session": session}
     if extra:
         body.update(extra)
     requests.post(daemon.rstrip("/") + "/aginfer/event", json=body, timeout=10)
 
 
-def generate(base: str, ids: List[int], max_new: int,
-             forced: Optional[List[int]], pid: str) -> Dict[str, Any]:
+def generate(
+    base: str, ids: List[int], max_new: int, forced: Optional[List[int]], pid: str
+) -> Dict[str, Any]:
     sp = {"temperature": 0.0, "max_new_tokens": max_new, "ignore_eos": True}
     if forced is not None:
         sp["custom_params"] = {"forced_output_ids": list(forced)}
     t0 = time.perf_counter()
-    r = requests.post(base.rstrip("/") + "/generate",
-                      json={"input_ids": ids, "sampling_params": sp,
-                            "program_id": pid, "stream": False}, timeout=300)
+    r = requests.post(
+        base.rstrip("/") + "/generate",
+        json={
+            "input_ids": ids,
+            "sampling_params": sp,
+            "program_id": pid,
+            "stream": False,
+        },
+        timeout=300,
+    )
     e2e = (time.perf_counter() - t0) * 1000.0
     r.raise_for_status()
     mi = r.json()["meta_info"]
-    return {"e2e_ms": e2e, "cached": int(mi.get("cached_tokens") or 0),
-            "prompt": int(mi.get("prompt_tokens") or len(ids))}
+    return {
+        "e2e_ms": e2e,
+        "cached": int(mi.get("cached_tokens") or 0),
+        "prompt": int(mi.get("prompt_tokens") or len(ids)),
+    }
 
 
 def tail_residence(base: str, pid: str) -> Dict[str, Any]:
@@ -65,8 +78,12 @@ def tail_residence(base: str, pid: str) -> Dict[str, Any]:
     if not owned:
         return {"present": False}
     u = max(owned, key=lambda x: x.get("n_tokens", 0))
-    return {"present": True, "residence": u.get("residence"),
-            "n_tokens": u.get("n_tokens"), "hash": u.get("hash", "")[:12]}
+    return {
+        "present": True,
+        "residence": u.get("residence"),
+        "n_tokens": u.get("n_tokens"),
+        "hash": u.get("hash", "")[:12],
+    }
 
 
 def main() -> int:
@@ -88,7 +105,9 @@ def main() -> int:
     post_event(daemon, "session_arrival", TGT)
     post_event(daemon, "llm_prefill", TGT)
     g0 = generate(base, pref, len(out0), out0, TGT)
-    print(f"[1] A turn0: prompt={g0['prompt']} cached={g0['cached']} e2e={g0['e2e_ms']:.0f}ms")
+    print(
+        f"[1] A turn0: prompt={g0['prompt']} cached={g0['cached']} e2e={g0['e2e_ms']:.0f}ms"
+    )
     res_before = tail_residence(base, TGT)
     print(f"[1] A tail residence after turn0: {res_before}")
     # tool gap begins → schedule promote
@@ -102,7 +121,9 @@ def main() -> int:
     print(f"[3] filler prefill {a.filler_tokens}: e2e={gf['e2e_ms']:.0f}ms")
     res_demoted = tail_residence(base, TGT)
     print(f"[3] A tail residence after filler: {res_demoted}")
-    demoted = res_demoted.get("present") and "HBM" not in (res_demoted.get("residence") or [])
+    demoted = res_demoted.get("present") and "HBM" not in (
+        res_demoted.get("residence") or []
+    )
     print(f"[3] A tail demoted out of HBM: {demoted}")
 
     # 3. ticker: advance the event clock until A's promote is due + fires
@@ -126,11 +147,21 @@ def main() -> int:
     seq1 = pref + out0
     out1 = list(range(910000, 910000 + a.output_tokens))
     g1 = generate(base, seq1, len(out1), out1, TGT)
-    print(f"[5] A resume turn1: prompt={g1['prompt']} cached={g1['cached']} "
-          f"e2e={g1['e2e_ms']:.0f}ms  (cached≈prefix={a.prefix_tokens} ⇒ reuse)")
+    print(
+        f"[5] A resume turn1: prompt={g1['prompt']} cached={g1['cached']} "
+        f"e2e={g1['e2e_ms']:.0f}ms  (cached≈prefix={a.prefix_tokens} ⇒ reuse)"
+    )
 
-    print(json.dumps({"demoted": bool(demoted), "promoted": bool(promoted),
-                      "resume_cached": g1["cached"], "prefix": a.prefix_tokens}))
+    print(
+        json.dumps(
+            {
+                "demoted": bool(demoted),
+                "promoted": bool(promoted),
+                "resume_cached": g1["cached"],
+                "prefix": a.prefix_tokens,
+            }
+        )
+    )
     return 0 if (demoted and promoted) else 1
 
 

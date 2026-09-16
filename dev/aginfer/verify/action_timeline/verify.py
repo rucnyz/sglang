@@ -17,6 +17,7 @@ Proves the predictive-promote-back machinery that S1 depends on:
 
 Pure + in-process (no GPU, no sglang).  Run: python verify/action_timeline/verify.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -44,24 +45,41 @@ class StageFail(Exception):
 
 
 def _sp(used: int, cap: int, page: int = 64 * 1024) -> Dict[str, int]:
-    return {"used_bytes": used, "cap_bytes": cap,
-            "available_bytes": max(0, cap - used),
-            "evictable_bytes": used, "page_bytes": page}
-
-
-def _unit(*, uhash: str, residence: List[str], holders: List[str],
-          n_tokens: int = 1000, subpool: str = "kv") -> Dict[str, Any]:
     return {
-        "hash": uhash, "residence": list(residence), "n_tokens": n_tokens,
-        "n_bytes": {t: {subpool: n_tokens * 2048} for t in residence},
-        "last_access_time": 0, "hit_count": 1, "session_ids": list(holders),
-        "is_device_leaf": True, "is_host_leaf": True, "is_tree_leaf": True,
+        "used_bytes": used,
+        "cap_bytes": cap,
+        "available_bytes": max(0, cap - used),
+        "evictable_bytes": used,
+        "page_bytes": page,
     }
 
 
-def _state_json(*, units: List[Dict[str, Any]],
-                programs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    GB = 1024 ** 3
+def _unit(
+    *,
+    uhash: str,
+    residence: List[str],
+    holders: List[str],
+    n_tokens: int = 1000,
+    subpool: str = "kv",
+) -> Dict[str, Any]:
+    return {
+        "hash": uhash,
+        "residence": list(residence),
+        "n_tokens": n_tokens,
+        "n_bytes": {t: {subpool: n_tokens * 2048} for t in residence},
+        "last_access_time": 0,
+        "hit_count": 1,
+        "session_ids": list(holders),
+        "is_device_leaf": True,
+        "is_host_leaf": True,
+        "is_tree_leaf": True,
+    }
+
+
+def _state_json(
+    *, units: List[Dict[str, Any]], programs: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    GB = 1024**3
     return {
         "time_counter": 100,
         "throughput_ema": {"prefill_bps": 0.0, "decode_per_program": {}},
@@ -73,24 +91,35 @@ def _state_json(*, units: List[Dict[str, Any]],
         "per_program_usage": programs or {},
         "units": units,
         "link_stats": {
-            link: {"peak_bw_bps": 64 * GB, "recent_throughput_bps": 0.0,
-                   "time_since_last_sample_s": 5.0}  # idle → bw_free=peak
-            for link in ("HBM->DRAM", "DRAM->HBM", "DRAM->DISK",
-                         "DISK->DRAM", "HBM->DISK", "DISK->HBM")
+            link: {
+                "peak_bw_bps": 64 * GB,
+                "recent_throughput_bps": 0.0,
+                "time_since_last_sample_s": 5.0,
+            }  # idle → bw_free=peak
+            for link in (
+                "HBM->DRAM",
+                "DRAM->HBM",
+                "DRAM->DISK",
+                "DISK->DRAM",
+                "HBM->DISK",
+                "DISK->HBM",
+            )
         },
         "tier_holding_cost": {
-            t: {"kv": {"h_max_per_byte_sec": 0.0}}
-            for t in ("HBM", "DRAM", "DISK")},
+            t: {"kv": {"h_max_per_byte_sec": 0.0}} for t in ("HBM", "DRAM", "DISK")
+        },
     }
 
 
 def _build(state_json, tracker, event):
-    return kvs.build_paper_state(state_json, event=event, tracker=tracker,
-                                 unknown_tier_log=set())
+    return kvs.build_paper_state(
+        state_json, event=event, tracker=tracker, unknown_tier_log=set()
+    )
 
 
 class _FakeOutbound:
     """Captures enqueue_migrate batches (the only method fire/dispatch uses)."""
+
     def __init__(self) -> None:
         self.batches: List[List[Dict[str, Any]]] = []
 
@@ -103,6 +132,7 @@ class _FakeRouter:
     """Minimal router surface the scheduler touches: a timeline, an async
     fetch_state returning a fixed dump, and the threshold attrs build paths
     read indirectly (unused on the fire path)."""
+
     def __init__(self, state_json=None) -> None:
         self.timeline = ActionTimeline()
         self.due_action_handler = None
@@ -113,9 +143,9 @@ class _FakeRouter:
 
 
 def _mk_sched(tracker, outbound):
-    return kvs.KvScheduler(tracker=tracker,
-                           sglang_base_url="http://127.0.0.1:30000",
-                           outbound=outbound)
+    return kvs.KvScheduler(
+        tracker=tracker, sglang_base_url="http://127.0.0.1:30000", outbound=outbound
+    )
 
 
 # ----------------------------------------------------------------- stages
@@ -148,13 +178,15 @@ def stage_a_heap() -> None:
 
 
 def stage_b_loadback() -> None:
-    tracker = ProgramTracker(); tracker.observe_arrival("S")
+    tracker = ProgramTracker()
+    tracker.observe_arrival("S")
     nb_tokens = 1000
-    sj = _state_json(units=[_unit(uhash="u1", residence=["HBM"], holders=["S"],
-                                  n_tokens=nb_tokens)])
+    sj = _state_json(
+        units=[_unit(uhash="u1", residence=["HBM"], holders=["S"], n_tokens=nb_tokens)]
+    )
     st = _build(sj, tracker, Event(kind=EventKind.LLM_PREFILL, session="S"))
     total_bytes = nb_tokens * 2048
-    GB = 1024 ** 3
+    GB = 1024**3
     # idle links → bw_free=peak=64GB/s on each hop; DISK two-hop:
     expect = total_bytes / (64 * GB) + total_bytes / (64 * GB)
     got = kvs._estimate_load_back_s(st, total_bytes)
@@ -166,14 +198,15 @@ def stage_b_loadback() -> None:
 
 
 def stage_c_schedule() -> None:
-    tracker = ProgramTracker(); tracker.observe_arrival("S")
-    out = _FakeOutbound(); sched = _mk_sched(tracker, out)
+    tracker = ProgramTracker()
+    tracker.observe_arrival("S")
+    out = _FakeOutbound()
+    sched = _mk_sched(tracker, out)
     router = _FakeRouter()
 
     # exclusive tail of S, currently HBM-resident
     sj = _state_json(units=[_unit(uhash="tail", residence=["HBM"], holders=["S"])])
-    ev = Event(kind=EventKind.TOOL_CALL_START, session="S",
-               payload={"tool_eta_s": 5.0})
+    ev = Event(kind=EventKind.TOOL_CALL_START, session="S", payload={"tool_eta_s": 5.0})
     object.__setattr__(ev, "enqueue_time", 1000.0)  # frozen dataclass
     st = _build(sj, tracker, ev)
     sched._schedule_promote_back(ev, st, router)
@@ -203,8 +236,9 @@ def stage_c_schedule() -> None:
 
     # shared tail (2 holders) → not an exclusive tail → no schedule
     r4 = _FakeRouter()
-    sj2 = _state_json(units=[_unit(uhash="shared", residence=["HBM"],
-                                   holders=["S", "T"])])
+    sj2 = _state_json(
+        units=[_unit(uhash="shared", residence=["HBM"], holders=["S", "T"])]
+    )
     st2 = _build(sj2, tracker, ev)
     sched._schedule_promote_back(ev, st2, r4)
     if r4.timeline.pending() != 0:
@@ -219,45 +253,61 @@ async def _fire(sched, router, payload):
 def stage_d_fire() -> None:
     # ACTING + demoted (DRAM) tail → Migrate(→HBM)
     tracker = ProgramTracker()
-    tracker.observe_arrival("S"); tracker.observe_completion("S")  # → ACTING
+    tracker.observe_arrival("S")
+    tracker.observe_completion("S")  # → ACTING
     if tracker.state("S") != State.ACTING:
         raise StageFail("D: setup — S not ACTING")
-    out = _FakeOutbound(); sched = _mk_sched(tracker, out)
-    sj_dram = _state_json(units=[_unit(uhash="tail", residence=["DRAM"],
-                                       holders=["S"])])
+    out = _FakeOutbound()
+    sched = _mk_sched(tracker, out)
+    sj_dram = _state_json(
+        units=[_unit(uhash="tail", residence=["DRAM"], holders=["S"])]
+    )
     router = _FakeRouter(sj_dram)
     pa = PromoteAction(session="S", unit_hashes=("tail",), eta_s=5.0)
     asyncio.run(_fire(sched, router, pa))
     if sched.promotes != 1 or len(out.batches) != 1:
-        raise StageFail(f"D: ACTING+DRAM should promote; promotes={sched.promotes} "
-                        f"batches={len(out.batches)}")
+        raise StageFail(
+            f"D: ACTING+DRAM should promote; promotes={sched.promotes} "
+            f"batches={len(out.batches)}"
+        )
     act = out.batches[0][0]
     # DESIGN §7 [] -> {HBM}: add HBM, KEEP the DRAM backup (remove nothing).
-    if act["hash"] != "tail" or act["add_tiers"] != ["HBM"] or \
-            act["remove_tiers"] != []:
+    if (
+        act["hash"] != "tail"
+        or act["add_tiers"] != ["HBM"]
+        or act["remove_tiers"] != []
+    ):
         raise StageFail(f"D: wrong promote wire {act}")
 
     # not ACTING (already REASONING) → stale no-op
-    tr2 = ProgramTracker(); tr2.observe_arrival("S")  # REASONING
-    out2 = _FakeOutbound(); s2 = _mk_sched(tr2, out2)
+    tr2 = ProgramTracker()
+    tr2.observe_arrival("S")  # REASONING
+    out2 = _FakeOutbound()
+    s2 = _mk_sched(tr2, out2)
     asyncio.run(_fire(s2, _FakeRouter(sj_dram), pa))
     if out2.batches or s2.promotes != 0 or s2.promotes_skipped_stale != 1:
         raise StageFail("D: non-ACTING must be a stale no-op")
 
     # ACTING but tail already HBM (never demoted) → no-op
-    tr3 = ProgramTracker(); tr3.observe_arrival("S"); tr3.observe_completion("S")
-    out3 = _FakeOutbound(); s3 = _mk_sched(tr3, out3)
-    sj_hbm = _state_json(units=[_unit(uhash="tail", residence=["HBM"],
-                                      holders=["S"])])
+    tr3 = ProgramTracker()
+    tr3.observe_arrival("S")
+    tr3.observe_completion("S")
+    out3 = _FakeOutbound()
+    s3 = _mk_sched(tr3, out3)
+    sj_hbm = _state_json(units=[_unit(uhash="tail", residence=["HBM"], holders=["S"])])
     asyncio.run(_fire(s3, _FakeRouter(sj_hbm), pa))
     if out3.batches or s3.promotes != 0 or s3.promotes_skipped_stale != 1:
         raise StageFail("D: already-HBM must be a no-op")
 
     # ACTING but tail dropped (absent from units) → no-op
-    tr4 = ProgramTracker(); tr4.observe_arrival("S"); tr4.observe_completion("S")
-    out4 = _FakeOutbound(); s4 = _mk_sched(tr4, out4)
-    sj_drop = _state_json(units=[_unit(uhash="other", residence=["HBM"],
-                                       holders=["S"])])
+    tr4 = ProgramTracker()
+    tr4.observe_arrival("S")
+    tr4.observe_completion("S")
+    out4 = _FakeOutbound()
+    s4 = _mk_sched(tr4, out4)
+    sj_drop = _state_json(
+        units=[_unit(uhash="other", residence=["HBM"], holders=["S"])]
+    )
     asyncio.run(_fire(s4, _FakeRouter(sj_drop), pa))
     if out4.batches or s4.promotes != 0 or s4.promotes_skipped_stale != 1:
         raise StageFail("D: dropped tail must be a no-op")
@@ -280,6 +330,7 @@ def stage_e_router_drain() -> None:
     async def _run():
         # event clock = 1000.0 → only due_a (<=1000) fires
         await router._fire_due_actions(1000.0)
+
     asyncio.run(_run())
     if fired != ["due_a"]:
         raise StageFail(f"E: drain fired {fired}, expected ['due_a']")
@@ -288,8 +339,10 @@ def stage_e_router_drain() -> None:
     # unwired timeline is inert (no crash)
     r2 = EventRouter(bus=EventBus(), sglang_base_url="http://x")
     asyncio.run(r2._fire_due_actions(1e18))
-    print("  E router drain: event-clock fires due payload, leaves future, "
-          "unwired inert OK")
+    print(
+        "  E router drain: event-clock fires due payload, leaves future, "
+        "unwired inert OK"
+    )
 
 
 STAGES = [
@@ -310,6 +363,7 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             failed += 1
             import traceback
+
             print(f"  [{name}] FAIL: {exc}")
             traceback.print_exc()
     print("=" * 60)

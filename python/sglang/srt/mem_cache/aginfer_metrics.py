@@ -28,6 +28,7 @@ in-flight splitting is a refinement for when such a model is deployed
 (the verifiable deployment is single-stack — one "full" subpool); same
 pragmatic boundary as the dump's single-subpool DRAM today.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Optional
@@ -46,6 +47,7 @@ def ema_update(prev: Optional[float], sample: float, alpha: float) -> float:
     non-finite sample is ignored (returns ``prev`` or 0.0) so a bad
     timing read never poisons the EMA."""
     import math
+
     if not math.isfinite(sample) or sample < 0.0:
         return float(prev) if prev is not None else 0.0
     if prev is None or not math.isfinite(prev):

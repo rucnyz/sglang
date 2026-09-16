@@ -54,13 +54,13 @@ Stages:
   F. e2e (env-gated AGINFER_VERIFY_BASE): PUT /aginfer/hints against
      a live sglang, read it back via /aginfer/state n_aginfer_hints
 """
+
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -80,8 +80,12 @@ from daemon.outbound import OutboundBatch, OutboundQueue  # noqa: E402
 from daemon.program_tracker import ProgramTracker  # noqa: E402
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -94,18 +98,26 @@ class StageFail(AssertionError):
 class _Resp:
     status_code = 200
     text = ""
-    def json(self): return {}
+
+    def json(self):
+        return {}
 
 
 class _DummyHttp:
-    async def post(self, *a, **k): return _Resp()
-    async def request(self, *a, **k): return _Resp()
-    async def aclose(self): return None
+    async def post(self, *a, **k):
+        return _Resp()
+
+    async def request(self, *a, **k):
+        return _Resp()
+
+    async def aclose(self):
+        return None
 
 
 class _RecordingHttp:
     """Records every (verb, url, body) so a stage can assert the
     outbound worker routed a batch to the right endpoint + HTTP verb."""
+
     def __init__(self):
         self.calls: List[Tuple[str, str, Any]] = []
 
@@ -123,7 +135,8 @@ class _RecordingHttp:
 
 def _new_outbound() -> OutboundQueue:
     return OutboundQueue(
-        sglang_base_url="http://unused", http_client=_DummyHttp(),
+        sglang_base_url="http://unused",
+        http_client=_DummyHttp(),
     )
 
 
@@ -154,18 +167,25 @@ def _state_json(
     units: List[Dict[str, Any]],
     time_counter: int = 100,
     subpool: str = "kv",
-    hbm_used_gb: float = 1.0,   # B1b raises this + h_max so a demote is
-    hbm_cap_gb: float = 10.0,   # net-positive under value-gated joint_decide
+    hbm_used_gb: float = 1.0,  # B1b raises this + h_max so a demote is
+    hbm_cap_gb: float = 10.0,  # net-positive under value-gated joint_decide
     h_max_per_byte_sec: float = 0.0,
 ) -> Dict[str, Any]:
     GB = 1024 * 1024 * 1024
 
     def _pool(used: int, cap: int) -> Dict[str, Any]:
-        return {"subpools": {subpool: {
-            "used_bytes": used, "cap_bytes": cap,
-            "available_bytes": max(0, cap - used),
-            "evictable_bytes": used, "page_bytes": 64 * 1024,
-        }}}
+        return {
+            "subpools": {
+                subpool: {
+                    "used_bytes": used,
+                    "cap_bytes": cap,
+                    "available_bytes": max(0, cap - used),
+                    "evictable_bytes": used,
+                    "page_bytes": 64 * 1024,
+                }
+            }
+        }
+
     return {
         "time_counter": time_counter,
         "throughput_ema": {"prefill_bps": 0.0, "decode_per_program": {}},
@@ -176,13 +196,18 @@ def _state_json(
         },
         "per_program_usage": {},
         "units": units,
-        "link_stats": {link: {
-            "peak_bw_bps": 64 * GB, "recent_throughput_bps": 0.0,
-            "time_since_last_sample_s": 5.0,
-        } for link in ("HBM->DRAM", "DRAM->HBM", "DRAM->DISK", "DISK->DRAM")},
-        "tier_holding_cost": {tier: {subpool:
-                              {"h_max_per_byte_sec": h_max_per_byte_sec}}
-                              for tier in ("HBM", "DRAM", "DISK")},
+        "link_stats": {
+            link: {
+                "peak_bw_bps": 64 * GB,
+                "recent_throughput_bps": 0.0,
+                "time_since_last_sample_s": 5.0,
+            }
+            for link in ("HBM->DRAM", "DRAM->HBM", "DRAM->DISK", "DISK->DRAM")
+        },
+        "tier_holding_cost": {
+            tier: {subpool: {"h_max_per_byte_sec": h_max_per_byte_sec}}
+            for tier in ("HBM", "DRAM", "DISK")
+        },
     }
 
 
@@ -190,6 +215,7 @@ class _FakeRouter:
     """Minimal EventRouter stand-in.  handle() reads fetch_state +
     observability, and (since the §9 joint_decide wiring) the admission
     thresholds theta_hi / theta_lo + the §8 forecast heartbeat_s."""
+
     def __init__(self, state_json: Dict[str, Any]):
         self._sj = state_json
         self.observability = None
@@ -204,10 +230,12 @@ class _FakeRouter:
 
 class _DeclinePolicy:
     """Returns no migrate assignments (Vt non-positive everywhere)."""
+
     # kv_scheduler reads policy.costs + policy.pi_u for the §7 migrate
     # candidate generator (real OursGreedyPolicy carries both).
     costs = default_costs()
     pi_u = 1.0e-4
+
     def decide(self, state) -> Action:  # noqa: ANN001
         return Action(assignments=[])
 
@@ -215,8 +243,10 @@ class _DeclinePolicy:
 class _MigratePolicy:
     """Demotes the first D_t unit HBM→DRAM, so handle() also enqueues
     a migrate POST alongside the hints PUT."""
+
     costs = default_costs()
     pi_u = 1.0e-4
+
     def decide(self, state) -> Action:  # noqa: ANN001
         for uid in state.decision_set:
             u = state.units.get(uid)
@@ -227,8 +257,10 @@ class _MigratePolicy:
 
 def _sched(tracker: ProgramTracker, ob: OutboundQueue, policy) -> "kvs.KvScheduler":
     return kvs.KvScheduler(
-        tracker=tracker, sglang_base_url="http://unused",
-        policy=policy, outbound=ob,
+        tracker=tracker,
+        sglang_base_url="http://unused",
+        policy=policy,
+        outbound=ob,
     )
 
 
@@ -288,6 +320,7 @@ def _expected_hints(sched_state) -> Dict[str, Dict[str, Any]]:  # noqa: ANN001
 def stage_b0_emit_one_hint_per_dt_unit() -> None:
     """handle() pushes exactly one hint per D_t unit, each carrying the
     EXACT p_hat / lambda the scorer computed and stamp == time_counter."""
+
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p0")  # REASONING, alive
@@ -299,18 +332,24 @@ def stage_b0_emit_one_hint_per_dt_unit() -> None:
         )
         ev = Event(EventKind.TOOL_CALL_END, session="p0")
         sched_state = kvs.build_paper_state(
-            sj, event=ev, tracker=tracker, unknown_tier_log=set(),
+            sj,
+            event=ev,
+            tracker=tracker,
+            unknown_tier_log=set(),
         )
         ob = _new_outbound()
         sched = _sched(tracker, ob, _DeclinePolicy())
         await sched.handle(ev, _FakeRouter(sj))
         return sched_state, _drain(ob)
+
     sched_state, batches = asyncio.run(_go())
     if not sched_state.decision_set:
         raise StageFail("fixture bug: D_t should be non-empty for TOOL_CALL_END")
     hb = _hints_batch(batches)
     if hb is None:
-        raise StageFail(f"no hints PUT enqueued; batches={[b.endpoint for b in batches]}")
+        raise StageFail(
+            f"no hints PUT enqueued; batches={[b.endpoint for b in batches]}"
+        )
     got = {h["hash"]: h for h in hb.body["hints"]}
     exp = _expected_hints(sched_state)
     if set(got) != set(exp):
@@ -320,15 +359,19 @@ def stage_b0_emit_one_hint_per_dt_unit() -> None:
     # NOT read back from build_paper_state) so a regression that zeroes every hint
     # can't pass by also zeroing the `exp` derived from the same build_paper_state.
     import math as _math
+
     exp_u0 = 1.0 - _math.exp(-kvs._PHAT_REUSE_ALPHA * (3 - 1))  # u0 hit_count=3
     if abs(float(got["u0"]["p_hat"]) - exp_u0) > 1e-9:
         raise StageFail(
             f"u0 p_hat must be the reuse-based {exp_u0:.6f} (alive, hits=3); "
-            f"got {got['u0']}")
+            f"got {got['u0']}"
+        )
     for uid, e in exp.items():
         g = got[uid]
         if g.get("stamp") != e["stamp"]:
-            raise StageFail(f"{uid} stamp: got {g.get('stamp')} exp {e['stamp']} (must == time_counter)")
+            raise StageFail(
+                f"{uid} stamp: got {g.get('stamp')} exp {e['stamp']} (must == time_counter)"
+            )
         if abs(float(g.get("p_hat")) - e["p_hat"]) > 1e-9:
             raise StageFail(f"{uid} p_hat: got {g.get('p_hat')} exp {e['p_hat']}")
         if abs(float(g.get("lambda")) - e["lambda"]) > 1e-9:
@@ -339,6 +382,7 @@ def stage_b1_push_unconditional_when_policy_declines() -> None:
     """The hint push is independent of the migrate decision: even when
     the policy declines to migrate (assignments empty), every D_t unit's
     hint is still pushed."""
+
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p0")
@@ -351,6 +395,7 @@ def stage_b1_push_unconditional_when_policy_declines() -> None:
         sched = _sched(tracker, ob, _DeclinePolicy())
         await sched.handle(ev, _FakeRouter(sj))
         return _drain(ob)
+
     batches = asyncio.run(_go())
     if any(b.endpoint == "migrate" for b in batches):
         raise StageFail("decline policy must not enqueue a migrate")
@@ -365,14 +410,16 @@ def stage_b1b_push_alongside_migrate() -> None:
     comes from joint_decide (state-driven, value-gated), not the policy's
     Action — so the unit must be an idle device-leaf under real HBM pressure
     (high occ + h_max>0) for the demote to be net-positive."""
+
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p0")
         sj = _state_json(
             units=[_unit(uhash="u0", residence=["HBM"], holders=["p0"])],
             time_counter=100,
-            hbm_used_gb=9.5, hbm_cap_gb=10.0,      # 95% HBM pressure
-            h_max_per_byte_sec=1.0,                # holding cost dominates
+            hbm_used_gb=9.5,
+            hbm_cap_gb=10.0,  # 95% HBM pressure
+            h_max_per_byte_sec=1.0,  # holding cost dominates
         )
         # MEMORY_PRESSURE → demote candidates by regret.  (NOT TOOL_CALL_END:
         # #223's reuse-imminent carve-out suppresses evicting the tail there,
@@ -382,6 +429,7 @@ def stage_b1b_push_alongside_migrate() -> None:
         sched = _sched(tracker, ob, _MigratePolicy())
         await sched.handle(ev, _FakeRouter(sj))
         return _drain(ob)
+
     batches = asyncio.run(_go())
     eps = sorted(b.endpoint for b in batches)
     if eps != ["hints", "migrate"]:
@@ -390,6 +438,7 @@ def stage_b1b_push_alongside_migrate() -> None:
 
 def stage_b2_empty_dt_no_hints() -> None:
     """LLM_PREFILL → D_t is empty → no hints (and no migrate)."""
+
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p0")
@@ -402,15 +451,19 @@ def stage_b2_empty_dt_no_hints() -> None:
         sched = _sched(tracker, ob, _DeclinePolicy())
         await sched.handle(ev, _FakeRouter(sj))
         return _drain(ob)
+
     batches = asyncio.run(_go())
     if batches:
-        raise StageFail(f"empty D_t must push nothing; got {[b.endpoint for b in batches]}")
+        raise StageFail(
+            f"empty D_t must push nothing; got {[b.endpoint for b in batches]}"
+        )
 
 
 def stage_b3_no_shadow_cache_repush() -> None:
     """No daemon-side shadow map: the SAME unit is re-pushed on a
     second event (unchanged value is NOT suppressed), with a strictly
     newer stamp from the advanced time_counter."""
+
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p0")
@@ -421,10 +474,13 @@ def stage_b3_no_shadow_cache_repush() -> None:
         await sched.handle(ev, _FakeRouter(_state_json(units=[u], time_counter=100)))
         await sched.handle(ev, _FakeRouter(_state_json(units=[u], time_counter=200)))
         return _drain(ob)
+
     batches = asyncio.run(_go())
     hint_puts = [b for b in batches if b.endpoint == "hints"]
     if len(hint_puts) != 2:
-        raise StageFail(f"expected 2 hint PUTs (re-pushed, no suppression); got {len(hint_puts)}")
+        raise StageFail(
+            f"expected 2 hint PUTs (re-pushed, no suppression); got {len(hint_puts)}"
+        )
     stamps = []
     for b in hint_puts:
         hs = {h["hash"]: h for h in b.body["hints"]}
@@ -440,15 +496,19 @@ def stage_b3_no_shadow_cache_repush() -> None:
 
 def _validator():
     from sglang.srt.entrypoints.http_server import _validate_hints_body
+
     return _validate_hints_body
 
 
 def stage_c0_validator_accepts() -> None:
     v = _validator()
-    body = {"hints": [
-        {"hash": "u0", "p_hat": 1.0, "lambda": 0.5, "stamp": 100},
-        {"hash": "u1", "p_hat": 0.25, "lambda": 0.0, "stamp": 100},
-    ], "batch_id": "abc"}
+    body = {
+        "hints": [
+            {"hash": "u0", "p_hat": 1.0, "lambda": 0.5, "stamp": 100},
+            {"hash": "u1", "p_hat": 0.25, "lambda": 0.0, "stamp": 100},
+        ],
+        "batch_id": "abc",
+    }
     hints = v(body)
     if len(hints) != 2:
         raise StageFail(f"validator should return 2 hints; got {hints!r}")
@@ -466,19 +526,68 @@ def stage_c1_validator_rejects() -> None:
         ("hints not a list", {"hints": {}}),
         ("hint not a dict", {"hints": [42]}),
         ("hint missing hash", {"hints": [{"p_hat": 1.0, "lambda": 0.0, "stamp": 1}]}),
-        ("empty hash", {"hints": [{"hash": "", "p_hat": 1.0, "lambda": 0.0, "stamp": 1}]}),
-        ("p_hat not numeric", {"hints": [{"hash": "u", "p_hat": "x", "lambda": 0.0, "stamp": 1}]}),
-        ("lambda not numeric", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": None, "stamp": 1}]}),
-        ("stamp not int", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": 0.0, "stamp": 1.5}]}),
-        ("stamp negative", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": 0.0, "stamp": -1}]}),
-        ("p_hat out of range", {"hints": [{"hash": "u", "p_hat": 2.0, "lambda": 0.0, "stamp": 1}]}),
-        ("lambda negative", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": -0.1, "stamp": 1}]}),
+        (
+            "empty hash",
+            {"hints": [{"hash": "", "p_hat": 1.0, "lambda": 0.0, "stamp": 1}]},
+        ),
+        (
+            "p_hat not numeric",
+            {"hints": [{"hash": "u", "p_hat": "x", "lambda": 0.0, "stamp": 1}]},
+        ),
+        (
+            "lambda not numeric",
+            {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": None, "stamp": 1}]},
+        ),
+        (
+            "stamp not int",
+            {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": 0.0, "stamp": 1.5}]},
+        ),
+        (
+            "stamp negative",
+            {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": 0.0, "stamp": -1}]},
+        ),
+        (
+            "p_hat out of range",
+            {"hints": [{"hash": "u", "p_hat": 2.0, "lambda": 0.0, "stamp": 1}]},
+        ),
+        (
+            "lambda negative",
+            {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": -0.1, "stamp": 1}]},
+        ),
         # audit A4: non-finite must be rejected at the door (the
         # validator is the safety boundary for the inline scorer).
-        ("p_hat nan", {"hints": [{"hash": "u", "p_hat": float("nan"), "lambda": 0.0, "stamp": 1}]}),
-        ("p_hat inf", {"hints": [{"hash": "u", "p_hat": float("inf"), "lambda": 0.0, "stamp": 1}]}),
-        ("lambda inf", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": float("inf"), "stamp": 1}]}),
-        ("lambda nan", {"hints": [{"hash": "u", "p_hat": 1.0, "lambda": float("nan"), "stamp": 1}]}),
+        (
+            "p_hat nan",
+            {
+                "hints": [
+                    {"hash": "u", "p_hat": float("nan"), "lambda": 0.0, "stamp": 1}
+                ]
+            },
+        ),
+        (
+            "p_hat inf",
+            {
+                "hints": [
+                    {"hash": "u", "p_hat": float("inf"), "lambda": 0.0, "stamp": 1}
+                ]
+            },
+        ),
+        (
+            "lambda inf",
+            {
+                "hints": [
+                    {"hash": "u", "p_hat": 1.0, "lambda": float("inf"), "stamp": 1}
+                ]
+            },
+        ),
+        (
+            "lambda nan",
+            {
+                "hints": [
+                    {"hash": "u", "p_hat": 1.0, "lambda": float("nan"), "stamp": 1}
+                ]
+            },
+        ),
     ]
     for label, body in bad_cases:
         try:
@@ -493,6 +602,7 @@ def stage_c1_validator_rejects() -> None:
 
 def _fresh_cache():
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache._aginfer_hints = {}
     return cache
@@ -556,17 +666,23 @@ def stage_d4_mixed_batch_applied_count() -> None:
     only SOME units advanced.  `applied` must count ONLY the hashes
     whose stamp strictly advanced (not len(batch), not 1)."""
     cache = _fresh_cache()
-    cache.set_aginfer_hints([
-        {"hash": "u0", "p_hat": 0.2, "lambda": 0.1, "stamp": 100},
-        {"hash": "u1", "p_hat": 0.3, "lambda": 0.2, "stamp": 100},
-    ])
-    ok, reason, applied = cache.set_aginfer_hints([
-        {"hash": "u0", "p_hat": 0.9, "lambda": 0.7, "stamp": 150},  # newer → apply
-        {"hash": "u1", "p_hat": 0.9, "lambda": 0.7, "stamp": 100},  # equal → skip
-        {"hash": "u2", "p_hat": 0.5, "lambda": 0.5, "stamp": 100},  # new   → apply
-    ])
+    cache.set_aginfer_hints(
+        [
+            {"hash": "u0", "p_hat": 0.2, "lambda": 0.1, "stamp": 100},
+            {"hash": "u1", "p_hat": 0.3, "lambda": 0.2, "stamp": 100},
+        ]
+    )
+    ok, reason, applied = cache.set_aginfer_hints(
+        [
+            {"hash": "u0", "p_hat": 0.9, "lambda": 0.7, "stamp": 150},  # newer → apply
+            {"hash": "u1", "p_hat": 0.9, "lambda": 0.7, "stamp": 100},  # equal → skip
+            {"hash": "u2", "p_hat": 0.5, "lambda": 0.5, "stamp": 100},  # new   → apply
+        ]
+    )
     if not ok or applied != 2:
-        raise StageFail(f"mixed batch should apply exactly 2 (u0 newer + u2 new); got applied={applied} reason={reason!r}")
+        raise StageFail(
+            f"mixed batch should apply exactly 2 (u0 newer + u2 new); got applied={applied} reason={reason!r}"
+        )
     if abs(cache.get_aginfer_hint("u0")["p_hat"] - 0.9) > 1e-9:
         raise StageFail("u0 should have advanced")
     if abs(cache.get_aginfer_hint("u1")["p_hat"] - 0.3) > 1e-9:
@@ -600,11 +716,15 @@ def stage_g0_dump_paths_both_echo_count() -> None:
     would otherwise ship green.  Both must reference the SAME source
     (`self._aginfer_hints`) and emit the key."""
     import inspect
+
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
     for meth in ("_dump_aginfer_state_dict", "_dump_aginfer_state_bytes"):
         src = inspect.getsource(getattr(UnifiedRadixCache, meth))
         if "n_aginfer_hints" not in src:
-            raise StageFail(f"{meth} does not emit n_aginfer_hints (dump-path divergence)")
+            raise StageFail(
+                f"{meth} does not emit n_aginfer_hints (dump-path divergence)"
+            )
         if "_aginfer_hints" not in src:
             raise StageFail(f"{meth} does not read self._aginfer_hints")
 
@@ -618,6 +738,7 @@ def stage_h0_worker_routes_hints_to_put() -> None:
     through `_post_one` and asserts it issues a PUT to /aginfer/hints
     (NOT a POST — the migrate hot path stays on .post()).  Closes the
     one dispatch branch t36/t41 don't cover for hints."""
+
     async def _go():
         rec = _RecordingHttp()
         ob = OutboundQueue(sglang_base_url="http://sg", http_client=rec)
@@ -625,12 +746,15 @@ def stage_h0_worker_routes_hints_to_put() -> None:
         batch = ob.queue.get_nowait()
         await ob._post_one(batch)
         return rec.calls
+
     calls = asyncio.run(_go())
     if len(calls) != 1:
         raise StageFail(f"expected exactly one HTTP call; got {calls!r}")
     verb, url, body = calls[0]
     if verb != "PUT":
-        raise StageFail(f"hints must dispatch via PUT (not {verb}); migrate stays on .post()")
+        raise StageFail(
+            f"hints must dispatch via PUT (not {verb}); migrate stays on .post()"
+        )
     if not url.endswith("/aginfer/hints"):
         raise StageFail(f"wrong URL: {url!r}")
     if "hints" not in (body or {}):
@@ -645,6 +769,7 @@ def stage_e0_wire_round_trip() -> None:
     AND its storage setter — catches a wire field-name mismatch
     (e.g. the daemon emitting 'lambda_rate' while sglang reads 'lambda',
     or 'stamp' vs 'seq')."""
+
     async def _go():
         tracker = ProgramTracker()
         tracker.observe_arrival("p0")
@@ -657,6 +782,7 @@ def stage_e0_wire_round_trip() -> None:
         sched = _sched(tracker, ob, _DeclinePolicy())
         await sched.handle(ev, _FakeRouter(sj))
         return _hints_batch(_drain(ob))
+
     hb = asyncio.run(_go())
     if hb is None:
         raise StageFail("no hints PUT to round-trip")
@@ -670,7 +796,9 @@ def stage_e0_wire_round_trip() -> None:
     cache = _fresh_cache()
     ok, reason, applied = cache.set_aginfer_hints(hints)
     if not (ok and applied == len(hints)):
-        raise StageFail(f"cache rejected the daemon's wire body: ok={ok} reason={reason!r} applied={applied}")
+        raise StageFail(
+            f"cache rejected the daemon's wire body: ok={ok} reason={reason!r} applied={applied}"
+        )
     # the stamp the scorer used (time_counter) must be what landed
     got = cache.get_aginfer_hint("u0")
     if got is None or got["stamp"] != 123:
@@ -691,7 +819,9 @@ def stage_f0_e2e_live_put_readback() -> None:
     def _req(method: str, path: str, body: Optional[dict] = None):
         data = json.dumps(body).encode() if body is not None else None
         r = urllib.request.Request(
-            f"{base}{path}", data=data, method=method,
+            f"{base}{path}",
+            data=data,
+            method=method,
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(r, timeout=30) as resp:
@@ -723,7 +853,9 @@ def stage_f0_e2e_live_put_readback() -> None:
     newer = [dict(h, stamp=run + 1, p_hat=0.1) for h in hints]
     _, out3 = _req("PUT", "/aginfer/hints", {"hints": newer, "batch_id": "e2e3"})
     if out3.get("applied", -1) < 2:
-        raise StageFail(f"live newer-stamp re-apply should advance both (>=2): {out3!r}")
+        raise StageFail(
+            f"live newer-stamp re-apply should advance both (>=2): {out3!r}"
+        )
     # read back the count via /aginfer/state
     _, state = _req("GET", "/aginfer/state")
     n = state.get("n_aginfer_hints")
@@ -741,68 +873,104 @@ def stage_b4_hint_delay_knob() -> None:
     freshness knee.  With the knob set, _dispatch_hints must NOT enqueue
     immediately; the batch appears only after the delay elapses.  Off (0)
     keeps the production path byte-identical."""
+
     async def _go():
         os.environ["AGINFER_HINT_DELAY_MS"] = "80"
         try:
-            tracker = ProgramTracker(); tracker.observe_arrival("p0")
+            tracker = ProgramTracker()
+            tracker.observe_arrival("p0")
             ob = _new_outbound()
             sched = _sched(tracker, ob, _DeclinePolicy())
             await sched._dispatch_hints(
-                [{"hash": "u0", "p_hat": 0.5, "lambda": 0.01, "stamp": 1}])
+                [{"hash": "u0", "p_hat": 0.5, "lambda": 0.01, "stamp": 1}]
+            )
             immediate = ob.queue.qsize()
-            await asyncio.sleep(0.15)          # > 80 ms
+            await asyncio.sleep(0.15)  # > 80 ms
             after = ob.queue.qsize()
             return immediate, after, sched.hint_delayed_calls
         finally:
             os.environ.pop("AGINFER_HINT_DELAY_MS", None)
+
     immediate, after, delayed = asyncio.run(_go())
     if immediate != 0:
-        raise StageFail(f"hint must NOT enqueue immediately under delay; "
-                        f"got qsize={immediate}")
+        raise StageFail(
+            f"hint must NOT enqueue immediately under delay; " f"got qsize={immediate}"
+        )
     if after != 1:
-        raise StageFail(f"hint must appear AFTER the delay elapses; "
-                        f"got qsize={after}")
+        raise StageFail(
+            f"hint must appear AFTER the delay elapses; " f"got qsize={after}"
+        )
     if delayed != 1:
         raise StageFail(f"hint_delayed_calls should be 1; got {delayed}")
+
     # off path: no delay → immediate enqueue (production unchanged).
     async def _off():
         os.environ.pop("AGINFER_HINT_DELAY_MS", None)
-        tracker = ProgramTracker(); tracker.observe_arrival("p0")
+        tracker = ProgramTracker()
+        tracker.observe_arrival("p0")
         ob = _new_outbound()
         sched = _sched(tracker, ob, _DeclinePolicy())
         await sched._dispatch_hints(
-            [{"hash": "u0", "p_hat": 0.5, "lambda": 0.01, "stamp": 1}])
+            [{"hash": "u0", "p_hat": 0.5, "lambda": 0.01, "stamp": 1}]
+        )
         return ob.queue.qsize(), sched.hint_delayed_calls
+
     q, d = asyncio.run(_off())
     if q != 1 or d != 0:
-        raise StageFail(f"delay=0 must enqueue immediately, no defer; "
-                        f"got qsize={q} delayed={d}")
-    print(_green("  [B4] AGINFER_HINT_DELAY_MS defers delivery (on); "
-                 "immediate when off (#230) OK"))
+        raise StageFail(
+            f"delay=0 must enqueue immediately, no defer; " f"got qsize={q} delayed={d}"
+        )
+    print(
+        _green(
+            "  [B4] AGINFER_HINT_DELAY_MS defers delivery (on); "
+            "immediate when off (#230) OK"
+        )
+    )
 
 
 # ============================================================ run
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 enqueue_hints PUT shape",                  stage_a0_enqueue_hints_shape),
-    ("B0 one hint per D_t unit (exact p_hat/lambda/stamp)", stage_b0_emit_one_hint_per_dt_unit),
-    ("B1 push unconditional when policy declines",  stage_b1_push_unconditional_when_policy_declines),
-    ("B1b hints pushed alongside a migrate",        stage_b1b_push_alongside_migrate),
-    ("B2 empty D_t → no hints",                     stage_b2_empty_dt_no_hints),
-    ("B3 no shadow cache: re-push same unit, newer stamp", stage_b3_no_shadow_cache_repush),
-    ("B4 hint-delay knob defers delivery (#230)",   stage_b4_hint_delay_knob),
+    ("A0 enqueue_hints PUT shape", stage_a0_enqueue_hints_shape),
+    (
+        "B0 one hint per D_t unit (exact p_hat/lambda/stamp)",
+        stage_b0_emit_one_hint_per_dt_unit,
+    ),
+    (
+        "B1 push unconditional when policy declines",
+        stage_b1_push_unconditional_when_policy_declines,
+    ),
+    ("B1b hints pushed alongside a migrate", stage_b1b_push_alongside_migrate),
+    ("B2 empty D_t → no hints", stage_b2_empty_dt_no_hints),
+    (
+        "B3 no shadow cache: re-push same unit, newer stamp",
+        stage_b3_no_shadow_cache_repush,
+    ),
+    ("B4 hint-delay knob defers delivery (#230)", stage_b4_hint_delay_knob),
     ("C0 _validate_hints_body accepts well-formed", stage_c0_validator_accepts),
-    ("C1 _validate_hints_body rejects malformed",   stage_c1_validator_rejects),
-    ("D0 set_aginfer_hints applies",                stage_d0_set_hints_applies),
-    ("D1 idempotent re-apply (same stamp) → 0",     stage_d1_idempotent_same_stamp),
-    ("D2 newer stamp overwrites",                   stage_d2_newer_stamp_overwrites),
-    ("D3 stale stamp rejected",                     stage_d3_stale_stamp_rejected),
-    ("D4 mixed batch → applied counts only advanced", stage_d4_mixed_batch_applied_count),
-    ("D5 clear_aginfer_hint present/absent",        stage_d5_clear_aginfer_hint),
-    ("E0 daemon wire body round-trips sglang validator+setter", stage_e0_wire_round_trip),
-    ("G0 both dump paths echo n_aginfer_hints (no divergence)", stage_g0_dump_paths_both_echo_count),
-    ("H0 outbound worker routes hints → PUT /aginfer/hints", stage_h0_worker_routes_hints_to_put),
+    ("C1 _validate_hints_body rejects malformed", stage_c1_validator_rejects),
+    ("D0 set_aginfer_hints applies", stage_d0_set_hints_applies),
+    ("D1 idempotent re-apply (same stamp) → 0", stage_d1_idempotent_same_stamp),
+    ("D2 newer stamp overwrites", stage_d2_newer_stamp_overwrites),
+    ("D3 stale stamp rejected", stage_d3_stale_stamp_rejected),
+    (
+        "D4 mixed batch → applied counts only advanced",
+        stage_d4_mixed_batch_applied_count,
+    ),
+    ("D5 clear_aginfer_hint present/absent", stage_d5_clear_aginfer_hint),
+    (
+        "E0 daemon wire body round-trips sglang validator+setter",
+        stage_e0_wire_round_trip,
+    ),
+    (
+        "G0 both dump paths echo n_aginfer_hints (no divergence)",
+        stage_g0_dump_paths_both_echo_count,
+    ),
+    (
+        "H0 outbound worker routes hints → PUT /aginfer/hints",
+        stage_h0_worker_routes_hints_to_put,
+    ),
     ("F0 e2e live PUT /aginfer/hints + state readback", stage_f0_e2e_live_put_readback),
 ]
 
@@ -822,8 +990,10 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: "
-                  f"unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: "
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\nT40 FAILED ({len(failures)}): {failures}"))
         return 1

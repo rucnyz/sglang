@@ -6,6 +6,7 @@ the request lifecycle.  sglang pushes the remaining 2
 All events land on a single ``asyncio.Queue`` and are processed by
 the event_worker (T7 / T8) serially with an action_lock.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -34,6 +35,13 @@ class EventKind(str, enum.Enum):
     TOOL_CALL_END = "tool_call_end"
     SUB_DISPATCH_BLOCKING = "sub_dispatch_blocking"
     SUB_DISPATCH_ASYNC = "sub_dispatch_async"
+    # P2c (in-engine belief plane, EXP_PLAN.md): a dispatched subagent
+    # returned to its parent. Not one of the original paper §4 eight kinds
+    # (those predate the fan-out/return distinction this project's replay
+    # traces carry -- see agentreplay.driver._emit); belief-plane-only, no
+    # webhook / decision-set wiring beyond ProgramTracker.observe_arrival on
+    # the parent (mirrors TOOL_CALL_END: the parent is about to reason again).
+    SUB_RETURN = "sub_return"
     # T41 (#185, DESIGN §4 / §11 F5): harbor signals end-of-session
     # out-of-band (harbor's /aginfer/session_end → daemon
     # /aginfer/event with kind=session_end).  Handler transitions
@@ -129,7 +137,5 @@ class EventBus:
         the queued copy carries the timestamp).
         """
         if event.enqueue_time == 0.0:
-            event = dataclasses.replace(
-                event, enqueue_time=time.perf_counter()
-            )
+            event = dataclasses.replace(event, enqueue_time=time.perf_counter())
         self._q.put_nowait(event)

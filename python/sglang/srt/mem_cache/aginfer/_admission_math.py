@@ -15,6 +15,7 @@ those bytes — adding them again via ``re_use`` double-counts, and
 the paused program gets stuck unable to resume because the "needed"
 bytes are reported as needed twice.
 """
+
 from __future__ import annotations
 
 from typing import Dict, Iterable, Mapping

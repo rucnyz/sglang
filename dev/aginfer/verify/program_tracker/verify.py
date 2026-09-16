@@ -9,6 +9,7 @@ that don't require a real proxy.
 Usage:
     python dev/aginfer/verify/t6/verify.py
 """
+
 from __future__ import annotations
 
 import ast
@@ -17,7 +18,6 @@ import inspect
 import sys
 import time
 from pathlib import Path
-
 
 # Make ``dev/aginfer`` importable so we can ``from daemon.program_tracker``.
 _AGINFER_ROOT = Path(__file__).resolve().parents[2]
@@ -135,11 +135,11 @@ async def step_pause_mid_flight_then_recover() -> None:
     pinned the trajectory.  This step pins it.
     """
     pt = ProgramTracker()
-    pt.observe_arrival("p-mid")          # REASONING
+    pt.observe_arrival("p-mid")  # REASONING
     assert pt.state("p-mid") is State.REASONING
-    pt.pause("p-mid")                    # PAUSED while REASONING
+    pt.pause("p-mid")  # PAUSED while REASONING
     assert pt.state("p-mid") is State.PAUSED
-    pt.observe_completion("p-mid")       # no-op (state is PAUSED, not REASONING)
+    pt.observe_completion("p-mid")  # no-op (state is PAUSED, not REASONING)
     assert pt.state("p-mid") is State.PAUSED, (
         f"pause-mid-flight completion clobbered the PAUSED state "
         f"(got {pt.state('p-mid')}); contract says completion is a no-op "
@@ -162,7 +162,7 @@ async def step_double_completion_is_noop() -> None:
     pt.observe_arrival("p-dup")
     pt.observe_completion("p-dup")
     assert pt.state("p-dup") is State.ACTING
-    pt.observe_completion("p-dup")      # second call, should no-op
+    pt.observe_completion("p-dup")  # second call, should no-op
     assert pt.state("p-dup") is State.ACTING
 
 
@@ -215,12 +215,12 @@ async def step_concurrent_arrival_completion() -> None:
 
     await asyncio.gather(arrival_burst(), completion_burst())
 
-    assert len(arrival_snapshots) == N, (
-        f"arrival burst ran {len(arrival_snapshots)} of {N} iterations"
-    )
-    assert len(completion_snapshots) == N, (
-        f"completion burst ran {len(completion_snapshots)} of {N} iterations"
-    )
+    assert (
+        len(arrival_snapshots) == N
+    ), f"arrival burst ran {len(arrival_snapshots)} of {N} iterations"
+    assert (
+        len(completion_snapshots) == N
+    ), f"completion burst ran {len(completion_snapshots)} of {N} iterations"
     bad_arrival = [
         i for i, s in enumerate(arrival_snapshots) if s is not State.REASONING
     ]
@@ -339,9 +339,15 @@ def step_no_wallclock_heuristic_in_source() -> None:
                 )
 
     forbidden_attrs = {
-        "time", "monotonic", "now", "perf_counter",
-        "time_ns", "monotonic_ns", "perf_counter_ns",
-        "today", "utcnow",
+        "time",
+        "monotonic",
+        "now",
+        "perf_counter",
+        "time_ns",
+        "monotonic_ns",
+        "perf_counter_ns",
+        "today",
+        "utcnow",
     }
     # Check every function (public + private) defined on
     # ProgramTracker.  No safe-list of method names — any timing call
@@ -366,11 +372,14 @@ async def step_gc_ended_bounds_tracker() -> None:
     live-unit set instead of growing one entry per session forever."""
     pt = ProgramTracker()
     # live programs (various states) + ended ones
-    pt.observe_arrival("p-reason")                       # REASONING
-    pt.observe_arrival("p-act"); pt.observe_completion("p-act")  # ACTING
-    pt.pause("p-pause")                                  # PAUSED
-    pt.observe_arrival("p-ended-units"); pt.end("p-ended-units")   # ENDED, has units
-    pt.observe_arrival("p-ended-gone");  pt.end("p-ended-gone")    # ENDED, no units
+    pt.observe_arrival("p-reason")  # REASONING
+    pt.observe_arrival("p-act")
+    pt.observe_completion("p-act")  # ACTING
+    pt.pause("p-pause")  # PAUSED
+    pt.observe_arrival("p-ended-units")
+    pt.end("p-ended-units")  # ENDED, has units
+    pt.observe_arrival("p-ended-gone")
+    pt.end("p-ended-gone")  # ENDED, no units
     assert pt.size() == 5, pt.size()
 
     # live_pids = the pids that still appear in the /aginfer/state dump
@@ -399,22 +408,25 @@ async def step_gc_ended_bounds_tracker() -> None:
 
     # an ENDED pid with a request still PARKED in the gate is NOT GC'd
     pt2 = ProgramTracker()
-    pt2.observe_arrival("p-gated"); pt2.pause("p-gated")
+    pt2.observe_arrival("p-gated")
+    pt2.pause("p-gated")
     waiter = asyncio.create_task(pt2.wait_if_paused("p-gated"))
     await asyncio.sleep(0.02)  # let it park
-    pt2.end("p-gated", release_gate=False)   # ENDED, but a waiter is parked
-    reclaimed_gated = pt2.gc_ended(set())    # not in live set, but gated
+    pt2.end("p-gated", release_gate=False)  # ENDED, but a waiter is parked
+    reclaimed_gated = pt2.gc_ended(set())  # not in live set, but gated
     assert reclaimed_gated == 0, "must NOT GC an ENDED pid with a parked waiter"
     assert pt2.state("p-gated") is State.ENDED
     # release + drain so the test doesn't leak the task
-    pt2.resume("p-gated"); await asyncio.wait_for(waiter, timeout=2.0)
+    pt2.resume("p-gated")
+    await asyncio.wait_for(waiter, timeout=2.0)
 
     # reused pid after GC: a new session reusing the id resurrects fresh
     pt3 = ProgramTracker()
-    pt3.observe_arrival("reuse"); pt3.end("reuse")
+    pt3.observe_arrival("reuse")
+    pt3.end("reuse")
     pt3.gc_ended(set())
     assert pt3.state("reuse") is None
-    pt3.observe_arrival("reuse")     # reused
+    pt3.observe_arrival("reuse")  # reused
     assert pt3.state("reuse") is State.REASONING, "reused pid must resurrect"
 
 
@@ -428,23 +440,25 @@ async def step_resume_ack_reconciliation() -> None:
     # before any resume: not in flight.
     assert not pt.resume_in_flight("p"), "no resume issued yet"
     # daemon issues the resume.
-    pt.resume("p")                         # resume() records issued (age 0)
+    pt.resume("p")  # resume() records issued (age 0)
     assert pt.resume_in_flight("p"), "resume must be in flight right after resume()"
 
     # dump STILL shows p PAUSED (overlay lag / lost clear): stays in flight up
     # to WIN reconciles, then re-arms (recovery) so the daemon re-fires.
     for k in range(WIN):
         pt.reconcile_resume_acks({"p"}, WIN)
-        assert pt.resume_in_flight("p"), (
-            f"must remain suppressed within the window (k={k})")
-    pt.reconcile_resume_acks({"p"}, WIN)   # one past the window
-    assert not pt.resume_in_flight("p"), (
-        "a clear that never lands must re-arm after the window (recovery)")
+        assert pt.resume_in_flight(
+            "p"
+        ), f"must remain suppressed within the window (k={k})"
+    pt.reconcile_resume_acks({"p"}, WIN)  # one past the window
+    assert not pt.resume_in_flight(
+        "p"
+    ), "a clear that never lands must re-arm after the window (recovery)"
 
     # clear LANDED: dump no longer shows p PAUSED → record dropped immediately.
     pt.resume("p")
     assert pt.resume_in_flight("p")
-    pt.reconcile_resume_acks(set(), WIN)   # p not in the dump's PAUSED set
+    pt.reconcile_resume_acks(set(), WIN)  # p not in the dump's PAUSED set
     assert not pt.resume_in_flight("p"), "clear landed → record dropped at once"
 
     # a fresh pause cycle clears a stale in-flight record so the new cycle's
@@ -457,7 +471,7 @@ async def step_resume_ack_reconciliation() -> None:
     # gc_ended also reclaims the record (no leak).
     pt.resume("p")
     pt.end("p")
-    pt.gc_ended(live_pids=set())           # p ended + no units → reclaimed
+    pt.gc_ended(live_pids=set())  # p ended + no units → reclaimed
     assert not pt.resume_in_flight("p"), "gc_ended must drop the record"
     assert "p" not in pt._resume_issued_age
 
@@ -477,38 +491,51 @@ async def main() -> None:
     print("[3] pause blocks wait_if_paused; resume unblocks within 100 ms ✓")
 
     await step_pause_unknown_program()
-    print("[4] WORST CASE: pause on unknown program -> placeholder; "
-          "late arrival waits + resumes correctly ✓")
+    print(
+        "[4] WORST CASE: pause on unknown program -> placeholder; "
+        "late arrival waits + resumes correctly ✓"
+    )
 
     await step_resume_unknown_program()
     print("[5] resume on unknown program is a no-op (log warning only) ✓")
 
     await step_pause_mid_flight_then_recover()
-    print("[5b] pause-mid-flight: completion is no-op on PAUSED; "
-          "next-arrival-after-resume flips to REASONING ✓")
+    print(
+        "[5b] pause-mid-flight: completion is no-op on PAUSED; "
+        "next-arrival-after-resume flips to REASONING ✓"
+    )
 
     await step_double_completion_is_noop()
     print("[5c] double observe_completion is safe (at-least-once delivery) ✓")
 
     await step_concurrent_arrival_completion()
-    print("[6] WORST CASE: 100 concurrent arrival/completion pairs "
-          "for one pid -> consistent final state ✓")
+    print(
+        "[6] WORST CASE: 100 concurrent arrival/completion pairs "
+        "for one pid -> consistent final state ✓"
+    )
 
     await step_program_churn_memory_bound()
-    print("[7] WORST CASE: 10k unique program_ids tracked; "
-          "size() == 10_000, no crash ✓")
+    print(
+        "[7] WORST CASE: 10k unique program_ids tracked; "
+        "size() == 10_000, no crash ✓"
+    )
 
     step_no_wallclock_heuristic_in_source()
-    print("[8] contract: NO time.* or loop.time in transition path "
-          "(AST grep clean) ✓")
+    print(
+        "[8] contract: NO time.* or loop.time in transition path " "(AST grep clean) ✓"
+    )
 
     await step_gc_ended_bounds_tracker()
-    print("[9] #190: gc_ended reclaims ENDED-no-units pids (bounded "
-          "tracker); keeps live + gated + ENDED-with-units; reuse resurrects ✓")
+    print(
+        "[9] #190: gc_ended reclaims ENDED-no-units pids (bounded "
+        "tracker); keeps live + gated + ENDED-with-units; reuse resurrects ✓"
+    )
 
     await step_resume_ack_reconciliation()
-    print("[10] #215: resume-in-flight bookkeeping — suppressed in the lag "
-          "window, re-arms on a lost clear, drops on landed/pause/gc ✓")
+    print(
+        "[10] #215: resume-in-flight bookkeeping — suppressed in the lag "
+        "window, re-arms on a lost clear, drops on landed/pause/gc ✓"
+    )
 
     dur_ms = (time.perf_counter() - t0) * 1000
     print()

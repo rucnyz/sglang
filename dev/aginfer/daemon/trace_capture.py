@@ -36,6 +36,7 @@ Design
   rebased to the first request, so the replay scheduler can reproduce the
   inter-arrival timing (and thus the concurrency/pressure profile).
 """
+
 from __future__ import annotations
 
 import json
@@ -75,7 +76,7 @@ def count_sse_content_tokens(chunk: bytes, _carry: Dict[str, bytes]) -> int:
         line = line.strip()
         if not line.startswith(b"data:"):
             continue
-        payload = line[len(b"data:"):].strip()
+        payload = line[len(b"data:") :].strip()
         if payload == b"[DONE]" or not payload:
             continue
         try:
@@ -186,7 +187,8 @@ def recorder_from_env() -> Optional[TraceRecorder]:
         return TraceRecorder(path)
     except Exception:  # noqa: BLE001
         logger.warning(
-            "trace_capture: could not open %s; capture disabled", path,
+            "trace_capture: could not open %s; capture disabled",
+            path,
             exc_info=True,
         )
         return None

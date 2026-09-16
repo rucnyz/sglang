@@ -77,6 +77,7 @@ LIVE program that never signals SESSION_END (REASONING/ACTING/PAUSED
 forever) is still kept — an LRU/idle cap for that case is future work,
 gated on profiling.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -171,6 +172,7 @@ class ProgramTracker:
         # resurrected pid) is not spuriously 499'd.
         self._ended_while_gated.discard(pid)
         from ._metrics import m as _m
+
         _m(
             "program_state",
             pid=pid,
@@ -189,6 +191,7 @@ class ProgramTracker:
         if self._states.get(pid) == State.REASONING:
             self._states[pid] = State.ACTING
             from ._metrics import m as _m
+
             _m("program_state", pid=pid, from_="REASONING", to="ACTING")
 
     # ---- admission_controller hooks ----
@@ -213,6 +216,7 @@ class ProgramTracker:
         self._event(pid).clear()
         logger.info("program_tracker: paused %s", pid)
         from ._metrics import m as _m
+
         _m(
             "program_state",
             pid=pid,
@@ -243,8 +247,11 @@ class ProgramTracker:
         # dump reflects the clear (reconcile_resume_acks drops it), the same
         # pid must not be re-proposed every event (overlay lag).
         self._resume_issued_age[pid] = 0
-        logger.info("program_tracker: resumed %s (state stays %s until next arrival)",
-                    pid, self._states.get(pid))
+        logger.info(
+            "program_tracker: resumed %s (state stays %s until next arrival)",
+            pid,
+            self._states.get(pid),
+        )
 
     # ---- #215 resume-ack reconciliation (the daemon's own un-acked action) --
 
@@ -274,11 +281,11 @@ class ProgramTracker:
             so the resume re-fires next decision (recovery, no re-starve)."""
         for pid in list(self._resume_issued_age):
             if pid not in dump_paused_pids:
-                del self._resume_issued_age[pid]            # clear landed
+                del self._resume_issued_age[pid]  # clear landed
             else:
                 self._resume_issued_age[pid] += 1
                 if self._resume_issued_age[pid] > window:
-                    del self._resume_issued_age[pid]        # lost → allow re-fire
+                    del self._resume_issued_age[pid]  # lost → allow re-fire
 
     # ---- SESSION_END hook (T41 #185, DESIGN §11 F5) ----
 
@@ -316,6 +323,7 @@ class ProgramTracker:
             self._ended_while_gated.add(pid)
             self._event(pid).set()
         from ._metrics import m as _m
+
         _m(
             "program_state",
             pid=pid,
@@ -345,13 +353,13 @@ class ProgramTracker:
         """
         prev = self.end(pid, release_gate=False)
         from ._metrics import m as _m
+
         _m(
             "client_disconnected",
             pid=pid,
             prev_state=prev.value if prev is not None else "NONE",
         )
-        logger.info("program_tracker: client_disconnected %s (prev=%s)",
-                    pid, prev)
+        logger.info("program_tracker: client_disconnected %s (prev=%s)", pid, prev)
         return prev
 
     def gc_ended(self, live_pids) -> int:
@@ -378,7 +386,8 @@ class ProgramTracker:
         Returns the number of pids reclaimed.
         """
         stale = [
-            pid for pid, st in self._states.items()
+            pid
+            for pid, st in self._states.items()
             if st is State.ENDED
             and pid not in live_pids
             and self._gated_count.get(pid, 0) == 0
@@ -388,9 +397,10 @@ class ProgramTracker:
             self._events.pop(pid, None)
             self._ended_while_gated.discard(pid)
             self._gated_count.pop(pid, None)
-            self._resume_issued_age.pop(pid, None)   # #215
+            self._resume_issued_age.pop(pid, None)  # #215
         if stale:
             from ._metrics import m as _m
+
             _m("program_gc_ended", reclaimed=len(stale))
         return len(stale)
 

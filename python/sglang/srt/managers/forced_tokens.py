@@ -52,7 +52,9 @@ def _report_skip(req, reason: str, pos: int, total: int) -> None:
     )
 
 
-def forced_override_positions(reqs, chunked_req=None, is_extend=True) -> List[Tuple[int, int]]:
+def forced_override_positions(
+    reqs, chunked_req=None, is_extend=True
+) -> List[Tuple[int, int]]:
     """For each req that commits a token THIS batch (not finished, not retracted,
     not the batch's still-chunking prefill req) and carries
     ``custom_params["forced_output_ids"]`` with ``forced_dispatched < len(forced)``,
@@ -99,12 +101,19 @@ def forced_override_positions(reqs, chunked_req=None, is_extend=True) -> List[Tu
         if is_extend and req is chunked_req:
             continue  # mid-prefill chunk: commits nothing, so nothing to override
         if req.finished() or req.is_retracted:
-            _report_skip(req, "finished" if req.finished() else "retracted",
-                         pos, len(forced))
+            _report_skip(
+                req, "finished" if req.finished() else "retracted", pos, len(forced)
+            )
             continue
         if _LOG_FORCED and (pos < 5 or pos % 500 == 0):
-            logger.warning("teacher forcing: rid=%s pos=%d/%d bi=%d/%d",
-                           getattr(req, "rid", None), pos, len(forced), i, len(reqs))
+            logger.warning(
+                "teacher forcing: rid=%s pos=%d/%d bi=%d/%d",
+                getattr(req, "rid", None),
+                pos,
+                len(forced),
+                i,
+                len(reqs),
+            )
         out.append((i, int(forced[pos])))
         req.forced_dispatched = pos + 1
     return out

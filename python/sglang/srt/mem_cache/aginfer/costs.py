@@ -4,19 +4,20 @@ benchmarks; defaults here are reasonable order-of-magnitude placeholders.
 
 Paper Section 2.2 / Section 7. All units explicit so you can sanity-check.
 """
+
 from __future__ import annotations
+
 from .base import Tier
 from .ours_greedy import TierCosts
-
 
 # Conservative defaults: tier 3 (HBM) ~ free, tier 2 (DRAM) ~ PCIe Gen5 x16 read,
 # tier 1 (NVMe) ~ enterprise NVMe. Calibrate from real measurements once smoke is up.
 DEFAULT_BW = {
-    (Tier.HBM, Tier.DRAM): 64e9,    # 64 GB/s PCIe G5 x16 read (B300 effective)
+    (Tier.HBM, Tier.DRAM): 64e9,  # 64 GB/s PCIe G5 x16 read (B300 effective)
     (Tier.DRAM, Tier.HBM): 64e9,
-    (Tier.DRAM, Tier.DISK): 7e9,    # NVMe seq write ~7 GB/s
+    (Tier.DRAM, Tier.DISK): 7e9,  # NVMe seq write ~7 GB/s
     (Tier.DISK, Tier.DRAM): 7e9,
-    (Tier.HBM, Tier.DISK): 7e9,     # bottleneck is the disk
+    (Tier.HBM, Tier.DISK): 7e9,  # bottleneck is the disk
     (Tier.DISK, Tier.HBM): 7e9,
 }
 
@@ -36,7 +37,7 @@ DEFAULT_RHO = {
 # opportunity cost (memory could host something more valuable). Calibrated so
 # h * b_u * (1 sec) is on the same order as the prefill cost it displaces.
 DEFAULT_H_BASE = {
-    Tier.HBM: 1e-9,    # HBM is precious
+    Tier.HBM: 1e-9,  # HBM is precious
     Tier.DRAM: 1e-11,
     Tier.DISK: 1e-13,
 }

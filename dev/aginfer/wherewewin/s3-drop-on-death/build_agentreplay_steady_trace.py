@@ -23,7 +23,6 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-
 SCHEMA_VERSION = 1
 
 
@@ -95,9 +94,7 @@ def program_index(
         for previous, current in zip(records, records[1:]):
             if current.get("context_reset"):
                 continue
-            prefix = list(previous["input_ids"]) + list(
-                previous["forced_output_ids"]
-            )
+            prefix = list(previous["input_ids"]) + list(previous["forced_output_ids"])
             if list(current["input_ids"][: len(prefix)]) != prefix:
                 raise ValueError(
                     f"program {program_id!r} step {current['step']} does not "
@@ -251,8 +248,7 @@ def clone_bundle(
             )
             spawn_ts = original.get("spawn_ts")
             row["spawn_ts"] = (
-                arrival_seconds
-                + max(0.0, float(spawn_ts) - source_bundle_start)
+                arrival_seconds + max(0.0, float(spawn_ts) - source_bundle_start)
                 if isinstance(spawn_ts, (int, float))
                 else None
             )
@@ -264,8 +260,7 @@ def clone_bundle(
             row["forced_output_ids"] = list(original["forced_output_ids"])
             row["t"] = arrival_seconds + max(
                 0.0,
-                float(original.get("t") or source_bundle_start)
-                - source_bundle_start,
+                float(original.get("t") or source_bundle_start) - source_bundle_start,
             )
             row["steady_role"] = role
             row["steady_root_id"] = new_root_id
@@ -426,8 +421,7 @@ def build_schedule(
             sum(len(row["forced_output_ids"]) for row in records) / total_seconds
         ),
         "max_request_tokens": max(
-            len(row["input_ids"]) + len(row["forced_output_ids"])
-            for row in records
+            len(row["input_ids"]) + len(row["forced_output_ids"]) for row in records
         ),
         "role_session_counts": role_counts,
         "role_program_counts": role_program_counts,

@@ -35,6 +35,7 @@ Stages (12):
     C1 ended verdict → 499, NO end() re-call, NO extra PUT
     C2 proceed verdict → forwards to sglang (no 499)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -42,20 +43,23 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
-
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
 if str(_AGINFER_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGINFER_ROOT))
 
-from daemon.program_tracker import ProgramTracker, State  # noqa: E402
-from daemon.outbound import OutboundQueue  # noqa: E402
 from daemon import proxy as proxy_mod  # noqa: E402
+from daemon.outbound import OutboundQueue  # noqa: E402
+from daemon.program_tracker import ProgramTracker, State  # noqa: E402
 from daemon.proxy import _gate_or_disconnect  # noqa: E402
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -63,18 +67,26 @@ class StageFail(AssertionError):
 
 
 class _DummyHttp:
-    async def post(self, *a, **k): return _Resp()
-    async def request(self, *a, **k): return _Resp()
-    async def aclose(self): return None
+    async def post(self, *a, **k):
+        return _Resp()
+
+    async def request(self, *a, **k):
+        return _Resp()
+
+    async def aclose(self):
+        return None
 
 
 class _Resp:
     """httpx-like response for the proxy's unary forward path."""
+
     status_code = 200
     text = ""
     content = b'{"ok": true}'
     headers = {"content-type": "application/json"}
-    def json(self): return {"ok": True}
+
+    def json(self):
+        return {"ok": True}
 
 
 def _new_outbound() -> OutboundQueue:
@@ -98,6 +110,7 @@ async def _never():
 def stage_a0_gate_true_proceed() -> None:
     async def _go():
         return await _gate_or_disconnect(_resolves_to(True), _never())
+
     if asyncio.run(_go()) != "proceed":
         raise StageFail("gate True should yield 'proceed'")
 
@@ -105,6 +118,7 @@ def stage_a0_gate_true_proceed() -> None:
 def stage_a1_gate_false_ended() -> None:
     async def _go():
         return await _gate_or_disconnect(_resolves_to(False), _never())
+
     if asyncio.run(_go()) != "ended":
         raise StageFail("gate False should yield 'ended'")
 
@@ -113,6 +127,7 @@ def stage_a2_disconnect_wins() -> None:
     async def _go():
         # Gate blocks forever; disconnect resolves quickly.
         return await _gate_or_disconnect(_never(), _resolves_to(None, 0.01))
+
     if asyncio.run(_go()) != "disconnect":
         raise StageFail("disconnect-first should yield 'disconnect'")
 
@@ -120,6 +135,7 @@ def stage_a2_disconnect_wins() -> None:
 def stage_a3_loser_cancelled() -> None:
     """The losing awaitable must be cancelled so it doesn't leak as a
     pending task / 'exception never retrieved' warning."""
+
     async def _go():
         # Track whether the gate coroutine gets cancelled when
         # disconnect wins.
@@ -133,11 +149,13 @@ def stage_a3_loser_cancelled() -> None:
                 raise
 
         verdict = await _gate_or_disconnect(
-            _gate_blocks(), _resolves_to(None, 0.01),
+            _gate_blocks(),
+            _resolves_to(None, 0.01),
         )
         # Give the cancelled task a tick to run its except.
         await asyncio.sleep(0.02)
         return verdict, cancelled["gate"]
+
     verdict, gate_cancelled = asyncio.run(_go())
     if verdict != "disconnect":
         raise StageFail(f"verdict: {verdict}")
@@ -149,21 +167,22 @@ def stage_a4_non_gated_fast_proceed() -> None:
     """A non-gated request: gate resolves True immediately; the race
     returns 'proceed' without waiting the disconnect poll interval."""
     import time
+
     async def _go():
         t0 = time.perf_counter()
         v = await _gate_or_disconnect(_resolves_to(True), _until_never_disc())
         return v, (time.perf_counter() - t0) * 1000.0
+
     # disconnect side polls but never returns; gate True wins fast.
     async def _until_never_disc():
         while True:
             await asyncio.sleep(proxy_mod._DISCONNECT_POLL_S)
+
     v, ms = asyncio.run(_go())
     if v != "proceed":
         raise StageFail(f"non-gated should proceed; got {v}")
     if ms > 50.0:
-        raise StageFail(
-            f"non-gated race should resolve fast (<50ms); took {ms:.1f}ms"
-        )
+        raise StageFail(f"non-gated race should resolve fast (<50ms); took {ms:.1f}ms")
 
 
 # ============================================================ B. client_disconnected
@@ -190,6 +209,7 @@ def stage_b1_disconnect_no_gate_release_no_flag_leak() -> None:
     Pin: a (hypothetical) parked waiter is NOT woken, _ended_while_
     gated stays empty.  Contrast with end() (SESSION_END), which
     DOES release."""
+
     async def _go():
         t = ProgramTracker()
         t.observe_arrival("p")
@@ -212,6 +232,7 @@ def stage_b1_disconnect_no_gate_release_no_flag_leak() -> None:
         except asyncio.CancelledError:
             pass
         return woke, flag, state
+
     woke, flag, state = asyncio.run(_go())
     if woke:
         raise StageFail(
@@ -220,8 +241,7 @@ def stage_b1_disconnect_no_gate_release_no_flag_leak() -> None:
         )
     if flag:
         raise StageFail(
-            f"client_disconnected must not leak _ended_while_gated; "
-            f"got {flag}"
+            f"client_disconnected must not leak _ended_while_gated; " f"got {flag}"
         )
     if state is not State.ENDED:
         raise StageFail(f"program should be ENDED; got {state}")
@@ -241,6 +261,7 @@ def stage_b3_emits_distinct_metric() -> None:
     (distinct from end()'s program_state) so ops can tell disconnect-
     driven ENDs from harbor SESSION_END."""
     import daemon._metrics as _metrics
+
     captured: List[Tuple[str, dict]] = []
     orig = _metrics.m
 
@@ -258,9 +279,7 @@ def stage_b3_emits_distinct_metric() -> None:
         _metrics.m = orig
     kinds = [e for e, _ in captured]
     if "client_disconnected" not in kinds:
-        raise StageFail(
-            f"expected a 'client_disconnected' metric; got {kinds}"
-        )
+        raise StageFail(f"expected a 'client_disconnected' metric; got {kinds}")
 
 
 # ============================================================ C. proxy integration
@@ -268,8 +287,10 @@ def stage_b3_emits_distinct_metric() -> None:
 
 def _make_app(outbound: Optional[OutboundQueue]):
     from daemon.proxy import create_app
+
     app = create_app(
-        sglang_base_url="http://unused", enable_event_router=False,
+        sglang_base_url="http://unused",
+        enable_event_router=False,
     )
     if outbound is not None:
         app.state.outbound = outbound
@@ -287,12 +308,15 @@ def _get_chat_handler(app):
 class _FakeRequest:
     """Minimal Request stand-in for the chat handler: a JSON body +
     a controllable is_disconnected()."""
+
     def __init__(self, body: dict, disconnected: bool = False):
         self._body = body
         self._disc = disconnected
         self.headers = {}
+
     async def json(self):
         return self._body
+
     async def is_disconnected(self):
         return self._disc
 
@@ -301,6 +325,7 @@ def stage_c0_disconnect_path() -> None:
     """Real create_app proxy + a request whose client is already
     disconnected → handler returns 499, transitions ENDED, enqueues
     PUT {ENDED}."""
+
     async def _go():
         ob = _new_outbound()
         app = _make_app(ob)
@@ -309,10 +334,12 @@ def stage_c0_disconnect_path() -> None:
         tracker.pause("pc0")  # gated
         handler = _get_chat_handler(app)
         req = _FakeRequest(
-            {"program_id": "pc0", "messages": []}, disconnected=True,
+            {"program_id": "pc0", "messages": []},
+            disconnected=True,
         )
         resp = await handler(req, x_aginfer_program=None)
         return resp, tracker, ob
+
     resp, tracker, ob = asyncio.run(_go())
     if getattr(resp, "status_code", None) != 499:
         raise StageFail(f"disconnect should yield 499; got {resp}")
@@ -321,9 +348,7 @@ def stage_c0_disconnect_path() -> None:
             f"disconnect should transition ENDED; got {tracker.state('pc0')}"
         )
     if ob.queue.qsize() != 1:
-        raise StageFail(
-            f"disconnect should enqueue one PUT; queue={ob.queue.qsize()}"
-        )
+        raise StageFail(f"disconnect should enqueue one PUT; queue={ob.queue.qsize()}")
     batch = ob.queue.get_nowait()
     if batch.endpoint != "program_paused" or batch.method != "PUT":
         raise StageFail(f"wrong batch: {batch.endpoint}/{batch.method}")
@@ -335,6 +360,7 @@ def stage_c1_ended_verdict_no_extra_put() -> None:
     """A SESSION_END-while-gated (ended verdict) → 499, but the proxy
     does NOT call client_disconnected / enqueue an extra PUT (the
     SESSION_END handler already did the PUT)."""
+
     async def _go():
         ob = _new_outbound()
         app = _make_app(ob)
@@ -349,6 +375,7 @@ def stage_c1_ended_verdict_no_extra_put() -> None:
         tracker.end("pc1")  # F5 SESSION_END while parked
         resp = await asyncio.wait_for(task, timeout=2.0)
         return resp, ob
+
     resp, ob = asyncio.run(_go())
     if getattr(resp, "status_code", None) != 499:
         raise StageFail(f"ended-while-gated should 499; got {resp}")
@@ -367,6 +394,7 @@ def stage_c3_mid_park_disconnect() -> None:
     disconnected).  Drives the real `_until_disconnected` via a
     Request whose is_disconnected() flips False→True after the
     request is confirmed parked."""
+
     async def _go():
         ob = _new_outbound()
         app = _make_app(ob)
@@ -379,8 +407,10 @@ def stage_c3_mid_park_disconnect() -> None:
             def __init__(self):
                 self._disc = False
                 self.headers = {}
+
             async def json(self):
                 return {"program_id": "pc3", "messages": []}
+
             async def is_disconnected(self):
                 return self._disc
 
@@ -393,6 +423,7 @@ def stage_c3_mid_park_disconnect() -> None:
         req._disc = True
         resp = await asyncio.wait_for(task, timeout=3.0)
         return resp, tracker, ob
+
     resp, tracker, ob = asyncio.run(_go())
     if getattr(resp, "status_code", None) != 499:
         raise StageFail(f"mid-park disconnect should 499; got {resp}")
@@ -412,6 +443,7 @@ def stage_c4_sibling_not_499d_on_disconnect() -> None:
     request A's connection drops mid-park.  A gets 499, but the LIVE
     sibling B must NOT be 499'd and the program must NOT be force-
     ended while B is parked (a disconnect is per-CONNECTION)."""
+
     async def _go():
         ob = _new_outbound()
         app = _make_app(ob)
@@ -425,10 +457,13 @@ def stage_c4_sibling_not_499d_on_disconnect() -> None:
             def __init__(self):
                 self._disc = False
                 self.headers = {}
+
             async def json(self):
                 return {"program_id": "pc4", "messages": []}
+
             async def is_disconnected(self):
                 return self._disc
+
             def drop(self):
                 self._disc = True
 
@@ -449,6 +484,7 @@ def stage_c4_sibling_not_499d_on_disconnect() -> None:
         tracker.resume("pc4")
         respB = await asyncio.wait_for(taskB, timeout=3.0)
         return respA, respB, b_done_early, tracker, ob
+
     respA, respB, b_done_early, tracker, ob = asyncio.run(_go())
     if getattr(respA, "status_code", None) != 499:
         raise StageFail(f"disconnected A should 499; got {respA}")
@@ -459,15 +495,13 @@ def stage_c4_sibling_not_499d_on_disconnect() -> None:
         )
     if getattr(respB, "status_code", None) == 499:
         raise StageFail(
-            f"live sibling B must NOT be 499'd by A's disconnect; "
-            f"got {respB}"
+            f"live sibling B must NOT be 499'd by A's disconnect; " f"got {respB}"
         )
     # The program must NOT have been ENDED while B was parked.  After
     # resume + B's arrival, B's observe_arrival flips it to REASONING.
     if tracker.state("pc4") is State.ENDED:
         raise StageFail(
-            "program should not be ENDED — only A's connection dropped, "
-            "B was live"
+            "program should not be ENDED — only A's connection dropped, " "B was live"
         )
     # No spurious disconnect-PUT (A didn't end the program).
     if ob.queue.qsize() != 0:
@@ -481,6 +515,7 @@ def stage_c2_proceed_forwards() -> None:
     """A non-gated request proceeds past the gate (no 499).  We stop
     at the forward step by pointing at a dead sglang — the contract
     here is just 'the gate let it through' (status != 499)."""
+
     async def _go():
         ob = _new_outbound()
         app = _make_app(ob)
@@ -491,6 +526,7 @@ def stage_c2_proceed_forwards() -> None:
         req = _FakeRequest({"program_id": "pc2", "messages": []})
         resp = await handler(req, x_aginfer_program=None)
         return resp, ob
+
     resp, ob = asyncio.run(_go())
     if getattr(resp, "status_code", None) == 499:
         raise StageFail("non-gated request must not be 499'd")
@@ -506,23 +542,29 @@ def stage_c2_proceed_forwards() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 race: gate True → proceed",                stage_a0_gate_true_proceed),
-    ("A1 race: gate False → ended",                 stage_a1_gate_false_ended),
-    ("A2 race: disconnect first → disconnect",      stage_a2_disconnect_wins),
-    ("A3 race: losing task cancelled",              stage_a3_loser_cancelled),
-    ("A4 race: non-gated fast-proceed (<50ms)",     stage_a4_non_gated_fast_proceed),
-    ("B0 client_disconnected(PAUSED) → ENDED",      stage_b0_disconnect_paused_to_ended),
-    ("B1 client_disconnected: no gate-release, no flag leak (release_gate=False)",
-                                                    stage_b1_disconnect_no_gate_release_no_flag_leak),
-    ("B2 client_disconnected(unknown) → ENDED",     stage_b2_disconnect_unknown),
-    ("B3 distinct client_disconnected metric",      stage_b3_emits_distinct_metric),
+    ("A0 race: gate True → proceed", stage_a0_gate_true_proceed),
+    ("A1 race: gate False → ended", stage_a1_gate_false_ended),
+    ("A2 race: disconnect first → disconnect", stage_a2_disconnect_wins),
+    ("A3 race: losing task cancelled", stage_a3_loser_cancelled),
+    ("A4 race: non-gated fast-proceed (<50ms)", stage_a4_non_gated_fast_proceed),
+    ("B0 client_disconnected(PAUSED) → ENDED", stage_b0_disconnect_paused_to_ended),
+    (
+        "B1 client_disconnected: no gate-release, no flag leak (release_gate=False)",
+        stage_b1_disconnect_no_gate_release_no_flag_leak,
+    ),
+    ("B2 client_disconnected(unknown) → ENDED", stage_b2_disconnect_unknown),
+    ("B3 distinct client_disconnected metric", stage_b3_emits_distinct_metric),
     ("C0 proxy disconnect path → 499 + ENDED + PUT", stage_c0_disconnect_path),
-    ("C1 proxy ended verdict → 499, no extra PUT",  stage_c1_ended_verdict_no_extra_put),
-    ("C2 proxy proceed → not 499, no PUT",          stage_c2_proceed_forwards),
-    ("C3 MID-PARK disconnect (connected→park→drop) → 499 + ENDED + PUT",
-                                                    stage_c3_mid_park_disconnect),
-    ("C4 sibling NOT 499'd on per-connection disconnect (#183 bug fix)",
-                                                    stage_c4_sibling_not_499d_on_disconnect),
+    ("C1 proxy ended verdict → 499, no extra PUT", stage_c1_ended_verdict_no_extra_put),
+    ("C2 proxy proceed → not 499, no PUT", stage_c2_proceed_forwards),
+    (
+        "C3 MID-PARK disconnect (connected→park→drop) → 499 + ENDED + PUT",
+        stage_c3_mid_park_disconnect,
+    ),
+    (
+        "C4 sibling NOT 499'd on per-connection disconnect (#183 bug fix)",
+        stage_c4_sibling_not_499d_on_disconnect,
+    ),
 ]
 
 
@@ -537,8 +579,10 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: "
-                  f"unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: "
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\nT30 FAILED ({len(failures)}): {failures}"))
         return 1

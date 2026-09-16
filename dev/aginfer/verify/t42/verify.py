@@ -28,6 +28,7 @@ event lands with the contract field set.
 Usage:
     python dev/aginfer/verify/t42/verify.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,7 +37,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -47,8 +47,8 @@ from daemon._observability import (  # noqa: E402
     DaemonObservability,
     _DaemonMetricsRing,
 )
-from daemon.events import Event, EventBus, EventKind  # noqa: E402
 from daemon.event_router import EventRouter  # noqa: E402
+from daemon.events import Event, EventBus, EventKind  # noqa: E402
 
 
 def _green(s: str) -> str:
@@ -69,12 +69,10 @@ class StageFail(AssertionError):
 def stage_a0_ring_empty_summary() -> None:
     r = _DaemonMetricsRing(capacity=64)
     s = r.summary()
-    expected = {"n", "n_recorded_total", "capacity",
-                "p50", "p95", "p99", "max", "mean"}
+    expected = {"n", "n_recorded_total", "capacity", "p50", "p95", "p99", "max", "mean"}
     if set(s.keys()) != expected:
         raise StageFail(
-            f"ring summary key mismatch: got {set(s.keys())}; "
-            f"want {expected}"
+            f"ring summary key mismatch: got {set(s.keys())}; " f"want {expected}"
         )
     if s["n"] != 0:
         raise StageFail(f"empty n != 0: {s}")
@@ -109,9 +107,7 @@ def stage_a2_ring_wraps() -> None:
     if s["n"] != 32:
         raise StageFail(f"wrapped n != cap 32: {s['n']}")
     if s["n_recorded_total"] != 200:
-        raise StageFail(
-            f"n_recorded_total != 200: {s['n_recorded_total']}"
-        )
+        raise StageFail(f"n_recorded_total != 200: {s['n_recorded_total']}")
     # The buffer holds samples 168..199; max should be 199.
     if abs(s["max"] - 199.0) > 0.001:
         raise StageFail(f"wrapped max != 199: {s['max']}")
@@ -133,13 +129,16 @@ def stage_a3_observability_empty_summary_shape() -> None:
     }
     if set(s.keys()) != required:
         raise StageFail(
-            f"summary_dict keys mismatch: got {set(s.keys())}; "
-            f"want {required}"
+            f"summary_dict keys mismatch: got {set(s.keys())}; " f"want {required}"
         )
     # Each ring sub-summary has the standard quantile fields.
-    for ring_key in ("state_fetch_lat_ms", "queue_depth",
-                     "time_in_queue_ms",
-                     "outbound_queue_depth", "outbound_oldest_age_ms"):
+    for ring_key in (
+        "state_fetch_lat_ms",
+        "queue_depth",
+        "time_in_queue_ms",
+        "outbound_queue_depth",
+        "outbound_oldest_age_ms",
+    ):
         sub = s[ring_key]
         if sub["n"] != 0 or sub["p99"] != 0.0:
             raise StageFail(f"empty {ring_key}: {sub}")
@@ -185,8 +184,7 @@ def stage_a5_emit_summary_cadence() -> None:
         for i in range(4):
             obs.record_dispatch(qdepth=i, time_in_queue_ms=float(i))
         n_summary_lines = sum(
-            1 for line in captured
-            if "event=daemon_obs_summary" in line
+            1 for line in captured if "event=daemon_obs_summary" in line
         )
         if n_summary_lines != 0:
             raise StageFail(
@@ -195,8 +193,7 @@ def stage_a5_emit_summary_cadence() -> None:
         # 5th event triggers a summary line
         obs.record_dispatch(qdepth=4, time_in_queue_ms=4.0)
         n_summary_lines = sum(
-            1 for line in captured
-            if "event=daemon_obs_summary" in line
+            1 for line in captured if "event=daemon_obs_summary" in line
         )
         if n_summary_lines != 1:
             raise StageFail(
@@ -207,13 +204,11 @@ def stage_a5_emit_summary_cadence() -> None:
         for i in range(5):
             obs.record_dispatch(qdepth=i, time_in_queue_ms=float(i))
         n_summary_lines = sum(
-            1 for line in captured
-            if "event=daemon_obs_summary" in line
+            1 for line in captured if "event=daemon_obs_summary" in line
         )
         if n_summary_lines != 2:
             raise StageFail(
-                f"expected 2 summary lines after 10 events; "
-                f"got {n_summary_lines}"
+                f"expected 2 summary lines after 10 events; " f"got {n_summary_lines}"
             )
     finally:
         logger.removeHandler(handler)
@@ -240,13 +235,9 @@ def stage_a6_emit_summary_contract_fields() -> None:
             obs.record_dispatch(qdepth=i, time_in_queue_ms=float(5 + i))
         obs.record_failure("add_already_present:DRAM")
         obs.emit_summary()  # force emit
-        summary_lines = [
-            l for l in captured if "event=daemon_obs_summary" in l
-        ]
+        summary_lines = [l for l in captured if "event=daemon_obs_summary" in l]
         if not summary_lines:
-            raise StageFail(
-                f"no daemon_obs_summary line captured; got: {captured}"
-            )
+            raise StageFail(f"no daemon_obs_summary line captured; got: {captured}")
         line = summary_lines[-1]
         required_substrings = (
             "state_fetch_p99_ms=",
@@ -259,27 +250,21 @@ def stage_a6_emit_summary_contract_fields() -> None:
         )
         for needle in required_substrings:
             if needle not in line:
-                raise StageFail(
-                    f"summary line missing {needle!r}; line={line!r}"
-                )
+                raise StageFail(f"summary line missing {needle!r}; line={line!r}")
         # Audit S3: the breakdown JSON value MUST be space-free
         # (line-format invariant) AND must round-trip as a JSON object
         # carrying the per-reason counts (not just a fold-down count).
         import json as _json
+
         m_token = [
-            tok for tok in line.split(" ")
-            if tok.startswith("failure_class_breakdown=")
+            tok for tok in line.split(" ") if tok.startswith("failure_class_breakdown=")
         ]
         if not m_token:
-            raise StageFail(
-                f"failure_class_breakdown token split lost; line={line!r}"
-            )
+            raise StageFail(f"failure_class_breakdown token split lost; line={line!r}")
         bjson = m_token[0].split("=", 1)[1]
         bdict = _json.loads(bjson)
         if bdict.get("add_already_present:DRAM") != 1:
-            raise StageFail(
-                f"breakdown JSON missing the recorded reason: {bdict!r}"
-            )
+            raise StageFail(f"breakdown JSON missing the recorded reason: {bdict!r}")
     finally:
         logger.removeHandler(handler)
         logger.setLevel(prior_level)
@@ -298,15 +283,12 @@ def stage_b0_enqueue_time_stamped_by_bus() -> None:
     evt = Event(kind=EventKind.MEMORY_PRESSURE)
     if evt.enqueue_time != 0.0:
         raise StageFail(
-            f"unstamped event should have enqueue_time=0.0; "
-            f"got {evt.enqueue_time}"
+            f"unstamped event should have enqueue_time=0.0; " f"got {evt.enqueue_time}"
         )
     asyncio.run(bus.emit(evt))
     queued = bus.queue.get_nowait()
     if queued.enqueue_time <= 0.0:
-        raise StageFail(
-            f"emit() should stamp enqueue_time; got {queued.enqueue_time}"
-        )
+        raise StageFail(f"emit() should stamp enqueue_time; got {queued.enqueue_time}")
     if (queued.kind, queued.payload) != (evt.kind, evt.payload):
         raise StageFail("emit replaced more than enqueue_time")
 
@@ -314,6 +296,7 @@ def stage_b0_enqueue_time_stamped_by_bus() -> None:
 def stage_b1_router_records_dispatch_and_time_in_queue() -> None:
     """Drive 5 events through a real EventRouter; observability should
     record 5 dispatch samples with time_in_queue > 0 and qdepth >= 0."""
+
     async def _scenario() -> Dict[str, Any]:
         bus = EventBus()
         router = EventRouter(
@@ -322,27 +305,35 @@ def stage_b1_router_records_dispatch_and_time_in_queue() -> None:
             theta_hi=0.7,
             theta_crit=0.9,
         )
+
         # Stub the inner HTTP impl so handlers don't hit the network
         # (the public fetch_state path keeps the instrumentation timer).
         async def _fake_fetch():
             return {"pool_usage": {"HBM": {"subpools": {}}}}
+
         router._fetch_state_impl = _fake_fetch  # type: ignore[assignment]
+
         # Trivial handler that just touches state once.
         async def _h(evt, r):
             await r.fetch_state()
-        for kind in (EventKind.MEMORY_PRESSURE,
-                     EventKind.SESSION_ARRIVAL,
-                     EventKind.LLM_PREFILL,
-                     EventKind.TOOL_CALL_START,
-                     EventKind.TOOL_CALL_END):
+
+        for kind in (
+            EventKind.MEMORY_PRESSURE,
+            EventKind.SESSION_ARRIVAL,
+            EventKind.LLM_PREFILL,
+            EventKind.TOOL_CALL_START,
+            EventKind.TOOL_CALL_END,
+        ):
             router.set_handler(kind, _h)
         await router.start()
         try:
-            for kind in (EventKind.MEMORY_PRESSURE,
-                         EventKind.SESSION_ARRIVAL,
-                         EventKind.LLM_PREFILL,
-                         EventKind.TOOL_CALL_START,
-                         EventKind.TOOL_CALL_END):
+            for kind in (
+                EventKind.MEMORY_PRESSURE,
+                EventKind.SESSION_ARRIVAL,
+                EventKind.LLM_PREFILL,
+                EventKind.TOOL_CALL_START,
+                EventKind.TOOL_CALL_END,
+            ):
                 await bus.emit(Event(kind=kind))
             # Wait for the worker to drain.
             await bus.queue.join()
@@ -371,6 +362,7 @@ def stage_b1_router_records_dispatch_and_time_in_queue() -> None:
 def stage_b2_router_records_state_fetch_latency() -> None:
     """``router.fetch_state()`` should bump ``state_fetch_lat_ms`` per
     call.  The PLAN F3-revisit trigger key on this metric directly."""
+
     async def _scenario() -> Dict[str, Any]:
         bus = EventBus()
         router = EventRouter(
@@ -379,11 +371,13 @@ def stage_b2_router_records_state_fetch_latency() -> None:
             theta_hi=0.7,
             theta_crit=0.9,
         )
+
         # A fake fetch with a fixed sleep so we know the latency is
         # measurable (>= 5 ms).
         async def _fake_fetch():
             await asyncio.sleep(0.005)
             return {"pool_usage": {"HBM": {"subpools": {}}}}
+
         router._fetch_state_impl = _fake_fetch  # type: ignore[assignment]
 
         # Call the public, instrumented entry point.  The 5 ms sleep
@@ -412,8 +406,10 @@ def stage_b3_router_records_failure_class() -> None:
     integration is exercised."""
     bus = EventBus()
     router = EventRouter(
-        bus=bus, sglang_base_url="http://unused",
-        theta_hi=0.7, theta_crit=0.9,
+        bus=bus,
+        sglang_base_url="http://unused",
+        theta_hi=0.7,
+        theta_crit=0.9,
     )
     router.observability.record_failure("not_in_tree")
     router.observability.record_failure("not_in_tree")
@@ -454,9 +450,7 @@ def stage_b4_kv_scheduler_dispatch_requires_outbound() -> None:
             "_dispatch_migrate() without outbound must raise; got no exception"
         )
     if "OutboundQueue" not in str(raised):
-        raise StageFail(
-            f"error message should mention OutboundQueue; got {raised!r}"
-        )
+        raise StageFail(f"error message should mention OutboundQueue; got {raised!r}")
 
 
 # ============================================================ Phase C
@@ -478,6 +472,7 @@ def stage_c0_summary_line_emitted_in_real_dispatch() -> None:
     metric_logger.addHandler(handler)
     metric_logger.setLevel(logging.INFO)
     try:
+
         async def _scenario():
             bus = EventBus()
             router = EventRouter(
@@ -487,11 +482,15 @@ def stage_c0_summary_line_emitted_in_real_dispatch() -> None:
                 theta_crit=0.9,
                 observability_summary_every_n=10,
             )
+
             async def _fake_fetch():
                 return {"pool_usage": {"HBM": {"subpools": {}}}}
+
             router._fetch_state_impl = _fake_fetch  # type: ignore[assignment]
+
             async def _h(evt, r):
                 pass
+
             for kind in EventKind:
                 router.set_handler(kind, _h)
             await router.start()
@@ -501,10 +500,9 @@ def stage_c0_summary_line_emitted_in_real_dispatch() -> None:
                 await bus.queue.join()
             finally:
                 await router.stop()
+
         asyncio.run(_scenario())
-        summary_lines = [
-            l for l in captured if "event=daemon_obs_summary" in l
-        ]
+        summary_lines = [l for l in captured if "event=daemon_obs_summary" in l]
         if len(summary_lines) != 1:
             raise StageFail(
                 f"expected exactly 1 daemon_obs_summary line after "
@@ -536,8 +534,10 @@ def stage_b5_state_fetch_failure_bumps_observability_counter() -> None:
     async def _scenario() -> Dict[str, Any]:
         bus = EventBus()
         router = EventRouter(
-            bus=bus, sglang_base_url="http://unused",
-            theta_hi=0.7, theta_crit=0.9,
+            bus=bus,
+            sglang_base_url="http://unused",
+            theta_hi=0.7,
+            theta_crit=0.9,
         )
         sched = KvScheduler(
             tracker=ProgramTracker(),
@@ -575,17 +575,24 @@ def stage_b6_enqueue_time_zero_fallback() -> None:
     ``event.enqueue_time > 0.0`` and substitutes ``0.0`` when unset
     so we don't produce a giant negative time-in-queue.  B0 proves
     emit() always stamps; only this stage proves the fallback path."""
+
     async def _scenario() -> Dict[str, Any]:
         bus = EventBus()
         router = EventRouter(
-            bus=bus, sglang_base_url="http://unused",
-            theta_hi=0.7, theta_crit=0.9,
+            bus=bus,
+            sglang_base_url="http://unused",
+            theta_hi=0.7,
+            theta_crit=0.9,
         )
+
         async def _fake_fetch():
             return {"pool_usage": {"HBM": {"subpools": {}}}}
+
         router._fetch_state_impl = _fake_fetch  # type: ignore[assignment]
+
         async def _h(evt, r):
             pass
+
         for kind in EventKind:
             router.set_handler(kind, _h)
         await router.start()
@@ -620,6 +627,7 @@ def stage_b7_ring_wrap_quantile_boundary() -> None:
     nearest-rank rounding).  A reverse-eviction would put 0..31 in
     the window with p50 = 15 — caught here."""
     from daemon._observability import _DaemonMetricsRing
+
     r = _DaemonMetricsRing(capacity=32)
     for i in range(200):
         r.record(float(i))
@@ -669,8 +677,7 @@ def stage_b8_kv_scheduler_observability_none_no_crash() -> None:
     # Just confirm the construct doesn't raise and the field is None.
     if sched.observability is not None:
         raise StageFail(
-            f"observability=None should remain None; "
-            f"got {sched.observability!r}"
+            f"observability=None should remain None; " f"got {sched.observability!r}"
         )
 
 
@@ -680,11 +687,14 @@ def stage_b9_fetch_state_exception_no_sample_no_leak() -> None:
     on the state_fetch_lat_ms ring (the timer block doesn't reach
     record() — current semantics).  Documents the chosen
     behavior so a refactor that adds a try/finally is visible."""
+
     async def _scenario() -> Tuple[Optional[Exception], Dict[str, Any]]:
         bus = EventBus()
         router = EventRouter(
-            bus=bus, sglang_base_url="http://unused",
-            theta_hi=0.7, theta_crit=0.9,
+            bus=bus,
+            sglang_base_url="http://unused",
+            theta_hi=0.7,
+            theta_crit=0.9,
         )
 
         async def _broken():
@@ -701,8 +711,7 @@ def stage_b9_fetch_state_exception_no_sample_no_leak() -> None:
     caught, summary = asyncio.run(_scenario())
     if caught is None or not isinstance(caught, RuntimeError):
         raise StageFail(
-            f"fetch_state should re-raise the impl's exception; "
-            f"got {caught!r}"
+            f"fetch_state should re-raise the impl's exception; " f"got {caught!r}"
         )
     if summary["state_fetch_lat_ms"]["n"] != 0:
         raise StageFail(
@@ -764,9 +773,7 @@ def stage_b10_shutdown_summary_emission() -> None:
                 f"summary; got {len(b_lines)}"
             )
         if "events_dispatched_total=5" not in b_lines[0]:
-            raise StageFail(
-                f"(b) partial-window summary should show dispatched=5"
-            )
+            raise StageFail(f"(b) partial-window summary should show dispatched=5")
 
         # (c) periodic + shutdown — exactly 20 events at cadence=20.
         captured.clear()
@@ -816,8 +823,14 @@ def stage_b12_outbound_queue_observability() -> None:
         # Simulate a gradient of queue depths + ages — most healthy,
         # one big tail (e.g. sglang briefly stalled).
         for depth, age_ms in [
-            (0, 0.0), (1, 5.0), (2, 10.0), (3, 12.0),
-            (5, 25.0), (8, 40.0), (4, 18.0), (2, 8.0),
+            (0, 0.0),
+            (1, 5.0),
+            (2, 10.0),
+            (3, 12.0),
+            (5, 25.0),
+            (8, 40.0),
+            (4, 18.0),
+            (2, 8.0),
             (100, 3000.0),  # the stall tail
         ]:
             obs.record_outbound(queue_depth=depth, oldest_age_ms=age_ms)
@@ -825,9 +838,7 @@ def stage_b12_outbound_queue_observability() -> None:
         oqd = s["outbound_queue_depth"]
         oa = s["outbound_oldest_age_ms"]
         if oqd["n"] != 9 or oa["n"] != 9:
-            raise StageFail(
-                f"expected 9 samples each; got {oqd['n']}/{oa['n']}"
-            )
+            raise StageFail(f"expected 9 samples each; got {oqd['n']}/{oa['n']}")
         if oqd["max"] != 100.0 or oa["max"] != 3000.0:
             raise StageFail(
                 f"max should hit the tail (100, 3000); "
@@ -835,9 +846,7 @@ def stage_b12_outbound_queue_observability() -> None:
             )
         # Now emit_summary and confirm the line carries the new fields.
         obs.emit_summary()
-        summary_lines = [
-            l for l in captured if "event=daemon_obs_summary" in l
-        ]
+        summary_lines = [l for l in captured if "event=daemon_obs_summary" in l]
         if not summary_lines:
             raise StageFail("no daemon_obs_summary line captured")
         line = summary_lines[-1]
@@ -848,9 +857,7 @@ def stage_b12_outbound_queue_observability() -> None:
             "outbound_oldest_age_ms_max=3000",
         ):
             if needle not in line:
-                raise StageFail(
-                    f"summary line missing {needle!r}; line={line!r}"
-                )
+                raise StageFail(f"summary line missing {needle!r}; line={line!r}")
     finally:
         metric_logger.removeHandler(handler)
         metric_logger.setLevel(prior_level)
@@ -875,33 +882,60 @@ def stage_b11_summary_every_n_rejects_non_positive() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 _DaemonMetricsRing empty summary",        stage_a0_ring_empty_summary),
-    ("A1 ring record + quantile monotonicity",     stage_a1_ring_record_and_quantiles),
-    ("A2 ring wraps at capacity",                  stage_a2_ring_wraps),
-    ("A3 observability empty summary shape",       stage_a3_observability_empty_summary_shape),
-    ("A4 failure-class counter increments",        stage_a4_observability_failure_counter),
-    ("A5 emit_summary cadence (every N events)",   stage_a5_emit_summary_cadence),
-    ("A6 summary line carries contract fields",    stage_a6_emit_summary_contract_fields),
-    ("B0 EventBus.emit stamps enqueue_time",       stage_b0_enqueue_time_stamped_by_bus),
-    ("B1 router records dispatch + time-in-queue", stage_b1_router_records_dispatch_and_time_in_queue),
-    ("B2 router records state-fetch latency",      stage_b2_router_records_state_fetch_latency),
-    ("B3 router exposes failure-class recorder",   stage_b3_router_records_failure_class),
-    ("B4 kv_scheduler._dispatch_migrate requires outbound (post-T36)",
-                                                   stage_b4_kv_scheduler_dispatch_requires_outbound),
-    ("B5 G2 state_fetch_failed counts in observability",
-                                                   stage_b5_state_fetch_failure_bumps_observability_counter),
-    ("B6 T1 enqueue_time=0 fallback (queue bypass of emit)",
-                                                   stage_b6_enqueue_time_zero_fallback),
-    ("B7 T2 ring wrap quantile boundary",          stage_b7_ring_wrap_quantile_boundary),
-    ("B8 T5 KvScheduler(observability=None) no-crash",
-                                                   stage_b8_kv_scheduler_observability_none_no_crash),
-    ("B9 T6 fetch_state exception re-raises, no sample",
-                                                   stage_b9_fetch_state_exception_no_sample_no_leak),
-    ("B10 T3 shutdown summary emission contract",  stage_b10_shutdown_summary_emission),
-    ("B11 T4 summary_every_n rejects non-positive", stage_b11_summary_every_n_rejects_non_positive),
-    ("B12 outbound queue depth + oldest-age observability (#163)",
-                                                   stage_b12_outbound_queue_observability),
-    ("C0 real-dispatch summary line lands",        stage_c0_summary_line_emitted_in_real_dispatch),
+    ("A0 _DaemonMetricsRing empty summary", stage_a0_ring_empty_summary),
+    ("A1 ring record + quantile monotonicity", stage_a1_ring_record_and_quantiles),
+    ("A2 ring wraps at capacity", stage_a2_ring_wraps),
+    (
+        "A3 observability empty summary shape",
+        stage_a3_observability_empty_summary_shape,
+    ),
+    ("A4 failure-class counter increments", stage_a4_observability_failure_counter),
+    ("A5 emit_summary cadence (every N events)", stage_a5_emit_summary_cadence),
+    ("A6 summary line carries contract fields", stage_a6_emit_summary_contract_fields),
+    ("B0 EventBus.emit stamps enqueue_time", stage_b0_enqueue_time_stamped_by_bus),
+    (
+        "B1 router records dispatch + time-in-queue",
+        stage_b1_router_records_dispatch_and_time_in_queue,
+    ),
+    (
+        "B2 router records state-fetch latency",
+        stage_b2_router_records_state_fetch_latency,
+    ),
+    ("B3 router exposes failure-class recorder", stage_b3_router_records_failure_class),
+    (
+        "B4 kv_scheduler._dispatch_migrate requires outbound (post-T36)",
+        stage_b4_kv_scheduler_dispatch_requires_outbound,
+    ),
+    (
+        "B5 G2 state_fetch_failed counts in observability",
+        stage_b5_state_fetch_failure_bumps_observability_counter,
+    ),
+    (
+        "B6 T1 enqueue_time=0 fallback (queue bypass of emit)",
+        stage_b6_enqueue_time_zero_fallback,
+    ),
+    ("B7 T2 ring wrap quantile boundary", stage_b7_ring_wrap_quantile_boundary),
+    (
+        "B8 T5 KvScheduler(observability=None) no-crash",
+        stage_b8_kv_scheduler_observability_none_no_crash,
+    ),
+    (
+        "B9 T6 fetch_state exception re-raises, no sample",
+        stage_b9_fetch_state_exception_no_sample_no_leak,
+    ),
+    ("B10 T3 shutdown summary emission contract", stage_b10_shutdown_summary_emission),
+    (
+        "B11 T4 summary_every_n rejects non-positive",
+        stage_b11_summary_every_n_rejects_non_positive,
+    ),
+    (
+        "B12 outbound queue depth + oldest-age observability (#163)",
+        stage_b12_outbound_queue_observability,
+    ),
+    (
+        "C0 real-dispatch summary line lands",
+        stage_c0_summary_line_emitted_in_real_dispatch,
+    ),
 ]
 
 

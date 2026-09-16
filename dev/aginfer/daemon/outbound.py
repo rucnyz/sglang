@@ -26,6 +26,7 @@ keyed by endpoint (``migrate`` today; ``program_paused`` / ``hints``
 / ``thresholds`` plug in via ``enqueue_<endpoint>`` helpers as those
 PLAN tasks land — DESIGN §6 L506 covers the full set).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -53,6 +54,7 @@ class OutboundBatch:
     yield age ≈ ``time.time() * 1000`` ≈ 1.7e15 ms, instantly tripping
     the sustained-escalation fatal.  The ``__post_init__`` guard
     catches explicit ``0`` or negative values for the same reason."""
+
     batch_id: str
     endpoint: str
     body: Dict[str, Any]
@@ -65,8 +67,7 @@ class OutboundBatch:
     def __post_init__(self) -> None:
         if self.method not in ("POST", "PUT"):
             raise ValueError(
-                f"OutboundBatch.method must be POST or PUT; "
-                f"got {self.method!r}"
+                f"OutboundBatch.method must be POST or PUT; " f"got {self.method!r}"
             )
         if self.enqueue_ts <= 0.0:
             raise ValueError(
@@ -136,9 +137,13 @@ def _partition_and_coalesce(
             passthrough.append(b)
 
     stats: Dict[str, int] = {
-        "migrate_in": len(migrates), "hints_in": len(hints),
-        "paused_in": len(paused), "migrate_dropped_stale": 0,
-        "migrate_out": 0, "hints_out": 0, "paused_out": 0,
+        "migrate_in": len(migrates),
+        "hints_in": len(hints),
+        "paused_in": len(paused),
+        "migrate_dropped_stale": 0,
+        "migrate_out": 0,
+        "hints_out": 0,
+        "paused_out": 0,
     }
     out: List[OutboundBatch] = list(passthrough)
 
@@ -174,18 +179,22 @@ def _partition_and_coalesce(
         if fresh:
             by_hash: Dict[Any, Dict[str, Any]] = {}
             for b in sorted(fresh, key=lambda x: x.enqueue_ts):
-                for a in (b.body.get("actions", []) if isinstance(b.body, dict)
-                          else []):
-                    by_hash[a.get("hash")] = a   # latest decision per unit
+                for a in (
+                    b.body.get("actions", []) if isinstance(b.body, dict) else []
+                ):
+                    by_hash[a.get("hash")] = a  # latest decision per unit
             merged = list(by_hash.values())
             if merged:
                 bid = str(uuid.uuid4())
-                out.append(OutboundBatch(
-                    batch_id=bid, endpoint="migrate",
-                    body={"actions": merged, "batch_id": bid},
-                    enqueue_ts=min(b.enqueue_ts for b in fresh),
-                    method="POST",
-                ))
+                out.append(
+                    OutboundBatch(
+                        batch_id=bid,
+                        endpoint="migrate",
+                        body={"actions": merged, "batch_id": bid},
+                        enqueue_ts=min(b.enqueue_ts for b in fresh),
+                        method="POST",
+                    )
+                )
                 stats["migrate_out"] = 1
 
     # ---- hints: coalesce ALL into one PUT, HIGHEST stamp per hash --------
@@ -195,8 +204,7 @@ def _partition_and_coalesce(
     if hints:
         by_hash_h: Dict[Any, Dict[str, Any]] = {}
         for b in hints:
-            for h in (b.body.get("hints", []) if isinstance(b.body, dict)
-                      else []):
+            for h in (b.body.get("hints", []) if isinstance(b.body, dict) else []):
                 hsh = h.get("hash")
                 prev = by_hash_h.get(hsh)
                 if prev is None or h.get("stamp", -1) >= prev.get("stamp", -1):
@@ -204,12 +212,15 @@ def _partition_and_coalesce(
         merged_h = list(by_hash_h.values())
         if merged_h:
             bid = str(uuid.uuid4())
-            out.append(OutboundBatch(
-                batch_id=bid, endpoint="hints",
-                body={"hints": merged_h, "batch_id": bid},
-                enqueue_ts=min(b.enqueue_ts for b in hints),
-                method="PUT",
-            ))
+            out.append(
+                OutboundBatch(
+                    batch_id=bid,
+                    endpoint="hints",
+                    body={"hints": merged_h, "batch_id": bid},
+                    enqueue_ts=min(b.enqueue_ts for b in hints),
+                    method="PUT",
+                )
+            )
             stats["hints_out"] = 1
 
     return out, stats
@@ -299,6 +310,7 @@ class OutboundQueue:
         self._escalate_oldest_age_s = float(escalate_oldest_age_s)
         if migrate_freshness_ms is None:
             import os
+
             # GENEROUS default (30 s): the hints COALESCING removes the
             # normal-operation latency, so this is purely a pathological-
             # spike floor — it drops only a migrate so old (sglang
@@ -314,17 +326,13 @@ class OutboundQueue:
         self._migrate_freshness_ms = float(migrate_freshness_ms)
         if self._migrate_freshness_ms < 0:
             raise ValueError(
-                f"migrate_freshness_ms must be >= 0; "
-                f"got {migrate_freshness_ms}"
+                f"migrate_freshness_ms must be >= 0; " f"got {migrate_freshness_ms}"
             )
         if self._escalate_failures < 1:
-            raise ValueError(
-                f"escalate_failures must be >= 1; got {escalate_failures}"
-            )
+            raise ValueError(f"escalate_failures must be >= 1; got {escalate_failures}")
         if self._escalate_oldest_age_s < 0:
             raise ValueError(
-                f"escalate_oldest_age_s must be >= 0; "
-                f"got {escalate_oldest_age_s}"
+                f"escalate_oldest_age_s must be >= 0; " f"got {escalate_oldest_age_s}"
             )
 
     # ---- observability (sync; safe to call from /health) -------------
@@ -345,6 +353,7 @@ class OutboundQueue:
         valid coarse observations).  We tolerate ``IndexError`` /
         ``AttributeError`` for the empty-queue race."""
         import time
+
         now = time.time()
         ages = []
         # In-flight drained burst (#228): counts as backlog until dispatched.
@@ -372,13 +381,16 @@ class OutboundQueue:
         having attached ``action_id`` per item if it wants per-item
         APPLY_FAILED correlation."""
         import time
+
         batch_id = str(uuid.uuid4())
         # DESIGN §6 L507: batch_id is written into the request body
         # envelope so sglang can echo it in APPLY_FAILED.
         body = {"actions": list(actions), "batch_id": batch_id}
         batch = OutboundBatch(
-            batch_id=batch_id, endpoint="migrate",
-            body=body, enqueue_ts=time.time(),
+            batch_id=batch_id,
+            endpoint="migrate",
+            body=body,
+            enqueue_ts=time.time(),
         )
         self.queue.put_nowait(batch)
         return batch_id
@@ -399,6 +411,7 @@ class OutboundQueue:
         echoes it in the next /aginfer/state dump (T21 #181).
         """
         import time
+
         batch_id = str(uuid.uuid4())
         body = {
             "pid": pid,
@@ -407,8 +420,11 @@ class OutboundQueue:
             "batch_id": batch_id,
         }
         batch = OutboundBatch(
-            batch_id=batch_id, endpoint="program_paused",
-            body=body, enqueue_ts=time.time(), method="PUT",
+            batch_id=batch_id,
+            endpoint="program_paused",
+            body=body,
+            enqueue_ts=time.time(),
+            method="PUT",
         )
         self.queue.put_nowait(batch)
         return batch_id
@@ -427,11 +443,15 @@ class OutboundQueue:
         Returns the batch_id for APPLY_FAILED correlation.
         """
         import time
+
         batch_id = str(uuid.uuid4())
         body = {"hints": list(hints), "batch_id": batch_id}
         batch = OutboundBatch(
-            batch_id=batch_id, endpoint="hints",
-            body=body, enqueue_ts=time.time(), method="PUT",
+            batch_id=batch_id,
+            endpoint="hints",
+            body=body,
+            enqueue_ts=time.time(),
+            method="PUT",
         )
         self.queue.put_nowait(batch)
         return batch_id
@@ -447,12 +467,16 @@ class OutboundQueue:
             # bounded so a dead sglang fails fast on send.
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
-                    connect=5.0, read=30.0, write=10.0, pool=5.0,
+                    connect=5.0,
+                    read=30.0,
+                    write=10.0,
+                    pool=5.0,
                 ),
             )
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(
-                self._worker_loop(), name="aginfer-outbound-worker",
+                self._worker_loop(),
+                name="aginfer-outbound-worker",
             )
 
     async def stop(self) -> None:
@@ -466,22 +490,20 @@ class OutboundQueue:
             except asyncio.CancelledError:
                 pass
             except Exception:  # noqa: BLE001
-                logger.exception(
-                    "outbound worker raised during shutdown"
-                )
+                logger.exception("outbound worker raised during shutdown")
             self._worker_task = None
         if self._owns_client and self._client is not None:
             try:
                 await self._client.aclose()
             except Exception:  # noqa: BLE001
-                logger.warning("outbound client aclose raised",
-                               exc_info=True)
+                logger.warning("outbound client aclose raised", exc_info=True)
             self._client = None
 
     # ---- worker -----------------------------------------------------
 
     async def _worker_loop(self) -> None:
         import time
+
         while True:
             first = await self.queue.get()
             # #228: drain everything ELSE currently queued so a wake
@@ -505,11 +527,14 @@ class OutboundQueue:
                     now_ts=time.time(),
                     migrate_freshness_ms=self._migrate_freshness_ms,
                 )
-                if (stats["migrate_dropped_stale"]
-                        or stats["hints_in"] != stats["hints_out"]
-                        or stats["migrate_in"] != stats["migrate_out"]
-                        or stats["paused_in"] != stats["paused_out"]):
+                if (
+                    stats["migrate_dropped_stale"]
+                    or stats["hints_in"] != stats["hints_out"]
+                    or stats["migrate_in"] != stats["migrate_out"]
+                    or stats["paused_in"] != stats["paused_out"]
+                ):
                     from ._metrics import m as _m
+
                     _m("outbound_coalesce", **stats)
                 for batch in to_dispatch:
                     await self._dispatch_one(batch)
@@ -528,6 +553,7 @@ class OutboundQueue:
         escalation check.  Cancellation propagates so ``stop()`` sees clean
         termination; the worker loop's ``finally`` still drains task_done."""
         import time
+
         oldest_age_ms = max(0.0, (time.time() - batch.enqueue_ts) * 1000.0)
         if self.observability is not None:
             self.observability.record_outbound(
@@ -540,8 +566,8 @@ class OutboundQueue:
             raise
         except Exception:  # noqa: BLE001
             logger.exception(
-                "outbound worker: unexpected exception while POSTing "
-                "batch %s", batch.batch_id,
+                "outbound worker: unexpected exception while POSTing " "batch %s",
+                batch.batch_id,
             )
             success = False
             self.consecutive_failures += 1
@@ -552,6 +578,7 @@ class OutboundQueue:
             and oldest_age_ms >= self._escalate_oldest_age_s * 1000.0
         ):
             from ._fatal import fatal
+
             fatal(
                 "sglang_sustained_unreachable",
                 sglang_base_url=self.sglang_base_url,
@@ -578,6 +605,7 @@ class OutboundQueue:
           * transport exception: failure (sglang unreachable)
         """
         from ._metrics import m as _m
+
         assert self._client is not None
         url = f"{self.sglang_base_url}/aginfer/{batch.endpoint}"
         try:
@@ -588,12 +616,16 @@ class OutboundQueue:
                 r = await self._client.post(url, json=batch.body)
             else:
                 r = await self._client.request(
-                    batch.method, url, json=batch.body,
+                    batch.method,
+                    url,
+                    json=batch.body,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "outbound %s batch %s: POST raised: %s",
-                batch.endpoint, batch.batch_id, exc,
+                batch.endpoint,
+                batch.batch_id,
+                exc,
             )
             _m(
                 "outbound_post",
@@ -607,7 +639,9 @@ class OutboundQueue:
             logger.warning(
                 "outbound %s batch %s: HTTP %d (transient — next "
                 "joint_decide re-converges)",
-                batch.endpoint, batch.batch_id, r.status_code,
+                batch.endpoint,
+                batch.batch_id,
+                r.status_code,
             )
             _m(
                 "outbound_post",
@@ -622,7 +656,9 @@ class OutboundQueue:
             # response body is structured; surface it once.
             logger.warning(
                 "outbound %s batch %s: HTTP %d body=%s",
-                batch.endpoint, batch.batch_id, r.status_code,
+                batch.endpoint,
+                batch.batch_id,
+                r.status_code,
                 r.text[:200] if hasattr(r, "text") else "<?>",
             )
             _m(

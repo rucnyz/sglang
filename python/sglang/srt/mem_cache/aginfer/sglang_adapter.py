@@ -29,6 +29,7 @@ under inspection.  T29's policy-module plugin will pass the daemon's
 hint-table state alongside so the scorer can use the full residence
 view; for now the inline scorer is layer-local.
 """
+
 from __future__ import annotations
 
 import math
@@ -39,10 +40,8 @@ from .base import ReuseUnit, Scope, Tier, UnitType
 from .costs import default_costs
 from .ours_greedy import (
     OursGreedyPolicy,
-    holding_unit_cost,
     reload_cost,
 )
-
 
 # ---- tunable knobs (overridable via env so we don't need to recompile) ----
 
@@ -61,8 +60,13 @@ if _CONST_VU:
     # Observable activation marker (#208) — so the const_vu arm's neutralised
     # ranking is unambiguous in the sglang log, no proc-env archaeology needed.
     import sys as _sys
-    print("[aginfer] AGINFER_CONST_VU active — inline V_u reuse signal "
-          "neutralised (p_hat=lambda=1.0) (#208)", file=_sys.stderr, flush=True)
+
+    print(
+        "[aginfer] AGINFER_CONST_VU active — inline V_u reuse signal "
+        "neutralised (p_hat=lambda=1.0) (#208)",
+        file=_sys.stderr,
+        flush=True,
+    )
 
 _COSTS = default_costs()
 
@@ -173,6 +177,7 @@ def _current_time_counter() -> int:
     from sglang.srt.mem_cache.unified_cache_components import (
         peek_time_counter,
     )
+
     return int(peek_time_counter())
 
 
@@ -287,9 +292,10 @@ def _v_u_from_unit(u: ReuseUnit) -> float:
     # from the daemon hint via hint_v_u; absent/local-derived units default to 1.
     n_hold = max(1, len(u.holders), int(getattr(u, "n_holders", 0)))
     # Saved prefill at current tier (vs DROP) -- bigger = more valuable to keep.
-    save_prefill = n_hold * u.p_hat * (
-        reload_cost(u, Tier.DROP, _COSTS, pi_u)
-        - reload_cost(u, tier, _COSTS, pi_u)
+    save_prefill = (
+        n_hold
+        * u.p_hat
+        * (reload_cost(u, Tier.DROP, _COSTS, pi_u) - reload_cost(u, tier, _COSTS, pi_u))
     )
     # Holding tax (occupancy-weighted) -- we don't have live pool occupancy
     # here so use h_base * b_u * 1/(N·lambda) as the per-unit-time cost amortised

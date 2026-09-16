@@ -82,6 +82,7 @@ from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.forced_tokens import forced_override_positions
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -110,16 +111,12 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetAginferMetricsReq,
+    GetAginferMetricsReqOutput,
     GetAginferStateReq,
     GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    MigrateAginferReq,
-    MigrateAginferReqOutput,
-    UpdateAginferProgramPausedReq,
-    UpdateAginferProgramPausedReqOutput,
-    UpdateAginferHintsReq,
-    UpdateAginferHintsReqOutput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -132,6 +129,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    MigrateAginferReq,
+    MigrateAginferReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -151,6 +150,12 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateAginferEventsReq,
+    UpdateAginferEventsReqOutput,
+    UpdateAginferHintsReq,
+    UpdateAginferHintsReqOutput,
+    UpdateAginferProgramPausedReq,
+    UpdateAginferProgramPausedReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -203,7 +208,6 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
-from sglang.srt.managers.forced_tokens import forced_override_positions
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
@@ -229,7 +233,9 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
-from sglang.srt.mem_cache.aginfer import metrics_hooks as _metrics_hooks  # aginfer EMA hooks (#251)
+from sglang.srt.mem_cache.aginfer import (
+    metrics_hooks as _metrics_hooks,  # aginfer EMA hooks (#251)
+)
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -503,6 +509,7 @@ class Scheduler(
         self._aginfer_driver = None
         if self._aginfer_in_engine:
             from sglang.srt.mem_cache.aginfer.scheduler_driver import AginferDriver
+
             self._aginfer_driver = AginferDriver()
             logger.info("aginfer in-engine driver armed (SGLANG_AGINFER_IN_ENGINE=1)")
 
@@ -1439,10 +1446,12 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (GetAginferStateReq, self.get_aginfer_state),
+                (GetAginferMetricsReq, self.get_aginfer_metrics),
                 (AginferSessionEndReq, self.end_aginfer_session),
                 (MigrateAginferReq, self.migrate_aginfer),
                 (UpdateAginferProgramPausedReq, self.update_aginfer_program_paused),
                 (UpdateAginferHintsReq, self.update_aginfer_hints),
+                (UpdateAginferEventsReq, self.update_aginfer_events),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
@@ -3730,18 +3739,22 @@ class Scheduler(
             if pu is not None:
                 occ = float(pu().get("HBM", {}).get("token_usage", 0.0))
             import time as _time
+
             theta_hi = getattr(self.server_args, "aginfer_theta_hi", 0.85)
             theta_lo = getattr(self.server_args, "aginfer_theta_lo", 0.70)
             heartbeat_s = getattr(self.server_args, "aginfer_heartbeat_s", 5.0)
             if self._aginfer_driver.should_tick(
-                occ, _time.monotonic(), theta_lo=theta_lo, min_interval_s=heartbeat_s):
-                result = self._aginfer_driver.tick(self, theta_hi=theta_hi, theta_lo=theta_lo,
-                                          heartbeat_s=heartbeat_s)
+                occ, _time.monotonic(), theta_lo=theta_lo, min_interval_s=heartbeat_s
+            ):
+                result = self._aginfer_driver.tick(
+                    self, theta_hi=theta_hi, theta_lo=theta_lo, heartbeat_s=heartbeat_s
+                )
                 logger.info("aginfer in-engine tick occ=%.4f result=%s", occ, result)
         except Exception:
             logger.exception(
                 "aginfer in-engine tick raised — DISABLING aginfer-in-engine for the "
-                "session (inline LRU scorer remains active; daemon path unaffected)")
+                "session (inline LRU scorer remains active; daemon path unaffected)"
+            )
             self._aginfer_in_engine = False
 
     # aginfer throughput/EMA hooks — logic in aginfer/metrics_hooks.py (#251 Stage A.2)
@@ -3770,7 +3783,9 @@ class Scheduler(
     def _aginfer_extend_token_count(*a, **k):
         return _metrics_hooks._aginfer_extend_token_count(*a, **k)
 
-    def get_aginfer_state(self, recv_req: GetAginferStateReq) -> GetAginferStateReqOutput:
+    def get_aginfer_state(
+        self, recv_req: GetAginferStateReq
+    ) -> GetAginferStateReqOutput:
         """Snapshot the radix cache for the aginfer daemon (paper §3 s_t).
 
         Only UnifiedRadixCache supports this; for other cache implementations
@@ -3802,6 +3817,38 @@ class Scheduler(
                 }
             )
         return GetAginferStateReqOutput(state=dump())
+
+    def get_aginfer_metrics(
+        self, recv_req: GetAginferMetricsReq
+    ) -> GetAginferMetricsReqOutput:
+        """P1: cumulative eviction/migrate counters, distinct from the
+        current-tree snapshot ``get_aginfer_state`` returns.
+
+        Unlike ``get_aginfer_state``, this degrades gracefully (empty dicts,
+        ``value_aware=False``) rather than an "unsupported" marker when the
+        tree cache predates the counters, since a caller diffing two polls
+        just wants "no evictions observed" rather than a hard failure.
+        """
+        cache = self.tree_cache
+        try:
+            from sglang.srt.mem_cache.aginfer.state_dump import _aginfer_pool_usage
+
+            pool_usage = _aginfer_pool_usage(cache)
+        except Exception:  # noqa: BLE001
+            # Non-Unified tree cache (e.g. plain RadixCache): no aginfer
+            # accounting to report, same "degrade gracefully" contract as
+            # the rest of this method.
+            pool_usage = {}
+        return GetAginferMetricsReqOutput(
+            evict=dict(getattr(cache, "_aginfer_evict_counters", {}) or {}),
+            migrate_applied=dict(getattr(cache, "_aginfer_migrate_counters", {}) or {}),
+            migrate_skipped=dict(
+                getattr(cache, "_aginfer_migrate_skipped_counters", {}) or {}
+            ),
+            hash_collisions=len(getattr(cache, "_aginfer_collision_seen", ()) or ()),
+            pool_usage=pool_usage,
+            value_aware=bool(getattr(cache, "_aginfer_value_aware", False)),
+        )
 
     def _aginfer_session_end_output(
         self,
@@ -4144,8 +4191,7 @@ class Scheduler(
             result = self._aginfer_drop_program(program_id)
             global_error = self._aginfer_any_rank(not bool(result.get("ok", False)))
             local_incomplete = (
-                bool(result.get("skipped"))
-                or int(result.get("remaining_nodes", 0)) > 0
+                bool(result.get("skipped")) or int(result.get("remaining_nodes", 0)) > 0
             )
             global_incomplete = self._aginfer_any_rank(local_incomplete)
             if not global_error and not global_incomplete:
@@ -4186,7 +4232,8 @@ class Scheduler(
         )
 
     def update_aginfer_program_paused(
-        self, recv_req: UpdateAginferProgramPausedReq,
+        self,
+        recv_req: UpdateAginferProgramPausedReq,
     ) -> UpdateAginferProgramPausedReqOutput:
         """T21 (#181): daemon → sglang PUT /aginfer/program_paused.
 
@@ -4201,7 +4248,9 @@ class Scheduler(
         the setter (legacy HiRadixCache) reject the PUT.
         """
         setter = getattr(
-            self.tree_cache, "set_aginfer_program_state", None,
+            self.tree_cache,
+            "set_aginfer_program_state",
+            None,
         )
         if setter is None:
             return UpdateAginferProgramPausedReqOutput(
@@ -4219,11 +4268,14 @@ class Scheduler(
             pre_pause_state=recv_req.pre_pause_state,
         )
         return UpdateAginferProgramPausedReqOutput(
-            ok=ok, reason=reason, applied=applied,
+            ok=ok,
+            reason=reason,
+            applied=applied,
         )
 
     def update_aginfer_hints(
-        self, recv_req: UpdateAginferHintsReq,
+        self,
+        recv_req: UpdateAginferHintsReq,
     ) -> UpdateAginferHintsReqOutput:
         """T40 (#184): daemon → sglang PUT /aginfer/hints handler.
 
@@ -4246,6 +4298,31 @@ class Scheduler(
             )
         ok, reason, applied = setter(recv_req.hints)
         return UpdateAginferHintsReqOutput(ok=ok, reason=reason, applied=applied)
+
+    def update_aginfer_events(
+        self,
+        recv_req: UpdateAginferEventsReq,
+    ) -> UpdateAginferEventsReqOutput:
+        """P2b (EXP_PLAN.md): Dynamo -> sglang push of agent lifecycle events,
+        forwarded from a generate request's ``extra_args.aginfer_events``.
+
+        Requires the in-engine driver (``SGLANG_AGINFER_IN_ENGINE=1``); a
+        normal launch rejects the RPC the same way ``update_aginfer_hints``
+        rejects a legacy tree cache, so a caller can tell "not applicable"
+        from "applied 0 events". See ``AginferDriver.apply_events`` for the
+        belief-transition mapping.
+        """
+        if self._aginfer_driver is None:
+            return UpdateAginferEventsReqOutput(
+                ok=False,
+                reason="in-engine driver not armed; set SGLANG_AGINFER_IN_ENGINE=1",
+            )
+        result = self._aginfer_driver.apply_events(recv_req.events)
+        return UpdateAginferEventsReqOutput(
+            ok=True,
+            applied=result["applied"],
+            skipped=result["skipped"],
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         server_args_dict = recv_req.server_args

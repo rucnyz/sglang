@@ -59,13 +59,13 @@ Stages:
     D2 clear is a no-op when the hint table is empty (non-aginfer mode
        pays nothing)
 """
+
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, List, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -79,11 +79,16 @@ from baselines.sglang_adapter import (  # noqa: E402
     hint_v_u,
     ours_greedy_score,
 )
+
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -95,20 +100,28 @@ class StageFail(AssertionError):
 
 class _CompData:
     def __init__(self, n_tokens: int):
-        self.value = list(range(n_tokens))   # device tokens
+        self.value = list(range(n_tokens))  # device tokens
         self.host_value = None
 
 
 class _Node:
     """Duck-typed UnifiedTreeNode for the scorers + cache methods."""
+
     _counter = 10000
 
-    def __init__(self, *, last_access_time: int = 0, hit_count: int = 0,
-                 n_tokens: int = 100, hash_value=None, parent=None):
+    def __init__(
+        self,
+        *,
+        last_access_time: int = 0,
+        hit_count: int = 0,
+        n_tokens: int = 100,
+        hash_value=None,
+        parent=None,
+    ):
         self.last_access_time = last_access_time
         self.hit_count = hit_count
         self.component_data = [_CompData(n_tokens)]
-        self.hash_value = hash_value          # list or None
+        self.hash_value = hash_value  # list or None
         self.parent = parent
         self.key = _Key()
         _Node._counter += 1
@@ -185,7 +198,9 @@ def stage_a3_monotonic_in_p_hat() -> None:
     for p in (0.0, 0.25, 0.5, 0.75, 1.0):
         v = hint_v_u(n, _LAYER, {"p_hat": p, "lambda": 0.2, "stamp": 1})
         if prev is not None and not (v >= prev):
-            raise StageFail(f"V_u must be monotonic in p_hat; p={p} v={v} < prev={prev}")
+            raise StageFail(
+                f"V_u must be monotonic in p_hat; p={p} v={v} < prev={prev}"
+            )
         prev = v
 
 
@@ -199,6 +214,7 @@ def stage_a4_scorer_does_not_advance_counter() -> None:
     go away: scoring the same node twice is deterministic and the
     counter is unchanged."""
     from sglang.srt.mem_cache.unified_cache_components import peek_time_counter
+
     n = _Node(last_access_time=0, hit_count=3, n_tokens=100)
     before = int(peek_time_counter())
     s1 = hint_v_u(n, _LAYER, None)
@@ -233,7 +249,8 @@ def stage_a5_hint_only_raises_never_lowers() -> None:
     if abs(low - local) > 1e-9:
         raise StageFail(
             f"a LOW hint must NOT lower a locally-hot prefix below local "
-            f"(max-combine); local={local} low_hint={low}")
+            f"(max-combine); local={local} low_hint={low}"
+        )
     # locally-COLD node (one-shot → local p_hat≈0) with a HIGH hint: the daemon's
     # foresight may still RAISE it (promote), so the score must exceed no-hint.
     cold = _Node(last_access_time=0, hit_count=1, n_tokens=100)
@@ -242,7 +259,8 @@ def stage_a5_hint_only_raises_never_lowers() -> None:
     if not (high > local_cold):
         raise StageFail(
             f"a HIGH hint must still RAISE a locally-cold node (promote foresight); "
-            f"local_cold={local_cold} high_hint={high}")
+            f"local_cold={local_cold} high_hint={high}"
+        )
 
 
 # ============================================================ B. selection + scorer
@@ -263,7 +281,9 @@ def stage_b0_sentinel_binds_hint_scorer() -> None:
         raise StageFail("sentinel spec must set _aginfer_hint_aware=True")
     # the scorer is the bound method
     if c._eviction_scorer != c._aginfer_eviction_score:
-        raise StageFail("sentinel must bind _eviction_scorer to _aginfer_eviction_score")
+        raise StageFail(
+            "sentinel must bind _eviction_scorer to _aginfer_eviction_score"
+        )
 
 
 def stage_b1_scorer_reads_hint_table() -> None:
@@ -340,6 +360,7 @@ def stage_c0_birth_seed_absent() -> None:
     a brand-new one-shot flood tie a heavily-reused prefix — so the seed must be a
     low floor and let demonstrated reuse (the local reuse-based p_hat) dominate."""
     from sglang.srt.mem_cache import unified_radix_cache as _urc
+
     seed = float(_urc._AGINFER_BIRTH_PHAT)
     c = _bare_cache()
     c._aginfer_hint_aware = True
@@ -351,7 +372,8 @@ def stage_c0_birth_seed_absent() -> None:
     if not (0.0 <= seed < 0.5):
         raise StageFail(
             f"birth-seed must be a LOW floor (<0.5) so a fresh flood can't tie a "
-            f"reused prefix under max-combine; got {seed}")
+            f"reused prefix under max-combine; got {seed}"
+        )
 
 
 def stage_c1_birth_seed_no_clobber() -> None:
@@ -362,7 +384,9 @@ def stage_c1_birth_seed_no_clobber() -> None:
     c._aginfer_seed_birth(n)
     h = c._aginfer_hints["u"]
     if abs(h["p_hat"] - 0.3) > 1e-9 or h["stamp"] != 99:
-        raise StageFail(f"birth-seed must NOT clobber an existing (daemon) hint; got {h!r}")
+        raise StageFail(
+            f"birth-seed must NOT clobber an existing (daemon) hint; got {h!r}"
+        )
 
 
 def stage_c2_birth_seed_noop_when_not_aware() -> None:
@@ -371,7 +395,9 @@ def stage_c2_birth_seed_noop_when_not_aware() -> None:
     n = _Node(hash_value=["fresh"], last_access_time=5)
     c._aginfer_seed_birth(n)
     if c._aginfer_hints:
-        raise StageFail(f"non-hint-aware mode must not birth-seed; got {c._aginfer_hints!r}")
+        raise StageFail(
+            f"non-hint-aware mode must not birth-seed; got {c._aginfer_hints!r}"
+        )
 
 
 def stage_c3_daemon_overwrites_birth_seed() -> None:
@@ -418,8 +444,10 @@ def stage_d0_remove_clears_hint() -> None:
     c = _bare_cache()
     c.page_size = 1
     _, child = _parented_node("dead")
-    c._aginfer_hints = {"dead": {"p_hat": 0.5, "lambda": 0.2, "stamp": 1},
-                        "live": {"p_hat": 0.9, "lambda": 0.2, "stamp": 1}}
+    c._aginfer_hints = {
+        "dead": {"p_hat": 0.5, "lambda": 0.2, "stamp": 1},
+        "live": {"p_hat": 0.9, "lambda": 0.2, "stamp": 1},
+    }
     c._remove_leaf_from_parent(child)
     if "dead" in c._aginfer_hints:
         raise StageFail("evicting (removing) a node must clear its hint")
@@ -450,7 +478,7 @@ def stage_d2_clear_noop_empty_table() -> None:
     c.page_size = 1
     parent, child = _parented_node("whatever")
     c._aginfer_hints = {}
-    c._remove_leaf_from_parent(child)   # must not raise
+    c._remove_leaf_from_parent(child)  # must not raise
     if parent.children.get("k") is not None:
         raise StageFail("node should still be detached even with empty table")
 
@@ -459,23 +487,44 @@ def stage_d2_clear_noop_empty_table() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 hint p_hat drives the eviction V_u",         stage_a0_hint_drives_score),
-    ("A1 no hint → local fallback (float)",            stage_a1_no_hint_fallback),
-    ("A2 drift guard: hint_v_u(None) == ours_greedy",  stage_a2_drift_guard_vs_ours_greedy),
-    ("A3 V_u monotonic in hint p_hat",                 stage_a3_monotonic_in_p_hat),
-    ("A4 scorer does not advance the time counter (#193)", stage_a4_scorer_does_not_advance_counter),
-    ("A5 hint only RAISES, never lowers below local (#250)", stage_a5_hint_only_raises_never_lowers),
-    ("B0 sentinel binds the hint-aware scorer",        stage_b0_sentinel_binds_hint_scorer),
-    ("B1 scorer reads _aginfer_hints by node hash",    stage_b1_scorer_reads_hint_table),
-    ("B2 default spec → not hint-aware",               stage_b2_normal_spec_not_hint_aware),
-    ("B3 real producer→consumer round-trip (hash key)", stage_b3_real_producer_consumer_round_trip),
-    ("C0 birth-seed low-floor p_hat for absent unit (#249/#250)", stage_c0_birth_seed_absent),
-    ("C1 birth-seed does not clobber daemon hint",     stage_c1_birth_seed_no_clobber),
-    ("C2 birth-seed no-op when not hint-aware",        stage_c2_birth_seed_noop_when_not_aware),
-    ("C3 daemon overwrites birth-seed (C7 stamp floor)", stage_c3_daemon_overwrites_birth_seed),
-    ("D0 remove_leaf_from_parent clears the hint",     stage_d0_remove_clears_hint),
-    ("D1 clear after detach (§10 ordering)",           stage_d1_clear_after_detach),
-    ("D2 clear no-op on empty table",                  stage_d2_clear_noop_empty_table),
+    ("A0 hint p_hat drives the eviction V_u", stage_a0_hint_drives_score),
+    ("A1 no hint → local fallback (float)", stage_a1_no_hint_fallback),
+    (
+        "A2 drift guard: hint_v_u(None) == ours_greedy",
+        stage_a2_drift_guard_vs_ours_greedy,
+    ),
+    ("A3 V_u monotonic in hint p_hat", stage_a3_monotonic_in_p_hat),
+    (
+        "A4 scorer does not advance the time counter (#193)",
+        stage_a4_scorer_does_not_advance_counter,
+    ),
+    (
+        "A5 hint only RAISES, never lowers below local (#250)",
+        stage_a5_hint_only_raises_never_lowers,
+    ),
+    ("B0 sentinel binds the hint-aware scorer", stage_b0_sentinel_binds_hint_scorer),
+    ("B1 scorer reads _aginfer_hints by node hash", stage_b1_scorer_reads_hint_table),
+    ("B2 default spec → not hint-aware", stage_b2_normal_spec_not_hint_aware),
+    (
+        "B3 real producer→consumer round-trip (hash key)",
+        stage_b3_real_producer_consumer_round_trip,
+    ),
+    (
+        "C0 birth-seed low-floor p_hat for absent unit (#249/#250)",
+        stage_c0_birth_seed_absent,
+    ),
+    ("C1 birth-seed does not clobber daemon hint", stage_c1_birth_seed_no_clobber),
+    (
+        "C2 birth-seed no-op when not hint-aware",
+        stage_c2_birth_seed_noop_when_not_aware,
+    ),
+    (
+        "C3 daemon overwrites birth-seed (C7 stamp floor)",
+        stage_c3_daemon_overwrites_birth_seed,
+    ),
+    ("D0 remove_leaf_from_parent clears the hint", stage_d0_remove_clears_hint),
+    ("D1 clear after detach (§10 ordering)", stage_d1_clear_after_detach),
+    ("D2 clear no-op on empty table", stage_d2_clear_noop_empty_table),
 ]
 
 
@@ -490,8 +539,10 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: "
-                  f"unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: "
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\nT27 FAILED ({len(failures)}): {failures}"))
         return 1

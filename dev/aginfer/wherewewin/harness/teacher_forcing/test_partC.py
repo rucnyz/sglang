@@ -14,6 +14,7 @@ within noise.
 
 Run: sglang up (override in-code, no flag). See run_partC.sh.
 """
+
 import argparse
 import json
 import statistics
@@ -41,9 +42,16 @@ def gen(base, input_ids, max_new, forced=None):
 
 def capture_ostar(base):
     n, _ = 0, None
-    body = {"input_ids": P_BASE, "sampling_params":
-            {"temperature": 0.0, "max_new_tokens": L, "ignore_eos": True},
-            "return_logprob": True, "stream": False}
+    body = {
+        "input_ids": P_BASE,
+        "sampling_params": {
+            "temperature": 0.0,
+            "max_new_tokens": L,
+            "ignore_eos": True,
+        },
+        "return_logprob": True,
+        "stream": False,
+    }
     r = requests.post(base.rstrip("/") + "/generate", json=body, timeout=600)
     r.raise_for_status()
     otl = r.json()["meta_info"].get("output_token_logprobs") or []
@@ -79,23 +87,37 @@ def level(base, n_conc, o_star, rounds):
     for r in range(rounds):
         tps_b, e_b = run_batch(base, n_conc, None)
         tps_f, e_f = run_batch(base, n_conc, o_star)
-        base_tps.append(tps_b); force_tps.append(tps_f)
-        base_p50.append(statistics.median(e_b)); force_p50.append(statistics.median(e_f))
-    bt, bs = band(base_tps); ft, fs = band(force_tps)
-    bp, _ = band(base_p50); fp, _ = band(force_p50)
+        base_tps.append(tps_b)
+        force_tps.append(tps_f)
+        base_p50.append(statistics.median(e_b))
+        force_p50.append(statistics.median(e_f))
+    bt, bs = band(base_tps)
+    ft, fs = band(force_tps)
+    bp, _ = band(base_p50)
+    fp, _ = band(force_p50)
     dpct = 100 * (ft - bt) / bt if bt else 0.0
     overlap = abs(ft - bt) <= 2 * max(bs, fs, 1e-9)
-    print(f"  conc={n_conc:4d}: base {bt:7.1f}±{bs:5.1f}  forced {ft:7.1f}±{fs:5.1f} tok/s  "
-          f"Δ {dpct:+.2f}%  p50 {bp:.0f}/{fp:.0f}ms  {'PASS' if overlap else 'REVIEW'}")
-    return {"concurrency": n_conc, "base_tps": [bt, bs], "forced_tps": [ft, fs],
-            "delta_pct": dpct, "overlap_2sigma": overlap}
+    print(
+        f"  conc={n_conc:4d}: base {bt:7.1f}±{bs:5.1f}  forced {ft:7.1f}±{fs:5.1f} tok/s  "
+        f"Δ {dpct:+.2f}%  p50 {bp:.0f}/{fp:.0f}ms  {'PASS' if overlap else 'REVIEW'}"
+    )
+    return {
+        "concurrency": n_conc,
+        "base_tps": [bt, bs],
+        "forced_tps": [ft, fs],
+        "delta_pct": dpct,
+        "overlap_2sigma": overlap,
+    }
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base-url", default="http://127.0.0.1:30000")
-    ap.add_argument("--concurrency", default="96,128,192,256",
-                    help="comma-separated concurrency levels")
+    ap.add_argument(
+        "--concurrency",
+        default="96,128,192,256",
+        help="comma-separated concurrency levels",
+    )
     ap.add_argument("--rounds", type=int, default=5)
     a = ap.parse_args()
     base = a.base_url

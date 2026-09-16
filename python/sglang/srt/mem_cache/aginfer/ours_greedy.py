@@ -15,10 +15,11 @@ the union action space; T12 will replace the soft-quadratic placeholder
 holding-cost shape.  T33 (this commit) covers the data-flow + 6-
 transition enumeration only.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from .base import Action, ReuseUnit, SchedulerState, Tier
 from .knapsack import Migrate
@@ -31,6 +32,7 @@ _TIER_LABEL = {Tier.HBM: "HBM", Tier.DRAM: "DRAM", Tier.DISK: "DISK"}
 @dataclass
 class TierCosts:
     """All per-tier scalars. Calibrate from trace warm-up."""
+
     # rho_τ: reload cost per token (sec/tok). DROP tier uses prefill cost pi_u.
     rho: Dict[Tier, float]
     # h_τ baseline; multiplied by (1 + occ^2) so cost rises near cap.
@@ -49,41 +51,40 @@ _TRANSITIONS: Dict[frozenset, List[Tuple[List[Tier], List[Tier]]]] = {
     # HBM only → HBM+DRAM (write_through) | HBM only → DRAM (host-only)
     # | HBM only → DROP (full eviction)
     frozenset({Tier.HBM}): [
-        ([Tier.DRAM], []),               # write_through; keep HBM
-        ([Tier.DRAM], [Tier.HBM]),       # evict HBM, host backup created
-        ([], [Tier.HBM]),                # DROP entirely
+        ([Tier.DRAM], []),  # write_through; keep HBM
+        ([Tier.DRAM], [Tier.HBM]),  # evict HBM, host backup created
+        ([], [Tier.HBM]),  # DROP entirely
     ],
     # HBM+DRAM → DRAM (HBM evict) | HBM+DRAM → HBM (DRAM drop)
     # | HBM+DRAM → DROP (full)
     frozenset({Tier.HBM, Tier.DRAM}): [
-        ([], [Tier.HBM]),                # HBM eviction
-        ([], [Tier.DRAM]),               # DRAM drop, device retained
-        ([], [Tier.HBM, Tier.DRAM]),     # DROP entirely
+        ([], [Tier.HBM]),  # HBM eviction
+        ([], [Tier.DRAM]),  # DRAM drop, device retained
+        ([], [Tier.HBM, Tier.DRAM]),  # DROP entirely
     ],
     # DRAM only → HBM+DRAM (load_back) | DRAM only → DRAM+DISK (spill)
     # | DRAM only → DROP
     frozenset({Tier.DRAM}): [
-        ([Tier.HBM], []),                # load_back to device
-        ([Tier.DISK], []),               # Mooncake spill
-        ([], [Tier.DRAM]),               # DROP
+        ([Tier.HBM], []),  # load_back to device
+        ([Tier.DISK], []),  # Mooncake spill
+        ([], [Tier.DRAM]),  # DROP
     ],
     # DRAM+DISK → DRAM (drop disk) | DRAM+DISK → HBM+DRAM (promote+drop_disk)
     # | DRAM+DISK → DISK
     frozenset({Tier.DRAM, Tier.DISK}): [
-        ([], [Tier.DISK]),               # disk spill rolled back
-        ([Tier.HBM], [Tier.DISK]),       # promote to device, lose disk
-        ([], [Tier.DRAM]),               # forget device-side, keep disk
+        ([], [Tier.DISK]),  # disk spill rolled back
+        ([Tier.HBM], [Tier.DISK]),  # promote to device, lose disk
+        ([], [Tier.DRAM]),  # forget device-side, keep disk
     ],
     # DISK only → DRAM+DISK (Mooncake load) | DISK only → DROP
     frozenset({Tier.DISK}): [
-        ([Tier.DRAM], []),               # Mooncake load to DRAM
-        ([], [Tier.DISK]),               # DROP
+        ([Tier.DRAM], []),  # Mooncake load to DRAM
+        ([], [Tier.DISK]),  # DROP
     ],
 }
 
 
-def reload_cost(u: ReuseUnit, tier: Tier, costs: TierCosts,
-                pi_u: float) -> float:
+def reload_cost(u: ReuseUnit, tier: Tier, costs: TierCosts, pi_u: float) -> float:
     """R(u, τ) — paper §2.2."""
     if tier == Tier.DROP:
         return pi_u * u.n_tokens
@@ -156,8 +157,10 @@ def _holder_actively_decoding(u: ReuseUnit, state: SchedulerState) -> bool:
         inflight = ppu.get(sid, {}).get("hbm", {}).get("inflight", {})
         # ``bool`` is an ``int`` subclass — exclude it so a stray True can
         # never masquerade as a positive byte count.
-        if any(isinstance(b, (int, float)) and not isinstance(b, bool)
-               and b > 0 for b in inflight.values()):
+        if any(
+            isinstance(b, (int, float)) and not isinstance(b, bool) and b > 0
+            for b in inflight.values()
+        ):
             return True
     return False
 
@@ -171,9 +174,13 @@ def _authoritative_of(residence: List[Tier]) -> Tier:
     return Tier.DROP
 
 
-def value_residence(u: ReuseUnit, next_residence: List[Tier],
-                    state: SchedulerState, costs: TierCosts,
-                    pi_u: float) -> float:
+def value_residence(
+    u: ReuseUnit,
+    next_residence: List[Tier],
+    state: SchedulerState,
+    costs: TierCosts,
+    pi_u: float,
+) -> float:
     """V_u over a candidate residence — paper §7 / DESIGN §7 ``_value``.
 
     Module-level so the §9 ``migrate_candidates`` generator and the
@@ -199,9 +206,13 @@ def value_residence(u: ReuseUnit, next_residence: List[Tier],
     # Single-holder units (n_hold==1) are unchanged; only genuinely-shared prefixes
     # are boosted, so they outrank any single program's stale scratch under churn.
     n_hold = max(1, len(u.holders), int(getattr(u, "n_holders", 0)))
-    save_prefill = n_hold * u.p_hat * (
-        reload_cost(u, Tier.DROP, costs, pi_u)
-        - reload_cost(u, reuse_tier, costs, pi_u)
+    save_prefill = (
+        n_hold
+        * u.p_hat
+        * (
+            reload_cost(u, Tier.DROP, costs, pi_u)
+            - reload_cost(u, reuse_tier, costs, pi_u)
+        )
     )
     occ = state.tier_usage.occupancy_ratio(tier) if tier != Tier.DROP else 0.0
     h = holding_unit_cost(tier, occ, costs)
@@ -263,8 +274,9 @@ def migrate_candidates(
             continue
         src = _authoritative_of(current)
         for add_tiers, remove_tiers in transitions:
-            new_residence = [t for t in current if t not in remove_tiers] \
-                + list(add_tiers)
+            new_residence = [t for t in current if t not in remove_tiers] + list(
+                add_tiers
+            )
             if frozenset(new_residence) == current_key:
                 continue  # no-op edit
             # #210: a remove that sglang is structurally guaranteed to reject
@@ -309,19 +321,24 @@ def migrate_candidates(
             # just-finished turn's snapshot lag, not active decoding — and a
             # parked unit will NOT re-lock, so there is no evict-storm to fear.
             # The event is the stronger signal than the lagging metric.
-            if (Tier.HBM in remove_tiers and not _chain
-                    and _holder_actively_decoding(u, state)):
+            if (
+                Tier.HBM in remove_tiers
+                and not _chain
+                and _holder_actively_decoding(u, state)
+            ):
                 continue
 
-            cost = value_residence(u, current, state, costs, pi_u) \
-                - value_residence(u, new_residence, state, costs, pi_u)
+            cost = value_residence(u, current, state, costs, pi_u) - value_residence(
+                u, new_residence, state, costs, pi_u
+            )
             # Migration (link) cost: each ADDED tier not already resident
             # copies u's bytes from the source over the relevant link.
             for t in add_tiers:
                 if t in current or t == Tier.DROP:
                     continue
                 cost += migration_cost_effective(
-                    u, src, t, state.tier_usage.bw_free, costs)
+                    u, src, t, state.tier_usage.bw_free, costs
+                )
             # unavailability_cost == 0 under write-through HiCache
             # (DESIGN §7); kept implicit (the +0 term).
 
@@ -331,10 +348,8 @@ def migrate_candidates(
                     continue
                 sp_bytes = u.n_bytes_by_tier.get(t, {})
                 if sp_bytes:
-                    relief[_TIER_LABEL[t]] = {sp: int(b)
-                                              for sp, b in sp_bytes.items()}
-            if not any(b > 0 for sub in relief.values()
-                       for b in sub.values()):
+                    relief[_TIER_LABEL[t]] = {sp: int(b) for sp, b in sp_bytes.items()}
+            if not any(b > 0 for sub in relief.values() for b in sub.values()):
                 continue  # no pressure relieved (DESIGN §7 filter)
 
             acquired: Dict[str, Dict[str, int]] = {}
@@ -345,16 +360,17 @@ def migrate_candidates(
                 # Same physical bytes land on the destination tier
                 # (write-through copies bit-for-bit; subpool layout is
                 # architecture-fixed) — size from the source tier.
-                acquired[_TIER_LABEL[t]] = {sp: int(b)
-                                            for sp, b in src_bytes.items()}
+                acquired[_TIER_LABEL[t]] = {sp: int(b) for sp, b in src_bytes.items()}
 
-            out.append(Migrate(
-                cost=cost,
-                relief=relief,
-                acquired=acquired,
-                id=(u.id, list(add_tiers), list(remove_tiers)),
-                group=u.id,   # #194: a unit's transitions are alternatives
-            ))
+            out.append(
+                Migrate(
+                    cost=cost,
+                    relief=relief,
+                    acquired=acquired,
+                    id=(u.id, list(add_tiers), list(remove_tiers)),
+                    group=u.id,  # #194: a unit's transitions are alternatives
+                )
+            )
     return out
 
 
@@ -365,15 +381,17 @@ class OursGreedyPolicy:
         self.costs = costs
         self.pi_u = prefill_cost_per_token
 
-    def _value(self, u: ReuseUnit, next_residence: List[Tier],
-               state: SchedulerState) -> float:
+    def _value(
+        self, u: ReuseUnit, next_residence: List[Tier], state: SchedulerState
+    ) -> float:
         """V_u over a candidate residence — delegates to the module-level
         :func:`value_residence` so the greedy policy, ``migrate_candidates``
         (§9), and admission share one value definition."""
         return value_residence(u, next_residence, state, self.costs, self.pi_u)
 
-    def _score_transition(self, u: ReuseUnit, next_residence: List[Tier],
-                          state: SchedulerState) -> float:
+    def _score_transition(
+        self, u: ReuseUnit, next_residence: List[Tier], state: SchedulerState
+    ) -> float:
         """V_u(next) − M_eff(current_auth → next_auth)."""
         v = self._value(u, next_residence, state)
         # Migration cost: src is current authoritative_tier, dst is next.
@@ -388,7 +406,8 @@ class OursGreedyPolicy:
         else:
             dst = Tier.DROP
         mig = migration_cost_effective(
-            u, src, dst, state.tier_usage.bw_free, self.costs)
+            u, src, dst, state.tier_usage.bw_free, self.costs
+        )
         return v - mig
 
     def decide(self, state: SchedulerState) -> Action:
@@ -401,7 +420,7 @@ class OursGreedyPolicy:
         # closed-form greedy.
         capacity_left = {
             t: state.tier_usage.cap_bytes_total(t)
-               - state.tier_usage.used_bytes_total(t)
+            - state.tier_usage.used_bytes_total(t)
             for t in (Tier.HBM, Tier.DRAM, Tier.DISK)
         }
 
@@ -421,10 +440,9 @@ class OursGreedyPolicy:
             best_score = self._score_transition(u, current_residence, state)
 
             for add_tiers, remove_tiers in candidates:
-                next_residence = (
-                    [t for t in current_residence if t not in remove_tiers]
-                    + list(add_tiers)
-                )
+                next_residence = [
+                    t for t in current_residence if t not in remove_tiers
+                ] + list(add_tiers)
                 # Capacity check: every tier we're ADDING to must have
                 # room for u's bytes.
                 fits = True

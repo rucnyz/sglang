@@ -8,7 +8,6 @@ import tempfile
 import types
 import unittest
 
-
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 SCRIPT = SCRIPT_DIR / "run_agentreplay_saturated_arm.py"
 SPEC = importlib.util.spec_from_file_location("saturated_runner", SCRIPT)
@@ -107,9 +106,7 @@ class SaturatedRunnerTests(unittest.TestCase):
         )
         state = {
             "pool_used_bytes": {tier: 0 for tier in runner.steady.TIERS},
-            "pool_max_subpool_utilization": {
-                tier: 0 for tier in runner.steady.TIERS
-            },
+            "pool_max_subpool_utilization": {tier: 0 for tier in runner.steady.TIERS},
             "dead_physical_bytes": {tier: 0 for tier in runner.steady.TIERS},
         }
         original_fetch = runner.steady.telemetry.fetch_json
@@ -136,9 +133,7 @@ class SaturatedRunnerTests(unittest.TestCase):
         self.assertEqual(result["concurrency"]["peak"], 2)
         self.assertGreater(result["concurrency"]["full_concurrency_fraction"], 0.5)
         self.assertGreaterEqual(result["concurrency"]["ready_queue_peak"], 2)
-        self.assertGreaterEqual(
-            result["concurrency"]["waiting_live_programs_peak"], 1
-        )
+        self.assertGreaterEqual(result["concurrency"]["waiting_live_programs_peak"], 1)
 
     def test_playlist_order_uses_original_deterministic_arrivals(self):
         programs = {
@@ -155,9 +150,7 @@ class SaturatedRunnerTests(unittest.TestCase):
     def test_live_revisits_are_spread_by_churn_completion_count(self):
         programs = {
             **{
-                f"steady-{index}": records(
-                    f"steady-{index}", "churn", 2, float(index)
-                )
+                f"steady-{index}": records(f"steady-{index}", "churn", 2, float(index))
                 for index in range(8)
             },
             "steady-8": records("steady-8", "live", 4, 8.0),

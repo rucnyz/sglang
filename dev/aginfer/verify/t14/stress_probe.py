@@ -24,6 +24,7 @@ The defaults push ~32 concurrent /v1/chat/completions with
 program_id-tagged unique long prefixes so each chat anchors its own
 chain in the radix tree (instead of all sharing one system prompt).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,32 +41,53 @@ from pathlib import Path
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
 
-
 # --------------------------------------------------------------- args
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(__doc__)
-    p.add_argument("--base", default=os.environ.get("AGINFER_VERIFY_BASE", ""),
-                   help="sglang base URL (default $AGINFER_VERIFY_BASE)")
-    p.add_argument("--model", default="Qwen/Qwen3-0.6B",
-                   help="served model name for /v1/chat/completions")
-    p.add_argument("--concurrency", type=int, default=32,
-                   help="number of concurrent chats")
-    p.add_argument("--duration", type=float, default=90.0,
-                   help="seconds to sustain load")
-    p.add_argument("--max-tokens", type=int, default=200,
-                   help="max_tokens per chat")
-    p.add_argument("--prefix-min-tokens", type=int, default=256,
-                   help="lower bound on the per-chat unique prefix length")
-    p.add_argument("--prefix-max-tokens", type=int, default=512,
-                   help="upper bound on the per-chat unique prefix length")
-    p.add_argument("--poll-interval", type=float, default=0.15,
-                   help="seconds between /aginfer/state polls")
-    p.add_argument("--out", default=None,
-                   help="optional TSV path for raw samples")
-    p.add_argument("--threshold-ms", type=float, default=50.0,
-                   help="PLAN T14 F3-revisit p99 threshold (ms)")
+    p.add_argument(
+        "--base",
+        default=os.environ.get("AGINFER_VERIFY_BASE", ""),
+        help="sglang base URL (default $AGINFER_VERIFY_BASE)",
+    )
+    p.add_argument(
+        "--model",
+        default="Qwen/Qwen3-0.6B",
+        help="served model name for /v1/chat/completions",
+    )
+    p.add_argument(
+        "--concurrency", type=int, default=32, help="number of concurrent chats"
+    )
+    p.add_argument(
+        "--duration", type=float, default=90.0, help="seconds to sustain load"
+    )
+    p.add_argument("--max-tokens", type=int, default=200, help="max_tokens per chat")
+    p.add_argument(
+        "--prefix-min-tokens",
+        type=int,
+        default=256,
+        help="lower bound on the per-chat unique prefix length",
+    )
+    p.add_argument(
+        "--prefix-max-tokens",
+        type=int,
+        default=512,
+        help="upper bound on the per-chat unique prefix length",
+    )
+    p.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.15,
+        help="seconds between /aginfer/state polls",
+    )
+    p.add_argument("--out", default=None, help="optional TSV path for raw samples")
+    p.add_argument(
+        "--threshold-ms",
+        type=float,
+        default=50.0,
+        help="PLAN T14 F3-revisit p99 threshold (ms)",
+    )
     args = p.parse_args()
     if not args.base:
         p.error("--base or $AGINFER_VERIFY_BASE required")
@@ -103,16 +125,18 @@ async def _drive_one_chat(
     are swallowed (the goal is to keep load up, not to crash on a
     transient sglang queue overflow)."""
     import aiohttp
+
     url = f"{base}/v1/chat/completions"
     body = {
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": (
-                f"Context: {prefix}\n\n"
-                f"Reply with: ok-{program_id[-6:]}"
-            ),
-        }],
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"Context: {prefix}\n\n" f"Reply with: ok-{program_id[-6:]}"
+                ),
+            }
+        ],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "program_id": program_id,
@@ -152,11 +176,12 @@ def _pool_used_frac(pool_usage: Dict[str, Any], tier: str) -> float:
 
 async def _stress_loop(args: argparse.Namespace) -> List[Dict[str, Any]]:
     """Concurrently:
-       (a) fire chats in a tight loop until --duration elapses,
-           keeping concurrency-many in flight at all times;
-       (b) sample /aginfer/state every --poll-interval seconds.
+    (a) fire chats in a tight loop until --duration elapses,
+        keeping concurrency-many in flight at all times;
+    (b) sample /aginfer/state every --poll-interval seconds.
     """
     import aiohttp
+
     rng = random.Random(0xA61F_E2)
     samples: List[Dict[str, Any]] = []
     t_start = time.perf_counter()
@@ -169,11 +194,17 @@ async def _stress_loop(args: argparse.Namespace) -> List[Dict[str, Any]]:
             program_id = f"t14-stress-{next_pid_n:05d}"
             next_pid_n += 1
             prefix = _unique_prefix(
-                rng, args.prefix_min_tokens, args.prefix_max_tokens,
+                rng,
+                args.prefix_min_tokens,
+                args.prefix_max_tokens,
             )
             await _drive_one_chat(
-                session, args.base, args.model,
-                program_id, prefix, args.max_tokens,
+                session,
+                args.base,
+                args.model,
+                program_id,
+                prefix,
+                args.max_tokens,
             )
 
     async def _poll_loop() -> None:
@@ -182,27 +213,33 @@ async def _stress_loop(args: argparse.Namespace) -> List[Dict[str, Any]]:
             state = _poll_state(args.base)
             if state is not None:
                 m = state.get("state_dump_metrics", {})
-                samples.append({
-                    "t_s": round(t, 3),
-                    "units": len(state.get("units", [])),
-                    "hbm_used_frac": round(
-                        _pool_used_frac(state.get("pool_usage", {}), "HBM"), 3),
-                    "dram_used_frac": round(
-                        _pool_used_frac(state.get("pool_usage", {}), "DRAM"), 3),
-                    "p50_ms": m.get("p50_ms", 0.0),
-                    "p95_ms": m.get("p95_ms", 0.0),
-                    "p99_ms": m.get("p99_ms", 0.0),
-                    "max_ms": m.get("max_ms", 0.0),
-                    "last_dump_bytes": m.get("last_dump_bytes", -1),
-                    "n_samples_in_window": m.get("n_samples", 0),
-                    "n_recorded_total": m.get("n_recorded_total", 0),
-                })
+                samples.append(
+                    {
+                        "t_s": round(t, 3),
+                        "units": len(state.get("units", [])),
+                        "hbm_used_frac": round(
+                            _pool_used_frac(state.get("pool_usage", {}), "HBM"), 3
+                        ),
+                        "dram_used_frac": round(
+                            _pool_used_frac(state.get("pool_usage", {}), "DRAM"), 3
+                        ),
+                        "p50_ms": m.get("p50_ms", 0.0),
+                        "p95_ms": m.get("p95_ms", 0.0),
+                        "p99_ms": m.get("p99_ms", 0.0),
+                        "max_ms": m.get("max_ms", 0.0),
+                        "last_dump_bytes": m.get("last_dump_bytes", -1),
+                        "n_samples_in_window": m.get("n_samples", 0),
+                        "n_recorded_total": m.get("n_recorded_total", 0),
+                    }
+                )
             await asyncio.sleep(args.poll_interval)
 
     timeout = aiohttp.ClientTimeout(total=180)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = [asyncio.create_task(_drive_forever(session))
-                 for _ in range(args.concurrency)]
+        tasks = [
+            asyncio.create_task(_drive_forever(session))
+            for _ in range(args.concurrency)
+        ]
         tasks.append(asyncio.create_task(_poll_loop()))
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -215,8 +252,7 @@ async def _stress_loop(args: argparse.Namespace) -> List[Dict[str, Any]]:
 # ----------------------------------------------------------- report
 
 
-def _print_tsv(samples: List[Dict[str, Any]],
-               out_path: Optional[str]) -> None:
+def _print_tsv(samples: List[Dict[str, Any]], out_path: Optional[str]) -> None:
     header = (
         "t_s\tunits\thbm%\tdram%\tp50_ms\tp95_ms\tp99_ms\tmax_ms\t"
         "dump_bytes\tn_recorded_total"
@@ -237,8 +273,7 @@ def _print_tsv(samples: List[Dict[str, Any]],
     print(text)
 
 
-def _summary(samples: List[Dict[str, Any]],
-             threshold_ms: float) -> Dict[str, Any]:
+def _summary(samples: List[Dict[str, Any]], threshold_ms: float) -> Dict[str, Any]:
     if not samples:
         return {"empty": True}
     peak_units = max(s["units"] for s in samples)
@@ -271,8 +306,7 @@ def main() -> int:
     try:
         import aiohttp  # noqa: F401
     except ImportError:
-        print("stress probe requires aiohttp; "
-              "pip install aiohttp", file=sys.stderr)
+        print("stress probe requires aiohttp; " "pip install aiohttp", file=sys.stderr)
         return 2
 
     print(

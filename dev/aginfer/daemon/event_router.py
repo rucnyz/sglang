@@ -21,6 +21,7 @@ Design contract (verify/t5/README.md):
 No new periodic timer.  The watermark heartbeat lives on sglang's
 side (managers/aginfer_webhook.py).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -90,7 +91,7 @@ class EventRouter:
         # behaves exactly as before.  The heap is drained by THIS event
         # worker using each event's ``enqueue_time`` as the clock (§3 "the
         # event stream is the clock") — no wall-clock timer task.
-        self.timeline = None            # action_timeline.ActionTimeline | None
+        self.timeline = None  # action_timeline.ActionTimeline | None
         self.due_action_handler = None  # async (payload, router) -> None
         # #238 predictive-promote warm: the proxy/driver registers each
         # session's CURRENT prefix tokens here (POST /aginfer/session_prefix).
@@ -139,11 +140,7 @@ class EventRouter:
         Pass ``force=True`` for legitimate test re-attach.
         """
         prev = self._handlers.get(kind.value)
-        if (
-            prev is not None
-            and getattr(prev, "_aginfer_wrap", False)
-            and not force
-        ):
+        if prev is not None and getattr(prev, "_aginfer_wrap", False) and not force:
             raise RuntimeError(
                 f"set_handler({kind.name}): refusing to overwrite a "
                 f"wrapped composite handler.  Pass force=True if you "
@@ -157,9 +154,7 @@ class EventRouter:
     async def start(self) -> None:
         """Start the worker.  Idempotent."""
         if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(5.0)
-            )
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(
                 self._event_worker(), name="aginfer-event-worker"
@@ -205,8 +200,7 @@ class EventRouter:
         subpools = state["pool_usage"]["HBM"]["subpools"]
         if subpools:
             occ = max(
-                (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0
-                else 0.0
+                (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
                 for e in subpools.values()
             )
             used = sum(e["used_bytes"] for e in subpools.values())
@@ -220,7 +214,9 @@ class EventRouter:
             logger.info(
                 "cold_start_probe: HBM occ %.3f > theta_hi %.3f; "
                 "synthesising memory_pressure (state=%s)",
-                occ, self.theta_hi, state_label,
+                occ,
+                self.theta_hi,
+                state_label,
             )
             await self.bus.emit(
                 Event(
@@ -321,6 +317,7 @@ class EventRouter:
 
     async def _event_worker(self) -> None:
         from ._metrics import m as _m
+
         while True:
             event = await self.bus.queue.get()
             self.events_received += 1
@@ -330,7 +327,8 @@ class EventRouter:
             t_dispatch = time.perf_counter()
             time_in_queue_ms = (
                 (t_dispatch - event.enqueue_time) * 1000.0
-                if event.enqueue_time > 0.0 else 0.0
+                if event.enqueue_time > 0.0
+                else 0.0
             )
             qdepth_after_pop = self.bus.queue.qsize()
             self.observability.record_dispatch(
@@ -352,9 +350,7 @@ class EventRouter:
                     # each belief-validated by the fire callback.  On an idle
                     # or unwired timeline this is a single cheap heap-peek.
                     await self._fire_due_actions(event.enqueue_time)
-                    handler = self._handlers.get(
-                        event.kind.value, _noop_handler
-                    )
+                    handler = self._handlers.get(event.kind.value, _noop_handler)
                     await handler(event, self)
                 self.events_handled += 1
             except asyncio.CancelledError:
@@ -407,17 +403,22 @@ async def _apply_failed_handler(event: Event, router: "EventRouter") -> None:
         h = payload.get("hash")
         if h and "leaf" in reason:
             import time as _time
+
             from .kv_scheduler import _EVICT_COOLDOWN_S
+
             cd = getattr(router, "evict_cooldown", None)
             if cd is None:
                 cd = router.evict_cooldown = {}
             cd[str(h)] = _time.monotonic() + _EVICT_COOLDOWN_S
     logger.info(
-        "aginfer apply_failed received: endpoint=%s action_id=%s reason=%s "
-        "hash=%s",
-        endpoint, action_id, reason, payload.get("hash"),
+        "aginfer apply_failed received: endpoint=%s action_id=%s reason=%s " "hash=%s",
+        endpoint,
+        action_id,
+        reason,
+        payload.get("hash"),
     )
     from ._metrics import m as _m
+
     _m(
         "apply_failed",
         endpoint=endpoint or "?",
@@ -445,6 +446,7 @@ async def _hash_collision_handler(event: Event, router: "EventRouter") -> None:
     enough context to recover).
     """
     from ._fatal import fatal
+
     payload = event.payload or {}
     fatal(
         "hash_collision",
@@ -513,6 +515,7 @@ def make_session_end_handler(tracker, outbound, kv_scheduler=None):
     them.  ``kv_scheduler=None`` keeps the pure F5 behaviour (tests
     that don't exercise the migrate path).
     """
+
     async def _session_end_handler(event: Event, router: "EventRouter") -> None:
         pid = event.session
         if pid is None:
@@ -533,14 +536,18 @@ def make_session_end_handler(tracker, outbound, kv_scheduler=None):
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "SESSION_END migrate (kv_scheduler.handle) failed for "
-                    "pid=%s; continuing to the F5 ENDED PUT", pid,
+                    "pid=%s; continuing to the F5 ENDED PUT",
+                    pid,
                 )
         # 3. F5 PUT — after the migrate batch (DESIGN: migrate, then
         #    PUT), regardless of prior state.
         outbound.enqueue_program_paused(
-            pid=pid, state="ENDED", pre_pause_state=None,
+            pid=pid,
+            state="ENDED",
+            pre_pause_state=None,
         )
         from ._metrics import m as _m
+
         _m(
             "session_end",
             pid=pid,
@@ -550,14 +557,19 @@ def make_session_end_handler(tracker, outbound, kv_scheduler=None):
         logger.info(
             "SESSION_END handled: pid=%s prev=%s → ENDED + migrate(%s) "
             "+ PUT enqueued",
-            pid, prev, kv_scheduler is not None,
+            pid,
+            prev,
+            kv_scheduler is not None,
         )
 
     return _session_end_handler
 
 
 def attach_session_end_handler(
-    router: "EventRouter", tracker, outbound, kv_scheduler=None,
+    router: "EventRouter",
+    tracker,
+    outbound,
+    kv_scheduler=None,
 ) -> None:
     """Register the SESSION_END handler.  Wired at daemon startup
     AFTER kv_scheduler's blanket attach so this composite OWNS
@@ -616,11 +628,7 @@ def attach_event_routes(app: FastAPI, router: EventRouter) -> None:
                 kind = EventKind.MEMORY_PRESSURE
             else:
                 return JSONResponse(
-                    {
-                        "error": {
-                            "message": f"unknown event kind: {kind_str!r}"
-                        }
-                    },
+                    {"error": {"message": f"unknown event kind: {kind_str!r}"}},
                     status_code=400,
                 )
         evt = Event(
@@ -641,14 +649,16 @@ def attach_event_routes(app: FastAPI, router: EventRouter) -> None:
         try:
             body = await raw.json()
         except Exception as exc:  # noqa: BLE001
-            return JSONResponse({"error": {"message": f"invalid JSON: {exc!s}"}},
-                                status_code=400)
+            return JSONResponse(
+                {"error": {"message": f"invalid JSON: {exc!s}"}}, status_code=400
+            )
         pid = body.get("program_id") or body.get("session")
         toks = body.get("input_ids")
         if not pid or not isinstance(toks, list) or not toks:
             return JSONResponse(
                 {"error": {"message": "need program_id + non-empty input_ids"}},
-                status_code=400)
+                status_code=400,
+            )
         router._session_prefix[str(pid)] = [int(t) for t in toks]
         return {"status": "registered", "n_tokens": len(toks)}
 
@@ -661,8 +671,8 @@ def attach_event_routes(app: FastAPI, router: EventRouter) -> None:
     @app.get("/aginfer/thresholds")
     async def aginfer_thresholds_get() -> Dict[str, float]:
         return {
-            "theta_hi":    float(router.theta_hi),
-            "theta_lo":    float(router.theta_lo),
-            "theta_crit":  float(router.theta_crit),
+            "theta_hi": float(router.theta_hi),
+            "theta_lo": float(router.theta_lo),
+            "theta_crit": float(router.theta_crit),
             "heartbeat_s": float(router.heartbeat_s),
         }

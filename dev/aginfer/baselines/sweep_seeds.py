@@ -3,12 +3,14 @@ Sensitivity sweep: run compare.py over multiple workload seeds; report the
 mean and std of per-policy reward so a single-seed result can't game the
 table. Writes a CSV-style summary to stdout.
 """
+
 from __future__ import annotations
 
 import random
 import statistics
 from typing import Dict, List
 
+from .base import Tier, TierUsage
 from .compare import (
     PolicyScore,
     WorldConfig,
@@ -16,7 +18,6 @@ from .compare import (
     _build_units,
     _simulate_policy,
 )
-from .base import Tier, TierUsage
 from .continuum import ContinuumPolicy
 from .costs import default_costs
 from .infercept import InferCeptPolicy
@@ -35,10 +36,15 @@ def main(n_seeds: int = 8) -> None:
         ("infercept", lambda: InferCeptPolicy()),
         ("continuum", lambda: ContinuumPolicy(ttl_seconds=90.0, pin_threshold=0.4)),
         ("kvflow", lambda: KVFlowPolicy()),
-        ("ours_greedy", lambda: OursGreedyPolicy(costs, prefill_cost_per_token=cfg.prefill_cost_per_token)),
+        (
+            "ours_greedy",
+            lambda: OursGreedyPolicy(
+                costs, prefill_cost_per_token=cfg.prefill_cost_per_token
+            ),
+        ),
     ]
     rewards: Dict[str, List[float]] = {n: [] for n, _ in policy_factories}
-    hits:    Dict[str, List[float]] = {n: [] for n, _ in policy_factories}
+    hits: Dict[str, List[float]] = {n: [] for n, _ in policy_factories}
     runtimes: Dict[str, List[float]] = {n: [] for n, _ in policy_factories}
     throughputs: Dict[str, List[float]] = {n: [] for n, _ in policy_factories}
 
@@ -79,7 +85,9 @@ def main(n_seeds: int = 8) -> None:
         rt_m = statistics.mean(runtimes[name])
         rt_s = statistics.stdev(runtimes[name]) if len(runtimes[name]) > 1 else 0.0
         tp_m = statistics.mean(throughputs[name])
-        tp_s = statistics.stdev(throughputs[name]) if len(throughputs[name]) > 1 else 0.0
+        tp_s = (
+            statistics.stdev(throughputs[name]) if len(throughputs[name]) > 1 else 0.0
+        )
         print(
             f"{name:<14} {rm:>12.3e} {rs:>11.3e} {hm:>10.1f} "
             f"{rt_m:>15.3e} {rt_s:>14.3e} {tp_m:>16.3e} {tp_s:>15.3e}"

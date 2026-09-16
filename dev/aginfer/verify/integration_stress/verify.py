@@ -34,6 +34,7 @@ Run
 About 5–10 minutes wall clock on GPUs 5–6 (sglang startup +
 ~30–60 s per flavor).  Sequential to avoid cross-flavor interference.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -49,7 +50,6 @@ from statistics import median
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import httpx
-
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
@@ -69,8 +69,12 @@ from harness import (  # noqa: E402
 )
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -100,13 +104,17 @@ def _chat_body(worker_idx: int, n: int) -> Dict[str, Any]:
     return {
         "model": MODEL,
         "messages": [
-            {"role": "system",
-             "content": f"{_PAD} (tag-{worker_idx}-{uuid.uuid4().hex[:8]})"},
-            {"role": "user",
-             "content": (
-                 f"reply with the literal token 'ack' (req {n} "
-                 f"worker {worker_idx} nonce {uuid.uuid4().hex[:12]})"
-             )},
+            {
+                "role": "system",
+                "content": f"{_PAD} (tag-{worker_idx}-{uuid.uuid4().hex[:8]})",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"reply with the literal token 'ack' (req {n} "
+                    f"worker {worker_idx} nonce {uuid.uuid4().hex[:12]})"
+                ),
+            },
         ],
         "max_tokens": 8,
         "temperature": 0.0,
@@ -114,13 +122,17 @@ def _chat_body(worker_idx: int, n: int) -> Dict[str, Any]:
 
 
 async def _post_chat(
-    cli: httpx.AsyncClient, base: str, body: Dict[str, Any],
+    cli: httpx.AsyncClient,
+    base: str,
+    body: Dict[str, Any],
 ) -> Tuple[bool, float]:
     """Returns (success, wall_ms)."""
     t0 = time.perf_counter()
     try:
         r = await cli.post(
-            f"http://{base}/v1/chat/completions", json=body, timeout=60.0,
+            f"http://{base}/v1/chat/completions",
+            json=body,
+            timeout=60.0,
         )
         ok = r.status_code == 200
     except (httpx.RequestError, asyncio.TimeoutError):
@@ -180,19 +192,17 @@ async def _flavor_a_proxy_overhead(stack_h: StackHandles) -> Dict[str, Any]:
 
 def stage_a(stack_h: StackHandles) -> None:
     res = asyncio.run(_flavor_a_proxy_overhead(stack_h))
-    print(f"  [A] {res['total']} req | succ {res['succeeded']} "
-          f"({res['success_rate']:.1%}) | "
-          f"p50 {res['p50_ms']:.1f} ms | p99 {res['p99_ms']:.1f} ms")
+    print(
+        f"  [A] {res['total']} req | succ {res['succeeded']} "
+        f"({res['success_rate']:.1%}) | "
+        f"p50 {res['p50_ms']:.1f} ms | p99 {res['p99_ms']:.1f} ms"
+    )
     if not res["daemon_alive"]:
         raise StageFail("daemon died mid-flavor-A")
     if res["success_rate"] < 0.95:
-        raise StageFail(
-            f"proxy success rate {res['success_rate']:.1%} below 95%"
-        )
+        raise StageFail(f"proxy success rate {res['success_rate']:.1%} below 95%")
     if res["p99_ms"] > 5000.0:
-        raise StageFail(
-            f"proxy p99 {res['p99_ms']:.0f} ms above 5000 ms ceiling"
-        )
+        raise StageFail(f"proxy p99 {res['p99_ms']:.0f} ms above 5000 ms ceiling")
 
 
 # ============================================================ B. state-dump under traffic
@@ -230,9 +240,7 @@ async def _flavor_b_state_dump_under_traffic(
         async with httpx.AsyncClient(timeout=10.0) as cli:
             while time.time() < deadline:
                 try:
-                    r = await cli.get(
-                        f"http://{SGLANG_BASE}/aginfer/state"
-                    )
+                    r = await cli.get(f"http://{SGLANG_BASE}/aginfer/state")
                     if r.status_code == 200:
                         body = r.json()
                         # Single-rank dump (TP=1, no per_rank wrap).
@@ -247,7 +255,8 @@ async def _flavor_b_state_dump_under_traffic(
                 await asyncio.sleep(0.5)
 
     await asyncio.gather(
-        *(worker(i) for i in range(WORKERS)), poller(),
+        *(worker(i) for i in range(WORKERS)),
+        poller(),
     )
     return {
         "p99_samples": p99_samples,
@@ -261,8 +270,10 @@ async def _flavor_b_state_dump_under_traffic(
 
 def stage_b(stack_h: StackHandles) -> None:
     res = asyncio.run(_flavor_b_state_dump_under_traffic(stack_h))
-    print(f"  [B] samples={res['samples']} | p50_median {res['p50_median']:.2f} ms"
-          f" | p99_max {res['p99_max']:.2f} ms | units peak {res['units_peak']}")
+    print(
+        f"  [B] samples={res['samples']} | p50_median {res['p50_median']:.2f} ms"
+        f" | p99_max {res['p99_max']:.2f} ms | units peak {res['units_peak']}"
+    )
     if not res["daemon_alive"]:
         raise StageFail("daemon died mid-flavor-B")
     if res["samples"] < 30:
@@ -301,7 +312,9 @@ async def _flavor_c_event_router_fanin(
         body = {"kind": kind, "session": sid}
         try:
             r = await cli.post(
-                f"http://{DAEMON_BASE}/aginfer/event", json=body, timeout=10.0,
+                f"http://{DAEMON_BASE}/aginfer/event",
+                json=body,
+                timeout=10.0,
             )
             if r.status_code == 200:
                 accepted += 1
@@ -311,8 +324,11 @@ async def _flavor_c_event_router_fanin(
     # Mix of paper §4 event kinds.  SESSION_ARRIVAL first per pid
     # so program_tracker sees a valid state machine.
     kinds_seq = [
-        "session_arrival", "llm_prefill", "tool_call_start",
-        "tool_call_end", "llm_prefill",
+        "session_arrival",
+        "llm_prefill",
+        "tool_call_start",
+        "tool_call_end",
+        "llm_prefill",
     ]
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(connect=5, read=10, write=5, pool=5),
@@ -331,7 +347,8 @@ async def _flavor_c_event_router_fanin(
         if tasks:
             await asyncio.gather(*tasks)
     return {
-        "fired": fired, "accepted": accepted,
+        "fired": fired,
+        "accepted": accepted,
         "transport_errors": transport_errors,
         "daemon_alive": (stack_h.daemon_proc.poll() is None),
     }
@@ -339,8 +356,10 @@ async def _flavor_c_event_router_fanin(
 
 def stage_c(stack_h: StackHandles) -> None:
     res = asyncio.run(_flavor_c_event_router_fanin(stack_h))
-    print(f"  [C] fired {res['fired']} | accepted {res['accepted']} | "
-          f"transport_err {res['transport_errors']}")
+    print(
+        f"  [C] fired {res['fired']} | accepted {res['accepted']} | "
+        f"transport_err {res['transport_errors']}"
+    )
     if not res["daemon_alive"]:
         raise StageFail("daemon died mid-flavor-C")
     if res["fired"] == 0:
@@ -406,7 +425,8 @@ async def _flavor_d_migrate_under_traffic(
                 try:
                     r = await cli.post(
                         f"http://{SGLANG_BASE}/aginfer/migrate",
-                        json=body, timeout=10.0,
+                        json=body,
+                        timeout=10.0,
                     )
                     if r.status_code == 200:
                         batches_ok += 1
@@ -438,9 +458,7 @@ def stage_d(stack_h: StackHandles) -> None:
         raise StageFail("no migrate batches dispatched")
     ok_rate = res["batches_ok"] / res["batches_fired"]
     if ok_rate < 0.95:
-        raise StageFail(
-            f"sglang migrate accept rate {ok_rate:.2%} below 95%"
-        )
+        raise StageFail(f"sglang migrate accept rate {ok_rate:.2%} below 95%")
 
 
 # ============================================================ E. threshold PUT atomicity
@@ -478,10 +496,8 @@ async def _flavor_e_threshold_put_under_traffic(
     # requires all 4 fields including `heartbeat_s` — missing it
     # returns 400.
     profiles = [
-        {"theta_lo": 0.65, "theta_hi": 0.80, "theta_crit": 0.90,
-         "heartbeat_s": 5.0},
-        {"theta_lo": 0.70, "theta_hi": 0.85, "theta_crit": 0.92,
-         "heartbeat_s": 4.0},
+        {"theta_lo": 0.65, "theta_hi": 0.80, "theta_crit": 0.90, "heartbeat_s": 5.0},
+        {"theta_lo": 0.70, "theta_hi": 0.85, "theta_crit": 0.92, "heartbeat_s": 4.0},
     ]
 
     async def chat_worker(idx: int) -> None:
@@ -504,7 +520,8 @@ async def _flavor_e_threshold_put_under_traffic(
                 try:
                     r = await cli.put(
                         f"http://{SGLANG_BASE}/aginfer/thresholds",
-                        json=body, timeout=10.0,
+                        json=body,
+                        timeout=10.0,
                     )
                     if r.status_code == 200:
                         puts_ok += 1
@@ -545,8 +562,10 @@ async def _flavor_e_threshold_put_under_traffic(
         daemon_threshold_reader(),
     )
     return {
-        "puts_fired": puts_fired, "puts_ok": puts_ok,
-        "torn_reads": torn_reads, "daemon_gets": daemon_gets,
+        "puts_fired": puts_fired,
+        "puts_ok": puts_ok,
+        "torn_reads": torn_reads,
+        "daemon_gets": daemon_gets,
         "first_400_body": first_400_body,
         "sglang_alive": (stack_h.sglang_proc.poll() is None),
         "daemon_alive": (stack_h.daemon_proc.poll() is None),
@@ -555,8 +574,10 @@ async def _flavor_e_threshold_put_under_traffic(
 
 def stage_e(stack_h: StackHandles) -> None:
     res = asyncio.run(_flavor_e_threshold_put_under_traffic(stack_h))
-    print(f"  [E] PUT fired {res['puts_fired']} | ok {res['puts_ok']} | "
-          f"daemon_gets {res['daemon_gets']} | torn {res['torn_reads']}")
+    print(
+        f"  [E] PUT fired {res['puts_fired']} | ok {res['puts_ok']} | "
+        f"daemon_gets {res['daemon_gets']} | torn {res['torn_reads']}"
+    )
     if res["first_400_body"]:
         print(f"  [E] first 400: {res['first_400_body'][0]}")
     if not res["sglang_alive"]:
@@ -567,9 +588,7 @@ def stage_e(stack_h: StackHandles) -> None:
         raise StageFail("no PUTs fired")
     ok_rate = res["puts_ok"] / res["puts_fired"]
     if ok_rate < 0.95:
-        raise StageFail(
-            f"sglang threshold PUT accept rate {ok_rate:.2%} below 95%"
-        )
+        raise StageFail(f"sglang threshold PUT accept rate {ok_rate:.2%} below 95%")
     if res["daemon_gets"] < 10:
         raise StageFail(
             f"daemon /aginfer/thresholds returned <10 successful "
@@ -626,16 +645,23 @@ async def _flavor_g_session_end_migrate(stack_h: StackHandles) -> Dict[str, Any]
             body = {
                 "model": MODEL,
                 "messages": [
-                    {"role": "system",
-                     "content": f"{_PAD} (sessend {pid} {n} {uuid.uuid4().hex[:8]})"},
-                    {"role": "user",
-                     "content": f"reply 'ack' ({pid} {n} {uuid.uuid4().hex[:12]})"},
+                    {
+                        "role": "system",
+                        "content": f"{_PAD} (sessend {pid} {n} {uuid.uuid4().hex[:8]})",
+                    },
+                    {
+                        "role": "user",
+                        "content": f"reply 'ack' ({pid} {n} {uuid.uuid4().hex[:12]})",
+                    },
                 ],
-                "max_tokens": 8, "temperature": 0.0,
+                "max_tokens": 8,
+                "temperature": 0.0,
                 "program_id": pid,
             }
             r = await cli.post(
-                f"http://{SGLANG_BASE}/v1/chat/completions", json=body, timeout=60.0,
+                f"http://{SGLANG_BASE}/v1/chat/completions",
+                json=body,
+                timeout=60.0,
             )
             r.raise_for_status()
 
@@ -656,14 +682,14 @@ async def _flavor_g_session_end_migrate(stack_h: StackHandles) -> Dict[str, Any]
             for e in hbm_subpools.values()
         )
         decode_bpt_sample = {
-            sp: e.get("decode_bytes_per_token")
-            for sp, e in hbm_subpools.items()
+            sp: e.get("decode_bytes_per_token") for sp, e in hbm_subpools.items()
         }
 
         # 2. Fire SESSION_END at the DAEMON.
         ev = await cli.post(
             f"http://{DAEMON_BASE}/aginfer/event",
-            json={"kind": "session_end", "session": pid}, timeout=10.0,
+            json={"kind": "session_end", "session": pid},
+            timeout=10.0,
         )
         event_accepted = ev.status_code == 200
 
@@ -708,13 +734,19 @@ async def _flavor_g_session_end_migrate(stack_h: StackHandles) -> Dict[str, Any]
 def stage_g(stack_h: StackHandles) -> None:
     res = asyncio.run(_flavor_g_session_end_migrate(stack_h))
     demote_note = (
-        "GC'd (units dropped)" if res["gc_dropped"]
-        else (f"demoted {res['hbm_before']}→{res['hbm_after']} HBM units"
-              if res["demoted"] else "policy declined (cold-start V_u; units kept)")
+        "GC'd (units dropped)"
+        if res["gc_dropped"]
+        else (
+            f"demoted {res['hbm_before']}→{res['hbm_after']} HBM units"
+            if res["demoted"]
+            else "policy declined (cold-start V_u; units kept)"
+        )
     )
-    print(f"  [G] pid={res['pid']} units_before={res['units_before']} "
-          f"ppu_before={res['ppu_before_state']} → ENDED={res['ended']} "
-          f"| migrate: {demote_note} | decode_bpt={res['decode_bpt_sample']}")
+    print(
+        f"  [G] pid={res['pid']} units_before={res['units_before']} "
+        f"ppu_before={res['ppu_before_state']} → ENDED={res['ended']} "
+        f"| migrate: {demote_note} | decode_bpt={res['decode_bpt_sample']}"
+    )
     if not res["sglang_alive"]:
         raise StageFail("sglang died mid-flavor-G")
     if not res["daemon_alive"]:
@@ -724,7 +756,8 @@ def stage_g(stack_h: StackHandles) -> None:
     if not res["decode_bpt_ok"]:
         raise StageFail(
             "sglang /aginfer/state HBM subpools missing decode_bytes_per_"
-            f"token (#199); got {res['decode_bpt_sample']}")
+            f"token (#199); got {res['decode_bpt_sample']}"
+        )
     if res["units_before"] == 0:
         raise StageFail(
             "no units tagged with the SESSION_END pid — program_id "
@@ -763,10 +796,10 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
     tagged = set(prog_ids)
     seen = {
         "prefill_bps_max": 0.0,
-        "decode_pos_tagged": set(),   # TAGGED pids seen with decode rate > 0
-        "inflight_tagged": set(),     # TAGGED pids seen with inflight > 0
+        "decode_pos_tagged": set(),  # TAGGED pids seen with decode rate > 0
+        "inflight_tagged": set(),  # TAGGED pids seen with inflight > 0
         "inflight_polls": 0,
-        "hbm_cap_max": 0,             # #209: pool_usage HBM cap_bytes (must be >0)
+        "hbm_cap_max": 0,  # #209: pool_usage HBM cap_bytes (must be >0)
         "polls": 0,
     }
 
@@ -779,21 +812,30 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
                 body = {
                     "model": MODEL,
                     "messages": [
-                        {"role": "system",
-                         "content": f"{_PAD} ({pid} {n} {uuid.uuid4().hex[:8]})"},
-                        {"role": "user",
-                         "content": (f"Count slowly from 1 to 40, one number "
-                                     f"per line. ({pid} {n} "
-                                     f"{uuid.uuid4().hex[:12]})")},
+                        {
+                            "role": "system",
+                            "content": f"{_PAD} ({pid} {n} {uuid.uuid4().hex[:8]})",
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Count slowly from 1 to 40, one number "
+                                f"per line. ({pid} {n} "
+                                f"{uuid.uuid4().hex[:12]})"
+                            ),
+                        },
                     ],
                     # Longer decode so the request is observably in-flight.
-                    "max_tokens": 96, "temperature": 0.0,
+                    "max_tokens": 96,
+                    "temperature": 0.0,
                     "program_id": pid,
                 }
                 try:
                     await cli.post(
                         f"http://{SGLANG_BASE}/v1/chat/completions",
-                        json=body, timeout=120.0)
+                        json=body,
+                        timeout=120.0,
+                    )
                 except Exception:
                     pass
                 n += 1
@@ -808,9 +850,11 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
                         seen["polls"] += 1
                         te = body.get("throughput_ema", {})
                         seen["prefill_bps_max"] = max(
-                            seen["prefill_bps_max"],
-                            float(te.get("prefill_bps", 0.0)))
-                        for pid, rate in (te.get("decode_per_program", {}) or {}).items():
+                            seen["prefill_bps_max"], float(te.get("prefill_bps", 0.0))
+                        )
+                        for pid, rate in (
+                            te.get("decode_per_program", {}) or {}
+                        ).items():
                             if pid in tagged and float(rate) > 0.0:
                                 seen["decode_pos_tagged"].add(pid)
                         ppu = body.get("per_program_usage", {}) or {}
@@ -825,11 +869,16 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
                         # #209 guard: pool_usage cap_bytes must be > 0.  A
                         # poisoned _aginfer_bytes_per_token cache zeroed every
                         # cap → occ_hbm≡0 → the daemon never saw HBM pressure.
-                        hbm_sp = (body.get("pool_usage", {}).get("HBM", {})
-                                  .get("subpools", {}) or {})
+                        hbm_sp = (
+                            body.get("pool_usage", {})
+                            .get("HBM", {})
+                            .get("subpools", {})
+                            or {}
+                        )
                         for e in hbm_sp.values():
                             seen["hbm_cap_max"] = max(
-                                seen["hbm_cap_max"], int(e.get("cap_bytes", 0) or 0))
+                                seen["hbm_cap_max"], int(e.get("cap_bytes", 0) or 0)
+                            )
                 except Exception:
                     pass
                 await asyncio.sleep(0.25)
@@ -851,10 +900,12 @@ async def _flavor_t26_measurement(stack_h: StackHandles) -> Dict[str, Any]:
 def stage_t26(stack_h: StackHandles) -> None:
     res = asyncio.run(_flavor_t26_measurement(stack_h))
     n = res["n_tagged"]
-    print(f"  [T26] polls={res['polls']} prefill_bps_max={res['prefill_bps_max']:.3g} "
-          f"decode_pos_tagged={res['decode_pos_tagged']}/{n} "
-          f"inflight_tagged={res['inflight_tagged']}/{n} "
-          f"inflight_polls={res['inflight_polls']} hbm_cap_max={res['hbm_cap_max']}")
+    print(
+        f"  [T26] polls={res['polls']} prefill_bps_max={res['prefill_bps_max']:.3g} "
+        f"decode_pos_tagged={res['decode_pos_tagged']}/{n} "
+        f"inflight_tagged={res['inflight_tagged']}/{n} "
+        f"inflight_polls={res['inflight_polls']} hbm_cap_max={res['hbm_cap_max']}"
+    )
     if not res["sglang_alive"]:
         raise StageFail("sglang died mid-flavor-T26")
     if res["polls"] == 0:
@@ -863,21 +914,29 @@ def stage_t26(stack_h: StackHandles) -> None:
     # daemon's occ_hbm ≡ 0 and it can never see pressure (a poisoned
     # _aginfer_bytes_per_token cache zeroed every cap_bytes).
     if res["hbm_cap_max"] <= 0:
-        raise StageFail("T26/#209: pool_usage HBM cap_bytes stayed 0 — daemon "
-                        "would never see HBM pressure (bytes_per_token cache "
-                        "poisoned by an early transient 0)")
+        raise StageFail(
+            "T26/#209: pool_usage HBM cap_bytes stayed 0 — daemon "
+            "would never see HBM pressure (bytes_per_token cache "
+            "poisoned by an early transient 0)"
+        )
     if res["prefill_bps_max"] <= 0.0:
-        raise StageFail("T26: prefill_bps never became > 0 under prefill load "
-                        "(measurement not wired)")
+        raise StageFail(
+            "T26: prefill_bps never became > 0 under prefill load "
+            "(measurement not wired)"
+        )
     # EVERY tagged program must be measured (not just one) — a single stuck
     # program or a misattributed pid would otherwise pass (#200 audit).
     if res["decode_pos_tagged"] < n:
-        raise StageFail(f"T26: only {res['decode_pos_tagged']}/{n} tagged "
-                        f"programs got a positive decode rate (per-program "
-                        f"decode measurement incomplete)")
+        raise StageFail(
+            f"T26: only {res['decode_pos_tagged']}/{n} tagged "
+            f"programs got a positive decode rate (per-program "
+            f"decode measurement incomplete)"
+        )
     if res["inflight_tagged"] < n:
-        raise StageFail(f"T26: only {res['inflight_tagged']}/{n} tagged "
-                        f"programs had inflight populated")
+        raise StageFail(
+            f"T26: only {res['inflight_tagged']}/{n} tagged "
+            f"programs had inflight populated"
+        )
 
 
 # ============================================================ F. escalate-to-fatal
@@ -917,20 +976,33 @@ async def _flavor_f_dead_sglang_resilience(
     env["PYTHONPATH"] = str(_HERE.parent.parent)
     env["AGINFER_DATA_DIR"] = str(results_dir / f"flavor_f_data_{ts}")
     args = [
-        sys.executable, "-m", "daemon.main",
-        "--sglang-base-url", f"http://127.0.0.1:{DEAD_PORT}",
-        "--host", "127.0.0.1", "--port", str(test_daemon_port),
-        "--kv-scheduler", "enabled",
-        "--admission-controller", "enabled",
+        sys.executable,
+        "-m",
+        "daemon.main",
+        "--sglang-base-url",
+        f"http://127.0.0.1:{DEAD_PORT}",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(test_daemon_port),
+        "--kv-scheduler",
+        "enabled",
+        "--admission-controller",
+        "enabled",
         # Tight thresholds: if the daemon WERE to populate the
         # outbound queue, these would fire fast.  Since it doesn't
         # (low-traffic path), they stay below threshold.
-        "--sustained-escalate-fails", "5",
-        "--sustained-escalate-age-s", "5.0",
+        "--sustained-escalate-fails",
+        "5",
+        "--sustained-escalate-age-s",
+        "5.0",
     ]
     f = open(daemon_log, "w")
     proc = subprocess.Popen(
-        args, env=env, stdout=f, stderr=subprocess.STDOUT,
+        args,
+        env=env,
+        stdout=f,
+        stderr=subprocess.STDOUT,
         cwd=str(_HERE.parent.parent),
     )
     events_accepted = 0
@@ -939,9 +1011,7 @@ async def _flavor_f_dead_sglang_resilience(
             deadline = time.time() + 30.0
             while time.time() < deadline:
                 try:
-                    r = await cli.get(
-                        f"http://127.0.0.1:{test_daemon_port}/health"
-                    )
+                    r = await cli.get(f"http://127.0.0.1:{test_daemon_port}/health")
                     if r.status_code == 200:
                         break
                 except Exception:
@@ -963,7 +1033,8 @@ async def _flavor_f_dead_sglang_resilience(
                 try:
                     r = await cli.post(
                         f"http://127.0.0.1:{test_daemon_port}/aginfer/event",
-                        json=body, timeout=5.0,
+                        json=body,
+                        timeout=5.0,
                     )
                     if r.status_code == 200:
                         events_accepted += 1
@@ -976,15 +1047,13 @@ async def _flavor_f_dead_sglang_resilience(
         # have by now.  Verify it's still alive AND /health still
         # answers.
         await asyncio.sleep(8.0)
-        daemon_still_alive = (proc.poll() is None)
+        daemon_still_alive = proc.poll() is None
         health_ok = False
         if daemon_still_alive:
             try:
                 async with httpx.AsyncClient(timeout=2.0) as cli:
-                    r = await cli.get(
-                        f"http://127.0.0.1:{test_daemon_port}/health"
-                    )
-                    health_ok = (r.status_code == 200)
+                    r = await cli.get(f"http://127.0.0.1:{test_daemon_port}/health")
+                    health_ok = r.status_code == 200
             except Exception:
                 health_ok = False
     finally:
@@ -1001,7 +1070,8 @@ async def _flavor_f_dead_sglang_resilience(
     forensic_dir = Path(env["AGINFER_DATA_DIR"]) / "forensic"
     forensic_files = (
         list(forensic_dir.glob("sglang_sustained_unreachable_*.json"))
-        if forensic_dir.exists() else []
+        if forensic_dir.exists()
+        else []
     )
 
     return {
@@ -1023,10 +1093,12 @@ def stage_f() -> None:
     results_dir = _HERE / "results"
     results_dir.mkdir(exist_ok=True)
     res = asyncio.run(_flavor_f_dead_sglang_resilience(results_dir))
-    print(f"  [F] daemon alive during test: {res['daemon_still_alive_during_test']} | "
-          f"health ok: {res['health_ok_during_test']} | "
-          f"events accepted: {res['events_accepted']} | "
-          f"forensic: {res['forensic_count']}")
+    print(
+        f"  [F] daemon alive during test: {res['daemon_still_alive_during_test']} | "
+        f"health ok: {res['health_ok_during_test']} | "
+        f"events accepted: {res['events_accepted']} | "
+        f"forensic: {res['forensic_count']}"
+    )
     if not res["daemon_still_alive_during_test"]:
         raise StageFail(
             f"daemon died (rc={res['daemon_returncode']}) under "
@@ -1072,12 +1144,12 @@ def main() -> int:
             t_ready = time.time() - t_start
             print(f"[integration_stress] stack ready in {t_ready:.0f}s")
             for label, fn in [
-                ("A proxy hot-path under load",     stage_a),
+                ("A proxy hot-path under load", stage_a),
                 ("B state-dump under sustained traffic", stage_b),
                 ("C event-router fan-in throughput", stage_c),
-                ("D migrate under traffic",         stage_d),
-                ("E threshold PUT atomicity",       stage_e),
-                ("G SESSION_END migrate e2e",       stage_g),
+                ("D migrate under traffic", stage_d),
+                ("E threshold PUT atomicity", stage_e),
+                ("G SESSION_END migrate e2e", stage_g),
                 ("T26 throughput/inflight measurement", stage_t26),
             ]:
                 try:
@@ -1085,8 +1157,7 @@ def main() -> int:
                     t0 = time.time()
                     fn(stack_h)
                     dt = time.time() - t0
-                    print(f"  {_green('PASS')} stage {label} "
-                          f"({dt:.1f}s)")
+                    print(f"  {_green('PASS')} stage {label} " f"({dt:.1f}s)")
                 except StageFail as exc:
                     failures.append(label)
                     print(f"  {_red('FAIL')} stage {label}: {exc}")
@@ -1113,16 +1184,21 @@ def main() -> int:
         if "event=cycle_summary" not in txt:
             raise StageFail(
                 "daemon never emitted event=cycle_summary on shutdown "
-                f"(handler crashed?); log={daemon_log_path}")
-        for bad in ("Application shutdown failed", "NameError",
-                    "Traceback (most recent call last)"):
+                f"(handler crashed?); log={daemon_log_path}"
+            )
+        for bad in (
+            "Application shutdown failed",
+            "NameError",
+            "Traceback (most recent call last)",
+        ):
             # Only flag tracebacks in the shutdown region (after the
             # cycle_summary attempt) — startup-phase noise is unrelated.
             tail = txt.split("event=cycle_summary", 1)[-1]
             if bad in tail:
                 raise StageFail(
                     f"daemon shutdown handler error ({bad!r}); "
-                    f"log={daemon_log_path}")
+                    f"log={daemon_log_path}"
+                )
         print(f"  {_green('PASS')} stage H shutdown-handler clean")
     except StageFail as exc:
         failures.append("H")
@@ -1133,26 +1209,27 @@ def main() -> int:
         print(f"[stage F] starting…")
         t0 = time.time()
         stage_f()
-        print(f"  {_green('PASS')} stage F escalate-to-fatal "
-              f"({time.time() - t0:.1f}s)")
+        print(
+            f"  {_green('PASS')} stage F escalate-to-fatal "
+            f"({time.time() - t0:.1f}s)"
+        )
     except StageFail as exc:
         failures.append("F")
         print(f"  {_red('FAIL')} stage F: {exc}")
     except Exception as exc:  # noqa: BLE001
         failures.append("F")
-        print(f"  {_red('FAIL')} stage F: "
-              f"unexpected {type(exc).__name__}: {exc}")
+        print(f"  {_red('FAIL')} stage F: " f"unexpected {type(exc).__name__}: {exc}")
 
     n_total = 7
     if failures:
-        print(_red(
-            f"\nintegration_stress FAILED ({len(failures)}/{n_total}): "
-            f"{failures}"
-        ))
+        print(
+            _red(
+                f"\nintegration_stress FAILED ({len(failures)}/{n_total}): "
+                f"{failures}"
+            )
+        )
         return 1
-    print(_green(
-        f"\nintegration_stress PASS — all {n_total} flavors green"
-    ))
+    print(_green(f"\nintegration_stress PASS — all {n_total} flavors green"))
     return 0
 
 

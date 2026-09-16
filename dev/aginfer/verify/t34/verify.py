@@ -23,6 +23,7 @@ Stages:
   E1 DP cell ceiling fails loud (KnapsackBudgetExceededError + ctx)
   E2 empty items / zero budget → empty plan (value-gated no-op)
 """
+
 from __future__ import annotations
 
 import itertools
@@ -30,7 +31,6 @@ import random
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -46,8 +46,12 @@ from baselines.knapsack import (  # noqa: E402
 )
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -67,8 +71,7 @@ def _brute_max_value(items, budget):
     best = 0.0
     for r in range(len(items) + 1):
         for subset in itertools.combinations(items, r):
-            if all(sum(_use_at(c, a) for c in subset) <= budget[a]
-                   for a in budget):
+            if all(sum(_use_at(c, a) for c in subset) <= budget[a] for a in budget):
                 gain = sum(c.gain for c in subset)
                 if gain > best:
                     best = gain
@@ -82,8 +85,10 @@ def _brute_max_value_q(items, budget, bucket_size):
     best = 0.0
     for r in range(len(items) + 1):
         for subset in itertools.combinations(items, r):
-            use = {a: sum(_bk_up(_use_at(c, a), bucket_size[a]) for c in subset)
-                   for a in budget}
+            use = {
+                a: sum(_bk_up(_use_at(c, a), bucket_size[a]) for c in subset)
+                for a in budget
+            }
             if all(use[a] <= Wb[a] for a in budget):
                 gain = sum(c.gain for c in subset)
                 if gain > best:
@@ -97,8 +102,7 @@ def _brute_max_value_grouped(groups, budget):
     opts = [[None] + list(g) for g in groups]
     for combo in itertools.product(*opts):
         subset = [m for m in combo if m is not None]
-        if all(sum(_use_at(c, a) for c in subset) <= budget[a]
-               for a in budget):
+        if all(sum(_use_at(c, a) for c in subset) <= budget[a] for a in budget):
             gain = sum(c.gain for c in subset)
             if gain > best:
                 best = gain
@@ -123,8 +127,10 @@ def stage_d0_single_axis() -> None:
     chosen = knapsack_max_value_multi(items, budget, bs)
     # within 100 bytes: a(60)+b(40)=gain 8 (uses 100); a+c=110 over; b+c=90 gain 7.
     if abs(sum(c.gain for c in chosen) - 8.0) > 1e-9:
-        raise StageFail(f"expected max gain 8.0 (a+b); got "
-                        f"{sum(c.gain for c in chosen)} ({[c.pid for c in chosen]})")
+        raise StageFail(
+            f"expected max gain 8.0 (a+b); got "
+            f"{sum(c.gain for c in chosen)} ({[c.pid for c in chosen]})"
+        )
 
 
 def stage_d1_exactness_vs_brute() -> None:
@@ -141,27 +147,32 @@ def stage_d1_exactness_vs_brute() -> None:
                 re_use["HBM"]["mamba"] = rng.randint(0, 40)
             # gains may be negative — the empty set must dominate a
             # net-negative pick (value-gated no-op).
-            items.append(Resume(gain=round(rng.uniform(-3, 10), 2),
-                                 re_use=re_use, pid=f"r{i}"))
-        budget = {("HBM", "full"): rng.randint(0, 200),
-                  ("HBM", "mamba"): rng.randint(0, 150)}
+            items.append(
+                Resume(gain=round(rng.uniform(-3, 10), 2), re_use=re_use, pid=f"r{i}")
+            )
+        budget = {
+            ("HBM", "full"): rng.randint(0, 200),
+            ("HBM", "mamba"): rng.randint(0, 150),
+        }
         brute = _brute_max_value(items, budget)
         chosen = knapsack_max_value_multi(items, budget, bs)
         dp_gain = sum(c.gain for c in chosen)
         if abs(dp_gain - brute) > 1e-9:
             raise StageFail(
                 f"trial {trial}: DP gain {dp_gain} != brute max {brute} "
-                f"(K={K}, budget={budget})")
+                f"(K={K}, budget={budget})"
+            )
         for a in budget:
             used = sum(_use_at(c, a) for c in chosen)
             if used > budget[a]:
-                raise StageFail(f"trial {trial}: chosen overspends {a}: "
-                                f"{used} > {budget[a]}")
+                raise StageFail(
+                    f"trial {trial}: chosen overspends {a}: " f"{used} > {budget[a]}"
+                )
 
 
 def stage_d2_budget_hard_and_roundup() -> None:
     bs = {("HBM", "kv"): 64}
-    budget = {("HBM", "kv"): 64}   # 1 bucket
+    budget = {("HBM", "kv"): 64}  # 1 bucket
     # re_use 1 byte → rounds UP to 1 bucket; two of them → 2 buckets > 1.
     items = [
         Resume(gain=5.0, re_use={"HBM": {"kv": 1}}, pid="a"),
@@ -169,8 +180,10 @@ def stage_d2_budget_hard_and_roundup() -> None:
     ]
     chosen = knapsack_max_value_multi(items, budget, bs)
     if len(chosen) != 1:
-        raise StageFail(f"re_use rounds UP (1B→1 bucket); only one fits a "
-                        f"1-bucket budget; got {len(chosen)}")
+        raise StageFail(
+            f"re_use rounds UP (1B→1 bucket); only one fits a "
+            f"1-bucket budget; got {len(chosen)}"
+        )
 
 
 def stage_d3_returned_subset_optimal() -> None:
@@ -184,8 +197,9 @@ def stage_d3_returned_subset_optimal() -> None:
     chosen = knapsack_max_value_multi(items, budget, bs)
     brute = _brute_max_value(items, budget)
     if abs(sum(c.gain for c in chosen) - brute) > 1e-9:
-        raise StageFail(f"returned gain {sum(c.gain for c in chosen)} "
-                        f"!= optimum {brute}")
+        raise StageFail(
+            f"returned gain {sum(c.gain for c in chosen)} " f"!= optimum {brute}"
+        )
 
 
 # ============================================================ G. grouping
@@ -204,8 +218,10 @@ def stage_g0_multiple_choice_groups() -> None:
     bs = _unit_buckets(("HBM", "kv"))
     chosen = knapsack_max_value_multi([a, b], {("HBM", "kv"): 1000}, bs)
     if [c.pid for c in chosen] != ["u-a"]:
-        raise StageFail(f"group 'u': at most one member, the higher-value; "
-                        f"got {[c.pid for c in chosen]}")
+        raise StageFail(
+            f"group 'u': at most one member, the higher-value; "
+            f"got {[c.pid for c in chosen]}"
+        )
 
     # exact vs grouped brute over random grouped fixtures, 2 axes.
     rng = random.Random(34_222)
@@ -216,25 +232,38 @@ def stage_g0_multiple_choice_groups() -> None:
         for gi in range(n_groups):
             members = []
             for mi in range(rng.randint(1, 3)):
-                re_use = {"HBM": {"full": rng.randint(0, 40)},
-                          "DRAM": {"kv": rng.randint(0, 40)}}
-                members.append(Resume(gain=round(rng.uniform(-2, 9), 2),
-                                       re_use=re_use, pid=(gi, mi),
-                                       group=f"g{gi}"))
+                re_use = {
+                    "HBM": {"full": rng.randint(0, 40)},
+                    "DRAM": {"kv": rng.randint(0, 40)},
+                }
+                members.append(
+                    Resume(
+                        gain=round(rng.uniform(-2, 9), 2),
+                        re_use=re_use,
+                        pid=(gi, mi),
+                        group=f"g{gi}",
+                    )
+                )
             groups.append(members)
         items = [m for g in groups for m in g]
-        budget = {("HBM", "full"): rng.randint(0, 120),
-                  ("DRAM", "kv"): rng.randint(0, 120)}
+        budget = {
+            ("HBM", "full"): rng.randint(0, 120),
+            ("DRAM", "kv"): rng.randint(0, 120),
+        }
         brute = _brute_max_value_grouped(groups, budget)
         chosen = knapsack_max_value_multi(items, budget, bs2)
         # at most one per group
         seen = [c.group for c in chosen]
         if len(seen) != len(set(seen)):
-            raise StageFail(f"trial {trial}: 2+ members of one group chosen: "
-                            f"{[c.pid for c in chosen]}")
+            raise StageFail(
+                f"trial {trial}: 2+ members of one group chosen: "
+                f"{[c.pid for c in chosen]}"
+            )
         if abs(sum(c.gain for c in chosen) - brute) > 1e-9:
-            raise StageFail(f"trial {trial}: grouped DP gain "
-                            f"{sum(c.gain for c in chosen)} != brute {brute}")
+            raise StageFail(
+                f"trial {trial}: grouped DP gain "
+                f"{sum(c.gain for c in chosen)} != brute {brute}"
+            )
 
 
 # ============================================================ E. audit closure
@@ -256,17 +285,21 @@ def stage_e0_bs_gt1_multi_axis_exactness() -> None:
                 re_use["DRAM"]["full"] = rng.randint(0, 200)
             if rng.random() < 0.6:
                 re_use["DRAM"]["mamba"] = rng.randint(0, 200)
-            items.append(Resume(gain=round(rng.uniform(-2, 9), 2),
-                                 re_use=re_use, pid=f"r{i}"))
-        budget = {("DRAM", "full"): rng.randint(0, 600),
-                  ("DRAM", "mamba"): rng.randint(0, 600)}
+            items.append(
+                Resume(gain=round(rng.uniform(-2, 9), 2), re_use=re_use, pid=f"r{i}")
+            )
+        budget = {
+            ("DRAM", "full"): rng.randint(0, 600),
+            ("DRAM", "mamba"): rng.randint(0, 600),
+        }
         brute = _brute_max_value_q(items, budget, bs)
         chosen = knapsack_max_value_multi(items, budget, bs)
         if abs(sum(c.gain for c in chosen) - brute) > 1e-9:
             raise StageFail(
                 f"trial {trial} (bs={BS}, multi-axis): DP gain "
                 f"{sum(c.gain for c in chosen)} != brute {brute} "
-                f"(budget={budget})")
+                f"(budget={budget})"
+            )
 
 
 def stage_e1_dp_cell_ceiling() -> None:
@@ -278,25 +311,35 @@ def stage_e1_dp_cell_ceiling() -> None:
     bs = _unit_buckets(("HBM", "kv"))
     # powers-of-two re_use → 2^K distinct partial sums; large budget so
     # nothing rejects → |dp| grows to ~2^K.
-    blow = [Resume(gain=1.0, re_use={"HBM": {"kv": 2 ** i}}, pid=i)
-            for i in range(12)]
+    blow = [Resume(gain=1.0, re_use={"HBM": {"kv": 2**i}}, pid=i) for i in range(12)]
     try:
-        knapsack_max_value_multi(blow, {("HBM", "kv"): 10 ** 9}, bs,
-                                 max_dp_cells=50, context={"event": "BLOW"})
+        knapsack_max_value_multi(
+            blow, {("HBM", "kv"): 10**9}, bs, max_dp_cells=50, context={"event": "BLOW"}
+        )
     except KnapsackBudgetExceededError as e:
-        for key in ("dp_size", "max_dp_cells", "item_index", "n_items",
-                    "items", "axes"):
+        for key in (
+            "dp_size",
+            "max_dp_cells",
+            "item_index",
+            "n_items",
+            "items",
+            "axes",
+        ):
             if key not in e.context:
                 raise StageFail(f"blowup ctx missing {key!r}: {list(e.context)}")
         if e.context["dp_size"] <= 50:
-            raise StageFail(f"ceiling should trip ABOVE max_dp_cells; "
-                            f"dp_size={e.context['dp_size']}")
+            raise StageFail(
+                f"ceiling should trip ABOVE max_dp_cells; "
+                f"dp_size={e.context['dp_size']}"
+            )
     else:
         raise StageFail("a 2^12-state fixture must trip max_dp_cells=50")
     # a normal small fixture stays well under the (default) ceiling
     ok = knapsack_max_value_multi(
         [Resume(gain=1.0, re_use={"HBM": {"kv": 100}}, pid="x")],
-        {("HBM", "kv"): 1000}, bs)
+        {("HBM", "kv"): 1000},
+        bs,
+    )
     if [c.pid for c in ok] != ["x"]:
         raise StageFail("a normal fixture must NOT trip the ceiling")
 
@@ -308,18 +351,28 @@ def stage_e2_empty_and_zero() -> None:
     if knapsack_max_value_multi([], {("HBM", "kv"): 100}, bs) != []:
         raise StageFail("empty items → []")
     # zero budget excludes a positive-re_use item
-    if knapsack_max_value_multi(
+    if (
+        knapsack_max_value_multi(
             [Resume(gain=5.0, re_use={"HBM": {"kv": 5}}, pid="a")],
-            {("HBM", "kv"): 0}, bs) != []:
+            {("HBM", "kv"): 0},
+            bs,
+        )
+        != []
+    ):
         raise StageFail("zero budget must exclude a positive-re_use item")
     # all-negative gains → empty (no item pays for itself)
     neg = knapsack_max_value_multi(
-        [Resume(gain=-1.0, re_use={"HBM": {"kv": 1}}, pid="a"),
-         Resume(gain=-3.0, re_use={"HBM": {"kv": 1}}, pid="b")],
-        {("HBM", "kv"): 100}, bs)
+        [
+            Resume(gain=-1.0, re_use={"HBM": {"kv": 1}}, pid="a"),
+            Resume(gain=-3.0, re_use={"HBM": {"kv": 1}}, pid="b"),
+        ],
+        {("HBM", "kv"): 100},
+        bs,
+    )
     if neg != []:
-        raise StageFail(f"all-negative gains must yield [] (no-op), got "
-                        f"{[c.pid for c in neg]}")
+        raise StageFail(
+            f"all-negative gains must yield [] (no-op), got " f"{[c.pid for c in neg]}"
+        )
 
 
 def stage_e3_nonpositive_bucket_guard() -> None:
@@ -330,15 +383,18 @@ def stage_e3_nonpositive_bucket_guard() -> None:
     item = [Resume(gain=5.0, re_use={"HBM": {"kv": 100}}, pid="a")]
     for bad_bs in (0, -64):
         try:
-            knapsack_max_value_multi(item, {("HBM", "kv"): 1000},
-                                     {("HBM", "kv"): bad_bs})
+            knapsack_max_value_multi(
+                item, {("HBM", "kv"): 1000}, {("HBM", "kv"): bad_bs}
+            )
         except ValueError as e:
             if "bucket_size" not in str(e):
                 raise StageFail(f"guard message must name bucket_size: {e}")
         except ZeroDivisionError:
-            raise StageFail(f"bucket_size={bad_bs} raised a bare "
-                            "ZeroDivisionError — the #218 positivity guard "
-                            "must catch it first with a clear message")
+            raise StageFail(
+                f"bucket_size={bad_bs} raised a bare "
+                "ZeroDivisionError — the #218 positivity guard "
+                "must catch it first with a clear message"
+            )
         else:
             raise StageFail(f"bucket_size={bad_bs} must raise ValueError")
 
@@ -347,21 +403,27 @@ def stage_e3_nonpositive_bucket_guard() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("D0 max-value single budget axis",             stage_d0_single_axis),
-    ("D1 max-value EXACT vs brute force (60 random, +/- gains)",
-     stage_d1_exactness_vs_brute),
+    ("D0 max-value single budget axis", stage_d0_single_axis),
+    (
+        "D1 max-value EXACT vs brute force (60 random, +/- gains)",
+        stage_d1_exactness_vs_brute,
+    ),
     ("D2 budget hard constraint; re_use rounds up", stage_d2_budget_hard_and_roundup),
-    ("D3 returned subset optimal",                  stage_d3_returned_subset_optimal),
-    ("G0 multiple-choice groups EXACT vs grouped brute (#194)",
-     stage_g0_multiple_choice_groups),
-    ("E0 EXACT vs brute at bucket>1, multi-axis (#10/#11)",
-     stage_e0_bs_gt1_multi_axis_exactness),
-    ("E1 DP cell ceiling fails loud (#9 blow-up guard)",
-     stage_e1_dp_cell_ceiling),
-    ("E2 empty items / zero budget / negative gains (#12)",
-     stage_e2_empty_and_zero),
-    ("E3 non-positive bucket_size → clear ValueError, not ZeroDiv (#218)",
-     stage_e3_nonpositive_bucket_guard),
+    ("D3 returned subset optimal", stage_d3_returned_subset_optimal),
+    (
+        "G0 multiple-choice groups EXACT vs grouped brute (#194)",
+        stage_g0_multiple_choice_groups,
+    ),
+    (
+        "E0 EXACT vs brute at bucket>1, multi-axis (#10/#11)",
+        stage_e0_bs_gt1_multi_axis_exactness,
+    ),
+    ("E1 DP cell ceiling fails loud (#9 blow-up guard)", stage_e1_dp_cell_ceiling),
+    ("E2 empty items / zero budget / negative gains (#12)", stage_e2_empty_and_zero),
+    (
+        "E3 non-positive bucket_size → clear ValueError, not ZeroDiv (#218)",
+        stage_e3_nonpositive_bucket_guard,
+    ),
 ]
 
 
@@ -376,8 +438,10 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: "
-                  f"unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: "
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\nT34 FAILED ({len(failures)}): {failures}"))
         return 1

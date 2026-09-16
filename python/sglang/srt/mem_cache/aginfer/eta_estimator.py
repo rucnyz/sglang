@@ -21,6 +21,7 @@ Timestamps come from the events themselves (``enqueue_time``), so the estimator
 holds no internal wall-clock — consistent with the tracker's timing-free design
 and deterministic under replay.
 """
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
@@ -45,7 +46,10 @@ def call_signature(tool_name: Optional[str], args: Any) -> Tuple[str, ...]:
                 # leading executable token, path-stripped: "/bin/ls -la" -> "ls"
                 tok = v.strip().split()[0].rsplit("/", 1)[-1]
                 # drop a leading env-assignment / sudo wrapper to reach the verb
-                if tok in ("sudo", "env", "time", "nohup") and len(v.strip().split()) > 1:
+                if (
+                    tok in ("sudo", "env", "time", "nohup")
+                    and len(v.strip().split()) > 1
+                ):
                     tok = v.strip().split()[1].rsplit("/", 1)[-1]
                 sub = tok[:64]
                 break
@@ -74,8 +78,9 @@ class ETAEstimator:
 
     # ---- observation ----
 
-    def on_tool_call_start(self, pid: str, tool_name: Optional[str],
-                           args: Any, ts: float) -> Tuple[str, ...]:
+    def on_tool_call_start(
+        self, pid: str, tool_name: Optional[str], args: Any, ts: float
+    ) -> Tuple[str, ...]:
         key = call_signature(tool_name, args)
         self._open[pid] = (key, float(ts))
         return key
@@ -90,7 +95,9 @@ class ETAEstimator:
             return None
         for k in _keys_for(key):
             n = self._n.get(k, 0)
-            self._ema[k] = dur if n == 0 else (1.0 - self.alpha) * self._ema[k] + self.alpha * dur
+            self._ema[k] = (
+                dur if n == 0 else (1.0 - self.alpha) * self._ema[k] + self.alpha * dur
+            )
             self._n[k] = n + 1
         return dur
 
@@ -117,6 +124,8 @@ class ETAEstimator:
         return {
             "keys": len(self._ema),
             "open": len(self._open),
-            "table": {"/".join(k): (round(self._ema[k], 3), self._n[k])
-                      for k in sorted(self._ema, key=lambda x: -self._n[x])[:20]},
+            "table": {
+                "/".join(k): (round(self._ema[k], 3), self._n[k])
+                for k in sorted(self._ema, key=lambda x: -self._n[x])[:20]
+            },
         }

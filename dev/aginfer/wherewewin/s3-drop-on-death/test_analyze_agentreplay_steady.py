@@ -7,7 +7,6 @@ import pathlib
 import tempfile
 import unittest
 
-
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 SCRIPT = SCRIPT_DIR / "analyze_agentreplay_steady.py"
 SPEC = importlib.util.spec_from_file_location("steady_analyzer", SCRIPT)
@@ -172,15 +171,11 @@ class SteadyAnalyzerTests(unittest.TestCase):
             self.assertTrue(ours["valid"])
             self.assertTrue(pairs[0]["comparable"])
             self.assertEqual(
-                pairs[0]["metrics"]["completion_goodput"][
-                    "delta_ours_minus_baseline"
-                ],
+                pairs[0]["metrics"]["completion_goodput"]["delta_ours_minus_baseline"],
                 10,
             )
             self.assertAlmostEqual(
-                pairs[0]["metrics"]["live_revisit_cache_hit"][
-                    "improvement_percent"
-                ],
+                pairs[0]["metrics"]["live_revisit_cache_hit"]["improvement_percent"],
                 100 * 0.2 / 0.701,
             )
 
@@ -203,10 +198,7 @@ class SteadyAnalyzerTests(unittest.TestCase):
             self.assertFalse(pairs[0]["comparable"])
             self.assertIn("salt SHA mismatch", pairs[0]["issues"])
             self.assertTrue(
-                any(
-                    "configuration mismatch" in issue
-                    for issue in pairs[0]["issues"]
-                )
+                any("configuration mismatch" in issue for issue in pairs[0]["issues"])
             )
 
     def test_legacy_summary_without_timeout_fields_is_invalid(self):
@@ -240,9 +232,7 @@ class SteadyAnalyzerTests(unittest.TestCase):
             self.assertFalse(warnings)
             self.assertEqual(aggregate["comparable_pair_count"], 3)
             self.assertIsNotNone(
-                aggregate["metrics"]["completion_goodput"][
-                    "mean_paired_delta_ci95"
-                ]
+                aggregate["metrics"]["completion_goodput"]["mean_paired_delta_ci95"]
             )
             self.assertIsNotNone(
                 aggregate["metrics"]["end_latency_mean"]["ours_mean_ci95"]

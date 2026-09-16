@@ -9,7 +9,9 @@ memory_pressure events), demote the oldest units in D_t down to tier 0 until
 HBM occupancy is back under threshold. Never use DRAM/Disk — pure LRU is
 HBM-or-drop.
 """
+
 from __future__ import annotations
+
 from typing import List
 
 from .base import Action, Policy, ReuseUnit, SchedulerState, Tier
@@ -37,7 +39,11 @@ class LRUPolicy:
 
         # Eldest first among the decision set (units the engine offered up).
         candidates: List[ReuseUnit] = sorted(
-            (state.units[uid] for uid in state.decision_set if state.units[uid].tier == hbm),
+            (
+                state.units[uid]
+                for uid in state.decision_set
+                if state.units[uid].tier == hbm
+            ),
             key=lambda u: -u.age_seconds,
         )
 
