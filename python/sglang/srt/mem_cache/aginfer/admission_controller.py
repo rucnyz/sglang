@@ -25,6 +25,7 @@ All inputs come from sglang's ``/aginfer/state`` (``per_program_usage``
 + ``pool_usage`` + ``throughput_ema``), read the same way kv_scheduler
 reads ``pool_usage`` — no tracker join.
 """
+
 from __future__ import annotations
 
 import logging
@@ -58,8 +59,7 @@ def _value_at_current_tier(
     """
     tier = u.authoritative_tier
     save_prefill = u.p_hat * (
-        reload_cost(u, Tier.DROP, costs, pi_u)
-        - reload_cost(u, tier, costs, pi_u)
+        reload_cost(u, Tier.DROP, costs, pi_u) - reload_cost(u, tier, costs, pi_u)
     )
     # Max-over-subpools occupancy at the authoritative tier; matches
     # OursGreedyPolicy._value (post-T33 phase 2) and DESIGN §5
@@ -118,9 +118,7 @@ def forecast_horizon(state: SchedulerState, heartbeat_s: float) -> float:
     return float(heartbeat_s)
 
 
-def expected_remaining_tokens(
-    pid: str, state: SchedulerState
-) -> Optional[float]:
+def expected_remaining_tokens(pid: str, state: SchedulerState) -> Optional[float]:
     """DESIGN §8 ``E[remaining_tokens(p)]`` — expected residual decode
     length for program ``pid``, conditional on its observable state.
 
@@ -264,8 +262,10 @@ def forecast(state: SchedulerState, heartbeat_s: float) -> Dict[str, float]:
     # Iterate the UNION (#199 audit): a demand subpool absent from
     # pool_used would otherwise be silently dropped before §9 ever sees
     # it (used_bytes defaults to 0 for such a subpool).
-    return {sp: float(used.get(sp, 0)) + float(demand.get(sp, 0.0))
-            for sp in (set(used) | set(demand))}
+    return {
+        sp: float(used.get(sp, 0)) + float(demand.get(sp, 0.0))
+        for sp in (set(used) | set(demand))
+    }
 
 
 # ----------------------------------------------- §8 program candidates
@@ -341,9 +341,7 @@ def forgone_progress(
     return max(0.0, float(W) - tau)
 
 
-def _committed_in_dt(
-    pu: Dict[str, Any], state: SchedulerState
-) -> Dict[str, int]:
+def _committed_in_dt(pu: Dict[str, Any], state: SchedulerState) -> Dict[str, int]:
     """Per-HBM-subpool committed (radix) bytes of p's units that are ALSO
     in this event's decision_set (D_t) — the bytes the MIGRATE lever will
     free (holistic-review #2).
@@ -408,8 +406,7 @@ def pause_relief(
     excl = exclude_committed or {}
     relief: Dict[str, int] = {}
     for sp in set(committed) | set(fut):
-        v = (max(0, committed.get(sp, 0) - int(excl.get(sp, 0)))
-             + int(fut.get(sp, 0.0)))
+        v = max(0, committed.get(sp, 0) - int(excl.get(sp, 0))) + int(fut.get(sp, 0.0))
         if v > 0:
             relief[sp] = v
     return relief
@@ -451,6 +448,7 @@ def pause_candidates(
     conditional p_hat lands (#126).
     """
     from .knapsack import Pause
+
     if prefill_bps is None:
         prefill_bps = float(state.throughput_ema.get("prefill_bps", 0.0))
     horizon = forecast_horizon(state, heartbeat_s)
@@ -460,8 +458,7 @@ def pause_candidates(
     for pid, pu in state.per_program_usage.items():
         if pu.get("state") not in _ACTIVE_STATES:
             continue
-        fut = _program_inflight_growth(
-            pid, pu, state, decode, dbpt, horizon)
+        fut = _program_inflight_growth(pid, pu, state, decode, dbpt, horizon)
         # #2: drop the committed bytes of p's units that the migrate lever
         # owns this event (units in D_t), so Migrate∩Pause don't double-
         # count the same radix bytes.
@@ -472,8 +469,9 @@ def pause_candidates(
         # NO V_u_program term — pausing p frees its bytes and p re-prefills them
         # on resume, which IS marginal_pause_cost; the program's hold-value would
         # double-count it, and was the term that "goes negative → wrongly fires".
-        cost = (marginal_pause_cost(pu, prefill_bps)
-                + forgone_progress(pu, state, heartbeat_s, eta_p))
+        cost = marginal_pause_cost(pu, prefill_bps) + forgone_progress(
+            pu, state, heartbeat_s, eta_p
+        )
         out.append(Pause(cost=cost, relief=relief, pid=pid))
     return out
 
@@ -547,8 +545,9 @@ def resume_candidates(
     ``re_use`` is the flat ``{sp: bytes}`` shape; ``joint_decide``
     normalises it to ``{"HBM": {...}}``.
     """
-    from .knapsack import Resume
     from ._admission_math import expected_peak_hbm_after_resume
+    from .knapsack import Resume
+
     hbm_subpools = state.tier_usage.pool_cap.get(Tier.HBM, {})
     # cap dict in the {sp: {"cap_bytes": ...}} shape capacity_fits wants.
     cap_view = {sp: {"cap_bytes": cap} for sp, cap in hbm_subpools.items()}
@@ -558,8 +557,7 @@ def resume_candidates(
     for pid, pu in state.per_program_usage.items():
         if pu.get("state") != "PAUSED":
             continue
-        re_use = expected_peak_hbm_after_resume(
-            pu.get("unit_hashes", []), state.units)
+        re_use = expected_peak_hbm_after_resume(pu.get("unit_hashes", []), state.units)
         if not capacity_fits(fc, re_use, cap_view, theta_hi):
             continue
         # #211: floor the gain so a paused program whose cached value is 0
@@ -568,4 +566,3 @@ def resume_candidates(
         gain = max(vprog.get(pid, 0.0), _RESUME_LIVENESS_FLOOR)
         out.append(Resume(gain=gain, re_use=re_use, pid=pid))
     return out
-

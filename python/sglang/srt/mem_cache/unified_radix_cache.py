@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import sys
 import threading
 import time
@@ -15,6 +14,17 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.aginfer import (
+    cache_hooks as _cache_hooks,  # aginfer hook (#251)
+)
+from sglang.srt.mem_cache.aginfer import dead_kv as _dead_kv  # aginfer SESSION_END
+from sglang.srt.mem_cache.aginfer import (
+    state_dump as _state_dump,  # aginfer hook (#251)
+)
+
+# --- aginfer: pluggable eviction scorer + write-through (framework extracted) ---
+# Framework (loaders, default LRU scorer, birth-seed constants) lives in the
+# self-contained aginfer module; this file carries only thin hooks that call it.
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -51,7 +61,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     SWAComponent,
     TreeComponent,
     get_and_increase_time_counter,
-    peek_time_counter,
 )
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
@@ -65,19 +74,6 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.session.streaming_session import StreamingSession
 
-# --- aginfer: pluggable eviction scorer + write-through (framework extracted) ---
-# Framework (loaders, default LRU scorer, birth-seed constants) lives in the
-# self-contained aginfer module; this file carries only thin hooks that call it.
-from sglang.srt.mem_cache.aginfer.cache_policy import (  # aginfer hook (#251)
-    _default_eviction_score,
-    _default_should_write_through,
-    _load_eviction_scorer,
-    _load_write_through_policy,
-    _AGINFER_BIRTH_PHAT,  # re-exported: read by verify/t27 via _urc._AGINFER_BIRTH_PHAT
-)
-from sglang.srt.mem_cache.aginfer import cache_hooks as _cache_hooks  # aginfer hook (#251)
-from sglang.srt.mem_cache.aginfer import dead_kv as _dead_kv  # aginfer SESSION_END
-from sglang.srt.mem_cache.aginfer import state_dump as _state_dump  # aginfer hook (#251)
 # ---------------------------------------------------------------------------
 
 if TYPE_CHECKING:
@@ -1803,9 +1799,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return False
         if mem_quota is not None and kv_tokens > mem_quota + result.delta:
-            self._last_load_back_decline = (
-                f"exceeds_mem_quota:kv_tokens={kv_tokens}>quota={mem_quota}+delta={result.delta}"
-            )
+            self._last_load_back_decline = f"exceeds_mem_quota:kv_tokens={kv_tokens}>quota={mem_quota}+delta={result.delta}"
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
@@ -1838,12 +1832,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if device_indices is None:
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             sub = (
-                getattr(self.cache_controller, "_last_load_decline", None)
-                or "unknown"
+                getattr(self.cache_controller, "_last_load_decline", None) or "unknown"
             )
-            self._last_load_back_decline = (
-                f"controller_load_returned_none:{sub}"
-            )
+            self._last_load_back_decline = f"controller_load_returned_none:{sub}"
             return False
 
         # Commit: each component gets only its own transfers

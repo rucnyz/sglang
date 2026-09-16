@@ -39,15 +39,6 @@ from sglang.srt.managers.io_struct import (
     GetAginferStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    MigrateAginferReq,
-    MigrateAginferReqOutput,
-    UpdateAginferProgramPausedReq,
-    UpdateAginferProgramPausedReqOutput,
-    UpdateAginferHintsReq,
-    UpdateAginferHintsReqOutput,
-    UpdateAginferEventsReq,
-    UpdateAginferEventsReqOutput,
-    GetLoadsReqInput,
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -62,6 +53,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
+    MigrateAginferReq,
+    MigrateAginferReqOutput,
     OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
@@ -80,6 +73,12 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateAginferEventsReq,
+    UpdateAginferEventsReqOutput,
+    UpdateAginferHintsReq,
+    UpdateAginferHintsReqOutput,
+    UpdateAginferProgramPausedReq,
+    UpdateAginferProgramPausedReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -944,7 +943,8 @@ class TokenizerControlMixin:
         return responses
 
     async def update_aginfer_events(
-        self: TokenizerManager, obj: UpdateAginferEventsReq,
+        self: TokenizerManager,
+        obj: UpdateAginferEventsReq,
     ) -> List[UpdateAginferEventsReqOutput]:
         """P2b (EXP_PLAN.md): Dynamo worker -> sglang push of agent lifecycle
         events (from a generate request's ``extra_args.aginfer_events``).

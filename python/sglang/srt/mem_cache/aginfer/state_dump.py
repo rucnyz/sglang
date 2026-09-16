@@ -9,6 +9,7 @@ pure mechanical move (``self`` → ``cache``), no logic change.  Instance fields
 ``_aginfer_state_dump_metrics`` / ``_aginfer_hints`` / ``_aginfer_bpt_cache``)
 are still initialised in the cache class; the functions here only read/write them.
 """
+
 from __future__ import annotations
 
 import shutil
@@ -40,7 +41,9 @@ class _StateDumpMetrics:
     """
 
     __slots__ = (
-        "_capacity", "_samples", "_first_recorded_perf_ns",
+        "_capacity",
+        "_samples",
+        "_first_recorded_perf_ns",
         "_total_count",
     )
 
@@ -97,7 +100,8 @@ class _StateDumpMetrics:
         now_ns = time.perf_counter_ns()
         window_s = (
             (now_ns - self._first_recorded_perf_ns) / 1e9
-            if self._first_recorded_perf_ns is not None else 0.0
+            if self._first_recorded_perf_ns is not None
+            else 0.0
         )
         return {
             "n_samples": n,
@@ -119,7 +123,7 @@ def set_aginfer_program_state(
     *,
     pid: str,
     state: str,
-    pre_pause_state: "Optional[str]",
+    pre_pause_state: Optional[str],
 ) -> tuple:
     """T21 (#181, DESIGN §6 round-6 H2): daemon → sglang PUT
     ``/aginfer/program_paused`` storage.
@@ -144,8 +148,7 @@ def set_aginfer_program_state(
     if pre_pause_state is not None and pre_pause_state not in valid:
         return (
             False,
-            f"pre_pause_state must be None or in {valid}; "
-            f"got {pre_pause_state!r}",
+            f"pre_pause_state must be None or in {valid}; " f"got {pre_pause_state!r}",
             0,
         )
     existing = cache._aginfer_program_states.get(pid)
@@ -187,13 +190,16 @@ def _aginfer_overlay_program_states(cache, per_program: dict) -> dict:
         if stored["state"] == "ENDED" and pid not in unit_pids:
             ended_no_units.append(pid)
             continue
-        e = per_program.setdefault(pid, {
-            "hbm":  {"committed": {}, "inflight": {}},
-            "dram": {"committed": {}},
-            "state": "REASONING",
-            "pre_pause_state": None,
-            "unit_hashes": [],
-        })
+        e = per_program.setdefault(
+            pid,
+            {
+                "hbm": {"committed": {}, "inflight": {}},
+                "dram": {"committed": {}},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": [],
+            },
+        )
         e["state"] = stored["state"]
         e["pre_pause_state"] = stored["pre_pause_state"]
     ended_gcd = set(ended_no_units)
@@ -211,18 +217,21 @@ def _aginfer_overlay_program_states(cache, per_program: dict) -> dict:
     # pushed yet (cold start before the scheduler's first
     # set_aginfer_runtime_metrics), and the overlay must still build a
     # valid program-state map rather than AttributeError.
-    for pid, sp_bytes in getattr(
-        cache, "_aginfer_runtime_metrics", {}
-    ).get("inflight", {}).items():
+    for pid, sp_bytes in (
+        getattr(cache, "_aginfer_runtime_metrics", {}).get("inflight", {}).items()
+    ):
         if pid in ended_gcd:
             continue
-        e = per_program.setdefault(pid, {
-            "hbm":  {"committed": {}, "inflight": {}},
-            "dram": {"committed": {}},
-            "state": "REASONING",
-            "pre_pause_state": None,
-            "unit_hashes": [],
-        })
+        e = per_program.setdefault(
+            pid,
+            {
+                "hbm": {"committed": {}, "inflight": {}},
+                "dram": {"committed": {}},
+                "state": "REASONING",
+                "pre_pause_state": None,
+                "unit_hashes": [],
+            },
+        )
         e["hbm"]["inflight"] = {sp: int(b) for sp, b in sp_bytes.items()}
     return per_program
 
@@ -324,8 +333,13 @@ def _aginfer_bytes_per_token(cache) -> int:
             # holds (swa_kv_pool / c128_kv_pool, each a
             # DeepSeekV4SingleKVPool).  Probe them so DSV4's byte
             # accounting isn't 0 → occ_hbm≡0 → daemon-blind (#209).
-            for _attr in ("full_kv_pool", "swa_kv_pool", "c128_kv_pool",
-                          "kv_pool", "_pool"):
+            for _attr in (
+                "full_kv_pool",
+                "swa_kv_pool",
+                "c128_kv_pool",
+                "kv_pool",
+                "_pool",
+            ):
                 _sub = getattr(kv, _attr, None)
                 if _sub is not None and hasattr(_sub, "get_bytes_per_token"):
                     try:
@@ -469,8 +483,10 @@ def _aginfer_pool_usage(cache) -> dict:
             }
     else:
         hbm_subpools[full_sp] = {
-            "used_bytes": 0, "cap_bytes": 0,
-            "available_bytes": 0, "evictable_bytes": 0,
+            "used_bytes": 0,
+            "cap_bytes": 0,
+            "available_bytes": 0,
+            "evictable_bytes": 0,
             "page_bytes": page_bytes_default,
             "decode_bytes_per_token": dbpt_full,
         }
@@ -495,10 +511,10 @@ def _aginfer_pool_usage(cache) -> dict:
     # DRAM used bytes are filled in by the dump walker; pool_usage
     # itself doesn't have a fast aggregate.  Caller patches in.
     dram_subpools[full_sp] = {
-        "used_bytes": 0,           # patched in by dump_aginfer_state_impl
+        "used_bytes": 0,  # patched in by dump_aginfer_state_impl
         "cap_bytes": dram_cap,
         "available_bytes": dram_cap,  # patched
-        "evictable_bytes": 0,         # patched
+        "evictable_bytes": 0,  # patched
         "page_bytes": page_bytes_default,
         "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
     }
@@ -531,14 +547,16 @@ def _aginfer_pool_usage(cache) -> dict:
             else:
                 disk_cap = int(usage.total)
                 disk_avail = int(usage.free)
-    disk_subpools = {full_sp: {
-        "used_bytes": max(0, disk_cap - disk_avail),
-        "cap_bytes": disk_cap,
-        "available_bytes": disk_avail,
-        "evictable_bytes": 0,
-        "page_bytes": page_bytes_default,
-        "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
-    }}
+    disk_subpools = {
+        full_sp: {
+            "used_bytes": max(0, disk_cap - disk_avail),
+            "cap_bytes": disk_cap,
+            "available_bytes": disk_avail,
+            "evictable_bytes": 0,
+            "page_bytes": page_bytes_default,
+            "decode_bytes_per_token": dbpt_full,  # schema uniformity; HBM-only signal
+        }
+    }
 
     # HBM occupancy signal the T5 watermark webhook fires on
     # (scheduler.maybe_fire reads pool_usage["HBM"]["token_usage"]).
@@ -556,7 +574,7 @@ def _aginfer_pool_usage(cache) -> dict:
             hbm_token_usage = max(hbm_token_usage, sp["used_bytes"] / cap)
 
     return {
-        "HBM":  {"subpools": hbm_subpools, "token_usage": hbm_token_usage},
+        "HBM": {"subpools": hbm_subpools, "token_usage": hbm_token_usage},
         "DRAM": {"subpools": dram_subpools},
         "DISK": {"subpools": disk_subpools},
     }
@@ -582,21 +600,29 @@ def _aginfer_link_stats(cache) -> dict:
     branch is ``> LINK_IDLE_SECONDS = 1.0`` so any value above
     the threshold takes the peak path.
     """
-    PEAK_HBM_DRAM = 64 * 1024 * 1024 * 1024 * 8   # ~64 GB/s PCIe 5.0 x16
+    PEAK_HBM_DRAM = 64 * 1024 * 1024 * 1024 * 8  # ~64 GB/s PCIe 5.0 x16
     PEAK_DRAM_DISK = 12 * 1024 * 1024 * 1024 * 8  # ~12 GB/s NVMe
     return {
-        "HBM->DRAM": {"peak_bw_bps": PEAK_HBM_DRAM,
-                      "recent_throughput_bps": 0,
-                      "time_since_last_sample_s": 1.0e12},
-        "DRAM->HBM": {"peak_bw_bps": PEAK_HBM_DRAM,
-                      "recent_throughput_bps": 0,
-                      "time_since_last_sample_s": 1.0e12},
-        "DRAM->DISK": {"peak_bw_bps": PEAK_DRAM_DISK,
-                       "recent_throughput_bps": 0,
-                       "time_since_last_sample_s": 1.0e12},
-        "DISK->DRAM": {"peak_bw_bps": PEAK_DRAM_DISK,
-                       "recent_throughput_bps": 0,
-                       "time_since_last_sample_s": 1.0e12},
+        "HBM->DRAM": {
+            "peak_bw_bps": PEAK_HBM_DRAM,
+            "recent_throughput_bps": 0,
+            "time_since_last_sample_s": 1.0e12,
+        },
+        "DRAM->HBM": {
+            "peak_bw_bps": PEAK_HBM_DRAM,
+            "recent_throughput_bps": 0,
+            "time_since_last_sample_s": 1.0e12,
+        },
+        "DRAM->DISK": {
+            "peak_bw_bps": PEAK_DRAM_DISK,
+            "recent_throughput_bps": 0,
+            "time_since_last_sample_s": 1.0e12,
+        },
+        "DISK->DRAM": {
+            "peak_bw_bps": PEAK_DRAM_DISK,
+            "recent_throughput_bps": 0,
+            "time_since_last_sample_s": 1.0e12,
+        },
     }
 
 
@@ -613,10 +639,7 @@ def _aginfer_tier_holding_cost(cache, pool_usage: dict) -> dict:
     H = 0.0
     out: dict = {}
     for tier, entry in pool_usage.items():
-        out[tier] = {
-            sp: {"h_max_per_byte_sec": H}
-            for sp in entry["subpools"].keys()
-        }
+        out[tier] = {sp: {"h_max_per_byte_sec": H} for sp in entry["subpools"].keys()}
     return out
 
 
@@ -644,7 +667,7 @@ def _aginfer_throughput_ema(cache) -> dict:
     Empty until the scheduler pushes a measurement, so the formulas
     still degenerate to their no-signal branches at cold-start.
     """
-    m = getattr(cache, "_aginfer_runtime_metrics", {})   # #217: cold-start safe
+    m = getattr(cache, "_aginfer_runtime_metrics", {})  # #217: cold-start safe
     return {
         "prefill_bps": float(m.get("prefill_bps", 0.0)),
         "decode_per_program": dict(m.get("decode_per_program", {})),
@@ -739,19 +762,26 @@ def _dump_aginfer_state_impl(cache, want_bytes: bool):
     metrics_summary = cache._aginfer_state_dump_metrics.summary()
     if want_bytes:
         result = _dump_aginfer_state_bytes(
-            cache, bytes_per_token, sp_full, metrics_summary,
+            cache,
+            bytes_per_token,
+            sp_full,
+            metrics_summary,
         )
         dump_bytes = len(result)
     else:
         result = _dump_aginfer_state_dict(
-            cache, bytes_per_token, sp_full, metrics_summary,
+            cache,
+            bytes_per_token,
+            sp_full,
+            metrics_summary,
         )
         # Dict path: serialised size isn't measured (the call site
         # doesn't go through orjson).  Sentinel.
         dump_bytes = -1
     elapsed_ns = time.perf_counter_ns() - t0
     cache._aginfer_state_dump_metrics.record(
-        elapsed_ns=elapsed_ns, dump_bytes=dump_bytes,
+        elapsed_ns=elapsed_ns,
+        dump_bytes=dump_bytes,
     )
     return result
 
@@ -805,24 +835,26 @@ def _dump_aginfer_state_dict(
             sids = node.session_ids
         except AttributeError:
             sids = None
-        units_append({
-            "hash": unit_hash,
-            "residence": residence,
-            "n_tokens": n_tokens,
-            "n_bytes": n_bytes,
-            "last_access_time": int(node.last_access_time),
-            "hit_count": int(node.hit_count),
-            "session_ids": sorted(sids) if sids else [],
-            # #210: the three structural leaf predicates the daemon's
-            # migrate_candidates needs to mirror sglang's apply-site
-            # guards (2673/2684/2687) — else reject storms under
-            # pressure (remove_not_leaf / remove_hbm_not_device_leaf /
-            # remove_dram_not_host_leaf).  is_host_leaf ⟹ is_tree_leaf,
-            # but is_device_leaf does NOT, so all three are dumped.
-            "is_device_leaf": cache._is_device_leaf(node),
-            "is_host_leaf": cache._is_host_leaf(node),
-            "is_tree_leaf": len(node.children) == 0,
-        })
+        units_append(
+            {
+                "hash": unit_hash,
+                "residence": residence,
+                "n_tokens": n_tokens,
+                "n_bytes": n_bytes,
+                "last_access_time": int(node.last_access_time),
+                "hit_count": int(node.hit_count),
+                "session_ids": sorted(sids) if sids else [],
+                # #210: the three structural leaf predicates the daemon's
+                # migrate_candidates needs to mirror sglang's apply-site
+                # guards (2673/2684/2687) — else reject storms under
+                # pressure (remove_not_leaf / remove_hbm_not_device_leaf /
+                # remove_dram_not_host_leaf).  is_host_leaf ⟹ is_tree_leaf,
+                # but is_device_leaf does NOT, so all three are dumped.
+                "is_device_leaf": cache._is_device_leaf(node),
+                "is_host_leaf": cache._is_host_leaf(node),
+                "is_tree_leaf": len(node.children) == 0,
+            }
+        )
 
     pool_usage = _aginfer_pool_usage(cache)
     _aginfer_patch_dram_used(cache, pool_usage, dram_used_by_sp)
@@ -835,13 +867,16 @@ def _dump_aginfer_state_dict(
             continue
         n_holders = len(sids)
         for pid in sids:
-            e = per_program.setdefault(pid, {
-                "hbm":  {"committed": {}, "inflight": {}},
-                "dram": {"committed": {}},
-                "state": "REASONING",
-                "pre_pause_state": None,
-                "unit_hashes": [],
-            })
+            e = per_program.setdefault(
+                pid,
+                {
+                    "hbm": {"committed": {}, "inflight": {}},
+                    "dram": {"committed": {}},
+                    "state": "REASONING",
+                    "pre_pause_state": None,
+                    "unit_hashes": [],
+                },
+            )
             e["unit_hashes"].append(u["hash"])
             for tier, sp_dict in u["n_bytes"].items():
                 if tier == "DISK":
@@ -876,8 +911,7 @@ def _dump_aginfer_state_dict(
     }
 
 
-def _aginfer_patch_dram_used(cache, pool_usage: dict,
-                             dram_used_by_sp: dict) -> None:
+def _aginfer_patch_dram_used(cache, pool_usage: dict, dram_used_by_sp: dict) -> None:
     """Post-walk DRAM-used patch on pool_usage."""
     for sp, used in dram_used_by_sp.items():
         if sp in pool_usage["DRAM"]["subpools"]:
@@ -934,8 +968,7 @@ def _dump_aginfer_state_bytes(
         if n_tokens_hbm == 0 and n_tokens_dram == 0:
             continue
         hbm_bytes = n_tokens_hbm * bytes_per_token if n_tokens_hbm else 0
-        dram_bytes = (n_tokens_dram * bytes_per_token
-                      if n_tokens_dram else 0)
+        dram_bytes = n_tokens_dram * bytes_per_token if n_tokens_dram else 0
         if dram_bytes:
             dram_used_by_sp[sp_full] += dram_bytes
 
@@ -970,18 +1003,25 @@ def _dump_aginfer_state_bytes(
         else:
             units_buf.extend(b'"DRAM"')
         units_buf.extend(b'],"n_tokens":')
-        units_buf.extend(str(max(n_tokens_hbm, n_tokens_dram))
-                         .encode("ascii"))
+        units_buf.extend(str(max(n_tokens_hbm, n_tokens_dram)).encode("ascii"))
         units_buf.extend(b',"n_bytes":{')
         n_bytes_pieces = []
         if hbm_bytes:
             n_bytes_pieces.append(
-                b'"HBM":{"' + sp_full.encode("ascii") + b'":'
-                + str(hbm_bytes).encode("ascii") + b'}')
+                b'"HBM":{"'
+                + sp_full.encode("ascii")
+                + b'":'
+                + str(hbm_bytes).encode("ascii")
+                + b"}"
+            )
         if dram_bytes:
             n_bytes_pieces.append(
-                b'"DRAM":{"' + sp_full.encode("ascii") + b'":'
-                + str(dram_bytes).encode("ascii") + b'}')
+                b'"DRAM":{"'
+                + sp_full.encode("ascii")
+                + b'":'
+                + str(dram_bytes).encode("ascii")
+                + b"}"
+            )
         units_buf.extend(b",".join(n_bytes_pieces))
         units_buf.extend(b'},"last_access_time":')
         units_buf.extend(str(int(node.last_access_time)).encode("ascii"))
@@ -990,6 +1030,7 @@ def _dump_aginfer_state_bytes(
         if sids_sorted:
             # orjson on the rare non-empty branch (~free vs json.dumps).
             import orjson as _o
+
             units_buf.extend(b',"session_ids":')
             units_buf.extend(_o.dumps(sids_sorted))
         else:
@@ -999,13 +1040,14 @@ def _dump_aginfer_state_bytes(
         # 2673/2684/2687 so it never proposes a reject-guaranteed migrate.
         units_buf.extend(
             b',"is_device_leaf":'
-            + (b"true" if cache._is_device_leaf(node) else b"false"))
+            + (b"true" if cache._is_device_leaf(node) else b"false")
+        )
         units_buf.extend(
-            b',"is_host_leaf":'
-            + (b"true" if cache._is_host_leaf(node) else b"false"))
+            b',"is_host_leaf":' + (b"true" if cache._is_host_leaf(node) else b"false")
+        )
         units_buf.extend(
-            b',"is_tree_leaf":'
-            + (b"true" if len(node.children) == 0 else b"false"))
+            b',"is_tree_leaf":' + (b"true" if len(node.children) == 0 else b"false")
+        )
         units_buf.extend(b"}")
 
         # ---- per-program accumulator (single dict-of-dicts per pid) ----
@@ -1040,7 +1082,7 @@ def _dump_aginfer_state_bytes(
     # Reshape per_program accumulators into DESIGN §5 form.
     per_program = {
         pid: {
-            "hbm":  {"committed": e["hbm_committed"], "inflight": {}},
+            "hbm": {"committed": e["hbm_committed"], "inflight": {}},
             "dram": {"committed": e["dram_committed"]},
             "state": "REASONING",
             "pre_pause_state": None,
@@ -1055,6 +1097,7 @@ def _dump_aginfer_state_bytes(
 
     # ---- assemble final wire JSON ----
     import orjson
+
     out = bytearray()
     out.extend(b'{"time_counter":')
     out.extend(str(int(peek_time_counter())).encode("ascii"))
@@ -1077,5 +1120,5 @@ def _dump_aginfer_state_bytes(
     # T14 — piggybacked state-dump cost observability.
     out.extend(b',"state_dump_metrics":')
     out.extend(orjson.dumps(metrics_summary))
-    out.extend(b'}')
+    out.extend(b"}")
     return bytes(out)

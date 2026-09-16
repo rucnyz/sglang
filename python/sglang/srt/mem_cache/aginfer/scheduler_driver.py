@@ -24,6 +24,7 @@ Responsibilities owned here (the saturation-yield / cooldown decision subsystem)
 State is reconstructed-from-scratch on restart (no persistence), exactly as the
 daemon's was — see `_update_demote_apply_rate`'s original docstring.
 """
+
 from __future__ import annotations
 
 import os
@@ -36,7 +37,9 @@ from sglang.srt.mem_cache.aginfer.knapsack import Migrate, Pause, Resume
 def tier_to_wire(tier: Tier) -> str:
     """Tier enum → the DESIGN §6 wire string. Single-sourced here (the daemon
     re-exports as `_tier_to_wire`)."""
-    return {Tier.HBM: "HBM", Tier.DRAM: "DRAM", Tier.DISK: "DISK", Tier.DROP: "DROP"}[tier]
+    return {Tier.HBM: "HBM", Tier.DRAM: "DRAM", Tier.DISK: "DISK", Tier.DROP: "DROP"}[
+        tier
+    ]
 
 
 def assignments_to_wire(assignments) -> List[Dict[str, Any]]:
@@ -45,6 +48,7 @@ def assignments_to_wire(assignments) -> List[Dict[str, Any]]:
     plus an opaque ``action_id`` correlator (echoed back in APPLY_FAILED webhooks).
     Moved verbatim from daemon/kv_scheduler.py (single source; daemon re-exports)."""
     import uuid
+
     return [
         {
             "hash": uhash,
@@ -70,8 +74,9 @@ def _env_float(name: str, default: str) -> float:
 _DEMOTE_YIELD_EMA = _env_float("AGINFER_DEMOTE_YIELD_EMA", "0.4")
 
 
-def filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
-                         now: float) -> List[Any]:
+def filter_cooled_evicts(
+    plan: List[Any], cooldown: Dict[str, float], now: float
+) -> List[Any]:
     """#223: drop any migrate that REMOVES a tier for a hash currently in the TOCTOU
     evict cooldown. Pure-add migrates (write-through) for a cooled hash still pass —
     only the failing remove is backed off. Expired entries are ignored (pruned by the
@@ -107,8 +112,8 @@ class AginferDriver:
         self._last_tick_t: Optional[float] = None
         # increment 4: belief + policy for the activated tick(), built lazily on first tick
         # (only when SGLANG_AGINFER_IN_ENGINE is on) so constructing a driver stays trivial.
-        self._tracker = None              # ProgramTracker
-        self._policy = None               # OursGreedyPolicy (supplies decide's costs + pi_u)
+        self._tracker = None  # ProgramTracker
+        self._policy = None  # OursGreedyPolicy (supplies decide's costs + pi_u)
         self._unknown_tier_log: set = set()
 
     # P2c (EXP_PLAN.md): belief-plane transitions driven by REAL agent
@@ -130,10 +135,16 @@ class AginferDriver:
     #   sub_return      (session=parent) -> observe_arrival:   parent resumes reasoning
     #   tool_call_end   (session)        -> observe_arrival:   REASONING (paper §4 table)
     #   tool_call_start (session)        -> observe_completion: REASONING->ACTING
-    _ARRIVAL_KINDS = frozenset((
-        "session_arrival", "llm_prefill", "tool_call_end",
-        "sub_dispatch_blocking", "sub_dispatch_async", "sub_return",
-    ))
+    _ARRIVAL_KINDS = frozenset(
+        (
+            "session_arrival",
+            "llm_prefill",
+            "tool_call_end",
+            "sub_dispatch_blocking",
+            "sub_dispatch_async",
+            "sub_return",
+        )
+    )
     _COMPLETION_KINDS = frozenset(("tool_call_start",))
 
     def apply_events(self, events: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -170,7 +181,12 @@ class AginferDriver:
             # ``update_aginfer_events`` in scheduler.py), so it would crash
             # the whole engine, not just this one RPC. Require both fields
             # to be non-empty strings before any set lookup / tracker call.
-            if not isinstance(kind, str) or not kind or not isinstance(session, str) or not session:
+            if (
+                not isinstance(kind, str)
+                or not kind
+                or not isinstance(session, str)
+                or not session
+            ):
                 skipped += 1
                 continue
             try:
@@ -210,8 +226,9 @@ class AginferDriver:
     # pressure ⇒ nothing to migrate) and INTERVAL-THROTTLED (≥ min_interval since the last
     # tick) so it never runs every step (the dump is 5-50ms, #160) nor competes with the
     # hot path under headroom. Pure + deterministic ⇒ unit-tested.
-    def should_tick(self, occ: float, now: float, *, theta_lo: float,
-                    min_interval_s: float) -> bool:
+    def should_tick(
+        self, occ: float, now: float, *, theta_lo: float, min_interval_s: float
+    ) -> bool:
         if occ < theta_lo:
             # pressure resolved: RE-ARM the throttle so the NEXT pressure onset ticks
             # promptly (react fast to a new spike) rather than waiting out the interval
@@ -229,7 +246,8 @@ class AginferDriver:
         hash STILL HBM-resident a dump-generation later did not apply (lock-race vs
         sglang's own eviction). Update the apply-rate EMA the saturation yield reads.
         The EMA tolerates the dump's <1s eventual-consistency lag. Reconstructed from
-        scratch on restart. Verbatim from daemon/kv_scheduler.py:_update_demote_apply_rate."""
+        scratch on restart. Verbatim from daemon/kv_scheduler.py:_update_demote_apply_rate.
+        """
         self._dump_gen += 1
         if not self._pending_demote:
             # Recovery drift: with nothing pending, slowly relax the EMA back toward
@@ -243,8 +261,9 @@ class AginferDriver:
                 continue  # give the apply at least one fresh dump to show up
             u = units.get(h)
             landed = (u is None) or (Tier.HBM not in u.residence)
-            self._demote_apply_ema = (
-                0.7 * self._demote_apply_ema + 0.3 * (1.0 if landed else 0.0))
+            self._demote_apply_ema = 0.7 * self._demote_apply_ema + 0.3 * (
+                1.0 if landed else 0.0
+            )
             del self._pending_demote[h]
         if len(self._pending_demote) > 4096:  # safety: never grow unbounded
             self._pending_demote.clear()
@@ -256,8 +275,9 @@ class AginferDriver:
         with the EMA that consumes it.)"""
         self._pending_demote[uid] = self._dump_gen
 
-    def postprocess_plan(self, plan: List[Any], evict_cooldown: Optional[Dict[str, float]],
-                         now: float) -> List[Any]:
+    def postprocess_plan(
+        self, plan: List[Any], evict_cooldown: Optional[Dict[str, float]], now: float
+    ) -> List[Any]:
         """The pure plan post-processing the daemon ran inline after joint_decide:
         (1) #223 evict-cooldown filter, (2) #240 saturation yield. Returns the final
         plan (possibly empty). `evict_cooldown` may be None/empty (no cooldown)."""
@@ -273,15 +293,24 @@ class AginferDriver:
         # resumes. Value-optimal do-no-harm (DESIGN §9 saturation yield).
         if plan and self._demote_apply_ema < _DEMOTE_YIELD_EMA:
             from sglang.srt.mem_cache.aginfer._metrics import m as _m
+
             _before = len(plan)
-            plan = [c for c in plan if not (
-                isinstance(c, Migrate)
-                and isinstance(getattr(c, "id", None), tuple)
-                and len(c.id) >= 3 and Tier.HBM in c.id[2])]
+            plan = [
+                c
+                for c in plan
+                if not (
+                    isinstance(c, Migrate)
+                    and isinstance(getattr(c, "id", None), tuple)
+                    and len(c.id) >= 3
+                    and Tier.HBM in c.id[2]
+                )
+            ]
             if len(plan) < _before:
-                _m("demote_saturation_yield",
-                   ema=round(self._demote_apply_ema, 3),
-                   stripped=_before - len(plan))
+                _m(
+                    "demote_saturation_yield",
+                    ema=round(self._demote_apply_ema, 3),
+                    stripped=_before - len(plan),
+                )
         return plan
 
     # -- in-process apply (the "no HTTP" half of the #251 blocker) ---------------
@@ -309,8 +338,13 @@ class AginferDriver:
         # uid, so it could not be applied anyway). Same defensive contract as the eviction path.
         # exact 3-tuple (uid, add, remove): a 4+ tuple would pass a >=3 guard then crash the
         # 3-way unpack in assignments_to_wire — so require == 3 (the live contract is exactly 3).
-        migrates = [c for c in plan if isinstance(c, Migrate)
-                    and isinstance(getattr(c, "id", None), tuple) and len(c.id) == 3]
+        migrates = [
+            c
+            for c in plan
+            if isinstance(c, Migrate)
+            and isinstance(getattr(c, "id", None), tuple)
+            and len(c.id) == 3
+        ]
         pauses = [getattr(c, "pid", None) for c in plan if isinstance(c, Pause)]
         resumes = [getattr(c, "pid", None) for c in plan if isinstance(c, Resume)]
         migrate_result = None
@@ -321,21 +355,35 @@ class AginferDriver:
                 if remove and Tier.HBM in remove:
                     self.note_demote_dispatched(uid)
             migrate_result = cache.apply_aginfer_migrations(wire)
-        return {"migrate_result": migrate_result,
-                "pauses": [p for p in pauses if p is not None],
-                "resumes": [p for p in resumes if p is not None]}
+        return {
+            "migrate_result": migrate_result,
+            "pauses": [p for p in pauses if p is not None],
+            "resumes": [p for p in resumes if p is not None],
+        }
 
-    def decide(self, sched_state, event, *, costs, pi_u, theta_hi: float,
-               theta_lo: float, heartbeat_s: float, admission_enabled: bool,
-               evict_cooldown: Optional[Dict[str, float]] = None,
-               now: Optional[float] = None) -> List[Any]:
+    def decide(
+        self,
+        sched_state,
+        event,
+        *,
+        costs,
+        pi_u,
+        theta_hi: float,
+        theta_lo: float,
+        heartbeat_s: float,
+        admission_enabled: bool,
+        evict_cooldown: Optional[Dict[str, float]] = None,
+        now: Optional[float] = None,
+    ) -> List[Any]:
         """Run the in-engine `joint_decide` over the union action space, then
         post-process (cooldown + saturation yield). Returns the final mixed plan.
         This is the in-process equivalent of the daemon's handle() decision body
         (kv_scheduler.py:1431-1467) — same call, same filters, no transport."""
         from sglang.srt.mem_cache.aginfer.joint_decide import joint_decide
+
         plan = joint_decide(
-            sched_state, event,
+            sched_state,
+            event,
             costs=costs,
             pi_u=pi_u,
             theta_hi=theta_hi,
@@ -345,6 +393,7 @@ class AginferDriver:
         )
         if now is None:
             import time as _time
+
             now = _time.monotonic()
         return self.postprocess_plan(plan, evict_cooldown, now)
 
@@ -371,15 +420,23 @@ class AginferDriver:
     # in-engine path stays flag-default-OFF and the daemon remains the production decision-maker.
     # Still flag-gated (SGLANG_AGINFER_IN_ENGINE) + wrapped by the hook's try/except; the live
     # under-load A/B awaits the V4 stack fix (S2_RESULTS) — the flag stays off by default.
-    def tick(self, scheduler, *, theta_hi: float = 0.85, theta_lo: float = 0.70,
-             heartbeat_s: float = 5.0) -> Dict[str, Any]:
+    def tick(
+        self,
+        scheduler,
+        *,
+        theta_hi: float = 0.85,
+        theta_lo: float = 0.70,
+        heartbeat_s: float = 5.0,
+    ) -> Dict[str, Any]:
         """One in-process scheduling tick (the daemon handle() equivalent, no transport).
         Returns a small status dict. MUST NOT raise into the scheduler loop — the hook wraps
         it, but it stays defensive."""
         dump_fn = getattr(scheduler.tree_cache, "dump_aginfer_state", None)
         if dump_fn is None:
             return {"status": "no_dump"}  # non-Unified cache: in-engine aginfer N/A
-        state_json = dump_fn()  # the engine's own s_t, in-process (no /aginfer/state HTTP)
+        state_json = (
+            dump_fn()
+        )  # the engine's own s_t, in-process (no /aginfer/state HTTP)
         if not isinstance(state_json, dict) or "unsupported_tree_cache" in state_json:
             return {"status": "unsupported"}
         # Lazy belief + policy (built once, only when needed). SESSION_END may
@@ -387,23 +444,46 @@ class AginferDriver:
         # these two initialisations independent.
         if self._tracker is None:
             from sglang.srt.mem_cache.aginfer.program_tracker import ProgramTracker
+
             self._tracker = ProgramTracker()
         if self._policy is None:
-            from sglang.srt.mem_cache.aginfer.ours_greedy import OursGreedyPolicy
             from sglang.srt.mem_cache.aginfer.costs import default_costs
+            from sglang.srt.mem_cache.aginfer.ours_greedy import OursGreedyPolicy
+
             self._policy = OursGreedyPolicy(default_costs())
-        from sglang.srt.mem_cache.aginfer.state_builder import build_paper_state, hints_from_state
         from sglang.srt.mem_cache.aginfer.events import Event, EventKind
-        evt = Event(kind=EventKind.MEMORY_PRESSURE)                                   # (a)
-        sched_state = build_paper_state(state_json, event=evt, tracker=self._tracker,
-                                        unknown_tier_log=self._unknown_tier_log)
-        self.update_demote_apply_rate(sched_state.units)                              # (b) before decide
+        from sglang.srt.mem_cache.aginfer.state_builder import (
+            build_paper_state,
+            hints_from_state,
+        )
+
+        evt = Event(kind=EventKind.MEMORY_PRESSURE)  # (a)
+        sched_state = build_paper_state(
+            state_json,
+            event=evt,
+            tracker=self._tracker,
+            unknown_tier_log=self._unknown_tier_log,
+        )
+        self.update_demote_apply_rate(sched_state.units)  # (b) before decide
         cache = scheduler.tree_cache
         hints = hints_from_state(sched_state)
-        self.apply_hints(hints, cache)              # the S2/value hint lever (full, n_holders-driven)
-        plan = self.decide(sched_state, evt, costs=self._policy.costs, pi_u=self._policy.pi_u,
-                           theta_hi=theta_hi, theta_lo=theta_lo, heartbeat_s=heartbeat_s,
-                           admission_enabled=False)                                   # (c) migration only
+        self.apply_hints(
+            hints, cache
+        )  # the S2/value hint lever (full, n_holders-driven)
+        plan = self.decide(
+            sched_state,
+            evt,
+            costs=self._policy.costs,
+            pi_u=self._policy.pi_u,
+            theta_hi=theta_hi,
+            theta_lo=theta_lo,
+            heartbeat_s=heartbeat_s,
+            admission_enabled=False,
+        )  # (c) migration only
         result = self.apply_plan(plan, cache)
-        return {"status": "ticked", "n_units": len(sched_state.units),
-                "n_hints": len(hints), "migrate_result": result.get("migrate_result")}
+        return {
+            "status": "ticked",
+            "n_units": len(sched_state.units),
+            "n_hints": len(hints),
+            "migrate_result": result.get("migrate_result"),
+        }

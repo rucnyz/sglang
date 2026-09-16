@@ -770,9 +770,7 @@ async def server_info():
 import os
 import threading
 
-_AGINFER_REFRESH_MS = float(
-    os.environ.get("AGINFER_STATE_REFRESH_MS", "50.0")
-)
+_AGINFER_REFRESH_MS = float(os.environ.get("AGINFER_STATE_REFRESH_MS", "50.0"))
 # Per #160 closure: a 50ms refresh cadence at ~5ms dump cost is <1%
 # scheduler overhead.  Operators can tune via the env var.
 
@@ -787,9 +785,7 @@ _aginfer_state_cache = AginferStateCache(_AGINFER_REFRESH_MS)
 
 @app.get("/aginfer/state")
 async def aginfer_state():
-    body, media = await _aginfer_state_cache.get(
-        _global_state.tokenizer_manager
-    )
+    body, media = await _aginfer_state_cache.get(_global_state.tokenizer_manager)
     return Response(content=body, media_type=media)
 
 
@@ -810,18 +806,20 @@ async def aginfer_metrics():
                 out[k] = out.get(k, 0) + v
         return out
 
-    return ORJSONResponse({
-        "ranks": len(responses),
-        "evict": _merge_counts(r.evict for r in responses),
-        "migrate_applied": _merge_counts(r.migrate_applied for r in responses),
-        "migrate_skipped": _merge_counts(r.migrate_skipped for r in responses),
-        "hash_collisions": sum(r.hash_collisions for r in responses),
-        # Occupancy is not additive in a meaningful way across DP ranks
-        # (each rank has its own HBM/DRAM pool); report per-rank list
-        # rather than summing bytes across independent pools.
-        "pool_usage_by_rank": [r.pool_usage for r in responses],
-        "value_aware": any(r.value_aware for r in responses),
-    })
+    return ORJSONResponse(
+        {
+            "ranks": len(responses),
+            "evict": _merge_counts(r.evict for r in responses),
+            "migrate_applied": _merge_counts(r.migrate_applied for r in responses),
+            "migrate_skipped": _merge_counts(r.migrate_skipped for r in responses),
+            "hash_collisions": sum(r.hash_collisions for r in responses),
+            # Occupancy is not additive in a meaningful way across DP ranks
+            # (each rank has its own HBM/DRAM pool); report per-rank list
+            # rather than summing bytes across independent pools.
+            "pool_usage_by_rank": [r.pool_usage for r in responses],
+            "value_aware": any(r.value_aware for r in responses),
+        }
+    )
 
 
 # POST /aginfer/migrate -- apply paper §6 residence-set transitions.
@@ -864,30 +862,28 @@ async def aginfer_migrate(raw_request: Request):
     # 400, not "scheduler subprocess KeyError + crash") so a malformed
     # daemon POST surfaces to ops without taking sglang down.
     _AGINFER_REQUIRED_ACTION_FIELDS = (
-        "hash", "add_tiers", "remove_tiers", "action_id",
+        "hash",
+        "add_tiers",
+        "remove_tiers",
+        "action_id",
     )
     for _i, _a in enumerate(actions):
         if not isinstance(_a, dict):
             raise HTTPException(
                 status_code=400,
-                detail=f"actions[{_i}] must be a dict, got "
-                       f"{type(_a).__name__}",
+                detail=f"actions[{_i}] must be a dict, got " f"{type(_a).__name__}",
             )
-        _missing = [f for f in _AGINFER_REQUIRED_ACTION_FIELDS
-                    if f not in _a]
+        _missing = [f for f in _AGINFER_REQUIRED_ACTION_FIELDS if f not in _a]
         if _missing:
             raise HTTPException(
                 status_code=400,
-                detail=f"actions[{_i}] missing required field(s): "
-                       f"{_missing!r}",
+                detail=f"actions[{_i}] missing required field(s): " f"{_missing!r}",
             )
         _h = _a["hash"]
         if isinstance(_h, str) and len(_h) > AGINFER_MAX_HASH_LEN:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"hash too long ({len(_h)} > {AGINFER_MAX_HASH_LEN})"
-                ),
+                detail=(f"hash too long ({len(_h)} > {AGINFER_MAX_HASH_LEN})"),
             )
     from sglang.srt.managers.io_struct import MigrateAginferReq
 
@@ -917,14 +913,19 @@ async def aginfer_migrate(raw_request: Request):
     )
 
 
-
 # aginfer HTTP request validators live in the self-contained module; the
 # endpoints below call them as thin hooks (#251).
-from sglang.srt.mem_cache.aginfer.http_validators import (  # aginfer hook (#251)
-    validate_session_end_body as _validate_session_end_body,
-    validate_program_paused_body as _validate_program_paused_body,
-    validate_hints_body as _validate_hints_body,
+from sglang.srt.mem_cache.aginfer.http_validators import (
     validate_events_body as _validate_events_body,
+)
+from sglang.srt.mem_cache.aginfer.http_validators import (
+    validate_hints_body as _validate_hints_body,
+)
+from sglang.srt.mem_cache.aginfer.http_validators import (
+    validate_program_paused_body as _validate_program_paused_body,
+)
+from sglang.srt.mem_cache.aginfer.http_validators import (
+    validate_session_end_body as _validate_session_end_body,  # aginfer hook (#251)
 )
 
 
@@ -1000,6 +1001,7 @@ async def aginfer_program_paused_put(raw_request: Request):
     from sglang.srt.managers.io_struct import (
         UpdateAginferProgramPausedReq,
     )
+
     try:
         pid, state, pre = _validate_program_paused_body(body)
     except ValueError as exc:
@@ -1009,9 +1011,7 @@ async def aginfer_program_paused_put(raw_request: Request):
         state=state,
         pre_pause_state=pre,
     )
-    responses = (
-        await _global_state.tokenizer_manager.update_aginfer_program_paused(req)
-    )
+    responses = await _global_state.tokenizer_manager.update_aginfer_program_paused(req)
     all_ok = all(r.ok for r in responses)
     if not all_ok:
         first_fail = next(r for r in responses if not r.ok)
@@ -1022,11 +1022,13 @@ async def aginfer_program_paused_put(raw_request: Request):
     # Sum applied across ranks (typically 1 OR len(responses); they
     # share the same daemon view so all flip in unison).  Caller
     # treats >0 as "state changed", 0 as "idempotent no-op".
-    return ORJSONResponse({
-        "ok": True,
-        "ranks": len(responses),
-        "applied": sum(int(r.applied) for r in responses),
-    })
+    return ORJSONResponse(
+        {
+            "ok": True,
+            "ranks": len(responses),
+            "applied": sum(int(r.applied) for r in responses),
+        }
+    )
 
 
 # T40 (#184, DESIGN §6 PUT /aginfer/hints): daemon → sglang push of
@@ -1041,14 +1043,13 @@ async def aginfer_hints_put(raw_request: Request):
     except Exception as exc:
         raise HTTPException(status_code=400, detail="invalid JSON") from exc
     from sglang.srt.managers.io_struct import UpdateAginferHintsReq
+
     try:
         hints = _validate_hints_body(body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     req = UpdateAginferHintsReq(hints=hints)
-    responses = (
-        await _global_state.tokenizer_manager.update_aginfer_hints(req)
-    )
+    responses = await _global_state.tokenizer_manager.update_aginfer_hints(req)
     all_ok = all(r.ok for r in responses)
     if not all_ok:
         first_fail = next(r for r in responses if not r.ok)
@@ -1058,11 +1059,13 @@ async def aginfer_hints_put(raw_request: Request):
         )
     # Sum applied across ranks; ranks share the daemon's hash space so
     # they advance in unison.  Caller treats 0 as idempotent no-op.
-    return ORJSONResponse({
-        "ok": True,
-        "ranks": len(responses),
-        "applied": sum(int(r.applied) for r in responses),
-    })
+    return ORJSONResponse(
+        {
+            "ok": True,
+            "ranks": len(responses),
+            "applied": sum(int(r.applied) for r in responses),
+        }
+    )
 
 
 # Remote Dynamo proxy (sglang_remote) → sglang push of agent lifecycle
@@ -1079,25 +1082,26 @@ async def aginfer_events_put(raw_request: Request):
     except Exception as exc:
         raise HTTPException(status_code=400, detail="invalid JSON") from exc
     from sglang.srt.managers.io_struct import UpdateAginferEventsReq
+
     try:
         events = _validate_events_body(body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     req = UpdateAginferEventsReq(events=events)
-    responses = (
-        await _global_state.tokenizer_manager.update_aginfer_events(req)
-    )
+    responses = await _global_state.tokenizer_manager.update_aginfer_events(req)
     # Driver-not-armed is a soft failure the proxy treats as best-effort
     # (same as fire-and-forget in decode_handler._forward_aginfer_events):
     # return 200 with ok=False so the generate path is never blocked.
     all_ok = bool(responses) and all(r.ok for r in responses)
-    return ORJSONResponse({
-        "ok": all_ok,
-        "ranks": len(responses),
-        "applied": sum(int(getattr(r, "applied", 0) or 0) for r in responses),
-        "skipped": sum(int(getattr(r, "skipped", 0) or 0) for r in responses),
-        "reasons": [getattr(r, "reason", "ok") for r in responses],
-    })
+    return ORJSONResponse(
+        {
+            "ok": all_ok,
+            "ranks": len(responses),
+            "applied": sum(int(getattr(r, "applied", 0) or 0) for r in responses),
+            "skipped": sum(int(getattr(r, "skipped", 0) or 0) for r in responses),
+            "reasons": [getattr(r, "reason", "ok") for r in responses],
+        }
+    )
 
 
 @app.get("/get_load")

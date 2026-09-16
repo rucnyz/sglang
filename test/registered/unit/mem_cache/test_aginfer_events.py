@@ -29,57 +29,84 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class AginferDriverApplyEventsTest(unittest.TestCase):
     def test_tool_call_end_then_start_drives_reasoning_then_acting(self):
         driver = AginferDriver()
-        result = driver.apply_events([
-            {"kind": "tool_call_end", "session": "p1", "payload": {}},
-        ])
+        result = driver.apply_events(
+            [
+                {"kind": "tool_call_end", "session": "p1", "payload": {}},
+            ]
+        )
         self.assertEqual(result, {"applied": 1, "skipped": 0})
         self.assertEqual(driver._tracker.state("p1"), State.REASONING)
 
-        result = driver.apply_events([
-            {"kind": "tool_call_start", "session": "p1", "payload": {}},
-        ])
+        result = driver.apply_events(
+            [
+                {"kind": "tool_call_start", "session": "p1", "payload": {}},
+            ]
+        )
         self.assertEqual(result, {"applied": 1, "skipped": 0})
         self.assertEqual(driver._tracker.state("p1"), State.ACTING)
 
     def test_sub_dispatch_arrives_the_child_not_the_parent(self):
         driver = AginferDriver()
-        driver.apply_events([{
-            "kind": "sub_dispatch_blocking", "session": "child1",
-            "payload": {"parent_session_id": "main", "fanout": 1},
-        }])
+        driver.apply_events(
+            [
+                {
+                    "kind": "sub_dispatch_blocking",
+                    "session": "child1",
+                    "payload": {"parent_session_id": "main", "fanout": 1},
+                }
+            ]
+        )
         self.assertEqual(driver._tracker.state("child1"), State.REASONING)
         self.assertIsNone(driver._tracker.state("main"))
 
     def test_sub_return_arrives_the_parent(self):
         driver = AginferDriver()
-        driver.apply_events([
-            {"kind": "tool_call_end", "session": "main", "payload": {}},
-            {"kind": "tool_call_start", "session": "main", "payload": {}},
-        ])
+        driver.apply_events(
+            [
+                {"kind": "tool_call_end", "session": "main", "payload": {}},
+                {"kind": "tool_call_start", "session": "main", "payload": {}},
+            ]
+        )
         self.assertEqual(driver._tracker.state("main"), State.ACTING)
-        driver.apply_events([{
-            "kind": "sub_return", "session": "main",
-            "payload": {"child_session_id": "child1"},
-        }])
+        driver.apply_events(
+            [
+                {
+                    "kind": "sub_return",
+                    "session": "main",
+                    "payload": {"child_session_id": "child1"},
+                }
+            ]
+        )
         self.assertEqual(driver._tracker.state("main"), State.REASONING)
 
     def test_sub_dispatch_async_also_arrives_the_child(self):
         driver = AginferDriver()
-        driver.apply_events([{
-            "kind": "sub_dispatch_async", "session": "child1",
-            "payload": {"parent_session_id": "main", "fanout": 2},
-        }])
+        driver.apply_events(
+            [
+                {
+                    "kind": "sub_dispatch_async",
+                    "session": "child1",
+                    "payload": {"parent_session_id": "main", "fanout": 2},
+                }
+            ]
+        )
         self.assertEqual(driver._tracker.state("child1"), State.REASONING)
 
     def test_unmapped_and_malformed_events_are_skipped_not_raised(self):
         driver = AginferDriver()
-        result = driver.apply_events([
-            {"kind": "memory_pressure", "session": None, "payload": {}},
-            {"kind": "session_end", "session": "p1", "payload": {}},  # own end_program path
-            {"session": "p1"},          # no kind
-            {"kind": "tool_call_end"},   # no session
-            "not-a-dict",
-        ])
+        result = driver.apply_events(
+            [
+                {"kind": "memory_pressure", "session": None, "payload": {}},
+                {
+                    "kind": "session_end",
+                    "session": "p1",
+                    "payload": {},
+                },  # own end_program path
+                {"session": "p1"},  # no kind
+                {"kind": "tool_call_end"},  # no session
+                "not-a-dict",
+            ]
+        )
         self.assertEqual(result, {"applied": 0, "skipped": 5})
 
     def test_apply_events_before_any_tick_lazily_builds_the_tracker(self):
@@ -104,10 +131,12 @@ class SchedulerUpdateAginferEventsTest(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._aginfer_driver = AginferDriver()
         out = scheduler.update_aginfer_events(
-            UpdateAginferEventsReq(events=[
-                {"kind": "tool_call_end", "session": "p1"},
-                {"kind": "unmapped_kind", "session": "p1"},
-            ])
+            UpdateAginferEventsReq(
+                events=[
+                    {"kind": "tool_call_end", "session": "p1"},
+                    {"kind": "unmapped_kind", "session": "p1"},
+                ]
+            )
         )
         self.assertTrue(out.ok)
         self.assertEqual(out.applied, 1)

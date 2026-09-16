@@ -4,6 +4,7 @@ Pure functions (no FastAPI deps) that the ``/aginfer/*`` endpoints in
 http_server.py call as thin hooks. They are the safety boundary for
 daemon-pushed inputs; verify/t21 and verify/t40 unit-test them directly.
 """
+
 from __future__ import annotations
 
 import math
@@ -110,13 +111,15 @@ def validate_hints_body(body):
             raise ValueError(f"hints[{i}].n_holders must be an int; got {n_holders!r}")
         if n_holders < 0:
             raise ValueError(f"hints[{i}].n_holders must be >= 0; got {n_holders}")
-        out.append({
-            "hash": uhash,
-            "p_hat": float(p_hat),
-            "lambda": float(lam),
-            "stamp": int(stamp),
-            "n_holders": int(n_holders),
-        })
+        out.append(
+            {
+                "hash": uhash,
+                "p_hat": float(p_hat),
+                "lambda": float(lam),
+                "stamp": int(stamp),
+                "n_holders": int(n_holders),
+            }
+        )
     return out
 
 
@@ -146,9 +149,7 @@ def validate_events_body(body):
     if not isinstance(events, list):
         raise ValueError("'events' must be a list")
     if len(events) > _MAX_EVENTS:
-        raise ValueError(
-            f"'events' has {len(events)} entries; max is {_MAX_EVENTS}"
-        )
+        raise ValueError(f"'events' has {len(events)} entries; max is {_MAX_EVENTS}")
     out = []
     for i, ev in enumerate(events):
         if not isinstance(ev, dict):

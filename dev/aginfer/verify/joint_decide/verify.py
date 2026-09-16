@@ -39,6 +39,7 @@ Stages (TDD — each builds a fixture, asserts the contract):
 Usage:
     python dev/aginfer/verify/joint_decide/verify.py
 """
+
 from __future__ import annotations
 
 import sys
@@ -50,20 +51,25 @@ _AGINFER_ROOT = _HERE.parent.parent
 if str(_AGINFER_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGINFER_ROOT))
 
-from baselines.base import Tier  # noqa: E402
-from baselines.costs import default_costs  # noqa: E402
-from baselines.ours_greedy import migrate_candidates  # noqa: E402
-from baselines.knapsack import Migrate, Pause, Resume  # noqa: E402
-from daemon import kv_scheduler as kvs  # noqa: E402
-from daemon import admission_controller as adm  # noqa: E402
-from daemon.events import Event, EventKind  # noqa: E402
-from daemon.program_tracker import ProgramTracker, State  # noqa: E402
-from daemon.outbound import OutboundQueue  # noqa: E402
 import asyncio  # noqa: E402
 
+from baselines.base import Tier  # noqa: E402
+from baselines.costs import default_costs  # noqa: E402
+from baselines.knapsack import Migrate, Pause, Resume  # noqa: E402
+from baselines.ours_greedy import migrate_candidates  # noqa: E402
+from daemon import admission_controller as adm  # noqa: E402
+from daemon import kv_scheduler as kvs  # noqa: E402
+from daemon.events import Event, EventKind  # noqa: E402
+from daemon.outbound import OutboundQueue  # noqa: E402
+from daemon.program_tracker import ProgramTracker, State  # noqa: E402
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -134,7 +140,7 @@ def _state_json(
     prefill_bps: float = 0.0,
     decode_per_program: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
-    GB = 1024 ** 3
+    GB = 1024**3
     hbm = hbm or {"kv": _sp(1 * GB, 10 * GB)}
     dram = dram or {"kv": _sp(1 * GB, 40 * GB)}
     disk = disk or {"kv": _sp(0, 200 * GB)}
@@ -156,9 +162,15 @@ def _state_json(
                 "peak_bw_bps": 64 * GB,
                 "recent_throughput_bps": 0.0,
                 "time_since_last_sample_s": 5.0,  # idle → full bw_free
-            } for link in ("HBM->DRAM", "DRAM->HBM",
-                           "DRAM->DISK", "DISK->DRAM",
-                           "HBM->DISK", "DISK->HBM")
+            }
+            for link in (
+                "HBM->DRAM",
+                "DRAM->HBM",
+                "DRAM->DISK",
+                "DISK->DRAM",
+                "HBM->DISK",
+                "DISK->HBM",
+            )
         },
         "tier_holding_cost": {
             tier: {"kv": {"h_max_per_byte_sec": 0.0}}
@@ -169,7 +181,8 @@ def _state_json(
 
 def _build_state(state_json, tracker, event):
     return kvs.build_paper_state(
-        state_json, event=event, tracker=tracker, unknown_tier_log=set())
+        state_json, event=event, tracker=tracker, unknown_tier_log=set()
+    )
 
 
 # ============================================================ Stage A
@@ -180,14 +193,21 @@ def stage_a_migrate_candidates() -> None:
     acquired), with the relief>0 filter and the (uid, add, remove) id."""
     tracker = ProgramTracker()
     tracker.observe_arrival("S")  # REASONING (alive holder)
-    GB = 1024 ** 3
+    GB = 1024**3
     nb = 2_000_000  # bytes per tier for the unit
     # hit_count=5 → reuse-based p_hat≈0.86 (#249: alive no longer forces 1.0).
     # A REUSED unit is what gives V({DRAM})>0, so DROP forgoing the retained
     # saved-prefill is a real cost — the property this stage exercises.
     sj = _state_json(
-        units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
-                     hit_count=5, n_bytes_per_tier={"HBM": nb, "DRAM": nb})],
+        units=[
+            _unit(
+                uhash="u1",
+                residence=["HBM", "DRAM"],
+                holders=["S"],
+                hit_count=5,
+                n_bytes_per_tier={"HBM": nb, "DRAM": nb},
+            )
+        ],
         hbm={"kv": _sp(5 * GB, 10 * GB)},
     )
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
@@ -202,7 +222,8 @@ def stage_a_migrate_candidates() -> None:
     if len(cands) != 3:
         raise StageFail(
             f"A: expected 3 relief-bearing candidates for {{HBM,DRAM}}, "
-            f"got {len(cands)}: {[c.id for c in cands]}")
+            f"got {len(cands)}: {[c.id for c in cands]}"
+        )
     by_remove = {tuple(sorted(t.name for t in c.id[2])): c for c in cands}
     if set(by_remove) != {("HBM",), ("DRAM",), ("DRAM", "HBM")}:
         raise StageFail(f"A: unexpected remove-sets {set(by_remove)}")
@@ -213,7 +234,8 @@ def stage_a_migrate_candidates() -> None:
     if evict_hbm.acquired:
         raise StageFail(
             f"A: evict-HBM should acquire nothing (DRAM already resident), "
-            f"got {evict_hbm.acquired}")
+            f"got {evict_hbm.acquired}"
+        )
 
     drop = by_remove[("DRAM", "HBM")]
     if set(drop.relief) != {"HBM", "DRAM"}:
@@ -227,18 +249,21 @@ def stage_a_migrate_candidates() -> None:
     #     (V({DRAM})>0 with a live holder) → DROP.cost > evictHBM.cost.
     if abs(drop_dram.cost) > 1e-12:
         raise StageFail(
-            f"A: drop-DRAM (keep HBM) must cost exactly 0, got {drop_dram.cost!r}")
+            f"A: drop-DRAM (keep HBM) must cost exactly 0, got {drop_dram.cost!r}"
+        )
     if not (drop.cost > evict_hbm.cost):
         raise StageFail(
             f"A: DROP must cost more than evict→DRAM (it forgoes the "
             f"retained saved-prefill): DROP={drop.cost:.4g} "
-            f"evictHBM={evict_hbm.cost:.4g}")
+            f"evictHBM={evict_hbm.cost:.4g}"
+        )
 
     # relief>0 filter: a unit on {HBM} only still yields evict→DRAM /
     # write-through(add DRAM, relief empty → dropped) / DROP.
     sj2 = _state_json(
         units=[_unit(uhash="u2", residence=["HBM"], holders=["S"])],
-        hbm={"kv": _sp(5 * GB, 10 * GB)})
+        hbm={"kv": _sp(5 * GB, 10 * GB)},
+    )
     st2 = _build_state(sj2, tracker, ev)
     c2 = migrate_candidates(st2, ["u2"], default_costs())
     # {HBM}: (add DRAM, keep HBM) relief={} DROPPED; (add DRAM, remove HBM)
@@ -246,7 +271,8 @@ def stage_a_migrate_candidates() -> None:
     if len(c2) != 2:
         raise StageFail(
             f"A: {{HBM}} expected 2 relief-bearing candidates (write-through "
-            f"is relief-empty → filtered), got {len(c2)}: {[c.id for c in c2]}")
+            f"is relief-empty → filtered), got {len(c2)}: {[c.id for c in c2]}"
+        )
     # the evict→DRAM candidate acquires DRAM bytes sized from HBM source.
     evict = next(c for c in c2 if c.id[1] == [Tier.DRAM])
     if set(evict.acquired) != {"DRAM"}:
@@ -271,22 +297,36 @@ def stage_a_leaf_filter() -> None:
         not a tree leaf, so device-leaf alone does not cover full-drop.
     Each non-leaf branch also asserts the OTHER candidates survive (no
     over-filtering)."""
-    GB = 1024 ** 3
+    GB = 1024**3
     nb = 2_000_000
 
     def _ids(unit_kwargs, residence, nbt):
         tracker = ProgramTracker()
         tracker.observe_arrival("S")
         sj = _state_json(
-            units=[_unit(uhash="u1", residence=residence, holders=["S"],
-                         n_bytes_per_tier=nbt, **unit_kwargs)],
-            hbm={"kv": _sp(5 * GB, 10 * GB)})
+            units=[
+                _unit(
+                    uhash="u1",
+                    residence=residence,
+                    holders=["S"],
+                    n_bytes_per_tier=nbt,
+                    **unit_kwargs,
+                )
+            ],
+            hbm={"kv": _sp(5 * GB, 10 * GB)},
+        )
         st = _build_state(
-            sj, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session="S"))
+            sj, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session="S")
+        )
         cands = migrate_candidates(st, ["u1"], default_costs())
         # (sorted add-tier names, sorted remove-tier names) per candidate.
-        return {(tuple(sorted(t.name for t in c.id[1])),
-                 tuple(sorted(t.name for t in c.id[2]))) for c in cands}
+        return {
+            (
+                tuple(sorted(t.name for t in c.id[1])),
+                tuple(sorted(t.name for t in c.id[2])),
+            )
+            for c in cands
+        }
 
     def _removes(ids):
         return {rem for _add, rem in ids}
@@ -300,7 +340,8 @@ def stage_a_leaf_filter() -> None:
     if any("HBM" in rs for rs in nonleaf):
         raise StageFail(
             f"#210: non-device-leaf must yield NO remove-HBM migrate "
-            f"(remove_hbm_not_device_leaf); got {nonleaf}")
+            f"(remove_hbm_not_device_leaf); got {nonleaf}"
+        )
 
     # ---- guard 2: remove-DRAM ⇐ host-leaf --------------------------------
     # {DRAM,DISK} (device-evicted): the ([],[DRAM]) transition drops the
@@ -314,11 +355,13 @@ def stage_a_leaf_filter() -> None:
     if any("DRAM" in rs for rs in hnon):
         raise StageFail(
             f"#210: non-host-leaf must yield NO remove-DRAM migrate "
-            f"(remove_dram_not_host_leaf); got {hnon}")
+            f"(remove_dram_not_host_leaf); got {hnon}"
+        )
     if ("DISK",) not in hnon:
         raise StageFail(
             f"over-filtered: remove-DISK must survive when only host-leaf "
-            f"is False; got {hnon}")
+            f"is False; got {hnon}"
+        )
 
     # ---- guard 3: full-drop ⇐ tree-leaf ----------------------------------
     # {HBM}-only with is_device_leaf=True but is_tree_leaf=False (disk-only
@@ -336,14 +379,20 @@ def stage_a_leaf_filter() -> None:
     if DROP in ntl:
         raise StageFail(
             f"#210: non-tree-leaf must yield NO full-drop migrate "
-            f"(remove_not_leaf, stricter than device-leaf); got {ntl}")
+            f"(remove_not_leaf, stricter than device-leaf); got {ntl}"
+        )
     if EVICT not in ntl:
         raise StageFail(
             f"over-filtered: device-leaf evict-HBM must survive when only "
-            f"tree-leaf is False; got {ntl}")
+            f"tree-leaf is False; got {ntl}"
+        )
 
-    print(_green("  [A-leaf] migrate_candidates mirrors sglang's 3 leaf "
-                 "guards (remove-HBM/DRAM/full-drop) (#210) OK"))
+    print(
+        _green(
+            "  [A-leaf] migrate_candidates mirrors sglang's 3 leaf "
+            "guards (remove-HBM/DRAM/full-drop) (#210) OK"
+        )
+    )
 
 
 def stage_a_inflight_holder_gate() -> None:
@@ -363,7 +412,7 @@ def stage_a_inflight_holder_gate() -> None:
     Crucially, a TOOL-PARKED program (awaiting a tool result → NOT in the
     running batch → ``inflight`` empty) keeps its idle tail EVICTABLE — that
     demote-during-the-tool-gap is the core §7/§9 value and must survive."""
-    GB = 1024 ** 3
+    GB = 1024**3
     nb = 2_000_000
     hd = {"HBM": nb, "DRAM": nb}
 
@@ -372,27 +421,38 @@ def stage_a_inflight_holder_gate() -> None:
         for h in holders:
             tracker.observe_arrival(h)
         sj = _state_json(
-            units=[_unit(uhash="u1", residence=["HBM", "DRAM"],
-                         holders=holders, n_bytes_per_tier=hd)],
-            programs=programs, hbm={"kv": _sp(5 * GB, 10 * GB)})
+            units=[
+                _unit(
+                    uhash="u1",
+                    residence=["HBM", "DRAM"],
+                    holders=holders,
+                    n_bytes_per_tier=hd,
+                )
+            ],
+            programs=programs,
+            hbm={"kv": _sp(5 * GB, 10 * GB)},
+        )
         st = _build_state(
-            sj, tracker,
-            Event(kind=EventKind.MEMORY_PRESSURE, session=holders[0]))
-        return {tuple(sorted(t.name for t in c.id[2]))
-                for c in migrate_candidates(st, ["u1"], default_costs())}
+            sj, tracker, Event(kind=EventKind.MEMORY_PRESSURE, session=holders[0])
+        )
+        return {
+            tuple(sorted(t.name for t in c.id[2]))
+            for c in migrate_candidates(st, ["u1"], default_costs())
+        }
 
     # (a) sole holder ACTIVELY DECODING (inflight>0) → NO remove-HBM at all.
-    active = _removes(["p_act"],
-                      {"p_act": _program("REASONING", inflight={"kv": GB})})
+    active = _removes(["p_act"], {"p_act": _program("REASONING", inflight={"kv": GB})})
     if any("HBM" in rs for rs in active):
         raise StageFail(
             f"#224: active-holder (inflight>0) unit must yield NO remove-HBM "
-            f"(races the device lock → remove_hbm_not_device_leaf); got {active}")
+            f"(races the device lock → remove_hbm_not_device_leaf); got {active}"
+        )
     # …but the device-retaining drop-DRAM (lock-safe) must NOT be over-filtered.
     if ("DRAM",) not in active:
         raise StageFail(
             f"#224 over-filter: remove-DRAM (keeps device, lock-safe) must "
-            f"survive for an active holder; got {active}")
+            f"survive for an active holder; got {active}"
+        )
 
     # (b) sole holder TOOL-PARKED (inflight empty) → remove-HBM PRESERVED.
     parked = _removes(["p_park"], {"p_park": _program("ACTING")})
@@ -400,17 +460,23 @@ def stage_a_inflight_holder_gate() -> None:
         raise StageFail(
             f"#224: tool-parked holder (inflight empty) MUST keep its "
             f"remove-HBM demote — the core demote-during-tool-gap value; "
-            f"got {parked}")
+            f"got {parked}"
+        )
 
     # (c) SHARED unit, one active + one parked holder → ANY active holder
     #     blocks remove-HBM (the node is locked by the active one).
-    shared = _removes(["p_act", "p_park"],
-                      {"p_act": _program("REASONING", inflight={"kv": GB}),
-                       "p_park": _program("ACTING")})
+    shared = _removes(
+        ["p_act", "p_park"],
+        {
+            "p_act": _program("REASONING", inflight={"kv": GB}),
+            "p_park": _program("ACTING"),
+        },
+    )
     if any("HBM" in rs for rs in shared):
         raise StageFail(
             f"#224: a shared unit with ANY actively-decoding holder must yield "
-            f"NO remove-HBM (locked by the active holder); got {shared}")
+            f"NO remove-HBM (locked by the active holder); got {shared}"
+        )
 
     # (d) inflight signal absent (cold-start / pre-T26) → must NOT suppress
     #     (no false strand of the policy when the signal is unpopulated).
@@ -418,43 +484,55 @@ def stage_a_inflight_holder_gate() -> None:
     if ("HBM",) not in cold:
         raise StageFail(
             f"#224: absent inflight signal must NOT suppress remove-HBM "
-            f"(cold-start safety); got {cold}")
+            f"(cold-start safety); got {cold}"
+        )
 
     # (e) inflight present-but-ZERO {"kv": 0} → program is NOT in the running
     #     batch → must NOT suppress.  (Guards against a future refactor to a
     #     truthiness test that would gate a populated-but-idle program.)
-    zero = _removes(["p_idle"],
-                    {"p_idle": _program("ACTING", inflight={"kv": 0})})
+    zero = _removes(["p_idle"], {"p_idle": _program("ACTING", inflight={"kv": 0})})
     if ("HBM",) not in zero:
         raise StageFail(
             f"#224: present-but-zero inflight must NOT suppress remove-HBM "
-            f"(zero bytes = not decoding); got {zero}")
+            f"(zero bytes = not decoding); got {zero}"
+        )
 
     # (f) holder present in per_program_usage but with NO "hbm" key at all →
     #     treated as not-decoding (defensive .get chain); must NOT suppress.
-    nohbm = _removes(["p_nh"], {"p_nh": {"state": "ACTING", "dram":
-                                         {"committed": {}}}})
+    nohbm = _removes(["p_nh"], {"p_nh": {"state": "ACTING", "dram": {"committed": {}}}})
     if ("HBM",) not in nohbm:
         raise StageFail(
             f"#224: holder with no hbm key must NOT suppress remove-HBM; "
-            f"got {nohbm}")
+            f"got {nohbm}"
+        )
 
     # (g) multi-subpool inflight with ONE nonzero sp → suppress (any sp>0 means
     #     the program holds running-batch KV somewhere).
-    multi = _removes(["p_m"],
-                     {"p_m": _program("REASONING",
-                                      inflight={"full": 0, "swa": GB})})
+    multi = _removes(
+        ["p_m"], {"p_m": _program("REASONING", inflight={"full": 0, "swa": GB})}
+    )
     if any("HBM" in rs for rs in multi):
         raise StageFail(
             f"#224: any nonzero inflight subpool must suppress remove-HBM; "
-            f"got {multi}")
+            f"got {multi}"
+        )
 
-    print(_green("  [A-inflight] active blocked, parked/zero/no-hbm/cold "
-                 "preserved, shared+multi-sp blocked (#224) OK"))
+    print(
+        _green(
+            "  [A-inflight] active blocked, parked/zero/no-hbm/cold "
+            "preserved, shared+multi-sp blocked (#224) OK"
+        )
+    )
 
 
-def _program(state="REASONING", *, inflight=None, committed=None,
-             unit_hashes=None, pre_pause_state=None):
+def _program(
+    state="REASONING",
+    *,
+    inflight=None,
+    committed=None,
+    unit_hashes=None,
+    pre_pause_state=None,
+):
     return {
         "state": state,
         "pre_pause_state": pre_pause_state,
@@ -472,7 +550,7 @@ def stage_b_forecast() -> None:
     0 under the T26/T11 placeholders); forecast_horizon = heartbeat_s."""
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
-    GB = 1024 ** 3
+    GB = 1024**3
     sj = _state_json(
         units=[_unit(uhash="u1", residence=["HBM"], holders=["S"])],
         hbm={"full": _sp(3 * GB, 10 * GB), "mamba": _sp(8 * GB, 9 * GB)},
@@ -481,8 +559,9 @@ def stage_b_forecast() -> None:
     st = _build_state(sj, tracker, ev)
     fc = adm.forecast(st, heartbeat_s=5.0)
     if fc != {"full": float(3 * GB), "mamba": float(8 * GB)}:
-        raise StageFail(f"B: forecast must equal HBM used_bytes per subpool, "
-                        f"got {fc}")
+        raise StageFail(
+            f"B: forecast must equal HBM used_bytes per subpool, " f"got {fc}"
+        )
     if adm.forecast_horizon(st, 5.0) != 5.0:
         raise StageFail("B: forecast_horizon must fall back to heartbeat_s")
     # inflight demand is 0 under the placeholder regardless of horizon.
@@ -497,14 +576,14 @@ def stage_b_forecast() -> None:
 def stage_c_program_candidates() -> None:
     """§8 pause_candidates / resume_candidates: cost/relief, gain/re_use,
     state filtering, capacity_fits gating."""
-    GB = 1024 ** 3
-    MB = 1024 ** 2
+    GB = 1024**3
+    MB = 1024**2
     # ---- pause_candidates ----
     tracker = ProgramTracker()
-    tracker.observe_arrival("A")            # REASONING
+    tracker.observe_arrival("A")  # REASONING
     tracker.observe_arrival("B")
-    tracker.observe_completion("B")         # ACTING
-    tracker.pause("P")                       # PAUSED
+    tracker.observe_completion("B")  # ACTING
+    tracker.pause("P")  # PAUSED
     # NOTE: relief is the shared-aware ``committed`` snapshot (#205 — raw
     # inflight is a re-prefill COST, not relief).  Units placed off-HBM so
     # MEMORY_PRESSURE's D_t is empty and this stage stays focused on
@@ -512,12 +591,14 @@ def stage_c_program_candidates() -> None:
     # D_t-exclusion (disjoint levers, #2) is pinned by
     # verify/admission_controller stage_disjoint.
     programs = {
-        "A": _program("REASONING", committed={"kv": 7 * MB},
-                      unit_hashes=["uA"]),
-        "B": _program("ACTING", committed={"kv": 3 * MB},
-                      unit_hashes=["uB"]),
-        "P": _program("PAUSED", committed={"kv": 1 * MB},
-                      unit_hashes=["uP"], pre_pause_state="REASONING"),
+        "A": _program("REASONING", committed={"kv": 7 * MB}, unit_hashes=["uA"]),
+        "B": _program("ACTING", committed={"kv": 3 * MB}, unit_hashes=["uB"]),
+        "P": _program(
+            "PAUSED",
+            committed={"kv": 1 * MB},
+            unit_hashes=["uP"],
+            pre_pause_state="REASONING",
+        ),
     }
     sj = _state_json(
         units=[
@@ -537,17 +618,21 @@ def stage_c_program_candidates() -> None:
     pcs = adm.pause_candidates(st)
     pids = {p.pid for p in pcs}
     if pids != {"A", "B"}:
-        raise StageFail(f"C: pause_candidates must cover REASONING+ACTING "
-                        f"only (not PAUSED/ENDED), got {pids}")
+        raise StageFail(
+            f"C: pause_candidates must cover REASONING+ACTING "
+            f"only (not PAUSED/ENDED), got {pids}"
+        )
     pa = next(p for p in pcs if p.pid == "A")
     # relief = committed (snapshot); future term 0, D_t empty here.
     if pa.relief != {"kv": 7 * MB}:
-        raise StageFail(f"C: A pause_relief should be committed=7MB, "
-                        f"got {pa.relief}")
+        raise StageFail(
+            f"C: A pause_relief should be committed=7MB, " f"got {pa.relief}"
+        )
     pb = next(p for p in pcs if p.pid == "B")
     if pb.relief != {"kv": 3 * MB}:
-        raise StageFail(f"C: B pause_relief (committed 3MB) should be 3MB, "
-                        f"got {pb.relief}")
+        raise StageFail(
+            f"C: B pause_relief (committed 3MB) should be 3MB, " f"got {pb.relief}"
+        )
     # #260: pause cost = marginal_pause_cost (0 here, prefill_bps=0) +
     # forgone_progress — pure WORK-LOSS, NO V_u_program.  A is REASONING →
     # forgone = the horizon W; the V_u_program term was dropped (it double-counted
@@ -555,19 +640,24 @@ def stage_c_program_candidates() -> None:
     vprog = adm.shared_aware_prog_scores(st)
     W = adm.forecast_horizon(st, 5.0)
     if abs(pa.cost - W) > 1e-9:
-        raise StageFail(f"C: REASONING A pause cost = forgone-progress horizon "
-                        f"(work-loss #260): {pa.cost} vs {W}")
+        raise StageFail(
+            f"C: REASONING A pause cost = forgone-progress horizon "
+            f"(work-loss #260): {pa.cost} vs {W}"
+        )
 
     # ---- resume_candidates ----
     rcs = adm.resume_candidates(st, heartbeat_s=5.0, theta_hi=0.85)
     if {r.pid for r in rcs} != {"P"}:
-        raise StageFail(f"C: resume_candidates must cover PAUSED only, "
-                        f"got {[r.pid for r in rcs]}")
+        raise StageFail(
+            f"C: resume_candidates must cover PAUSED only, "
+            f"got {[r.pid for r in rcs]}"
+        )
     rp = rcs[0]
     # uP lives on DRAM only → resume re-enters its bytes into HBM.
     if rp.re_use.get("kv", 0) <= 0:
-        raise StageFail(f"C: P re_use should be >0 (uP not HBM-resident): "
-                        f"{rp.re_use}")
+        raise StageFail(
+            f"C: P re_use should be >0 (uP not HBM-resident): " f"{rp.re_use}"
+        )
     # T11 (DESIGN §7 holder-product): PAUSED now correctly contributes
     # EXACTLY 0 to p_hat for a unit it exclusively holds (uP's only
     # holder is P) — the #126 counterfactual re-score under
@@ -579,28 +669,43 @@ def stage_c_program_candidates() -> None:
         raise StageFail(
             f"C: with T11 holder-product, P's exclusively-held uP should "
             f"score p_hat=0 -> a non-positive V_u_program (pure holding "
-            f"cost, no save-prefill term); got vprog['P']={vprog['P']}")
+            f"cost, no save-prefill term); got vprog['P']={vprog['P']}"
+        )
     if abs(rp.gain - adm._RESUME_LIVENESS_FLOOR) > 1e-15:
         raise StageFail(
             f"C: P resume gain should be the #211 liveness floor "
             f"{adm._RESUME_LIVENESS_FLOOR} (vprog['P']={vprog['P']} < 0 "
-            f"is below it); got {rp.gain}")
+            f"is below it); got {rp.gain}"
+        )
 
     # capacity_fits gate: HBM near cap → Resume omitted (would overflow).
     sj_full = _state_json(
-        units=[_unit(uhash="uP", residence=["DRAM"], holders=["P"],
-                     n_bytes_per_tier={"DRAM": 2 * GB})],
-        programs={"P": _program("PAUSED", unit_hashes=["uP"],
-                                pre_pause_state="REASONING")},
-        hbm={"kv": _sp(8 * GB, 10 * GB)},   # 80% used; +2GB re_use > 85%*10GB
+        units=[
+            _unit(
+                uhash="uP",
+                residence=["DRAM"],
+                holders=["P"],
+                n_bytes_per_tier={"DRAM": 2 * GB},
+            )
+        ],
+        programs={
+            "P": _program("PAUSED", unit_hashes=["uP"], pre_pause_state="REASONING")
+        },
+        hbm={"kv": _sp(8 * GB, 10 * GB)},  # 80% used; +2GB re_use > 85%*10GB
     )
     st_full = _build_state(sj_full, tracker, ev)
     rcs_full = adm.resume_candidates(st_full, heartbeat_s=5.0, theta_hi=0.85)
     if rcs_full:
-        raise StageFail(f"C: capacity_fits must omit Resume that overflows "
-                        f"theta_hi (8GB+2GB > 8.5GB), got {[r.pid for r in rcs_full]}")
-    print(_green("  [C] pause/resume candidates: cost/relief, gain/re_use, "
-                 "capacity_fits OK"))
+        raise StageFail(
+            f"C: capacity_fits must omit Resume that overflows "
+            f"theta_hi (8GB+2GB > 8.5GB), got {[r.pid for r in rcs_full]}"
+        )
+    print(
+        _green(
+            "  [C] pause/resume candidates: cost/relief, gain/re_use, "
+            "capacity_fits OK"
+        )
+    )
 
 
 def _hbm_relief(chosen) -> Dict[str, int]:
@@ -620,9 +725,15 @@ def stage_d_joint_decide_select() -> None:
     dead-zone no-ops; an UNRELIEVABLE pegged subpool no-ops (do-no-harm);
     headroom resume runs; the Pause lever is dormant (never appears)."""
     from daemon import joint_decide as jd
-    GB = 1024 ** 3
-    kw = dict(costs=default_costs(), pi_u=1.0e-4,
-              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
+    GB = 1024**3
+    kw = dict(
+        costs=default_costs(),
+        pi_u=1.0e-4,
+        theta_hi=0.85,
+        theta_lo=0.70,
+        heartbeat_s=5.0,
+    )
 
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
@@ -631,8 +742,14 @@ def stage_d_joint_decide_select() -> None:
     #     net-positive: DRAM retains the data) → relief migrates it out.
     #     No forced cover target; the action is taken because value>0. ---
     sj = _state_json(
-        units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
-                     n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
+        units=[
+            _unit(
+                uhash="u1",
+                residence=["HBM", "DRAM"],
+                holders=["S"],
+                n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB},
+            )
+        ],
         hbm={"kv": _sp(9 * GB, 10 * GB)},
     )
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
@@ -640,31 +757,37 @@ def stage_d_joint_decide_select() -> None:
     plan = jd.joint_decide(st, ev, **kw)
     migs = [c for c in plan if isinstance(c, Migrate)]
     if not migs:
-        raise StageFail("D: pressure + net-positive relief must migrate the "
-                        f"cold unit out; got {[type(c).__name__ for c in plan]}")
+        raise StageFail(
+            "D: pressure + net-positive relief must migrate the "
+            f"cold unit out; got {[type(c).__name__ for c in plan]}"
+        )
     # u1 emits THREE net-positive transitions (evict-HBM, drop-DRAM, DROP)
     # all sharing group=u1's hash; the multiple-choice exclusion via
     # `_ValueItem.group` must pick AT MOST ONE (else the unit's bytes
     # double-count).  Asserting exactly one pins the grouping WIRING in
     # joint_decide, not just the primitive (t34 G0 covers the primitive).
     if len(migs) != 1:
-        raise StageFail(f"D: same-unit transitions must collapse to ONE "
-                        f"migrate (group exclusion); got {len(migs)}: "
-                        f"{[c.id for c in migs]}")
+        raise StageFail(
+            f"D: same-unit transitions must collapse to ONE "
+            f"migrate (group exclusion); got {len(migs)}: "
+            f"{[c.id for c in migs]}"
+        )
     if any(isinstance(c, Pause) for c in plan):
         raise StageFail("D: the Pause lever is DORMANT — no Pause may appear")
     if any(isinstance(c, Resume) for c in plan):
         raise StageFail("D: no PAUSED program here → no Resume expected")
     # the chosen migrate must actually relieve the pegged subpool.
     if _hbm_relief(plan).get("kv", 0) <= 0:
-        raise StageFail(f"D: relief must free the pegged subpool, got "
-                        f"{_hbm_relief(plan)}")
+        raise StageFail(
+            f"D: relief must free the pegged subpool, got " f"{_hbm_relief(plan)}"
+        )
 
     # --- dead-zone: HBM 78% (between theta_lo=70% and theta_hi=85%) → no
     #     relief candidates generated, no paused program → empty no-op. ---
     sj_dz = _state_json(
         units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"])],
-        hbm={"kv": _sp(int(7.8 * GB), 10 * GB)})
+        hbm={"kv": _sp(int(7.8 * GB), 10 * GB)},
+    )
     st_dz = _build_state(sj_dz, tracker, ev)
     if jd.joint_decide(st_dz, ev, **kw) != []:
         raise StageFail("D: hysteresis dead-zone (70–85%) must return []")
@@ -677,39 +800,60 @@ def stage_d_joint_decide_select() -> None:
     #     room) and cannot touch 'swa' → empty plan, exactly like no daemon.
     #     This is the A3 swa regime that the value-gate must leave alone. ---
     sj_noop = _state_json(
-        units=[_unit(uhash="uf", residence=["HBM", "DRAM"], holders=["S"],
-                     n_bytes_per_tier={"HBM": {"full": 1 * GB},
-                                       "DRAM": {"full": 1 * GB}},
-                     subpool="full")],
-        hbm={"swa": _sp(9 * GB, 10 * GB),      # pegged, no migratable units
-             "full": _sp(1 * GB, 10 * GB)},    # healthy, holds the cold unit
+        units=[
+            _unit(
+                uhash="uf",
+                residence=["HBM", "DRAM"],
+                holders=["S"],
+                n_bytes_per_tier={"HBM": {"full": 1 * GB}, "DRAM": {"full": 1 * GB}},
+                subpool="full",
+            )
+        ],
+        hbm={
+            "swa": _sp(9 * GB, 10 * GB),  # pegged, no migratable units
+            "full": _sp(1 * GB, 10 * GB),
+        },  # healthy, holds the cold unit
     )
     st_noop = _build_state(sj_noop, tracker, ev)
     plan_noop = jd.joint_decide(st_noop, ev, **kw)
     if plan_noop != []:
-        raise StageFail("D: pegged-but-unrelievable subpool (swa) + a healthy "
-                        "subpool holding the only cold unit must NO-OP "
-                        f"(do-no-harm); got {[type(c).__name__ for c in plan_noop]}")
+        raise StageFail(
+            "D: pegged-but-unrelievable subpool (swa) + a healthy "
+            "subpool holding the only cold unit must NO-OP "
+            f"(do-no-harm); got {[type(c).__name__ for c in plan_noop]}"
+        )
 
     # --- headroom: HBM 5% (< theta_lo) + PAUSED program fits → resume P,
     #     no Pause, no Migrate. ---
     tracker.pause("P")
     sj_hr = _state_json(
-        units=[_unit(uhash="uP", residence=["DRAM"], holders=["P"],
-                     n_bytes_per_tier={"DRAM": 1 * GB})],
-        programs={"P": _program("PAUSED", unit_hashes=["uP"],
-                                pre_pause_state="REASONING")},
+        units=[
+            _unit(
+                uhash="uP",
+                residence=["DRAM"],
+                holders=["P"],
+                n_bytes_per_tier={"DRAM": 1 * GB},
+            )
+        ],
+        programs={
+            "P": _program("PAUSED", unit_hashes=["uP"], pre_pause_state="REASONING")
+        },
         hbm={"kv": _sp(int(0.5 * GB), 10 * GB)},
     )
     er = Event(kind=EventKind.PRESSURE_RESOLVED, session="P")
     st_hr = _build_state(sj_hr, tracker, er)
     plan_hr = jd.joint_decide(st_hr, er, **kw)
-    if not (len(plan_hr) == 1 and isinstance(plan_hr[0], Resume)
-            and plan_hr[0].pid == "P"):
+    if not (
+        len(plan_hr) == 1 and isinstance(plan_hr[0], Resume) and plan_hr[0].pid == "P"
+    ):
         raise StageFail(f"D: headroom must resume P (only), got {plan_hr}")
 
-    print(_green("  [D] value-gated select: net-positive relief acts; "
-                 "dead-zone + unrelievable-swa no-op; resume; pauses dormant OK"))
+    print(
+        _green(
+            "  [D] value-gated select: net-positive relief acts; "
+            "dead-zone + unrelievable-swa no-op; resume; pauses dormant OK"
+        )
+    )
 
 
 def stage_d_resume_starvation() -> None:
@@ -728,9 +872,15 @@ def stage_d_resume_starvation() -> None:
       (b) ``unit_hashes == []`` (the overlay's empty-residue PAUSED entry,
           unified_radix_cache._aginfer_overlay_program_states)."""
     from daemon import joint_decide as jd
-    GB = 1024 ** 3
-    kw = dict(costs=default_costs(), pi_u=1.0e-4,
-              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
+    GB = 1024**3
+    kw = dict(
+        costs=default_costs(),
+        pi_u=1.0e-4,
+        theta_hi=0.85,
+        theta_lo=0.70,
+        heartbeat_s=5.0,
+    )
     er = Event(kind=EventKind.PRESSURE_RESOLVED, session="P")
 
     def _resume_pids(unit_hashes):
@@ -738,25 +888,30 @@ def stage_d_resume_starvation() -> None:
         tracker.observe_arrival("P")
         tracker.pause("P")
         sj = _state_json(
-            units=[],   # P's units have been DROPped while it was gated
-            programs={"P": _program("PAUSED", unit_hashes=unit_hashes,
-                                    pre_pause_state="REASONING")},
-            hbm={"kv": _sp(int(0.5 * GB), 10 * GB)},   # 5% occ → headroom
+            units=[],  # P's units have been DROPped while it was gated
+            programs={
+                "P": _program(
+                    "PAUSED", unit_hashes=unit_hashes, pre_pause_state="REASONING"
+                )
+            },
+            hbm={"kv": _sp(int(0.5 * GB), 10 * GB)},  # 5% occ → headroom
         )
         st = _build_state(sj, tracker, er)
         plan = jd.joint_decide(st, er, **kw)
         return [c.pid for c in plan if isinstance(c, Resume)]
 
-    a = _resume_pids(unit_hashes=["uP"])   # dropped, hash still referenced
+    a = _resume_pids(unit_hashes=["uP"])  # dropped, hash still referenced
     if "P" not in a:
         raise StageFail(
             "#211: PAUSED program with DROPped units (hash still listed) "
-            f"must still be resumed in headroom; got resumes {a}")
-    b = _resume_pids(unit_hashes=[])       # overlay empty-residue entry
+            f"must still be resumed in headroom; got resumes {a}"
+        )
+    b = _resume_pids(unit_hashes=[])  # overlay empty-residue entry
     if "P" not in b:
         raise StageFail(
             "#211: PAUSED program with empty unit_hashes (overlay empty-"
-            f"residue) must still be resumed in headroom; got resumes {b}")
+            f"residue) must still be resumed in headroom; got resumes {b}"
+        )
 
     # --- multi-subpool gate + ordering (audit finding 5): with TWO HBM
     #     subpools both below theta_lo (so `all(r>0)` headroom gate fires),
@@ -768,16 +923,26 @@ def stage_d_resume_starvation() -> None:
         tracker.observe_arrival(p)
         tracker.pause(p)
     sj_multi = _state_json(
-        units=[_unit(uhash="uV", residence=["DRAM"], holders=["V"],
-                     n_bytes_per_tier={"DRAM": {"sp_a": 1 * GB}})],
+        units=[
+            _unit(
+                uhash="uV",
+                residence=["DRAM"],
+                holders=["V"],
+                n_bytes_per_tier={"DRAM": {"sp_a": 1 * GB}},
+            )
+        ],
         programs={
-            "V": _program("PAUSED", unit_hashes=["uV"],
-                          pre_pause_state="REASONING"),
-            "Z": _program("PAUSED", unit_hashes=[],   # dropped → floored
-                          pre_pause_state="REASONING"),
+            "V": _program("PAUSED", unit_hashes=["uV"], pre_pause_state="REASONING"),
+            "Z": _program(
+                "PAUSED",
+                unit_hashes=[],  # dropped → floored
+                pre_pause_state="REASONING",
+            ),
         },
-        hbm={"sp_a": _sp(int(0.5 * GB), 10 * GB),
-             "sp_b": _sp(int(0.5 * GB), 10 * GB)},   # both 5% → headroom
+        hbm={
+            "sp_a": _sp(int(0.5 * GB), 10 * GB),
+            "sp_b": _sp(int(0.5 * GB), 10 * GB),
+        },  # both 5% → headroom
     )
     st_multi = _build_state(sj_multi, tracker, er)
     plan_multi = jd.joint_decide(st_multi, er, **kw)
@@ -785,10 +950,15 @@ def stage_d_resume_starvation() -> None:
     if pids_multi != {"V", "Z"}:
         raise StageFail(
             "#211: multi-subpool headroom must resume BOTH the valuable (V) "
-            f"and the floored zero-re_use (Z) program; got {pids_multi}")
+            f"and the floored zero-re_use (Z) program; got {pids_multi}"
+        )
 
-    print(_green("  [D-starve] dropped-unit PAUSED programs still resume "
-                 "in headroom; valuable+floored co-grant (#211) OK"))
+    print(
+        _green(
+            "  [D-starve] dropped-unit PAUSED programs still resume "
+            "in headroom; valuable+floored co-grant (#211) OK"
+        )
+    )
 
 
 def stage_d_resume_under_pressure() -> None:
@@ -807,9 +977,15 @@ def stage_d_resume_under_pressure() -> None:
     plan under pressure carries BOTH the pressure response AND the un-starve
     resume."""
     from daemon import joint_decide as jd
-    GB = 1024 ** 3
-    kw = dict(costs=default_costs(), pi_u=1.0e-4,
-              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
+    GB = 1024**3
+    kw = dict(
+        costs=default_costs(),
+        pi_u=1.0e-4,
+        theta_hi=0.85,
+        theta_lo=0.70,
+        heartbeat_s=5.0,
+    )
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
     tracker.observe_arrival("P")
@@ -818,13 +994,21 @@ def stage_d_resume_under_pressure() -> None:
     # An ACTIVE program S holds the HBM-resident pressure; a PAUSED program P
     # has DROPped units (empty re_use → zero weight on the pegged subpool).
     sj = _state_json(
-        units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
-                     n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
+        units=[
+            _unit(
+                uhash="u1",
+                residence=["HBM", "DRAM"],
+                holders=["S"],
+                n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB},
+            )
+        ],
         programs={
-            "S": _program("REASONING", committed={"kv": 9 * GB},
-                          unit_hashes=["u1"]),
-            "P": _program("PAUSED", unit_hashes=[],   # dropped → empty re_use
-                          pre_pause_state="REASONING"),
+            "S": _program("REASONING", committed={"kv": 9 * GB}, unit_hashes=["u1"]),
+            "P": _program(
+                "PAUSED",
+                unit_hashes=[],  # dropped → empty re_use
+                pre_pause_state="REASONING",
+            ),
         },
         hbm={"kv": _sp(9 * GB, 10 * GB)},
     )
@@ -835,14 +1019,17 @@ def stage_d_resume_under_pressure() -> None:
     if not any(isinstance(c, Migrate) for c in plan):
         raise StageFail(
             "D-press-resume: the net-positive relief migrate must be taken "
-            f"under pressure; got {[type(c).__name__ for c in plan]}")
+            f"under pressure; got {[type(c).__name__ for c in plan]}"
+        )
     # #260: Pause is LIVE, but the only active program here (S) is REASONING —
     # hold_frac=0 (its relief does not persist; it resumes at once) so its pause
     # gain ≤ 0 and it is NEVER paused.  do-no-harm: an actively-decoding agent is
     # never stalled (the A3 regression is closed by the cost model, robustly).
     if any(isinstance(c, Pause) for c in plan):
-        raise StageFail("D-press-resume: a REASONING agent must NEVER be paused "
-                        "(do-no-harm #260); got a Pause in the plan")
+        raise StageFail(
+            "D-press-resume: a REASONING agent must NEVER be paused "
+            "(do-no-harm #260); got a Pause in the plan"
+        )
     # ...AND the un-starve resume of P COEXISTS with the relief in one plan
     #    (relief and resume are NOT mutually exclusive — the #213 fix).
     resumed = {c.pid for c in plan if isinstance(c, Resume)}
@@ -850,9 +1037,14 @@ def stage_d_resume_under_pressure() -> None:
         raise StageFail(
             "#213: a dropped-units PAUSED program must resume even under "
             "pressure (relief + resume coexist); got "
-            f"resumes={resumed}, plan={[type(c).__name__ for c in plan]}")
-    print(_green("  [D-press-resume] relief migrate + un-starve resume coexist "
-                 "in one plan under pressure; no pause (#213) OK"))
+            f"resumes={resumed}, plan={[type(c).__name__ for c in plan]}"
+        )
+    print(
+        _green(
+            "  [D-press-resume] relief migrate + un-starve resume coexist "
+            "in one plan under pressure; no pause (#213) OK"
+        )
+    )
 
 
 # ============================================================ Stage E
@@ -862,9 +1054,13 @@ def stage_e_dp_correctness() -> None:
     """§9 value-max DP (`knapsack_max_value_multi`): no same-group double-
     pick (multiple-choice), exact vs brute-force value oracle, empty set
     when nothing pays, multi-axis budget respected, blow-up → raise."""
-    from baselines.knapsack import (knapsack_max_value_multi,
-                                     KnapsackBudgetExceededError, Resume)
     import itertools
+
+    from baselines.knapsack import (
+        KnapsackBudgetExceededError,
+        Resume,
+        knapsack_max_value_multi,
+    )
 
     # --- no same-group double-pick: two transitions of unit "u" both
     #     consume DRAM budget; the DP must pick AT MOST ONE (the higher
@@ -872,33 +1068,41 @@ def stage_e_dp_correctness() -> None:
     a = Resume(gain=10.0, re_use={"DRAM": {"kv": 100}}, pid=("u", "a"), group="u")
     b = Resume(gain=4.0, re_use={"DRAM": {"kv": 100}}, pid=("u", "b"), group="u")
     chosen = knapsack_max_value_multi(
-        [a, b], budget={("DRAM", "kv"): 10_000},
-        bucket_size={("DRAM", "kv"): 1})
+        [a, b], budget={("DRAM", "kv"): 10_000}, bucket_size={("DRAM", "kv"): 1}
+    )
     if [c.pid for c in chosen] != [("u", "a")]:
-        raise StageFail(f"E: must pick the single higher-value group member, "
-                        f"got {[c.pid for c in chosen]}")
+        raise StageFail(
+            f"E: must pick the single higher-value group member, "
+            f"got {[c.pid for c in chosen]}"
+        )
 
     # --- empty set when no item pays: all-negative-value items → []. ---
     neg = knapsack_max_value_multi(
-        [Resume(gain=-1.0, re_use={"DRAM": {"kv": 10}}, pid="n1", group="g1"),
-         Resume(gain=-5.0, re_use={"DRAM": {"kv": 10}}, pid="n2", group="g2")],
-        budget={("DRAM", "kv"): 10_000}, bucket_size={("DRAM", "kv"): 1})
+        [
+            Resume(gain=-1.0, re_use={"DRAM": {"kv": 10}}, pid="n1", group="g1"),
+            Resume(gain=-5.0, re_use={"DRAM": {"kv": 10}}, pid="n2", group="g2"),
+        ],
+        budget={("DRAM", "kv"): 10_000},
+        bucket_size={("DRAM", "kv"): 1},
+    )
     if neg != []:
-        raise StageFail(f"E: all-negative-value items must yield the empty "
-                        f"set (value-gated no-op), got {[c.pid for c in neg]}")
+        raise StageFail(
+            f"E: all-negative-value items must yield the empty "
+            f"set (value-gated no-op), got {[c.pid for c in neg]}"
+        )
 
     # --- exact vs brute-force value oracle over grouped, MULTI-AXIS items.
     #     Deterministic fixtures (no RNG per harness rules — vary by index). ---
     def brute_max_value(groups, budget):
-        best_val, best_pick = 0.0, []          # empty set is always allowed
+        best_val, best_pick = 0.0, []  # empty set is always allowed
         opts = [[None] + list(g) for g in groups]
         for combo in itertools.product(*opts):
             picked = [m for m in combo if m is not None]
             use = {}
             for m in picked:
-                for (t, sp), bd in (((t, sp), v)
-                                    for t, d in m.re_use.items()
-                                    for sp, v in d.items()):
+                for (t, sp), bd in (
+                    ((t, sp), v) for t, d in m.re_use.items() for sp, v in d.items()
+                ):
                     use[(t, sp)] = use.get((t, sp), 0) + bd
             if any(use.get(ax, 0) > cap for ax, cap in budget.items()):
                 continue
@@ -917,23 +1121,27 @@ def stage_e_dp_correctness() -> None:
             # bind is multi-dimensional.
             ga = ((seed + ui) % 7) - 2.0
             gb = ((seed * 3 + ui) % 6) - 1.0
-            g = [Resume(gain=ga, re_use={"DRAM": {"kv": wa}}, pid=(ui, "a"),
-                        group=f"u{ui}"),
-                 Resume(gain=gb, re_use={"DISK": {"kv": wb}}, pid=(ui, "b"),
-                        group=f"u{ui}")]
+            g = [
+                Resume(
+                    gain=ga, re_use={"DRAM": {"kv": wa}}, pid=(ui, "a"), group=f"u{ui}"
+                ),
+                Resume(
+                    gain=gb, re_use={"DISK": {"kv": wb}}, pid=(ui, "b"), group=f"u{ui}"
+                ),
+            ]
             groups.append(g)
         items = [m for g in groups for m in g]
-        budget = {("DRAM", "kv"): 60 + (seed % 40),
-                  ("DISK", "kv"): 50 + (seed % 30)}
+        budget = {("DRAM", "kv"): 60 + (seed % 40), ("DISK", "kv"): 50 + (seed % 30)}
         oracle = brute_max_value(groups, budget)
         dp = knapsack_max_value_multi(
-            items, budget,
-            bucket_size={("DRAM", "kv"): 1, ("DISK", "kv"): 1})
+            items, budget, bucket_size={("DRAM", "kv"): 1, ("DISK", "kv"): 1}
+        )
         # at most one per group
         gseen = [c.group for c in dp]
         if len(gseen) != len(set(gseen)):
-            raise StageFail(f"E: seed {seed} DP picked 2+ from one group: "
-                            f"{[c.pid for c in dp]}")
+            raise StageFail(
+                f"E: seed {seed} DP picked 2+ from one group: " f"{[c.pid for c in dp]}"
+            )
         # budget respected
         use = {}
         for m in dp:
@@ -953,17 +1161,24 @@ def stage_e_dp_correctness() -> None:
     blew = False
     try:
         knapsack_max_value_multi(
-            [Resume(gain=1.0, re_use={"DRAM": {"kv": i * 64 * 1024}},
-                    pid=i, group=i) for i in range(1, 60)],
+            [
+                Resume(gain=1.0, re_use={"DRAM": {"kv": i * 64 * 1024}}, pid=i, group=i)
+                for i in range(1, 60)
+            ],
             budget={("DRAM", "kv"): 64 * 1024 * 100000},
             bucket_size={("DRAM", "kv"): 64 * 1024},
-            max_dp_cells=50)
+            max_dp_cells=50,
+        )
     except KnapsackBudgetExceededError:
         blew = True
     if not blew:
         raise StageFail("E: DP cell ceiling must raise KnapsackBudgetExceededError")
-    print(_green("  [E] value DP: no same-group double-pick, empty-on-no-pay, "
-                 "exact vs brute (40, multi-axis), budget held, blow-up→raise OK"))
+    print(
+        _green(
+            "  [E] value DP: no same-group double-pick, empty-on-no-pay, "
+            "exact vs brute (40, multi-axis), budget held, blow-up→raise OK"
+        )
+    )
 
 
 # ============================================================ Stage F
@@ -973,16 +1188,27 @@ class _DummyHttp:
     async def post(self, url, *, json=None):  # noqa: ANN001
         class _R:
             status_code = 200
-            def json(self): return {}
+
+            def json(self):
+                return {}
+
             text = ""
+
         return _R()
+
     async def put(self, url, *, json=None):  # noqa: ANN001
         class _R:
             status_code = 200
-            def json(self): return {}
+
+            def json(self):
+                return {}
+
             text = ""
+
         return _R()
-    async def aclose(self): return None
+
+    async def aclose(self):
+        return None
 
 
 class _StubRouter:
@@ -992,6 +1218,7 @@ class _StubRouter:
         self.theta_lo = theta_lo
         self.heartbeat_s = heartbeat_s
         self.observability = None
+
     async def fetch_state(self):
         return self._sj
 
@@ -1008,92 +1235,123 @@ def stage_f_live_dispatch() -> None:
     plan: Migrate → POST /aginfer/migrate; Resume → tracker.resume +
     PUT{pre_pause_state}.  The Pause lever is dormant, so no pause is ever
     dispatched.  Pinned end-to-end through KvScheduler.handle (admission ON)."""
-    GB = 1024 ** 3
+    GB = 1024**3
 
     # --- pressure → a net-positive relief Migrate is dispatched (POST
     #     /aginfer/migrate), and NO pause is dispatched (dormant lever). ---
     def _migrate_case():
         tracker = ProgramTracker()
-        tracker.observe_arrival("P")            # REASONING
-        ob = OutboundQueue(sglang_base_url="http://unused",
-                           http_client=_DummyHttp())
-        sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
-                                outbound=ob)
+        tracker.observe_arrival("P")  # REASONING
+        ob = OutboundQueue(sglang_base_url="http://unused", http_client=_DummyHttp())
+        sched = kvs.KvScheduler(
+            tracker=tracker, sglang_base_url="http://unused", outbound=ob
+        )
         sched.admission_enabled = True
         sj = _state_json(
-            units=[_unit(uhash="uP", residence=["HBM", "DRAM"], holders=["P"],
-                         n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
-            programs={"P": _program("REASONING", committed={"kv": 1 * GB},
-                                    unit_hashes=["uP"])},
-            hbm={"kv": _sp(9 * GB, 10 * GB)})
+            units=[
+                _unit(
+                    uhash="uP",
+                    residence=["HBM", "DRAM"],
+                    holders=["P"],
+                    n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB},
+                )
+            ],
+            programs={
+                "P": _program("REASONING", committed={"kv": 1 * GB}, unit_hashes=["uP"])
+            },
+            hbm={"kv": _sp(9 * GB, 10 * GB)},
+        )
         router = _StubRouter(sj)
-        asyncio.run(sched.handle(Event(EventKind.MEMORY_PRESSURE, session="P"),
-                                 router))
+        asyncio.run(sched.handle(Event(EventKind.MEMORY_PRESSURE, session="P"), router))
         return tracker, sched, _drain(ob)
 
     tracker, sched, batches = _migrate_case()
     if sched.migrate_calls != 1:
-        raise StageFail(f"F: pressure → relief migrate must dispatch once, "
-                        f"got migrate_calls={sched.migrate_calls}")
+        raise StageFail(
+            f"F: pressure → relief migrate must dispatch once, "
+            f"got migrate_calls={sched.migrate_calls}"
+        )
     if sched.pause_calls != 0:
         raise StageFail("F: Pause lever is dormant — pause_calls must be 0")
     if tracker.state("P") is State.PAUSED:
         raise StageFail("F: no program may be paused (dormant pause lever)")
     migs = [b for b in batches if b.endpoint == "migrate"]
     if not migs:
-        raise StageFail(f"F: relief must enqueue a /aginfer/migrate POST; "
-                        f"got {[b.endpoint for b in batches]}")
+        raise StageFail(
+            f"F: relief must enqueue a /aginfer/migrate POST; "
+            f"got {[b.endpoint for b in batches]}"
+        )
     if any(b.endpoint == "program_paused" for b in batches):
         raise StageFail("F: no program_paused PUT may be enqueued (no pause)")
 
     # --- headroom → a Resume is dispatched, restoring pre_pause_state ---
     def _resume_case():
         tracker = ProgramTracker()
-        tracker.pause("R")                       # PAUSED
-        ob = OutboundQueue(sglang_base_url="http://unused",
-                           http_client=_DummyHttp())
-        sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
-                                outbound=ob)
+        tracker.pause("R")  # PAUSED
+        ob = OutboundQueue(sglang_base_url="http://unused", http_client=_DummyHttp())
+        sched = kvs.KvScheduler(
+            tracker=tracker, sglang_base_url="http://unused", outbound=ob
+        )
         sched.admission_enabled = True
         sj = _state_json(
-            units=[_unit(uhash="uR", residence=["DRAM"], holders=["R"],
-                         n_bytes_per_tier={"DRAM": 1 * GB})],
-            programs={"R": _program("PAUSED", unit_hashes=["uR"],
-                                    pre_pause_state="ACTING")},
-            hbm={"kv": _sp(int(0.5 * GB), 10 * GB)})  # < theta_lo → headroom
+            units=[
+                _unit(
+                    uhash="uR",
+                    residence=["DRAM"],
+                    holders=["R"],
+                    n_bytes_per_tier={"DRAM": 1 * GB},
+                )
+            ],
+            programs={
+                "R": _program("PAUSED", unit_hashes=["uR"], pre_pause_state="ACTING")
+            },
+            hbm={"kv": _sp(int(0.5 * GB), 10 * GB)},
+        )  # < theta_lo → headroom
         router = _StubRouter(sj)
-        asyncio.run(sched.handle(Event(EventKind.PRESSURE_RESOLVED, session="R"),
-                                 router))
+        asyncio.run(
+            sched.handle(Event(EventKind.PRESSURE_RESOLVED, session="R"), router)
+        )
         return tracker, sched, _drain(ob)
 
     tracker, sched, batches = _resume_case()
     if sched.resume_calls != 1:
-        raise StageFail(f"F: headroom → resume_calls must be 1, got "
-                        f"{sched.resume_calls}")
+        raise StageFail(
+            f"F: headroom → resume_calls must be 1, got " f"{sched.resume_calls}"
+        )
     puts = [b for b in batches if b.endpoint == "program_paused"]
     if not puts or puts[0].body.get("state") != "ACTING":
-        raise StageFail(f"F: resume PUT must restore pre_pause_state=ACTING; "
-                        f"got {[b.body for b in puts]}")
+        raise StageFail(
+            f"F: resume PUT must restore pre_pause_state=ACTING; "
+            f"got {[b.body for b in puts]}"
+        )
 
     # --- admission OFF → no Pause even under pressure (kv-only arm) ---
     def _kvonly_case():
         tracker = ProgramTracker()
         tracker.observe_arrival("P")
-        ob = OutboundQueue(sglang_base_url="http://unused",
-                           http_client=_DummyHttp())
-        sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
-                                outbound=ob)
+        ob = OutboundQueue(sglang_base_url="http://unused", http_client=_DummyHttp())
+        sched = kvs.KvScheduler(
+            tracker=tracker, sglang_base_url="http://unused", outbound=ob
+        )
         # admission_enabled stays False (default)
         sj = _state_json(
-            units=[_unit(uhash="uP", residence=["HBM", "DRAM"], holders=["P"],
-                         n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
-            programs={"P": _program("REASONING", inflight={"kv": 1 * GB},
-                                    unit_hashes=["uP"])},
-            hbm={"kv": _sp(9 * GB, 10 * GB)})
+            units=[
+                _unit(
+                    uhash="uP",
+                    residence=["HBM", "DRAM"],
+                    holders=["P"],
+                    n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB},
+                )
+            ],
+            programs={
+                "P": _program("REASONING", inflight={"kv": 1 * GB}, unit_hashes=["uP"])
+            },
+            hbm={"kv": _sp(9 * GB, 10 * GB)},
+        )
         router = _StubRouter(sj)
-        asyncio.run(sched.handle(Event(EventKind.MEMORY_PRESSURE, session="P"),
-                                 router))
+        asyncio.run(sched.handle(Event(EventKind.MEMORY_PRESSURE, session="P"), router))
         return tracker, sched
+
     tracker, sched = _kvonly_case()
     if sched.pause_calls != 0:
         raise StageFail("F: admission OFF must dispatch no Pause (kv-only arm)")
@@ -1101,8 +1359,11 @@ def stage_f_live_dispatch() -> None:
         raise StageFail("F: admission OFF must dispatch no Resume (kv-only arm)")
     if tracker.state("P") is State.PAUSED:
         raise StageFail("F: admission OFF must not pause P")
-    print(_green("  [F] live dispatch: migrate+POST / resume+PUT / "
-                 "kv-only relief-only OK"))
+    print(
+        _green(
+            "  [F] live dispatch: migrate+POST / resume+PUT / " "kv-only relief-only OK"
+        )
+    )
 
 
 # ============================================================ Stage G
@@ -1113,7 +1374,8 @@ def stage_g_robustness() -> None:
     subscribed destination must not reject a zero-acquire evict) + the
     value-gate excludes a HOT (cost ≥ 0) relief candidate end-to-end."""
     from daemon import joint_decide as jd
-    GB = 1024 ** 3
+
+    GB = 1024**3
 
     # --- budget clamp: DRAM over-subscribed (used > cap → free room < 0).
     #     A unit on {HBM,DRAM} can still evict-HBM (acquired={}) — the
@@ -1122,20 +1384,38 @@ def stage_g_robustness() -> None:
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
     sj = _state_json(
-        units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
-                     n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB})],
+        units=[
+            _unit(
+                uhash="u1",
+                residence=["HBM", "DRAM"],
+                holders=["S"],
+                n_bytes_per_tier={"HBM": 1 * GB, "DRAM": 1 * GB},
+            )
+        ],
         hbm={"kv": _sp(9 * GB, 10 * GB)},
-        dram={"kv": _sp(50 * GB, 40 * GB)})   # used > cap → free room = -10GB
+        dram={"kv": _sp(50 * GB, 40 * GB)},
+    )  # used > cap → free room = -10GB
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
     st = _build_state(sj, tracker, ev)
-    plan = jd.joint_decide(st, ev, costs=default_costs(), pi_u=1e-4,
-                           theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+    plan = jd.joint_decide(
+        st,
+        ev,
+        costs=default_costs(),
+        pi_u=1e-4,
+        theta_hi=0.85,
+        theta_lo=0.70,
+        heartbeat_s=5.0,
+    )
     if not plan:
-        raise StageFail("G: over-subscribed DRAM must NOT block relief — "
-                        "evict-HBM (acquired={}) is still net-positive & valid")
+        raise StageFail(
+            "G: over-subscribed DRAM must NOT block relief — "
+            "evict-HBM (acquired={}) is still net-positive & valid"
+        )
     if _hbm_relief(plan).get("kv", 0) <= 0:
-        raise StageFail(f"G: clamp must let the HBM-freeing plan through; "
-                        f"freed {_hbm_relief(plan)}")
+        raise StageFail(
+            f"G: clamp must let the HBM-freeing plan through; "
+            f"freed {_hbm_relief(plan)}"
+        )
 
     # --- value-gate excludes a HOT candidate, end-to-end.  Inject (via
     #     migrate_candidates) a HOT HBM-relieving migrate (cost > 0 → moving
@@ -1144,26 +1424,48 @@ def stage_g_robustness() -> None:
     #     NOT the hot one — pins the `cost < 0` filter wiring, not the
     #     real-cost coincidence. ---
     inject = [
-        Migrate(cost=-5.0, relief={"HBM": {"kv": 1 * GB}}, acquired={},
-                id=("cold", [], ["HBM"]), group="cold"),
-        Migrate(cost=+5.0, relief={"HBM": {"kv": 1 * GB}}, acquired={},
-                id=("hot", [], ["HBM"]), group="hot"),
+        Migrate(
+            cost=-5.0,
+            relief={"HBM": {"kv": 1 * GB}},
+            acquired={},
+            id=("cold", [], ["HBM"]),
+            group="cold",
+        ),
+        Migrate(
+            cost=+5.0,
+            relief={"HBM": {"kv": 1 * GB}},
+            acquired={},
+            id=("hot", [], ["HBM"]),
+            group="hot",
+        ),
     ]
     orig_mc = jd.migrate_candidates
     jd.migrate_candidates = lambda *a, **k: list(inject)
     try:
-        plan2 = jd.joint_decide(st, ev, costs=default_costs(), pi_u=1e-4,
-                                theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+        plan2 = jd.joint_decide(
+            st,
+            ev,
+            costs=default_costs(),
+            pi_u=1e-4,
+            theta_hi=0.85,
+            theta_lo=0.70,
+            heartbeat_s=5.0,
+        )
     finally:
         jd.migrate_candidates = orig_mc
     tags = [c.id[0] for c in plan2 if isinstance(c, Migrate)]
     if "cold" not in tags:
         raise StageFail(f"G: the COLD (cost<0) migrate must be taken; got {tags}")
     if "hot" in tags:
-        raise StageFail(f"G: the HOT (cost≥0) migrate must be value-gated OUT; "
-                        f"got {tags}")
-    print(_green("  [G] destination-budget ≥0 clamp; value-gate excludes the "
-                 "hot (cost≥0) relief candidate end-to-end OK"))
+        raise StageFail(
+            f"G: the HOT (cost≥0) migrate must be value-gated OUT; " f"got {tags}"
+        )
+    print(
+        _green(
+            "  [G] destination-budget ≥0 clamp; value-gate excludes the "
+            "hot (cost≥0) relief candidate end-to-end OK"
+        )
+    )
 
 
 # ============================================================ Stage H
@@ -1187,9 +1489,11 @@ def stage_h_relief_targets_pressured_subpool() -> None:
     Pinned end-to-end through joint_decide by injecting candidates (so it
     tests the WIRING of the filter, not a real-cost coincidence)."""
     from daemon import joint_decide as jd
-    GB = 1024 ** 3
-    kw = dict(costs=default_costs(), pi_u=1e-4,
-              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
+    GB = 1024**3
+    kw = dict(
+        costs=default_costs(), pi_u=1e-4, theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0
+    )
 
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
@@ -1198,21 +1502,41 @@ def stage_h_relief_targets_pressured_subpool() -> None:
     #   • cold migrate that relieves the HEALTHY 'full' → MUST be dropped
     #   • negative-cost DISK-relieving HBM(swa)-ACQUIRER → MUST be dropped
     sj = _state_json(
-        units=[_unit(uhash="u1", residence=["HBM", "DRAM"], holders=["S"],
-                     n_bytes_per_tier={"HBM": {"swa": 1 * GB},
-                                       "DRAM": {"swa": 1 * GB}}, subpool="swa")],
+        units=[
+            _unit(
+                uhash="u1",
+                residence=["HBM", "DRAM"],
+                holders=["S"],
+                n_bytes_per_tier={"HBM": {"swa": 1 * GB}, "DRAM": {"swa": 1 * GB}},
+                subpool="swa",
+            )
+        ],
         hbm={"swa": _sp(9 * GB, 10 * GB), "full": _sp(1 * GB, 10 * GB)},
     )
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
     st = _build_state(sj, tracker, ev)
     inject = [
-        Migrate(cost=-5.0, relief={"HBM": {"swa": 1 * GB}}, acquired={},
-                id=("relieve_swa", [], ["HBM"]), group="g_swa"),
-        Migrate(cost=-5.0, relief={"HBM": {"full": 1 * GB}}, acquired={},
-                id=("relieve_full", [], ["HBM"]), group="g_full"),
-        Migrate(cost=-10.0, relief={"DISK": {"kv": 1 * GB}},
-                acquired={"HBM": {"swa": 1 * GB}},
-                id=("acquire_swa", ["HBM"], ["DISK"]), group="g_acq"),
+        Migrate(
+            cost=-5.0,
+            relief={"HBM": {"swa": 1 * GB}},
+            acquired={},
+            id=("relieve_swa", [], ["HBM"]),
+            group="g_swa",
+        ),
+        Migrate(
+            cost=-5.0,
+            relief={"HBM": {"full": 1 * GB}},
+            acquired={},
+            id=("relieve_full", [], ["HBM"]),
+            group="g_full",
+        ),
+        Migrate(
+            cost=-10.0,
+            relief={"DISK": {"kv": 1 * GB}},
+            acquired={"HBM": {"swa": 1 * GB}},
+            id=("acquire_swa", ["HBM"], ["DISK"]),
+            group="g_acq",
+        ),
     ]
     orig_mc = jd.migrate_candidates
     jd.migrate_candidates = lambda *a, **k: list(inject)
@@ -1222,19 +1546,28 @@ def stage_h_relief_targets_pressured_subpool() -> None:
         jd.migrate_candidates = orig_mc
     tags = [c.id[0] for c in plan if isinstance(c, Migrate)]
     if "relieve_swa" not in tags:
-        raise StageFail(f"H: the migrate that relieves the PEGGED swa subpool "
-                        f"must be taken; got {tags}")
+        raise StageFail(
+            f"H: the migrate that relieves the PEGGED swa subpool "
+            f"must be taken; got {tags}"
+        )
     if "relieve_full" in tags:
-        raise StageFail(f"H: a migrate relieving the HEALTHY 'full' subpool "
-                        f"must be dropped (relief targets the bottleneck); {tags}")
+        raise StageFail(
+            f"H: a migrate relieving the HEALTHY 'full' subpool "
+            f"must be dropped (relief targets the bottleneck); {tags}"
+        )
     for c in plan:
         if (getattr(c, "acquired", {}) or {}).get("HBM"):
             raise StageFail(
                 "H: no relief candidate may ACQUIRE into the pegged HBM "
                 f"subpool (it grows the bottleneck); got {c.id} "
-                f"acquired={c.acquired}")
-    print(_green("  [H] relief targets the pressured subpool only; never "
-                 "churns a healthy subpool nor grows the pegged one (SF-3) OK"))
+                f"acquired={c.acquired}"
+            )
+    print(
+        _green(
+            "  [H] relief targets the pressured subpool only; never "
+            "churns a healthy subpool nor grows the pegged one (SF-3) OK"
+        )
+    )
 
 
 def stage_i_off_budget_consumption_rejected() -> None:
@@ -1249,25 +1582,43 @@ def stage_i_off_budget_consumption_rejected() -> None:
     Without the union-budget fix the over-subscriber's 2GB lands on an axis
     the DP never budgeted → free → wrongly taken."""
     from daemon import joint_decide as jd
-    GB = 1024 ** 3
-    kw = dict(costs=default_costs(), pi_u=1e-4,
-              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
+    GB = 1024**3
+    kw = dict(
+        costs=default_costs(), pi_u=1e-4, theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0
+    )
     tracker = ProgramTracker()
     tracker.observe_arrival("S")
     sj = _state_json(
-        units=[_unit(uhash="u1", residence=["HBM"], holders=["S"],
-                     n_bytes_per_tier={"HBM": {"swa": 1 * GB}}, subpool="swa")],
+        units=[
+            _unit(
+                uhash="u1",
+                residence=["HBM"],
+                holders=["S"],
+                n_bytes_per_tier={"HBM": {"swa": 1 * GB}},
+                subpool="swa",
+            )
+        ],
         hbm={"swa": _sp(9 * GB, 10 * GB)},
-        dram={"kv": _sp(0, 40 * GB)},          # NO 'xx' subpool configured
+        dram={"kv": _sp(0, 40 * GB)},  # NO 'xx' subpool configured
     )
     ev = Event(kind=EventKind.MEMORY_PRESSURE, session="S")
     st = _build_state(sj, tracker, ev)
     inject = [
-        Migrate(cost=-10.0, relief={"HBM": {"swa": 1 * GB}},
-                acquired={"DRAM": {"xx": 2 * GB}},   # off-budget destination
-                id=("oversub", ["DRAM"], ["HBM"]), group="g_over"),
-        Migrate(cost=-5.0, relief={"HBM": {"swa": 1 * GB}}, acquired={},
-                id=("clean_drop", [], ["HBM"]), group="g_drop"),
+        Migrate(
+            cost=-10.0,
+            relief={"HBM": {"swa": 1 * GB}},
+            acquired={"DRAM": {"xx": 2 * GB}},  # off-budget destination
+            id=("oversub", ["DRAM"], ["HBM"]),
+            group="g_over",
+        ),
+        Migrate(
+            cost=-5.0,
+            relief={"HBM": {"swa": 1 * GB}},
+            acquired={},
+            id=("clean_drop", [], ["HBM"]),
+            group="g_drop",
+        ),
     ]
     orig_mc = jd.migrate_candidates
     jd.migrate_candidates = lambda *a, **k: list(inject)
@@ -1280,12 +1631,18 @@ def stage_i_off_budget_consumption_rejected() -> None:
         raise StageFail(
             "I: a migrate acquiring into an UNCONFIGURED destination subpool "
             "(DRAM['xx'], 0 room) must be rejected, not taken for free; "
-            f"got {tags}")
+            f"got {tags}"
+        )
     if "clean_drop" not in tags:
-        raise StageFail(f"I: the clean no-acquire DROP relieving swa must be "
-                        f"taken; got {tags}")
-    print(_green("  [I] off-budget consumption is 0-room (rejected), never "
-                 "silently free (round-2 audit) OK"))
+        raise StageFail(
+            f"I: the clean no-acquire DROP relieving swa must be " f"taken; got {tags}"
+        )
+    print(
+        _green(
+            "  [I] off-budget consumption is 0-room (rejected), never "
+            "silently free (round-2 audit) OK"
+        )
+    )
 
 
 def stage_j_resume_dedup() -> None:
@@ -1297,21 +1654,31 @@ def stage_j_resume_dedup() -> None:
     (re-fire) after the bounded window, else the program re-starves.  Drives
     KvScheduler.handle with a FIXED dump (overlay never advances) to model the
     lag/loss, then flips the dump to model the clear landing."""
-    GB = 1024 ** 3
+    GB = 1024**3
     from daemon import kv_scheduler as _kvs
+
     win = _kvs._RESUME_DEDUP_WINDOW
     tracker = ProgramTracker()
     tracker.pause("R")
     ob = OutboundQueue(sglang_base_url="http://unused", http_client=_DummyHttp())
-    sched = kvs.KvScheduler(tracker=tracker, sglang_base_url="http://unused",
-                            outbound=ob)
+    sched = kvs.KvScheduler(
+        tracker=tracker, sglang_base_url="http://unused", outbound=ob
+    )
     sched.admission_enabled = True
     sj = _state_json(
-        units=[_unit(uhash="uR", residence=["DRAM"], holders=["R"],
-                     n_bytes_per_tier={"DRAM": 1 * GB})],
-        programs={"R": _program("PAUSED", unit_hashes=["uR"],
-                                pre_pause_state="ACTING")},
-        hbm={"kv": _sp(int(0.5 * GB), 10 * GB)})   # 5% → headroom, R fits
+        units=[
+            _unit(
+                uhash="uR",
+                residence=["DRAM"],
+                holders=["R"],
+                n_bytes_per_tier={"DRAM": 1 * GB},
+            )
+        ],
+        programs={
+            "R": _program("PAUSED", unit_hashes=["uR"], pre_pause_state="ACTING")
+        },
+        hbm={"kv": _sp(int(0.5 * GB), 10 * GB)},
+    )  # 5% → headroom, R fits
     router = _StubRouter(sj)
     ev = Event(EventKind.PRESSURE_RESOLVED, session="R")
 
@@ -1319,15 +1686,18 @@ def stage_j_resume_dedup() -> None:
     # now reports the resume in flight.
     asyncio.run(sched.handle(ev, router))
     if sched.resume_calls != 1:
-        raise StageFail(f"J: first event must resume R once, got "
-                        f"{sched.resume_calls}")
+        raise StageFail(
+            f"J: first event must resume R once, got " f"{sched.resume_calls}"
+        )
     if not tracker.resume_in_flight("R"):
         raise StageFail("J: tracker must report R's resume in flight after dispatch")
     # event 2: SAME dump (overlay lag) → within the dedup window → no re-fire.
     asyncio.run(sched.handle(ev, router))
     if sched.resume_calls != 1:
-        raise StageFail(f"#215: a resume re-proposed within the window "
-                        f"(overlay lag) must NOT re-fire; got {sched.resume_calls}")
+        raise StageFail(
+            f"#215: a resume re-proposed within the window "
+            f"(overlay lag) must NOT re-fire; got {sched.resume_calls}"
+        )
     # keep the SAME dump (clear never lands): the tracker must re-arm after the
     # window and the resume must recover (re-fire) — bounded by win+1 events.
     fired_again_at = None
@@ -1337,22 +1707,32 @@ def stage_j_resume_dedup() -> None:
             fired_again_at = k
             break
     if fired_again_at is None:
-        raise StageFail(f"#215: a lost clear must recover (re-fire) within the "
-                        f"window ({win}); resume_calls stuck at {sched.resume_calls}")
+        raise StageFail(
+            f"#215: a lost clear must recover (re-fire) within the "
+            f"window ({win}); resume_calls stuck at {sched.resume_calls}"
+        )
     # the dump finally reflects the clear (R no longer PAUSED): no further
     # resume, and the tracker's in-flight record is pruned.
     calls_before = sched.resume_calls
     router._sj["per_program_usage"]["R"]["state"] = "ACTING"
     asyncio.run(sched.handle(ev, router))
     if sched.resume_calls != calls_before:
-        raise StageFail(f"J: once the dump clears PAUSED, no further resume; "
-                        f"{sched.resume_calls} vs {calls_before}")
+        raise StageFail(
+            f"J: once the dump clears PAUSED, no further resume; "
+            f"{sched.resume_calls} vs {calls_before}"
+        )
     if tracker.resume_in_flight("R"):
-        raise StageFail("J: tracker in-flight record must be pruned once the "
-                        "dump confirms the clear (no longer PAUSED)")
-    print(_green("  [J] resume dedup via program_tracker: suppresses re-fire in "
-                 "the overlay-lag window, recovers a lost clear, prunes on clear "
-                 "(#215) OK"))
+        raise StageFail(
+            "J: tracker in-flight record must be pruned once the "
+            "dump confirms the clear (no longer PAUSED)"
+        )
+    print(
+        _green(
+            "  [J] resume dedup via program_tracker: suppresses re-fire in "
+            "the overlay-lag window, recovers a lost clear, prunes on clear "
+            "(#215) OK"
+        )
+    )
 
 
 def stage_k_no_evict_reuse_imminent_tail() -> None:
@@ -1367,27 +1747,41 @@ def stage_k_no_evict_reuse_imminent_tail() -> None:
     unit under MEMORY_PRESSURE (the cold-unit top-k path) is still evictable,
     so relief is not crippled."""
     from daemon import joint_decide as jd
-    GB = 1024 ** 3
-    kw = dict(costs=default_costs(), pi_u=1.0e-4,
-              theta_hi=0.85, theta_lo=0.70, heartbeat_s=5.0)
+
+    GB = 1024**3
+    kw = dict(
+        costs=default_costs(),
+        pi_u=1.0e-4,
+        theta_hi=0.85,
+        theta_lo=0.70,
+        heartbeat_s=5.0,
+    )
 
     def _plan(kind):
         tracker = ProgramTracker()
         tracker.observe_arrival("S")
-        tracker.observe_completion("S")          # ACTING (alive holder)
+        tracker.observe_completion("S")  # ACTING (alive holder)
         sj = _state_json(
-            units=[_unit(uhash="tail", residence=["HBM"], holders=["S"],
-                         n_bytes_per_tier={"HBM": 1 * GB}, last_access_time=999)],
-            programs={"S": _program("ACTING", committed={"kv": 1 * GB},
-                                    unit_hashes=["tail"])},
-            hbm={"kv": _sp(9 * GB, 10 * GB)},     # 90% → pressured
-            time_counter=1000)
+            units=[
+                _unit(
+                    uhash="tail",
+                    residence=["HBM"],
+                    holders=["S"],
+                    n_bytes_per_tier={"HBM": 1 * GB},
+                    last_access_time=999,
+                )
+            ],
+            programs={
+                "S": _program("ACTING", committed={"kv": 1 * GB}, unit_hashes=["tail"])
+            },
+            hbm={"kv": _sp(9 * GB, 10 * GB)},  # 90% → pressured
+            time_counter=1000,
+        )
         ev = Event(kind=kind, session="S")
         st = _build_state(sj, tracker, ev)
         plan = jd.joint_decide(st, ev, **kw)
         # remove-HBM migrates in the plan (the #223 futile evict)
-        return [c for c in plan if isinstance(c, Migrate)
-                and Tier.HBM in c.id[2]]
+        return [c for c in plan if isinstance(c, Migrate) and Tier.HBM in c.id[2]]
 
     # net-positive sanity: the evict IS net-positive, so suppression is real
     # work, not vacuous (the value-gate would otherwise take it — proven by
@@ -1396,14 +1790,20 @@ def stage_k_no_evict_reuse_imminent_tail() -> None:
     if end_evicts:
         raise StageFail(
             "#223: TOOL_CALL_END must NOT evict the reuse-imminent session "
-            f"tail (futile TOCTOU); got remove-HBM {[c.id[0] for c in end_evicts]}")
+            f"tail (futile TOCTOU); got remove-HBM {[c.id[0] for c in end_evicts]}"
+        )
     mp_evicts = _plan(EventKind.MEMORY_PRESSURE)
     if not mp_evicts:
         raise StageFail(
             "#223: MEMORY_PRESSURE relief must still evict (the cold-unit "
-            "top-k path is not crippled by the TOOL_CALL_END guard); got none")
-    print(_green("  [K] reuse-imminent TOOL_CALL_END tail not evicted (futile "
-                 "TOCTOU), MEMORY_PRESSURE relief intact (#223) OK"))
+            "top-k path is not crippled by the TOOL_CALL_END guard); got none"
+        )
+    print(
+        _green(
+            "  [K] reuse-imminent TOOL_CALL_END tail not evicted (futile "
+            "TOCTOU), MEMORY_PRESSURE relief intact (#223) OK"
+        )
+    )
 
 
 # ============================================================ runner
@@ -1441,6 +1841,7 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             failed.append(name)
             import traceback
+
             print(_red(f"  [{name}] ERROR: {e}"))
             traceback.print_exc()
     print("=" * 64)

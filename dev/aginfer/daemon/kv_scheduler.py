@@ -35,6 +35,7 @@ Design contract (verify/t7/README.md):
 Lambda calibration justification: see verify/t7/README.md §CALIBRATION
 and the sensitivity sweep in verify/t7/verify.py [step_lambda_sweep].
 """
+
 from __future__ import annotations
 
 import logging
@@ -45,8 +46,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from baselines.base import (
     Action,
     ReuseUnit,
-    Scope,
     SchedulerState,
+    Scope,
     Tier,
     TierUsage,
     UnitType,
@@ -54,42 +55,42 @@ from baselines.base import (
 from baselines.costs import default_costs
 from baselines.ours_greedy import OursGreedyPolicy
 
-from ._fatal import fatal
-from .action_timeline import PromoteAction
-from .events import Event, EventKind
-from .program_tracker import ProgramTracker, State
-
 # #251 increment 4: build_paper_state + its closure moved to the in-engine package
 # (sglang.srt.mem_cache.aginfer.state_builder) so the ENGINE builds its own s_t in-process.
 # Re-imported here (single source) so the daemon's call sites + the verify suite that import
 # these names from daemon.kv_scheduler keep working unchanged.
 from sglang.srt.mem_cache.aginfer.state_builder import (  # noqa: E402,F401
-    _clamp_lambda_acting,
-    _estimate_load_back_s,
-    _tier_from_string,
-    _log_unknown_tier_once,
-    _flatten_per_rank,
-    build_paper_state,
-    _units_for_session,
-    _shared_prefix_units,
-    _top_k_by_regret,
-    _build_decision_set,
-    hints_from_state,
-    _env_float,
-    _env_int,
-    _LAMBDA_ACTING_FLOOR,
-    _LAMBDA_ACTING_CEIL,
-    _DEFAULT_LAMBDA_ACTING,
     _CONST_VU,
-    _PHAT_REUSE_ALPHA,
-    _PHAT_BOOTSTRAP_DT,
-    _p_access_holder,
+    _DEFAULT_LAMBDA_ACTING,
     _DEFAULT_MEMORY_PRESSURE_TOPK,
+    _LAMBDA_ACTING_CEIL,
+    _LAMBDA_ACTING_FLOOR,
+    _PHAT_BOOTSTRAP_DT,
+    _PHAT_REUSE_ALPHA,
     _PROMOTE_FALLBACK_BW_BPS,
+    _TIER_LABEL_MAP,
     LINK_IDLE_SECONDS,
     LINK_PAIRS,
-    _TIER_LABEL_MAP,
+    _build_decision_set,
+    _clamp_lambda_acting,
+    _env_float,
+    _env_int,
+    _estimate_load_back_s,
+    _flatten_per_rank,
+    _log_unknown_tier_once,
+    _p_access_holder,
+    _shared_prefix_units,
+    _tier_from_string,
+    _top_k_by_regret,
+    _units_for_session,
+    build_paper_state,
+    hints_from_state,
 )
+
+from ._fatal import fatal
+from .action_timeline import PromoteAction
+from .events import Event, EventKind
+from .program_tracker import ProgramTracker, State
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +100,6 @@ logger = logging.getLogger(__name__)
 # λ for a unit owned by a program in ACTING state.  Default 1/5: mean
 # tool call on terminus-2's swebenchpro is ~5 s (range 1–30).  Clamped
 # to [1/30, 1/1] per audit #15 — see verify/t7/README.md WORST CASE.
-
-
-
-
-
 
 
 # #208 const-V_u isolation arm: neutralise the reuse-prediction signal
@@ -119,7 +115,8 @@ logger = logging.getLogger(__name__)
 if _CONST_VU:
     logging.getLogger(__name__).warning(
         "AGINFER_CONST_VU active — daemon V_u reuse signal neutralised "
-        "(p_hat=lambda=1.0) (#208)")
+        "(p_hat=lambda=1.0) (#208)"
+    )
 
 # Top-k cap on the memory_pressure decision_set.  Paper §7.1.  256 is
 # enough to materially affect HBM occ on a B300 (~half a percent per
@@ -176,12 +173,14 @@ _PROMOTE_SAFETY_MARGIN_S = _env_float("AGINFER_PROMOTE_MARGIN_S", "0.05")
 _WARM_LEAD_S = _env_float("AGINFER_WARM_LEAD_S", "2.5")
 
 
-def _filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
-                          now: float) -> List[Any]:
+def _filter_cooled_evicts(
+    plan: List[Any], cooldown: Dict[str, float], now: float
+) -> List[Any]:
     """#223 / #251 Stage B: the cooldown filter moved into the in-engine driver
     (single implementation).  This thin delegator keeps the daemon's call path and
     verify/kv_scheduler_value_rule working unchanged."""
     from sglang.srt.mem_cache.aginfer.scheduler_driver import filter_cooled_evicts
+
     return filter_cooled_evicts(plan, cooldown, now)
 
 
@@ -196,32 +195,10 @@ def _filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
 # LINK_IDLE_SECONDS above.
 
 
-
-
-
-
 # ----------------------------------------------------------------- adapter
 
 
-
-
-
-
-
-
-
-
-
-
 # ----------------------------------------------------------------- D_t builders
-
-
-
-
-
-
-
-
 
 
 # ----------------------------------------------------------------- dispatch
@@ -231,13 +208,12 @@ def _filter_cooled_evicts(plan: List[Any], cooldown: Dict[str, float],
 # driver (so the in-process apply path and this daemon HTTP path emit byte-identical
 # wire). Re-exported here so existing `from daemon.kv_scheduler import assignments_to_wire`
 # callers (verify/kv_scheduler_value_rule, verify/t36, the legacy probe) keep working.
-from sglang.srt.mem_cache.aginfer.scheduler_driver import (  # noqa: E402
-    tier_to_wire as _tier_to_wire,
+from sglang.srt.mem_cache.aginfer.scheduler_driver import (
     assignments_to_wire,
 )
-
-
-
+from sglang.srt.mem_cache.aginfer.scheduler_driver import (  # noqa: E402
+    tier_to_wire as _tier_to_wire,
+)
 
 # ----------------------------------------------------------------- handler
 
@@ -257,7 +233,7 @@ class KvScheduler:
         policy: Optional[OursGreedyPolicy] = None,
         lambda_acting: float = _DEFAULT_LAMBDA_ACTING,
         observability=None,  # daemon._observability.DaemonObservability
-        outbound=None,       # daemon.outbound.OutboundQueue
+        outbound=None,  # daemon.outbound.OutboundQueue
     ) -> None:
         self.tracker = tracker
         self.sglang_base_url = sglang_base_url.rstrip("/")
@@ -269,6 +245,7 @@ class KvScheduler:
         # value-gate uses a SELF-LEARNED ETA instead of an externally-fed
         # constant.  Cold start falls back to the event-provided `tool_eta_s`.
         from .eta_estimator import ETAEstimator
+
         self.eta_estimator = ETAEstimator()
         # T42: optional injection from main.py (router.observability).
         # When set, ``_record_skips`` and other failure paths can bump
@@ -292,11 +269,11 @@ class KvScheduler:
         # Telemetry for tests.
         self.decisions: int = 0
         self.migrate_calls: int = 0
-        self.pause_calls: int = 0    # #194: program pauses dispatched
-        self.resume_calls: int = 0   # #194: program resumes dispatched
+        self.pause_calls: int = 0  # #194: program pauses dispatched
+        self.resume_calls: int = 0  # #194: program resumes dispatched
         # DESIGN §3/§7 predictive promote (action-timeline) telemetry.
-        self.promotes_scheduled: int = 0     # promote actions placed on heap
-        self.promotes: int = 0               # promote migrates dispatched
+        self.promotes_scheduled: int = 0  # promote actions placed on heap
+        self.promotes: int = 0  # promote migrates dispatched
         self.promotes_skipped_stale: int = 0  # belief-invalidated at fire
         self.hint_calls: int = 0  # T40 (#184): hint PUTs enqueued
         # #230 Tier-2 characterization knob: artificially defer hint
@@ -304,8 +281,7 @@ class KvScheduler:
         # sglang stale).  0 = off (production default).  Used ONLY by the
         # hint-latency-budget e2e arms to measure the freshness knee on the
         # real stack; never set in production.
-        self._hint_delay_s: float = _env_float(
-            "AGINFER_HINT_DELAY_MS", "0") / 1000.0
+        self._hint_delay_s: float = _env_float("AGINFER_HINT_DELAY_MS", "0") / 1000.0
         self.hint_delayed_calls: int = 0
         self.last_action: Optional[Action] = None
         self.last_plan: Optional[List[Any]] = None
@@ -316,6 +292,7 @@ class KvScheduler:
         # _pending_demote/_demote_apply_ema/_dump_gen + handle() block — this is the
         # first piece of the decision brain relocated in-process (the #251 blocker).
         from sglang.srt.mem_cache.aginfer.scheduler_driver import AginferDriver
+
         self.driver = AginferDriver()
         # Audit round-2 R2-N2: per-instance unknown-tier log set so
         # cross-test / cross-restart state doesn't leak.
@@ -352,14 +329,19 @@ class KvScheduler:
             _tn = event.payload.get("tool_name")
             _ta = event.payload.get("tool_args") or event.payload.get("args") or {}
             _sig = self.eta_estimator.on_tool_call_start(
-                event.session, _tn, _ta, event.enqueue_time)
+                event.session, _tn, _ta, event.enqueue_time
+            )
             _learned = self.eta_estimator.predict(_tn, _ta)
             if _learned is not None and _learned > 0.0:
                 event.payload["tool_eta_s"] = _learned
             from ._metrics import m as _m
-            _m("eta_estimate", sig="/".join(_sig),
-               learned=("none" if _learned is None else round(_learned, 3)),
-               bootstrap=round(float(event.payload.get("tool_eta_s") or 0.0), 3))
+
+            _m(
+                "eta_estimate",
+                sig="/".join(_sig),
+                learned=("none" if _learned is None else round(_learned, 3)),
+                bootstrap=round(float(event.payload.get("tool_eta_s") or 0.0), 3),
+            )
         elif event.kind == EventKind.TOOL_CALL_END and event.session:
             self.eta_estimator.on_tool_call_end(event.session, event.enqueue_time)
         elif event.kind == EventKind.SESSION_END and event.session:
@@ -370,9 +352,11 @@ class KvScheduler:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "kv_scheduler: /aginfer/state fetch failed for %s: %r",
-                event.kind.value, exc,
+                event.kind.value,
+                exc,
             )
             from ._metrics import m as _m
+
             _m("state_fetch_failed", kind=event.kind.value)
             # T42 audit G2: route load-fault tally through the same
             # observability counter that already collects migrate-skip
@@ -385,6 +369,7 @@ class KvScheduler:
         # event.  Bounded ~16 ms wall per cycle.  Raw data behind
         # the F3 / T14 occupancy-trajectory observability.
         from ._metrics import m as _m
+
         # Direct subscript: schema contract is enforced by sglang's dump;
         # a real schema break should surface as a KeyError logged with
         # full traceback (handle()'s try/except surrounds the
@@ -397,32 +382,43 @@ class KvScheduler:
         # Authoritative HBM occupancy = MAX over subpools per DESIGN §5
         # ('admission acts when ANY subpool crosses theta_hi').
         hbm_subpools = pool_usage["HBM"]["subpools"]
-        occ_hbm = max(
-            (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
-            for e in hbm_subpools.values()
-        ) if hbm_subpools else 0.0
+        occ_hbm = (
+            max(
+                (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
+                for e in hbm_subpools.values()
+            )
+            if hbm_subpools
+            else 0.0
+        )
         dram_subpools = pool_usage["DRAM"]["subpools"]
-        occ_dram = max(
-            (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
-            for e in dram_subpools.values()
-        ) if dram_subpools else 0.0
+        occ_dram = (
+            max(
+                (e["used_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
+                for e in dram_subpools.values()
+            )
+            if dram_subpools
+            else 0.0
+        )
         # Radix-resident slice (evictable bytes) as a separate signal:
         # post-T17 the daemon no longer maintains a "tree-view" stat
         # because pool_usage IS the unified allocator view.  Emit
         # evictable_bytes / cap_bytes as a proxy for "how much of HBM
         # is radix-resident" so the trajectory parse can see the
         # in-flight-vs-radix split.
-        tree_occ_hbm = max(
-            (e["evictable_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0
+        tree_occ_hbm = (
+            max(
+                (e["evictable_bytes"] / e["cap_bytes"]) if e["cap_bytes"] > 0 else 0.0
+                for e in hbm_subpools.values()
+            )
+            if hbm_subpools
             else 0.0
-            for e in hbm_subpools.values()
-        ) if hbm_subpools else 0.0
+        )
         n_units = len(flat["units"])
         _m(
             "state_fetched",
             kind=event.kind.value,
-            occ_hbm=occ_hbm,              # AUTHORITATIVE pressure
-            tree_occ_hbm=tree_occ_hbm,    # evictable slice for debug
+            occ_hbm=occ_hbm,  # AUTHORITATIVE pressure
+            tree_occ_hbm=tree_occ_hbm,  # evictable slice for debug
             occ_dram=occ_dram,
             units=n_units,
         )
@@ -445,9 +441,7 @@ class KvScheduler:
         # event on the fresh state (cheap dict scan), mirroring sglang's
         # ENDED-no-units dump-GC (#186) so the daemon tracker stays
         # bounded by the live-unit set.
-        live_pids = {
-            sid for u in sched_state.units.values() for sid in u.holders
-        }
+        live_pids = {sid for u in sched_state.units.values() for sid in u.holders}
         self.tracker.gc_ended(live_pids)
         # #240 saturation-yield: measure whether our recently-dispatched demotes
         # actually landed (the hash is no longer HBM-resident in THIS fresh dump)
@@ -491,7 +485,8 @@ class KvScheduler:
         # fetch above and the dispatch below).  `evict_cooldown` is mutated in place
         # (expired-entry prune) exactly as before.
         plan = self.driver.decide(
-            sched_state, event,
+            sched_state,
+            event,
             costs=self.policy.costs,
             pi_u=self.policy.pi_u,
             theta_hi=router.theta_hi,
@@ -507,8 +502,11 @@ class KvScheduler:
         # lost) is observed promptly.  The tracker drops a pid once the dump no
         # longer shows it PAUSED (clear landed) or after the recovery window
         # (clear lost → re-fire).
-        _paused_now = {pid for pid, pu in sched_state.per_program_usage.items()
-                       if pu.get("state") == "PAUSED"}
+        _paused_now = {
+            pid
+            for pid, pu in sched_state.per_program_usage.items()
+            if pu.get("state") == "PAUSED"
+        }
         self.tracker.reconcile_resume_acks(_paused_now, _RESUME_DEDUP_WINDOW)
         if not plan:
             # Nothing to do this event — declined (every V_u-positive
@@ -546,7 +544,9 @@ class KvScheduler:
             a ``PUT`` clearing the paused mark back to ``pre_pause_state``.
         """
         from baselines.knapsack import Migrate, Pause, Resume
+
         from ._metrics import m as _m
+
         migrates = [c for c in plan if isinstance(c, Migrate)]
         pauses = [c for c in plan if isinstance(c, Pause)]
         resumes = [c for c in plan if isinstance(c, Resume)]
@@ -597,8 +597,10 @@ class KvScheduler:
         self.pause_calls += 1
         if self.outbound is not None:
             self.outbound.enqueue_program_paused(
-                pid=pid, state="PAUSED", pre_pause_state=prior)
+                pid=pid, state="PAUSED", pre_pause_state=prior
+            )
         from ._metrics import m as _m
+
         _m("admission_pause", pid=pid, pre_pause_state=prior)
 
     async def _dispatch_resume(self, pid: str, sched_state) -> None:
@@ -612,8 +614,10 @@ class KvScheduler:
             # paused mark is cleared (pre_pause_state=None on the resumed
             # record).
             self.outbound.enqueue_program_paused(
-                pid=pid, state=pre or "REASONING", pre_pause_state=None)
+                pid=pid, state=pre or "REASONING", pre_pause_state=None
+            )
         from ._metrics import m as _m
+
         _m("admission_resume", pid=pid, restored_state=pre)
 
     async def _dispatch_migrate(
@@ -643,6 +647,7 @@ class KvScheduler:
         batch_id = self.outbound.enqueue_migrate(actions_wire)
         self.migrate_calls += 1
         from ._metrics import m as _m
+
         _m(
             "migrate_enqueued",
             batch_id=batch_id,
@@ -667,18 +672,25 @@ class KvScheduler:
                 "outbound=OutboundQueue(...)."
             )
         from ._metrics import m as _m
+
         # #230: defer hint DELIVERY (computed-now, delivered-stale) for the
         # latency-budget arms.  The list is already shaped; call_later just
         # enqueues it later so sglang sees it ``_hint_delay_s`` late.
         if self._hint_delay_s > 0.0:
             import asyncio
+
             loop = asyncio.get_running_loop()
-            loop.call_later(self._hint_delay_s,
-                            self.outbound.enqueue_hints, list(hints))
+            loop.call_later(
+                self._hint_delay_s, self.outbound.enqueue_hints, list(hints)
+            )
             self.hint_calls += 1
             self.hint_delayed_calls += 1
-            _m("hints_enqueued", batch_id="deferred",
-               n_hints=len(hints), delay_ms=int(self._hint_delay_s * 1000))
+            _m(
+                "hints_enqueued",
+                batch_id="deferred",
+                n_hints=len(hints),
+                delay_ms=int(self._hint_delay_s * 1000),
+            )
             return
         batch_id = self.outbound.enqueue_hints(hints)
         self.hint_calls += 1
@@ -703,11 +715,14 @@ class KvScheduler:
         if not pid:
             return
         k = event.kind
-        if k in (EventKind.SESSION_ARRIVAL, EventKind.LLM_PREFILL,
-                 EventKind.TOOL_CALL_END):
-            self.tracker.observe_arrival(pid)      # → REASONING
+        if k in (
+            EventKind.SESSION_ARRIVAL,
+            EventKind.LLM_PREFILL,
+            EventKind.TOOL_CALL_END,
+        ):
+            self.tracker.observe_arrival(pid)  # → REASONING
         elif k == EventKind.TOOL_CALL_START:
-            self.tracker.observe_completion(pid)   # REASONING → ACTING
+            self.tracker.observe_completion(pid)  # REASONING → ACTING
 
     # ------------------------------------------------- action-timeline (§3/§7)
 
@@ -744,8 +759,9 @@ class KvScheduler:
         tail = _units_for_session(sched_state.units, session)
         if not tail:
             return
-        total_bytes = sum(sched_state.units[uid].n_bytes
-                          for uid in tail if uid in sched_state.units)
+        total_bytes = sum(
+            sched_state.units[uid].n_bytes for uid in tail if uid in sched_state.units
+        )
         load_back_s = _estimate_load_back_s(sched_state, total_bytes)
         # #241: the promote runs as a prefill-only WARM (#238), whose completion
         # is prefill-class (queue+compute+load), not transfer-class.  Use
@@ -754,17 +770,38 @@ class KvScheduler:
         now = event.enqueue_time  # event-stream clock (perf_counter frame)
         lead = max(0.0, eta - eff_lead_cost - _PROMOTE_SAFETY_MARGIN_S)
         due = now + lead
-        from_tiers = tuple({t for uid in tail if uid in sched_state.units
-                            for t in sched_state.units[uid].residence})
-        tl.schedule(due, PromoteAction(
-            session=session, unit_hashes=tuple(tail), from_tiers=from_tiers,
-            eta_s=eta, load_back_s=load_back_s, scheduled_at=now,
-            reason="tool_eta"))
+        from_tiers = tuple(
+            {
+                t
+                for uid in tail
+                if uid in sched_state.units
+                for t in sched_state.units[uid].residence
+            }
+        )
+        tl.schedule(
+            due,
+            PromoteAction(
+                session=session,
+                unit_hashes=tuple(tail),
+                from_tiers=from_tiers,
+                eta_s=eta,
+                load_back_s=load_back_s,
+                scheduled_at=now,
+                reason="tool_eta",
+            ),
+        )
         self.promotes_scheduled += 1
         from ._metrics import m as _m
-        _m("promote_scheduled", session=session, n_units=len(tail),
-           eta_s=round(eta, 3), load_back_s=round(load_back_s, 4),
-           lead_s=round(lead, 4), bytes=int(total_bytes))
+
+        _m(
+            "promote_scheduled",
+            session=session,
+            n_units=len(tail),
+            eta_s=round(eta, 3),
+            load_back_s=round(load_back_s, 4),
+            lead_s=round(lead, 4),
+            bytes=int(total_bytes),
+        )
 
     async def fire_due_action(self, payload, router) -> None:  # noqa: ANN001
         """DESIGN §3 belief-validated fire of a due action-timeline action.
@@ -779,6 +816,7 @@ class KvScheduler:
         if not isinstance(payload, PromoteAction):
             return
         from ._metrics import m as _m
+
         session = payload.session
         # Belief 1 — still tool-bound?  ACTING is the window between
         # TOOL_CALL_START and the program's next LLM event (program_tracker).
@@ -786,8 +824,11 @@ class KvScheduler:
         st = self.tracker.state(session)
         if st != State.ACTING:
             self.promotes_skipped_stale += 1
-            _m("promote_skipped", session=session,
-               reason=f"state={st.value if st else None}")
+            _m(
+                "promote_skipped",
+                session=session,
+                reason=f"state={st.value if st else None}",
+            )
             return
         # Belief 2 — fresh residence.  A promote only helps a tail currently in
         # DRAM/DISK; one already in HBM (never demoted) or dropped is a no-op.
@@ -836,19 +877,28 @@ class KvScheduler:
             ok = await router.warm_to_hbm(prefix_tokens, session)
             if ok:
                 self.promotes += 1
-                _m("promote_dispatched", session=session, via="warm",
-                   n_tokens=len(prefix_tokens), eta_s=round(payload.eta_s, 3))
+                _m(
+                    "promote_dispatched",
+                    session=session,
+                    via="warm",
+                    n_tokens=len(prefix_tokens),
+                    eta_s=round(payload.eta_s, 3),
+                )
                 return
             # warm dispatch failed → fall through to the migrate fallback
         if not assignments:
             self.promotes_skipped_stale += 1
-            _m("promote_skipped", session=session,
-               reason="no_prefix_and_no_dram_units")
+            _m("promote_skipped", session=session, reason="no_prefix_and_no_dram_units")
             return
         await self._dispatch_migrate(assignments)
         self.promotes += len(assignments)
-        _m("promote_dispatched", session=session, via="migrate",
-           n=len(assignments), eta_s=round(payload.eta_s, 3))
+        _m(
+            "promote_dispatched",
+            session=session,
+            via="migrate",
+            n=len(assignments),
+            eta_s=round(payload.eta_s, 3),
+        )
 
 
 # ----------------------------------------------------------------- attach

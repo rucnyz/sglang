@@ -5,6 +5,7 @@ Stages:
   B. (optional, AGINFER_VERIFY_BASE) live HTTP round-trip against a running
      sglang.launch_server with SGLANG_AGINFER_IN_ENGINE=1
 """
+
 from __future__ import annotations
 
 import json
@@ -71,19 +72,13 @@ def stage_a1_malformed(validate_events_body) -> None:
 
 
 def stage_a2_caps(validate_events_body) -> None:
-    too_many = {
-        "events": [
-            {"kind": "llm_prefill", "session": "p"} for _ in range(257)
-        ]
-    }
+    too_many = {"events": [{"kind": "llm_prefill", "session": "p"} for _ in range(257)]}
     try:
         validate_events_body(too_many)
         raise AssertionError("expected ValueError for oversized batch")
     except ValueError:
         pass
-    long_session = {
-        "events": [{"kind": "x", "session": "s" * 65}]
-    }
+    long_session = {"events": [{"kind": "x", "session": "s" * 65}]}
     try:
         validate_events_body(long_session)
         raise AssertionError("expected ValueError for long session")
@@ -98,9 +93,7 @@ def stage_b0_live_http() -> None:
         return
     url = f"{base}/aginfer/events"
     payload = {
-        "events": [
-            {"kind": "llm_prefill", "session": "verify-events", "payload": {}}
-        ]
+        "events": [{"kind": "llm_prefill", "session": "verify-events", "payload": {}}]
     }
     req = urllib.request.Request(
         url,

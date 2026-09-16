@@ -37,6 +37,7 @@ attribute raises loudly instead of the test silently passing.
 Run:
     python dev/aginfer/verify/disk_tier_migrate/verify.py
 """
+
 from __future__ import annotations
 
 import sys
@@ -55,8 +56,12 @@ from sglang.srt.mem_cache.unified_cache_components import (  # noqa: E402
 )
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -70,25 +75,28 @@ class _Node:
     """Duck-typed UnifiedTreeNode: only the fields apply_aginfer_migrations'
     add-DISK / remove-DISK branches (+ the shared pre-checks they fall
     through) actually touch."""
+
     _counter = 0
 
-    def __init__(self, *, hash_value=None, device=True, host=None,
-                 backuped: bool = False):
+    def __init__(
+        self, *, hash_value=None, device=True, host=None, backuped: bool = False
+    ):
         _Node._counter += 1
         self.id = _Node._counter
         self.hash_value = hash_value
         self.children: dict = {}
-        self.component_data = [SimpleNamespace(
-            value=[1, 2, 3] if device else None,
-            host_value=host,
-            lock_ref=0,
-        )]
+        self.component_data = [
+            SimpleNamespace(
+                value=[1, 2, 3] if device else None,
+                host_value=host,
+                lock_ref=0,
+            )
+        ]
         self.backuped = backuped
 
 
 class _FakeCache:
-    def __init__(self, *, enable_storage: bool = False,
-                 cache_controller: Any = None):
+    def __init__(self, *, enable_storage: bool = False, cache_controller: Any = None):
         self.root_node = _Node()
         self._aginfer_collision_seen: set = set()
         self._aginfer_migrate_skipped_counters: dict = {}
@@ -127,10 +135,15 @@ class _FakeCache:
             raise self._write_backup_storage_raises
 
 
-def _action(hash_: str, add: list[str], remove: list[str],
-            action_id: str = "a") -> dict:
-    return {"hash": hash_, "add_tiers": add, "remove_tiers": remove,
-            "action_id": action_id}
+def _action(
+    hash_: str, add: list[str], remove: list[str], action_id: str = "a"
+) -> dict:
+    return {
+        "hash": hash_,
+        "add_tiers": add,
+        "remove_tiers": remove,
+        "action_id": action_id,
+    }
 
 
 def _run(cache: _FakeCache, actions: list[dict]) -> dict:
@@ -141,8 +154,9 @@ def _skip_reason(resp: dict, action_id: str) -> str:
     for s in resp["skipped"]:
         if s["action_id"] == action_id:
             return s["reason"]
-    raise StageFail(f"no skip entry for action_id={action_id!r}; "
-                    f"skipped={resp['skipped']!r}")
+    raise StageFail(
+        f"no skip entry for action_id={action_id!r}; " f"skipped={resp['skipped']!r}"
+    )
 
 
 # ============================================================ stages
@@ -207,7 +221,9 @@ def stage_3_add_disk_declined_no_storage_backend() -> None:
         raise StageFail(f"add=[DISK] w/o storage backend must not apply; resp={resp!r}")
     reason = _skip_reason(resp, "a3")
     if reason != "disk_add_declined:no_storage_backend":
-        raise StageFail(f"expected disk_add_declined:no_storage_backend; got {reason!r}")
+        raise StageFail(
+            f"expected disk_add_declined:no_storage_backend; got {reason!r}"
+        )
     if cache.write_backup_storage_calls:
         raise StageFail("write_backup_storage must NOT be called when declined")
 
@@ -221,7 +237,9 @@ def stage_4_add_disk_declined_no_cache_controller() -> None:
     resp = _run(cache, [_action("u4", ["DISK"], [], "a4")])
     reason = _skip_reason(resp, "a4")
     if reason != "disk_add_declined:no_storage_backend":
-        raise StageFail(f"expected disk_add_declined:no_storage_backend; got {reason!r}")
+        raise StageFail(
+            f"expected disk_add_declined:no_storage_backend; got {reason!r}"
+        )
 
 
 def stage_5_add_disk_declined_not_host_backed() -> None:
@@ -239,7 +257,9 @@ def stage_5_add_disk_declined_not_host_backed() -> None:
     if reason != "disk_add_declined:not_host_backed":
         raise StageFail(f"expected disk_add_declined:not_host_backed; got {reason!r}")
     if cache.write_backup_storage_calls:
-        raise StageFail("write_backup_storage must NOT be called on a non-host-backed node")
+        raise StageFail(
+            "write_backup_storage must NOT be called on a non-host-backed node"
+        )
 
 
 def stage_6_add_disk_success_on_host_backed_node() -> None:
@@ -253,15 +273,19 @@ def stage_6_add_disk_success_on_host_backed_node() -> None:
     if resp["applied"] != 1:
         raise StageFail(f"add=[DISK] on host-backed node should apply; resp={resp!r}")
     if resp["applied_hashes"] != ["u6"]:
-        raise StageFail(f"applied_hashes should be ['u6']; got {resp['applied_hashes']!r}")
+        raise StageFail(
+            f"applied_hashes should be ['u6']; got {resp['applied_hashes']!r}"
+        )
     if cache.write_backup_storage_calls != [n]:
         raise StageFail(
             f"write_backup_storage should be called exactly once with n; "
-            f"calls={cache.write_backup_storage_calls!r}")
+            f"calls={cache.write_backup_storage_calls!r}"
+        )
     if cache._aginfer_migrate_counters.get("disk_backup") != 1:
         raise StageFail(
             f"transition metrics should tag this 'disk_backup'; "
-            f"counters={cache._aginfer_migrate_counters!r}")
+            f"counters={cache._aginfer_migrate_counters!r}"
+        )
 
 
 def stage_7_add_disk_with_add_dram_same_action_rejected() -> None:
@@ -279,15 +303,19 @@ def stage_7_add_disk_with_add_dram_same_action_rejected() -> None:
     resp = _run(cache, [_action("u7", ["DRAM", "DISK"], [], "a7")])
     if resp["applied"] != 0:
         raise StageFail(
-            f"combined add=[DRAM,DISK] must be rejected, not applied; "
-            f"resp={resp!r}")
+            f"combined add=[DRAM,DISK] must be rejected, not applied; " f"resp={resp!r}"
+        )
     reason = _skip_reason(resp, "a7")
     if reason != "disk_add_conflicts_with_dram_add":
         raise StageFail(f"expected disk_add_conflicts_with_dram_add; got {reason!r}")
     if cache.write_backup_calls:
-        raise StageFail("write_backup (DRAM) must NOT be called; whole action rejected up front")
+        raise StageFail(
+            "write_backup (DRAM) must NOT be called; whole action rejected up front"
+        )
     if cache.write_backup_storage_calls:
-        raise StageFail("write_backup_storage (DISK) must NOT be called; whole action rejected up front")
+        raise StageFail(
+            "write_backup_storage (DISK) must NOT be called; whole action rejected up front"
+        )
 
 
 def stage_7b_add_disk_with_remove_dram_same_action_rejected() -> None:
@@ -303,12 +331,16 @@ def stage_7b_add_disk_with_remove_dram_same_action_rejected() -> None:
     cache = _FakeCache(enable_storage=True, cache_controller=object())
     resp = _run(cache, [_action("nonexistent", ["DISK"], ["DRAM"], "a7b")])
     if resp["applied"] != 0:
-        raise StageFail(f"combined add=[DISK],remove=[DRAM] must be rejected; resp={resp!r}")
+        raise StageFail(
+            f"combined add=[DISK],remove=[DRAM] must be rejected; resp={resp!r}"
+        )
     reason = _skip_reason(resp, "a7b")
     if reason != "disk_add_conflicts_with_dram_remove":
         raise StageFail(f"expected disk_add_conflicts_with_dram_remove; got {reason!r}")
     if cache.write_backup_storage_calls:
-        raise StageFail("write_backup_storage must NOT be called; whole action rejected up front")
+        raise StageFail(
+            "write_backup_storage must NOT be called; whole action rejected up front"
+        )
 
 
 def stage_8_add_disk_raises_is_caught_and_skipped() -> None:
@@ -320,7 +352,9 @@ def stage_8_add_disk_raises_is_caught_and_skipped() -> None:
     cache.add_leaf(n)
     resp = _run(cache, [_action("u8", ["DISK"], [], "a8")])
     if resp["applied"] != 0:
-        raise StageFail(f"a raising write_backup_storage must not count as applied; resp={resp!r}")
+        raise StageFail(
+            f"a raising write_backup_storage must not count as applied; resp={resp!r}"
+        )
     reason = _skip_reason(resp, "a8")
     if not reason.startswith("disk_backup_raised:RuntimeError"):
         raise StageFail(f"expected disk_backup_raised:RuntimeError:...; got {reason!r}")
@@ -344,28 +378,60 @@ def stage_9_disk_never_blocks_readd_already_present() -> None:
         raise StageFail(
             f"re-requested add=[DISK] should apply again (not "
             f"add_already_present -- DISK isn't tracked in residence); "
-            f"resp={resp2!r}")
+            f"resp={resp2!r}"
+        )
     if len(cache.write_backup_storage_calls) != 2:
         raise StageFail(
             f"write_backup_storage should have fired twice; "
-            f"calls={cache.write_backup_storage_calls!r}")
+            f"calls={cache.write_backup_storage_calls!r}"
+        )
 
 
 # ============================================================ run
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("0 baseline add=DRAM (harness sanity)",                     stage_0_baseline_add_dram_still_works),
-    ("1 remove=[DISK] alone -> disk_remove_unsupported_upstream", stage_1_remove_disk_alone_rejected),
-    ("2 remove=[DISK,HBM] combined -> whole action rejected",     stage_2_remove_disk_combined_rejects_whole_action),
-    ("3 add=[DISK] no storage backend -> declined",               stage_3_add_disk_declined_no_storage_backend),
-    ("4 add=[DISK] no cache_controller -> declined",              stage_4_add_disk_declined_no_cache_controller),
-    ("5 add=[DISK] not host-backed -> declined",                  stage_5_add_disk_declined_not_host_backed),
-    ("6 add=[DISK] host-backed -> applied (happy path)",          stage_6_add_disk_success_on_host_backed_node),
-    ("7 add=[DRAM,DISK] combined -> conflicts_with_dram_add",     stage_7_add_disk_with_add_dram_same_action_rejected),
-    ("7b add=[DISK],remove=[DRAM] -> conflicts_with_dram_remove", stage_7b_add_disk_with_remove_dram_same_action_rejected),
-    ("8 write_backup_storage raises -> caught + skipped",         stage_8_add_disk_raises_is_caught_and_skipped),
-    ("9 repeat add=[DISK] never add_already_present",             stage_9_disk_never_blocks_readd_already_present),
+    ("0 baseline add=DRAM (harness sanity)", stage_0_baseline_add_dram_still_works),
+    (
+        "1 remove=[DISK] alone -> disk_remove_unsupported_upstream",
+        stage_1_remove_disk_alone_rejected,
+    ),
+    (
+        "2 remove=[DISK,HBM] combined -> whole action rejected",
+        stage_2_remove_disk_combined_rejects_whole_action,
+    ),
+    (
+        "3 add=[DISK] no storage backend -> declined",
+        stage_3_add_disk_declined_no_storage_backend,
+    ),
+    (
+        "4 add=[DISK] no cache_controller -> declined",
+        stage_4_add_disk_declined_no_cache_controller,
+    ),
+    (
+        "5 add=[DISK] not host-backed -> declined",
+        stage_5_add_disk_declined_not_host_backed,
+    ),
+    (
+        "6 add=[DISK] host-backed -> applied (happy path)",
+        stage_6_add_disk_success_on_host_backed_node,
+    ),
+    (
+        "7 add=[DRAM,DISK] combined -> conflicts_with_dram_add",
+        stage_7_add_disk_with_add_dram_same_action_rejected,
+    ),
+    (
+        "7b add=[DISK],remove=[DRAM] -> conflicts_with_dram_remove",
+        stage_7b_add_disk_with_remove_dram_same_action_rejected,
+    ),
+    (
+        "8 write_backup_storage raises -> caught + skipped",
+        stage_8_add_disk_raises_is_caught_and_skipped,
+    ),
+    (
+        "9 repeat add=[DISK] never add_already_present",
+        stage_9_disk_never_blocks_readd_already_present,
+    ),
 ]
 
 
@@ -380,8 +446,10 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: "
-                  f"unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: "
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\ndisk_tier_migrate FAILED ({len(failures)}): {failures}"))
         return 1

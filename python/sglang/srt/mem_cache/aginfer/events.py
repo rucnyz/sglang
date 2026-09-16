@@ -6,6 +6,7 @@ the request lifecycle.  sglang pushes the remaining 2
 All events land on a single ``asyncio.Queue`` and are processed by
 the event_worker (T7 / T8) serially with an action_lock.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -136,7 +137,5 @@ class EventBus:
         the queued copy carries the timestamp).
         """
         if event.enqueue_time == 0.0:
-            event = dataclasses.replace(
-                event, enqueue_time=time.perf_counter()
-            )
+            event = dataclasses.replace(event, enqueue_time=time.perf_counter())
         self._q.put_nowait(event)

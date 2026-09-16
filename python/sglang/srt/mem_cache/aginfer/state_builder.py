@@ -9,26 +9,28 @@ own call sites + the verify suite keep working unchanged. ONE canonical copy of 
 Imports resolve to the in-engine package directly (the daemon reached them via baselines.*/.xxx
 alias-shims). A FRESH module logger (not the daemon's) — the only move-proof straggler.
 """
+
 from __future__ import annotations
 
 import logging
 import math
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from sglang.srt.mem_cache.aginfer.base import (
-    ReuseUnit, Scope, SchedulerState, Tier, TierUsage, UnitType,
-)
 from sglang.srt.mem_cache.aginfer._fatal import fatal
+from sglang.srt.mem_cache.aginfer.base import (
+    ReuseUnit,
+    SchedulerState,
+    Scope,
+    Tier,
+    TierUsage,
+    UnitType,
+)
 from sglang.srt.mem_cache.aginfer.costs import default_costs
 from sglang.srt.mem_cache.aginfer.events import Event, EventKind
 from sglang.srt.mem_cache.aginfer.program_tracker import ProgramTracker, State
 
 logger = logging.getLogger("sglang.srt.mem_cache.aginfer.state_builder")
-
-
-
-
 
 
 # --- env-var helpers ---
@@ -44,9 +46,7 @@ def _env_float(key: str, default: str) -> float:
     try:
         return float(raw)
     except ValueError as exc:
-        raise ValueError(
-            f"env var {key}={raw!r} is not a valid float: {exc}"
-        ) from exc
+        raise ValueError(f"env var {key}={raw!r} is not a valid float: {exc}") from exc
 
 
 def _env_int(key: str, default: str) -> int:
@@ -54,12 +54,7 @@ def _env_int(key: str, default: str) -> int:
     try:
         return int(raw)
     except ValueError as exc:
-        raise ValueError(
-            f"env var {key}={raw!r} is not a valid int: {exc}"
-        ) from exc
-
-
-
+        raise ValueError(f"env var {key}={raw!r} is not a valid int: {exc}") from exc
 
 
 # --- calibration constants (DESIGN §7) ---
@@ -117,9 +112,6 @@ _TIER_LABEL_MAP: Dict[str, Tier] = {
     "DISK": Tier.DISK,
     "DROP": Tier.DROP,
 }
-
-
-
 
 
 # --- dump→PaperState helpers + the transform ---
@@ -318,7 +310,8 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 # decode_bytes_per_token (#199) is static (architecture
                 # constant); take rank-0.  Older sglang may omit it → 0.
                 "decode_bytes_per_token": int(
-                    rank0_subpools[sp].get("decode_bytes_per_token", 0)),
+                    rank0_subpools[sp].get("decode_bytes_per_token", 0)
+                ),
             }
         for rank in per_rank:
             rank_subpools = rank["pool_usage"][tier]["subpools"]
@@ -336,10 +329,8 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
             for sp, fields in rank_subpools.items():
                 agg_subpools[sp]["used_bytes"] += int(fields["used_bytes"])
                 agg_subpools[sp]["cap_bytes"] += int(fields["cap_bytes"])
-                agg_subpools[sp]["available_bytes"] += int(
-                    fields["available_bytes"])
-                agg_subpools[sp]["evictable_bytes"] += int(
-                    fields["evictable_bytes"])
+                agg_subpools[sp]["available_bytes"] += int(fields["available_bytes"])
+                agg_subpools[sp]["evictable_bytes"] += int(fields["evictable_bytes"])
         agg_pool[tier] = {"subpools": agg_subpools}
 
     # ---- link_stats ----
@@ -392,14 +383,15 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
     # pre-aggregated dump → _flatten_per_rank returns it unchanged).
     agg_throughput: Dict[str, Any] = {
         "prefill_bps": sum(
-            float(rank["throughput_ema"]["prefill_bps"]) for rank in per_rank),
+            float(rank["throughput_ema"]["prefill_bps"]) for rank in per_rank
+        ),
         "decode_per_program": {},
     }
     for rank in per_rank:
         for pid, bps in rank["throughput_ema"]["decode_per_program"].items():
-            agg_throughput["decode_per_program"][pid] = (
-                agg_throughput["decode_per_program"].get(pid, 0.0)
-                + float(bps))
+            agg_throughput["decode_per_program"][pid] = agg_throughput[
+                "decode_per_program"
+            ].get(pid, 0.0) + float(bps)
 
     # ---- per_program_usage: sum committed bytes; union unit_hashes ----
     # Cross-rank state reconciliation.  PUT /aginfer/program_paused fans
@@ -444,8 +436,7 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                     "unit_hashes": [],
                 }
                 agg_programs[pid] = agg
-            for side, side_dict in (("hbm", e["hbm"]),
-                                    ("dram", e["dram"])):
+            for side, side_dict in (("hbm", e["hbm"]), ("dram", e["dram"])):
                 for sub_kind, sub in side_dict.items():
                     if side == "dram" and sub_kind != "committed":
                         continue
@@ -474,7 +465,8 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 # union is a superset of any single rank's view).
                 existing = agg_units[hash_to_idx[uhash]]
                 merged_residence = sorted(
-                    set(existing["residence"]) | set(u["residence"]))
+                    set(existing["residence"]) | set(u["residence"])
+                )
                 # n_bytes: DESIGN §6 L736 — identical across ranks
                 # (derived from architecture).  When the SAME
                 # (tier, subpool) key is present on both ranks for the
@@ -520,8 +512,9 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 # rank rejects, re-arming the #210 apply_failed leak.  AND is
                 # the stricter mirror of the (colder-superset) residence union.
                 for _flag in ("is_device_leaf", "is_host_leaf", "is_tree_leaf"):
-                    existing[_flag] = bool(existing.get(_flag, True)) \
-                        and bool(u.get(_flag, True))
+                    existing[_flag] = bool(existing.get(_flag, True)) and bool(
+                        u.get(_flag, True)
+                    )
                 # UNION session_ids (holders) across ranks.  Node session
                 # tagging (``node.session_ids.add(pid)`` / SESSION_END
                 # untagging) runs in each rank's OWN scheduler, driven by
@@ -539,8 +532,7 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 # view strand a still-shared unit as session-scoped.
                 existing_sids = existing.get("session_ids") or []
                 u_sids = u.get("session_ids") or []
-                existing["session_ids"] = sorted(
-                    set(existing_sids) | set(u_sids))
+                existing["session_ids"] = sorted(set(existing_sids) | set(u_sids))
                 # MAX-reconcile last_access_time + hit_count (same transient-
                 # divergence class as the #210 leaf flags / #211 holders
                 # union).  Each rank's scheduler bumps the radix node's
@@ -558,10 +550,11 @@ def _flatten_per_rank(state_json: Dict[str, Any]) -> Dict[str, Any]:
                 # spuriously demotes a still-warm unit.  Order-independent.
                 existing["last_access_time"] = max(
                     int(existing.get("last_access_time", 0)),
-                    int(u.get("last_access_time", 0)))
+                    int(u.get("last_access_time", 0)),
+                )
                 existing["hit_count"] = max(
-                    int(existing.get("hit_count", 0)),
-                    int(u.get("hit_count", 0)))
+                    int(existing.get("hit_count", 0)), int(u.get("hit_count", 0))
+                )
                 # n_tokens: REPLICATED logical token count (every rank holds
                 # the same prefix tokens; only the head-dim slice of each
                 # token's KV differs), so it is identical across ranks by
@@ -627,9 +620,15 @@ def build_paper_state(
     # bugs → fatal()".  Every consumer below assumes these blocks
     # exist; failing fast with a forensic dump is strictly better than
     # a KeyError at line 420.
-    for field in ("pool_usage", "link_stats", "tier_holding_cost",
-                  "throughput_ema", "per_program_usage", "units",
-                  "time_counter"):
+    for field in (
+        "pool_usage",
+        "link_stats",
+        "tier_holding_cost",
+        "throughput_ema",
+        "per_program_usage",
+        "units",
+        "time_counter",
+    ):
         if field not in state_json:
             fatal(
                 "missing_state_field",
@@ -665,7 +664,8 @@ def build_paper_state(
                 if v < 0.0:
                     fatal(
                         "holding_cost_non_positive",
-                        tier=tier_label, subpool=sp,
+                        tier=tier_label,
+                        subpool=sp,
                         h_max_per_byte_sec=v,
                         state=state_json,
                     )
@@ -678,7 +678,8 @@ def build_paper_state(
                 if v <= 0.0:
                     fatal(
                         "holding_cost_non_positive",
-                        tier=tier_label, subpool=sp,
+                        tier=tier_label,
+                        subpool=sp,
                         h_max_per_byte_sec=v,
                         state=state_json,
                     )
@@ -709,8 +710,7 @@ def build_paper_state(
     raw_pool = state_json["pool_usage"]
     tier_usage = TierUsage()
     pool_pressure: Dict[Tier, Dict[str, float]] = {}
-    for label, tier in (("HBM", Tier.HBM), ("DRAM", Tier.DRAM),
-                        ("DISK", Tier.DISK)):
+    for label, tier in (("HBM", Tier.HBM), ("DRAM", Tier.DRAM), ("DISK", Tier.DISK)):
         subpools = raw_pool[label]["subpools"]
         tier_usage.pool_used[tier] = {}
         tier_usage.pool_cap[tier] = {}
@@ -729,7 +729,8 @@ def build_paper_state(
             tier_usage.page_bytes[tier][sp] = int(fields["page_bytes"])
             # #199: optional (older sglang omits it) → default 0.
             tier_usage.decode_bytes_per_token[tier][sp] = int(
-                fields.get("decode_bytes_per_token", 0))
+                fields.get("decode_bytes_per_token", 0)
+            )
             pool_pressure[tier][sp] = used / cap if cap > 0 else 0.0
     # bw_free derived from link_stats: peak when link is cold-idle,
     # else (peak - recent_throughput).  Negative bw_free clamps to 0.
@@ -762,8 +763,7 @@ def build_paper_state(
     units: Dict[str, ReuseUnit] = {}
     # Owner program → its ACTING-floor λ (cached per call).
     program_lambda: Dict[str, float] = {}
-    _RESIDENCE_TIER = {"HBM": Tier.HBM, "DRAM": Tier.DRAM,
-                       "DISK": Tier.DISK}
+    _RESIDENCE_TIER = {"HBM": Tier.HBM, "DRAM": Tier.DRAM, "DISK": Tier.DISK}
     for raw in units_raw:
         uhash = str(raw["hash"])
         if not uhash:
@@ -1068,21 +1068,26 @@ def hints_from_state(sched_state) -> List[Dict[str, Any]]:  # noqa: ANN001
             # skip defensively rather than push a hint for a hash
             # sglang has no unit for.
             continue
-        hints.append({
-            "hash": uid,
-            "p_hat": float(u.p_hat),
-            "lambda": float(u.lambda_rate),
-            # DESIGN §2 fact 1 / S2: holder-count so the inline eviction scorer can
-            # value a fleet-shared prefix by N× saved-prefill (it builds units with
-            # empty `holders` and can't recover the count from the node alone).
-            "n_holders": len(u.holders),
-            "stamp": stamp,
-        })
+        hints.append(
+            {
+                "hash": uid,
+                "p_hat": float(u.p_hat),
+                "lambda": float(u.lambda_rate),
+                # DESIGN §2 fact 1 / S2: holder-count so the inline eviction scorer can
+                # value a fleet-shared prefix by N× saved-prefill (it builds units with
+                # empty `holders` and can't recover the count from the node alone).
+                "n_holders": len(u.holders),
+                "stamp": stamp,
+            }
+        )
     # S2 diagnostic: confirm the daemon actually observes shared units (n_holders>1)
     _mx = max((h["n_holders"] for h in hints), default=0)
     if _mx > 1:
         import logging as _lg
+
         _lg.getLogger("aginfer.kv").info(
             "[aginfer] S2 hint push: n=%d units, MAX n_holders=%d (shared prefix seen)",
-            len(hints), _mx)
+            len(hints),
+            _mx,
+        )
     return hints
