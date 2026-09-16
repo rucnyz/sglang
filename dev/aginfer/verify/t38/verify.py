@@ -30,13 +30,13 @@ DISTINCT ``last_access_time`` to every node (same-batch prefix nodes
 are spaced 1e-5 apart), so exact ties never occur.  The hit_count
 write-through behaviour it was loosely mirroring lives in T28 (#178).
 """
+
 from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -49,8 +49,12 @@ from baselines.sglang_adapter import (  # noqa: E402
 )
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -68,6 +72,7 @@ class _StubLayer:
 @dataclass
 class _StubNode:
     """Minimum shape default_policy_score / lru_score touch."""
+
     last_access_time: int
     hit_count: int = 0
     id: int = 0
@@ -95,9 +100,7 @@ def stage_a1_zero_hits_equals_lru() -> None:
         d = default_policy_score(n, _LAYER_HBM)
         l = lru_score(n, _LAYER_HBM)
         if d != l:
-            raise StageFail(
-                f"hit=0: default({ts})={d} != lru({ts})={l}"
-            )
+            raise StageFail(f"hit=0: default({ts})={d} != lru({ts})={l}")
 
 
 # ============================================================ B. ordering
@@ -109,7 +112,7 @@ def stage_b0_hit_count_does_not_affect_score() -> None:
     2^32+ that sglang's `node.hit_count += 1` allows by construction)
     yields the SAME score == lru_score.  hit_count's job is the
     write-through trigger (#178), not eviction."""
-    for hc in (0, 1, 50, 2 ** 30, 2 ** 32, 10 ** 18):
+    for hc in (0, 1, 50, 2**30, 2**32, 10**18):
         n = _StubNode(last_access_time=777, hit_count=hc)
         d = default_policy_score(n, _LAYER_HBM)
         if d != float(777):
@@ -129,10 +132,10 @@ def stage_b1_uniform_hit_count_matches_lru_order() -> None:
     default_policy_score matches lru_score.  10 nodes, uniform
     hit_count=5."""
     import random
+
     rng = random.Random(20260601)
     nodes = [
-        _StubNode(last_access_time=rng.randint(0, 1_000_000),
-                  hit_count=5)
+        _StubNode(last_access_time=rng.randint(0, 1_000_000), hit_count=5)
         for _ in range(10)
     ]
     by_default = sorted(nodes, key=lambda n: default_policy_score(n, _LAYER_HBM))
@@ -176,6 +179,7 @@ def stage_c0_module_spec_resolvable() -> None:
     spec = "baselines.sglang_adapter:default_policy_score"
     mod_name, attr = spec.split(":")
     import importlib
+
     mod = importlib.import_module(mod_name)
     fn = getattr(mod, attr, None)
     if fn is None:
@@ -197,11 +201,13 @@ def stage_c1_sglang_resolver_loads_it() -> None:
     end-to-end.  This catches a regression where the env-var format
     or import path changes silently."""
     import os
+
     sys.path.insert(0, "/scratch/yuzhou/projects/sglang/python")
     from sglang.srt.mem_cache.unified_radix_cache import (
         _default_eviction_score,
         _load_eviction_scorer,
     )
+
     spec = "baselines.sglang_adapter:default_policy_score"
     os.environ["SGLANG_KV_POLICY_MODULE"] = spec
     try:
@@ -228,12 +234,21 @@ def stage_c1_sglang_resolver_loads_it() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 default_policy_score returns float",       stage_a0_returns_float),
-    ("A1 hit_count=0 equals lru_score exactly",     stage_a1_zero_hits_equals_lru),
-    ("B0 hit_count does NOT affect eviction score (incl 2^32+)", stage_b0_hit_count_does_not_affect_score),
-    ("B1 uniform hit ordering matches LRU",         stage_b1_uniform_hit_count_matches_lru_order),
-    ("B2 tied age → identical score (no tie-break)", stage_b2_tied_age_identical_score_no_tiebreak),
-    ("C0 module:callable spec resolvable",          stage_c0_module_spec_resolvable),
+    ("A0 default_policy_score returns float", stage_a0_returns_float),
+    ("A1 hit_count=0 equals lru_score exactly", stage_a1_zero_hits_equals_lru),
+    (
+        "B0 hit_count does NOT affect eviction score (incl 2^32+)",
+        stage_b0_hit_count_does_not_affect_score,
+    ),
+    (
+        "B1 uniform hit ordering matches LRU",
+        stage_b1_uniform_hit_count_matches_lru_order,
+    ),
+    (
+        "B2 tied age → identical score (no tie-break)",
+        stage_b2_tied_age_identical_score_no_tiebreak,
+    ),
+    ("C0 module:callable spec resolvable", stage_c0_module_spec_resolvable),
     ("C1 sglang _resolve_kv_policy_module loads it", stage_c1_sglang_resolver_loads_it),
 ]
 

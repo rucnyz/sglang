@@ -53,11 +53,11 @@ sets ``group = unit hash``; Resume leaves it None (one per program).
 This is a DESIGN §9 "exact 0/1 knapsack" correction — plain 0/1 would
 double-count.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
-
 
 # ------------------------------------------------------------- candidates
 
@@ -77,6 +77,7 @@ class Migrate:
     non-None ``group`` as at-most-one (multiple-choice knapsack).
     ``group=None`` (the default) ⇒ an independent 0/1 item — preserving
     the original single-item behaviour for callers that don't set it."""
+
     cost: float
     relief: Dict[str, Dict[str, int]] = field(default_factory=dict)
     acquired: Dict[str, Dict[str, int]] = field(default_factory=dict)
@@ -92,6 +93,7 @@ class Pause:
 
     Retained for the candidate generators / baselines, but **DORMANT** in
     ``joint_decide`` (not generated — see the module docstring)."""
+
     cost: float
     relief: Dict[str, Dict[str, int]] = field(default_factory=dict)
     pid: Any = None
@@ -104,6 +106,7 @@ class Resume:
     per-(HBM, subpool) bytes that re-enter HBM on resume; ``gain`` is
     the V_u recovered.  ``group`` defaults to None (one Resume per
     program — independent 0/1 items)."""
+
     gain: float
     re_use: Dict[str, Dict[str, int]] = field(default_factory=dict)
     pid: Any = None
@@ -132,6 +135,7 @@ class KnapsackBudgetExceededError(Exception):
     ``joint_decide`` maps it to ``fatal("joint_decide_dp_blowup", …)`` —
     a pathological candidate set (excess relief/acquire variance at the
     chosen quantisation), not a workload reality."""
+
     def __init__(self, context: Dict[str, Any]):
         self.context = context
         super().__init__(
@@ -214,7 +218,8 @@ def knapsack_max_value_multi(
     if bad:
         raise ValueError(
             f"knapsack_max_value_multi: bucket_size must be > 0 for every "
-            f"axis; non-positive at {bad} (bucket_size={bucket_size})")
+            f"axis; non-positive at {bad} (bucket_size={bucket_size})"
+        )
     W = {a: _bk(budget[a], bucket_size[a]) for a in axes}
     K = len(items)
     NEG = float("-inf")
@@ -229,11 +234,12 @@ def knapsack_max_value_multi(
     parent: Dict[tuple, tuple] = {}
     for gi, group in enumerate(grouped):
         base = dp
-        new_dp = dict(dp)                            # option: take none
+        new_dp = dict(dp)  # option: take none
         for member in group:
-            d = tuple(_bk_up(member.re_use.get(t, {}).get(sp, 0),
-                             bucket_size[(t, sp)])
-                      for (t, sp) in axes)
+            d = tuple(
+                _bk_up(member.re_use.get(t, {}).get(sp, 0), bucket_size[(t, sp)])
+                for (t, sp) in axes
+            )
             for s, gain in base.items():
                 s_new = tuple(s[i] + d[i] for i in range(len(axes)))
                 if any(s_new[i] > W[axes[i]] for i in range(len(axes))):
@@ -245,11 +251,16 @@ def knapsack_max_value_multi(
         dp = new_dp
         if len(dp) > max_dp_cells:
             ctx = dict(context or {})
-            ctx.update({
-                "dp_size": len(dp), "max_dp_cells": max_dp_cells,
-                "item_index": gi, "n_items": K, "axes": axes,
-                "items": list(items),
-            })
+            ctx.update(
+                {
+                    "dp_size": len(dp),
+                    "max_dp_cells": max_dp_cells,
+                    "item_index": gi,
+                    "n_items": K,
+                    "axes": axes,
+                    "items": list(items),
+                }
+            )
             raise KnapsackBudgetExceededError(ctx)
 
     s_pick = max(dp, key=dp.get)

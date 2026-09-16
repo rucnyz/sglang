@@ -32,13 +32,11 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import run_agentreplay_with_telemetry as telemetry  # noqa: E402
-
 
 SCHEMA_VERSION = 1
 TIERS = ("HBM", "DRAM", "DISK")
@@ -74,9 +72,7 @@ def summarize(values: Sequence[float]) -> dict[str, float | int]:
         position = q * (len(ordered) - 1)
         lower = int(position)
         upper = min(lower + 1, len(ordered) - 1)
-        return ordered[lower] * (upper - position) + ordered[upper] * (
-            position - lower
-        )
+        return ordered[lower] * (upper - position) + ordered[upper] * (position - lower)
 
     return {
         "n": len(ordered),
@@ -103,9 +99,7 @@ def load_trace(path: pathlib.Path) -> list[dict[str, Any]]:
             if not isinstance(row, Mapping):
                 raise ValueError(f"trace line {line_number} is not an object")
             if row.get("steady_role") not in {"live", "churn"}:
-                raise ValueError(
-                    f"trace line {line_number} has no valid steady_role"
-                )
+                raise ValueError(f"trace line {line_number} has no valid steady_role")
             records.append(dict(row))
     if not records:
         raise ValueError("steady trace is empty")
@@ -236,13 +230,8 @@ def safe_request_row(
             "role": record["steady_role"],
             "traffic_class": (
                 "live_revisit"
-                if record["steady_role"] == "live"
-                and int(record.get("step") or 0) > 1
-                else (
-                    "live_initial"
-                    if record["steady_role"] == "live"
-                    else "churn"
-                )
+                if record["steady_role"] == "live" and int(record.get("step") or 0) > 1
+                else ("live_initial" if record["steady_role"] == "live" else "churn")
             ),
             "is_root": bool(record.get("steady_is_root")),
             "root_id_sha256": hashlib.sha256(
@@ -312,11 +301,7 @@ def request_window_metrics(
     metrics["by_traffic_class"] = (
         {
             traffic_class: request_window_metrics(
-                [
-                    row
-                    for row in rows
-                    if row.get("traffic_class") == traffic_class
-                ],
+                [row for row in rows if row.get("traffic_class") == traffic_class],
                 start,
                 end,
                 include_breakdown=False,
@@ -341,11 +326,7 @@ def state_window_metrics(
     samples: Sequence[Mapping[str, Any]], start: float, end: float
 ) -> dict[str, Any]:
     valid = sorted(
-        (
-            sample
-            for sample in samples
-            if isinstance(sample.get("state"), Mapping)
-        ),
+        (sample for sample in samples if isinstance(sample.get("state"), Mapping)),
         key=lambda sample: float(sample["elapsed_seconds"]),
     )
     fields = {
@@ -353,10 +334,7 @@ def state_window_metrics(
         "pool_used_bytes": {tier: 0.0 for tier in TIERS},
         "pool_max_subpool_utilization": {tier: 0.0 for tier in TIERS},
     }
-    peaks = {
-        field: {tier: 0.0 for tier in TIERS}
-        for field in fields
-    }
+    peaks = {field: {tier: 0.0 for tier in TIERS} for field in fields}
     lifecycle_fields = (
         "logical_ended_programs",
         "session_end_acked_programs",
@@ -394,10 +372,7 @@ def state_window_metrics(
         }
         for field, tiers in fields.items()
     }
-    auc = {
-        tier: fields["dead_physical_bytes"][tier]
-        for tier in TIERS
-    }
+    auc = {tier: fields["dead_physical_bytes"][tier] for tier in TIERS}
     return {
         "window_seconds": end - start,
         "covered_seconds": coverage,
@@ -462,10 +437,13 @@ def admission_delay_metrics(
         mean_y = statistics.fmean(delay for _scheduled, delay in ordered)
         denominator = sum((scheduled - mean_x) ** 2 for scheduled, _ in ordered)
         if denominator > 0:
-            slope = sum(
-                (scheduled - mean_x) * (delay - mean_y)
-                for scheduled, delay in ordered
-            ) / denominator
+            slope = (
+                sum(
+                    (scheduled - mean_x) * (delay - mean_y)
+                    for scheduled, delay in ordered
+                )
+                / denominator
+            )
     return {
         **summarize([delay for _scheduled, delay in ordered]),
         "scheduled_roots": len(ordered),
@@ -545,12 +523,10 @@ async def execute(
         for program_id, rows in programs.items()
     }
     role_by_program = {
-        program_id: str(rows[0]["steady_role"])
-        for program_id, rows in programs.items()
+        program_id: str(rows[0]["steady_role"]) for program_id, rows in programs.items()
     }
     runtime_ids = {
-        driver._runtime_program_id(program_id, args.salt)
-        for program_id in programs
+        driver._runtime_program_id(program_id, args.salt) for program_id in programs
     }
     logical_ended: set[str] = set()
     logical_ended_source: set[str] = set()
@@ -592,9 +568,7 @@ async def execute(
         state = None
         if error is None:
             try:
-                state = telemetry.analyze_state(
-                    payload, runtime_ids, ended_snapshot
-                )
+                state = telemetry.analyze_state(payload, runtime_ids, ended_snapshot)
             except Exception as exc:  # telemetry must not stop inference
                 error = f"{type(exc).__name__}: {exc}"[:300]
         sample = {
@@ -678,14 +652,10 @@ async def execute(
             row["completed_elapsed_seconds"] = completed
             request_done = logical_end_elapsed.get(program_id)
             row["queue_delay_ms"] = (
-                (started - request_done) * 1000.0
-                if request_done is not None
-                else None
+                (started - request_done) * 1000.0 if request_done is not None else None
             )
             row["role"] = role_by_program[program_id]
-            row["program_id_sha256"] = hashlib.sha256(
-                program_id.encode()
-            ).hexdigest()
+            row["program_id_sha256"] = hashlib.sha256(program_id.encode()).hexdigest()
             end_rows.append(row)
             append_jsonl(
                 end_path,
@@ -726,9 +696,7 @@ async def execute(
     requests_metrics = request_window_metrics(
         request_rows, measurement_start, measurement_end
     )
-    state_metrics = state_window_metrics(
-        samples, measurement_start, measurement_end
-    )
+    state_metrics = state_window_metrics(samples, measurement_start, measurement_end)
     first_by_program: dict[str, Mapping[str, Any]] = {}
     for row in request_rows:
         digest = str(row["program_id_sha256"])
@@ -788,9 +756,7 @@ async def execute(
         "measurement": {
             "requests": requests_metrics,
             "state": state_metrics,
-            "session_end": end_metrics(
-                end_rows, measurement_start, measurement_end
-            ),
+            "session_end": end_metrics(end_rows, measurement_start, measurement_end),
             "session_arrival_admission_delay_seconds": admission_delay_metrics(
                 arrival_delays, measurement_start, measurement_end
             ),

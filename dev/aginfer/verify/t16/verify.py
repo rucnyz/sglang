@@ -23,12 +23,12 @@ they're in.
 Usage:
     python dev/aginfer/verify/t16/verify.py
 """
+
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -82,9 +82,14 @@ def stage_0_empty_program() -> None:
     accidentally returns ``None``."""
     out = expected_peak_hbm_after_resume(
         program_unit_hashes=[],
-        units={"h1": _unit("h1", residence=[Tier.HBM],
-                           n_bytes_by_tier={Tier.HBM: {"attn": 4096}},
-                           holders=["other"])},
+        units={
+            "h1": _unit(
+                "h1",
+                residence=[Tier.HBM],
+                n_bytes_by_tier={Tier.HBM: {"attn": 4096}},
+                holders=["other"],
+            )
+        },
     )
     if out != {}:
         raise StageFail(f"empty program should return {{}}: got {out!r}")
@@ -98,7 +103,7 @@ def stage_1_hbm_resident_unit_contributes_zero() -> None:
     units = {
         "h1": _unit(
             "h1",
-            residence=[Tier.HBM, Tier.DRAM],   # write-through state
+            residence=[Tier.HBM, Tier.DRAM],  # write-through state
             n_bytes_by_tier={
                 Tier.HBM: {"attn": 4096},
                 Tier.DRAM: {"attn": 4096},
@@ -107,7 +112,8 @@ def stage_1_hbm_resident_unit_contributes_zero() -> None:
         ),
     }
     out = expected_peak_hbm_after_resume(
-        program_unit_hashes=["h1"], units=units,
+        program_unit_hashes=["h1"],
+        units=units,
     )
     if out != {}:
         raise StageFail(
@@ -130,12 +136,11 @@ def stage_2_dram_only_unit_full_bytes() -> None:
         ),
     }
     out = expected_peak_hbm_after_resume(
-        program_unit_hashes=["h1"], units=units,
+        program_unit_hashes=["h1"],
+        units=units,
     )
     if out != {"attn": 8192}:
-        raise StageFail(
-            f"DRAM-only unit should drive re_use[attn]=8192; got {out!r}"
-        )
+        raise StageFail(f"DRAM-only unit should drive re_use[attn]=8192; got {out!r}")
 
 
 def stage_3_disk_only_unit_full_bytes() -> None:
@@ -150,12 +155,11 @@ def stage_3_disk_only_unit_full_bytes() -> None:
         ),
     }
     out = expected_peak_hbm_after_resume(
-        program_unit_hashes=["h1"], units=units,
+        program_unit_hashes=["h1"],
+        units=units,
     )
     if out != {"attn": 16384}:
-        raise StageFail(
-            f"DISK-only unit should drive re_use[attn]=16384; got {out!r}"
-        )
+        raise StageFail(f"DISK-only unit should drive re_use[attn]=16384; got {out!r}")
 
 
 def stage_4_mixed_bag_only_non_hbm_counts() -> None:
@@ -196,12 +200,12 @@ def stage_4_mixed_bag_only_non_hbm_counts() -> None:
         ),
     }
     out = expected_peak_hbm_after_resume(
-        program_unit_hashes=["h_hbm", "h_dram", "h_disk"], units=units,
+        program_unit_hashes=["h_hbm", "h_dram", "h_disk"],
+        units=units,
     )
     if out != {"attn": 2048 + 8192}:
         raise StageFail(
-            f"mixed: HBM=0 + DRAM=2048 + DISK=8192 = 10240; "
-            f"got re_use={out!r}"
+            f"mixed: HBM=0 + DRAM=2048 + DISK=8192 = 10240; " f"got re_use={out!r}"
         )
 
 
@@ -244,9 +248,7 @@ def stage_5_multi_subpool_aggregation() -> None:
         units=units,
     )
     if out != {"attn": 4096, "moe_expert": 32768, "ssm_snapshot": 2048}:
-        raise StageFail(
-            f"multi-subpool aggregation wrong: {out!r}"
-        )
+        raise StageFail(f"multi-subpool aggregation wrong: {out!r}")
 
 
 def stage_6_partial_drop_credits_reprefill() -> None:
@@ -273,7 +275,8 @@ def stage_6_partial_drop_credits_reprefill() -> None:
     if out != {"attn": 3072}:
         raise StageFail(
             f"partial drop must credit dropped units the surviving per-unit "
-            f"mean (1024 load-back + 2×1024 dropped = 3072); got {out!r}")
+            f"mean (1024 load-back + 2×1024 dropped = 3072); got {out!r}"
+        )
 
 
 def stage_6b_full_drop_stays_zero() -> None:
@@ -285,12 +288,16 @@ def stage_6b_full_drop_stays_zero() -> None:
     units = {}  # all of this program's units were DROPped
     out_a = expected_peak_hbm_after_resume(["h_gone", "h_also_gone"], units)
     if out_a != {}:
-        raise StageFail(f"#211: fully-dropped (hashes listed, all gone) must "
-                        f"keep re_use={{}} to un-starve; got {out_a!r}")
+        raise StageFail(
+            f"#211: fully-dropped (hashes listed, all gone) must "
+            f"keep re_use={{}} to un-starve; got {out_a!r}"
+        )
     out_b = expected_peak_hbm_after_resume([], units)
     if out_b != {}:
-        raise StageFail(f"#211: empty unit_hashes (overlay residue) must keep "
-                        f"re_use={{}}; got {out_b!r}")
+        raise StageFail(
+            f"#211: empty unit_hashes (overlay residue) must keep "
+            f"re_use={{}}; got {out_b!r}"
+        )
 
 
 def stage_6c_hbm_resident_survivor_sizes_dropped() -> None:
@@ -310,17 +317,26 @@ def stage_6c_hbm_resident_survivor_sizes_dropped() -> None:
     if out != {"attn": 2048}:
         raise StageFail(
             f"HBM-resident survivor must size the dropped credit (0 load-back "
-            f"+ 1×2048 dropped = 2048); got {out!r}")
+            f"+ 1×2048 dropped = 2048); got {out!r}"
+        )
 
 
 def stage_6d_no_drop_unchanged() -> None:
     """No dropped units → behaviour is exactly the load-back sum (the #216
     credit never fires).  2 DRAM survivors (1024 + 4096) → {'attn': 5120}."""
     units = {
-        "h1": _unit("h1", residence=[Tier.DRAM],
-                    n_bytes_by_tier={Tier.DRAM: {"attn": 1024}}, holders=["p"]),
-        "h2": _unit("h2", residence=[Tier.DRAM],
-                    n_bytes_by_tier={Tier.DRAM: {"attn": 4096}}, holders=["p"]),
+        "h1": _unit(
+            "h1",
+            residence=[Tier.DRAM],
+            n_bytes_by_tier={Tier.DRAM: {"attn": 1024}},
+            holders=["p"],
+        ),
+        "h2": _unit(
+            "h2",
+            residence=[Tier.DRAM],
+            n_bytes_by_tier={Tier.DRAM: {"attn": 4096}},
+            holders=["p"],
+        ),
     }
     out = expected_peak_hbm_after_resume(["h1", "h2"], units)
     if out != {"attn": 5120}:
@@ -334,16 +350,25 @@ def stage_6e_multi_subpool_credit() -> None:
       'swa' : 200 load-back + (200/2)*2 = 200+200 = 400
     (mean per subpool divides by the TOTAL survivor count, n=2.)"""
     units = {
-        "h_full": _unit("h_full", residence=[Tier.DRAM],
-                        n_bytes_by_tier={Tier.DRAM: {"full": 600}}, holders=["p"]),
-        "h_swa": _unit("h_swa", residence=[Tier.DRAM],
-                       n_bytes_by_tier={Tier.DRAM: {"swa": 200}}, holders=["p"]),
+        "h_full": _unit(
+            "h_full",
+            residence=[Tier.DRAM],
+            n_bytes_by_tier={Tier.DRAM: {"full": 600}},
+            holders=["p"],
+        ),
+        "h_swa": _unit(
+            "h_swa",
+            residence=[Tier.DRAM],
+            n_bytes_by_tier={Tier.DRAM: {"swa": 200}},
+            holders=["p"],
+        ),
     }
-    out = expected_peak_hbm_after_resume(
-        ["h_full", "h_swa", "h_d1", "h_d2"], units)
+    out = expected_peak_hbm_after_resume(["h_full", "h_swa", "h_d1", "h_d2"], units)
     if out != {"full": 1200, "swa": 400}:
-        raise StageFail(f"multi-subpool credit wrong; expected "
-                        f"{{'full':1200,'swa':400}}, got {out!r}")
+        raise StageFail(
+            f"multi-subpool credit wrong; expected "
+            f"{{'full':1200,'swa':400}}, got {out!r}"
+        )
 
 
 def stage_7_idempotent_pure_function() -> None:
@@ -360,9 +385,7 @@ def stage_7_idempotent_pure_function() -> None:
         ),
     }
     snapshot_residence = list(units["h1"].residence)
-    snapshot_n_bytes = {
-        t: dict(sp) for t, sp in units["h1"].n_bytes_by_tier.items()
-    }
+    snapshot_n_bytes = {t: dict(sp) for t, sp in units["h1"].n_bytes_by_tier.items()}
     out_a = expected_peak_hbm_after_resume(["h1"], units)
     out_b = expected_peak_hbm_after_resume(["h1"], units)
     if out_a != out_b:
@@ -381,17 +404,17 @@ def stage_7_idempotent_pure_function() -> None:
 
 def stage_8_capacity_fits_no_double_count_scenario() -> None:
     """End-to-end B1 scenario.  Build a state where:
-       - HBM cap = 10 KB, currently 4 KB used (unit h1 on HBM held by
-         the LIVE program live-prog)
-       - Paused program paused-prog ALSO holds h1 (multi-holder)
-       - Free HBM = 6 KB
-       - re_use(paused-prog) MUST be 0 (B1) → capacity_fits trivially
-         passes for paused-prog resume.
-       Pre-B1-fix re_use would have been 4096 → capacity_fits would
-       check `free (6 KB) >= forecast (0) + re_use (4 KB)` which
-       still passes BUT in a tighter HBM (e.g. free=3 KB) it would
-       have over-pessimised.  We re-run with free=3 KB to surface
-       the bug shape.
+    - HBM cap = 10 KB, currently 4 KB used (unit h1 on HBM held by
+      the LIVE program live-prog)
+    - Paused program paused-prog ALSO holds h1 (multi-holder)
+    - Free HBM = 6 KB
+    - re_use(paused-prog) MUST be 0 (B1) → capacity_fits trivially
+      passes for paused-prog resume.
+    Pre-B1-fix re_use would have been 4096 → capacity_fits would
+    check `free (6 KB) >= forecast (0) + re_use (4 KB)` which
+    still passes BUT in a tighter HBM (e.g. free=3 KB) it would
+    have over-pessimised.  We re-run with free=3 KB to surface
+    the bug shape.
     """
     units = {
         "h1": _unit(
@@ -419,33 +442,41 @@ def stage_8_capacity_fits_no_double_count_scenario() -> None:
     hypothetical_free_hbm = 3 * 1024  # tighter than 4 KB
     paused_forecast = 0  # no inflight, just resume capacity
     if not (hypothetical_free_hbm >= paused_forecast + sum(re_use.values())):
-        raise StageFail(
-            "capacity_fits should pass under tight HBM since re_use=0"
-        )
+        raise StageFail("capacity_fits should pass under tight HBM since re_use=0")
 
 
 # ----------------------------------------------------------------- run
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("0  empty program → {}",                          stage_0_empty_program),
-    ("1  HBM-resident unit contributes 0 (B1 isolated)",
-                                                       stage_1_hbm_resident_unit_contributes_zero),
-    ("2  DRAM-only unit full bytes",                   stage_2_dram_only_unit_full_bytes),
-    ("3  DISK-only unit full bytes",                   stage_3_disk_only_unit_full_bytes),
-    ("4  mixed bag — only non-HBM counts",             stage_4_mixed_bag_only_non_hbm_counts),
-    ("5  multi-subpool aggregation",                   stage_5_multi_subpool_aggregation),
-    ("6  partial-drop credits re-prefill estimate (#216)",
-                                                       stage_6_partial_drop_credits_reprefill),
-    ("6b full-drop stays zero — un-starve preserved (#211/#213)",
-                                                       stage_6b_full_drop_stays_zero),
-    ("6c HBM-resident survivor sizes dropped credit (#216+B1)",
-                                                       stage_6c_hbm_resident_survivor_sizes_dropped),
-    ("6d no-drop unchanged (load-back sum)",           stage_6d_no_drop_unchanged),
-    ("6e multi-subpool credit distribution (#216)",    stage_6e_multi_subpool_credit),
-    ("7  pure / idempotent / non-mutating",            stage_7_idempotent_pure_function),
-    ("8  capacity_fits no-double-count scenario (B1 E2E)",
-                                                       stage_8_capacity_fits_no_double_count_scenario),
+    ("0  empty program → {}", stage_0_empty_program),
+    (
+        "1  HBM-resident unit contributes 0 (B1 isolated)",
+        stage_1_hbm_resident_unit_contributes_zero,
+    ),
+    ("2  DRAM-only unit full bytes", stage_2_dram_only_unit_full_bytes),
+    ("3  DISK-only unit full bytes", stage_3_disk_only_unit_full_bytes),
+    ("4  mixed bag — only non-HBM counts", stage_4_mixed_bag_only_non_hbm_counts),
+    ("5  multi-subpool aggregation", stage_5_multi_subpool_aggregation),
+    (
+        "6  partial-drop credits re-prefill estimate (#216)",
+        stage_6_partial_drop_credits_reprefill,
+    ),
+    (
+        "6b full-drop stays zero — un-starve preserved (#211/#213)",
+        stage_6b_full_drop_stays_zero,
+    ),
+    (
+        "6c HBM-resident survivor sizes dropped credit (#216+B1)",
+        stage_6c_hbm_resident_survivor_sizes_dropped,
+    ),
+    ("6d no-drop unchanged (load-back sum)", stage_6d_no_drop_unchanged),
+    ("6e multi-subpool credit distribution (#216)", stage_6e_multi_subpool_credit),
+    ("7  pure / idempotent / non-mutating", stage_7_idempotent_pure_function),
+    (
+        "8  capacity_fits no-double-count scenario (B1 E2E)",
+        stage_8_capacity_fits_no_double_count_scenario,
+    ),
 ]
 
 
@@ -460,7 +491,9 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\nT16 FAILED ({len(failures)} stage(s)): {failures}"))
         return 1

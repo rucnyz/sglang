@@ -77,7 +77,7 @@ B. Robustness
      → saturated=False (false-positive guards on both bounds)
 C. Log parser
   C0 groups by (tier, subpool); ignores non-t12_calibration lines
-  C1 malformed lines (missing field / unparseable float) → silently dropped
+  C1 malformed lines (missing field / unparsable float) → silently dropped
 ```
 
 ## REPRODUCING

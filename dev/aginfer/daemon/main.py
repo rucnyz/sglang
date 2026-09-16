@@ -18,6 +18,7 @@ Emits the T9 startup invariants the run_k.sh grep depends on:
 * ``kv_scheduler=<enabled|disabled>``
 * ``admission_controller=<enabled|disabled>``
 """
+
 from __future__ import annotations
 
 import argparse
@@ -25,6 +26,8 @@ import logging
 import sys
 
 import uvicorn
+
+from .action_timeline import ActionTimeline
 
 # #194: admission is now the §8 candidate generator consumed by
 # kv_scheduler's joint_decide, not a separate composed handler — no
@@ -34,7 +37,6 @@ from .event_router import (
     attach_hash_collision_handler,
     attach_session_end_handler,
 )
-from .action_timeline import ActionTimeline
 from .kv_scheduler import KvScheduler, attach_kv_scheduler
 from .outbound import OutboundQueue
 from .proxy import create_app
@@ -51,45 +53,56 @@ def _parse_bool_flag(s: str, name: str) -> bool:
         return True
     if s == "disabled":
         return False
-    raise SystemExit(
-        f"--{name} must be 'enabled' or 'disabled'; got {s!r}"
-    )
+    raise SystemExit(f"--{name} must be 'enabled' or 'disabled'; got {s!r}")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aginfer-daemon")
     p.add_argument(
-        "--sglang-base-url", required=True,
+        "--sglang-base-url",
+        required=True,
         help="sglang server base URL (e.g. http://127.0.0.1:30000)",
     )
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=9100)
     p.add_argument(
-        "--kv-scheduler", default="enabled",
+        "--kv-scheduler",
+        default="enabled",
         help="enabled|disabled — gate T7 paper §4 migrations",
     )
     p.add_argument(
-        "--admission-controller", default="enabled",
+        "--admission-controller",
+        default="enabled",
         help="enabled|disabled — gate T8 program-level pause/resume",
     )
     p.add_argument(
-        "--theta-hi", type=float, default=0.85,
+        "--theta-hi",
+        type=float,
+        default=0.85,
         help="admission pause-trigger watermark (default 0.85)",
     )
     p.add_argument(
-        "--theta-lo", type=float, default=0.70,
+        "--theta-lo",
+        type=float,
+        default=0.70,
         help="admission resume-gate watermark (default 0.70)",
     )
     p.add_argument(
-        "--theta-crit", type=float, default=0.90,
+        "--theta-crit",
+        type=float,
+        default=0.90,
         help="critical-pressure threshold (default 0.90)",
     )
     p.add_argument(
-        "--heartbeat-s", type=float, default=5.0,
+        "--heartbeat-s",
+        type=float,
+        default=5.0,
         help="seconds between still_high heartbeats (default 5.0)",
     )
     p.add_argument(
-        "--observability-summary-every-n", type=int, default=200,
+        "--observability-summary-every-n",
+        type=int,
+        default=200,
         help=(
             "T42: emit one daemon_obs_summary line per N handled events "
             "(default 200).  Set lower (e.g. 20) for short load demos / "
@@ -98,7 +111,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--sustained-escalate-fails", type=int, default=100,
+        "--sustained-escalate-fails",
+        type=int,
+        default=100,
         help=(
             "T36/F3 #164: outbound consecutive POST failures threshold "
             "for sustained-escalation fatal.  Default 100.  Daemon "
@@ -110,7 +125,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--sustained-escalate-age-s", type=float, default=300.0,
+        "--sustained-escalate-age-s",
+        type=float,
+        default=300.0,
         help=(
             "T36/F3 #164: outbound oldest-pending-batch age (seconds) "
             "threshold for sustained-escalation fatal.  Default 300 (5 "
@@ -119,7 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--log-level", default="info",
+        "--log-level",
+        default="info",
         help="uvicorn / daemon log level",
     )
     return p
@@ -172,7 +190,8 @@ def main(argv=None) -> None:
 
     if enable_kv:
         sched = KvScheduler(
-            tracker=tracker, sglang_base_url=args.sglang_base_url,
+            tracker=tracker,
+            sglang_base_url=args.sglang_base_url,
             # T42 — share the router's T42 aggregator so kv_scheduler's
             # per-skip reason counts land in the same observability
             # summary the router emits.
@@ -241,8 +260,10 @@ def main(argv=None) -> None:
         "theta_hi=%s theta_lo=%s sglang_base_url=%s port=%d",
         "enabled" if enable_kv else "disabled",
         "enabled" if enable_admission else "disabled",
-        args.theta_hi, args.theta_lo,
-        args.sglang_base_url, args.port,
+        args.theta_hi,
+        args.theta_lo,
+        args.sglang_base_url,
+        args.port,
     )
 
     # Register a shutdown handler that dumps cumulative counters as a
@@ -252,6 +273,7 @@ def main(argv=None) -> None:
     @app.on_event("shutdown")
     async def _emit_cycle_summary():  # type: ignore[unused-function]
         from ._metrics import m as _m
+
         kv_calls = sched.migrate_calls if sched is not None else 0
         kv_decisions = sched.decisions if sched is not None else 0
         # #194: admission is folded into joint_decide (no AdmissionController);
@@ -279,9 +301,7 @@ def main(argv=None) -> None:
         # `daemon_obs_summary`; operator's grep pipeline gets both.
         router.observability.emit_summary()
 
-    uvicorn.run(
-        app, host=args.host, port=args.port, log_level=args.log_level
-    )
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 
 if __name__ == "__main__":

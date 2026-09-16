@@ -41,6 +41,7 @@ Stages (13):
     D1 handler with no session id → no-op (logs, no enqueue)
     D2 attach_session_end_handler registers on EventKind.SESSION_END
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -48,23 +49,26 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
-
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
 if str(_AGINFER_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGINFER_ROOT))
 
-from daemon.events import Event, EventKind  # noqa: E402
-from daemon.program_tracker import ProgramTracker, State  # noqa: E402
-from daemon.outbound import OutboundBatch, OutboundQueue  # noqa: E402
 from daemon.event_router import (  # noqa: E402
-    make_session_end_handler,
     attach_session_end_handler,
+    make_session_end_handler,
 )
+from daemon.events import Event, EventKind  # noqa: E402
+from daemon.outbound import OutboundBatch, OutboundQueue  # noqa: E402
+from daemon.program_tracker import ProgramTracker, State  # noqa: E402
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -72,20 +76,28 @@ class StageFail(AssertionError):
 
 
 class _DummyHttp:
-    async def post(self, *a, **k): return _Resp()
-    async def request(self, *a, **k): return _Resp()
-    async def aclose(self): return None
+    async def post(self, *a, **k):
+        return _Resp()
+
+    async def request(self, *a, **k):
+        return _Resp()
+
+    async def aclose(self):
+        return None
 
 
 class _Resp:
     status_code = 200
     text = ""
-    def json(self): return {}
+
+    def json(self):
+        return {}
 
 
 def _new_outbound() -> OutboundQueue:
     return OutboundQueue(
-        sglang_base_url="http://unused", http_client=_DummyHttp(),
+        sglang_base_url="http://unused",
+        http_client=_DummyHttp(),
     )
 
 
@@ -151,6 +163,7 @@ def stage_b0_unpaused_proceeds() -> None:
     async def _go():
         t = ProgramTracker()
         return await t.wait_if_paused("fresh")
+
     proceed = asyncio.run(_go())
     if proceed is not True:
         raise StageFail(f"un-paused should proceed (True); got {proceed}")
@@ -160,6 +173,7 @@ def stage_b1_paused_then_end_aborts() -> None:
     """The F5 mechanism: a request is parked in wait_if_paused on a
     PAUSED program; SESSION_END calls end() which releases the gate;
     the parked wait_if_paused wakes and returns False → proxy 499."""
+
     async def _go():
         t = ProgramTracker()
         t.observe_arrival("p")
@@ -173,11 +187,11 @@ def stage_b1_paused_then_end_aborts() -> None:
         t.end("p")
         proceed = await asyncio.wait_for(waiter, timeout=2.0)
         return proceed
+
     proceed = asyncio.run(_go())
     if proceed is not False:
         raise StageFail(
-            f"ended-while-gated waiter should return False (→499); "
-            f"got {proceed}"
+            f"ended-while-gated waiter should return False (→499); " f"got {proceed}"
         )
 
 
@@ -187,6 +201,7 @@ def stage_b2_arrival_after_end_proceeds() -> None:
     (the gate event is set), so it PROCEEDS, and observe_arrival
     resurrects ENDED→REASONING.  Only requests that ACTUALLY BLOCKED
     when end() fired get 499 (B1 / B5)."""
+
     async def _go():
         t = ProgramTracker()
         t.observe_arrival("p")
@@ -196,6 +211,7 @@ def stage_b2_arrival_after_end_proceeds() -> None:
         proceed = await t.wait_if_paused("p")
         t.observe_arrival("p")  # the proxy's next step
         return proceed, t.state("p")
+
     proceed, state = asyncio.run(_go())
     if proceed is not True:
         raise StageFail(
@@ -204,8 +220,7 @@ def stage_b2_arrival_after_end_proceeds() -> None:
         )
     if state is not State.REASONING:
         raise StageFail(
-            f"observe_arrival should resurrect ENDED→REASONING; "
-            f"got {state}"
+            f"observe_arrival should resurrect ENDED→REASONING; " f"got {state}"
         )
 
 
@@ -215,6 +230,7 @@ def stage_b5_two_waiters_both_499() -> None:
     ended session → BOTH must get 499.  The old read-once flag let
     the second proceed (leaking a request for an ended session to
     sglang)."""
+
     async def _go():
         t = ProgramTracker()
         t.observe_arrival("p")
@@ -228,6 +244,7 @@ def stage_b5_two_waiters_both_499() -> None:
         r1 = await asyncio.wait_for(w1, timeout=2.0)
         r2 = await asyncio.wait_for(w2, timeout=2.0)
         return r1, r2
+
     r1, r2 = asyncio.run(_go())
     if r1 is not False or r2 is not False:
         raise StageFail(
@@ -240,12 +257,14 @@ def stage_b3_end_non_paused_no_499() -> None:
     """A REASONING program that ends mid-flight just transitions; it
     must NOT set the 499 verdict (no request is parked in the gate —
     the in-flight request is already past wait_if_paused)."""
+
     async def _go():
         t = ProgramTracker()
         t.observe_arrival("p")  # REASONING, not gated
         t.end("p")
         # A fresh wait (e.g. a re-arrival) should proceed.
         return await t.wait_if_paused("p")
+
     proceed = asyncio.run(_go())
     if proceed is not True:
         raise StageFail(
@@ -260,7 +279,9 @@ def stage_b3_end_non_paused_no_499() -> None:
 def stage_c0_enqueue_program_paused_shape() -> None:
     ob = _new_outbound()
     batch_id = ob.enqueue_program_paused(
-        pid="p", state="ENDED", pre_pause_state=None,
+        pid="p",
+        state="ENDED",
+        pre_pause_state=None,
     )
     if ob.queue.qsize() != 1:
         raise StageFail(f"queue size: {ob.queue.qsize()}")
@@ -283,8 +304,11 @@ def stage_c0_enqueue_program_paused_shape() -> None:
 def stage_c1_invalid_method_rejected() -> None:
     try:
         OutboundBatch(
-            batch_id="x", endpoint="program_paused", body={},
-            enqueue_ts=1.0, method="DELETE",
+            batch_id="x",
+            endpoint="program_paused",
+            body={},
+            enqueue_ts=1.0,
+            method="DELETE",
         )
     except ValueError:
         return
@@ -298,6 +322,7 @@ def stage_c2_put_body_passes_sglang_validator() -> None:
     pseudocode used program_id/transition — confirm the WIRE matches
     what sglang actually parses)."""
     import sys as _sys
+
     _sys.path.insert(0, "/scratch/yuzhou/projects/sglang/python")
     from sglang.srt.entrypoints.http_server import (
         _validate_program_paused_body,
@@ -320,7 +345,9 @@ def stage_c2_put_body_passes_sglang_validator() -> None:
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache._aginfer_program_states = {}
     ok, reason, applied = cache.set_aginfer_program_state(
-        pid=pid, state=state, pre_pause_state=pre,
+        pid=pid,
+        state=state,
+        pre_pause_state=pre,
     )
     if not (ok and applied == 1):
         raise StageFail(
@@ -341,13 +368,12 @@ def stage_d0_handler_ends_and_enqueues() -> None:
         handler = make_session_end_handler(t, ob)
         await handler(Event(EventKind.SESSION_END, session="p"), router=None)
         return t, ob
+
     t, ob = asyncio.run(_go())
     if t.state("p") is not State.ENDED:
         raise StageFail(f"handler should end the program; got {t.state('p')}")
     if ob.queue.qsize() != 1:
-        raise StageFail(
-            f"handler should enqueue one PUT; queue={ob.queue.qsize()}"
-        )
+        raise StageFail(f"handler should enqueue one PUT; queue={ob.queue.qsize()}")
     batch = ob.queue.get_nowait()
     if batch.endpoint != "program_paused" or batch.method != "PUT":
         raise StageFail(f"wrong batch: {batch.endpoint}/{batch.method}")
@@ -362,11 +388,11 @@ def stage_d1_handler_no_session_noop() -> None:
         handler = make_session_end_handler(t, ob)
         await handler(Event(EventKind.SESSION_END, session=None), router=None)
         return ob
+
     ob = asyncio.run(_go())
     if ob.queue.qsize() != 0:
         raise StageFail(
-            f"no-session SESSION_END should not enqueue; "
-            f"queue={ob.queue.qsize()}"
+            f"no-session SESSION_END should not enqueue; " f"queue={ob.queue.qsize()}"
         )
 
 
@@ -383,9 +409,7 @@ def stage_d2_attach_registers_handler() -> None:
     ob = _new_outbound()
     attach_session_end_handler(_FakeRouter(), t, ob)
     if EventKind.SESSION_END not in registered:
-        raise StageFail(
-            f"SESSION_END handler not registered; got {list(registered)}"
-        )
+        raise StageFail(f"SESSION_END handler not registered; got {list(registered)}")
     if not callable(registered[EventKind.SESSION_END]):
         raise StageFail("registered handler not callable")
 
@@ -411,12 +435,15 @@ def stage_d3_composed_router_routes_to_f5() -> None:
         tracker.pause("p")
         ob = _new_outbound()
         router = EventRouter(
-            bus=EventBus(), sglang_base_url="http://unused",
+            bus=EventBus(),
+            sglang_base_url="http://unused",
         )
         # kv_scheduler blanket-attaches EVERY EventKind (incl.
         # SESSION_END) — must run BEFORE F5 so F5 wins.
         sched = KvScheduler(
-            tracker=tracker, sglang_base_url="http://unused", outbound=ob,
+            tracker=tracker,
+            sglang_base_url="http://unused",
+            outbound=ob,
         )
         attach_kv_scheduler(router, sched)
         attach_session_end_handler(router, tracker, ob)
@@ -426,6 +453,7 @@ def stage_d3_composed_router_routes_to_f5() -> None:
             raise StageFail("no SESSION_END handler registered on router")
         await handler(Event(EventKind.SESSION_END, session="p"), router)
         return tracker, ob, sched
+
     tracker, ob, sched = asyncio.run(_go())
     # F5 ran iff the program is ENDED + a PUT was enqueued.
     if tracker.state("p") is not State.ENDED:
@@ -451,24 +479,32 @@ def stage_d3_composed_router_routes_to_f5() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 end(REASONING) → ENDED, prev=REASONING",   stage_a0_end_reasoning),
-    ("A1 end(ACTING) → ENDED, prev=ACTING",         stage_a1_end_acting),
-    ("A2 end(PAUSED) → ENDED, prev=PAUSED",         stage_a2_end_paused),
-    ("A3 end(unknown) → ENDED, prev=None",          stage_a3_end_unknown),
-    ("A4 end() idempotent",                         stage_a4_end_idempotent),
-    ("B0 un-paused program proceeds (True)",        stage_b0_unpaused_proceeds),
+    ("A0 end(REASONING) → ENDED, prev=REASONING", stage_a0_end_reasoning),
+    ("A1 end(ACTING) → ENDED, prev=ACTING", stage_a1_end_acting),
+    ("A2 end(PAUSED) → ENDED, prev=PAUSED", stage_a2_end_paused),
+    ("A3 end(unknown) → ENDED, prev=None", stage_a3_end_unknown),
+    ("A4 end() idempotent", stage_a4_end_idempotent),
+    ("B0 un-paused program proceeds (True)", stage_b0_unpaused_proceeds),
     ("B1 PAUSED + end() → parked waiter aborts (499)", stage_b1_paused_then_end_aborts),
-    ("B2 arrival after end() proceeds (new session)", stage_b2_arrival_after_end_proceeds),
-    ("B3 end() on non-paused → no 499 verdict",     stage_b3_end_non_paused_no_499),
-    ("B5 two parked waiters → BOTH 499",            stage_b5_two_waiters_both_499),
-    ("C0 enqueue_program_paused PUT shape",         stage_c0_enqueue_program_paused_shape),
-    ("C1 OutboundBatch rejects invalid method",     stage_c1_invalid_method_rejected),
-    ("C2 PUT body passes sglang validator + setter", stage_c2_put_body_passes_sglang_validator),
-    ("D0 handler ends program + enqueues PUT",      stage_d0_handler_ends_and_enqueues),
-    ("D1 handler no-session → no-op",               stage_d1_handler_no_session_noop),
+    (
+        "B2 arrival after end() proceeds (new session)",
+        stage_b2_arrival_after_end_proceeds,
+    ),
+    ("B3 end() on non-paused → no 499 verdict", stage_b3_end_non_paused_no_499),
+    ("B5 two parked waiters → BOTH 499", stage_b5_two_waiters_both_499),
+    ("C0 enqueue_program_paused PUT shape", stage_c0_enqueue_program_paused_shape),
+    ("C1 OutboundBatch rejects invalid method", stage_c1_invalid_method_rejected),
+    (
+        "C2 PUT body passes sglang validator + setter",
+        stage_c2_put_body_passes_sglang_validator,
+    ),
+    ("D0 handler ends program + enqueues PUT", stage_d0_handler_ends_and_enqueues),
+    ("D1 handler no-session → no-op", stage_d1_handler_no_session_noop),
     ("D2 attach registers on EventKind.SESSION_END", stage_d2_attach_registers_handler),
-    ("D3 composed router routes SESSION_END to F5 (not kv_scheduler)",
-                                                    stage_d3_composed_router_routes_to_f5),
+    (
+        "D3 composed router routes SESSION_END to F5 (not kv_scheduler)",
+        stage_d3_composed_router_routes_to_f5,
+    ),
 ]
 
 
@@ -483,8 +519,10 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: "
-                  f"unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: "
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\nT41 FAILED ({len(failures)}): {failures}"))
         return 1

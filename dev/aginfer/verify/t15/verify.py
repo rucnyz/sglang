@@ -39,12 +39,12 @@ Stage list (10):
 Usage:
     python dev/aginfer/verify/t15/verify.py
 """
+
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
-
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
@@ -56,8 +56,12 @@ from detector import (  # noqa: E402
 )
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -76,14 +80,13 @@ def _rank(units: List[Dict[str, Any]], *, time_counter: int = 0) -> Dict[str, An
     return {"units": list(units), "time_counter": time_counter}
 
 
-def _multi(ranks: List[List[Dict[str, Any]]], *, time_counter: int = 0) -> Dict[str, Any]:
+def _multi(
+    ranks: List[List[Dict[str, Any]]], *, time_counter: int = 0
+) -> Dict[str, Any]:
     """Build a per-rank state-dump JSON: ranks is a list of unit
     lists; each rank gets the same time_counter."""
     return {
-        "per_rank": [
-            _rank(units, time_counter=time_counter)
-            for units in ranks
-        ],
+        "per_rank": [_rank(units, time_counter=time_counter) for units in ranks],
     }
 
 
@@ -106,8 +109,8 @@ def stage_a1_single_rank_multi_snapshot() -> None:
     comparison possible → no divergence ever."""
     seq = [
         _single([_unit("u0"), _unit("u1"), _unit("u2")]),
-        _single([_unit("u0"), _unit("u2")]),                        # u1 evicted
-        _single([_unit("u0")]),                                     # u2 also evicted
+        _single([_unit("u0"), _unit("u2")]),  # u1 evicted
+        _single([_unit("u0")]),  # u2 also evicted
     ]
     reports = detect_divergence(seq)
     if reports:
@@ -129,16 +132,12 @@ def stage_b0_multi_rank_no_eviction() -> None:
 def stage_b1_multi_rank_identical_eviction() -> None:
     """2 ranks, both evict u1 in the same window → no divergence."""
     seq = [
-        _multi([[_unit("u0"), _unit("u1")],
-                [_unit("u0"), _unit("u1")]]),
-        _multi([[_unit("u0")],
-                [_unit("u0")]]),  # both evict u1
+        _multi([[_unit("u0"), _unit("u1")], [_unit("u0"), _unit("u1")]]),
+        _multi([[_unit("u0")], [_unit("u0")]]),  # both evict u1
     ]
     reports = detect_divergence(seq)
     if reports:
-        raise StageFail(
-            f"identical eviction across ranks → no report: {reports}"
-        )
+        raise StageFail(f"identical eviction across ranks → no report: {reports}")
 
 
 # ============================================================ C. divergence
@@ -147,12 +146,20 @@ def stage_b1_multi_rank_identical_eviction() -> None:
 def stage_c0_divergence_distinct_evictions() -> None:
     """rank-0 evicts {u1}, rank-1 evicts {u2} → 1 report."""
     seq = [
-        _multi([[_unit("u0"), _unit("u1"), _unit("u2")],
-                [_unit("u0"), _unit("u1"), _unit("u2")]],
-               time_counter=10),
-        _multi([[_unit("u0"), _unit("u2")],            # rank-0 lost u1
-                [_unit("u0"), _unit("u1")]],            # rank-1 lost u2
-               time_counter=20),
+        _multi(
+            [
+                [_unit("u0"), _unit("u1"), _unit("u2")],
+                [_unit("u0"), _unit("u1"), _unit("u2")],
+            ],
+            time_counter=10,
+        ),
+        _multi(
+            [
+                [_unit("u0"), _unit("u2")],  # rank-0 lost u1
+                [_unit("u0"), _unit("u1")],
+            ],  # rank-1 lost u2
+            time_counter=20,
+        ),
     ]
     reports = detect_divergence(seq)
     if len(reports) != 1:
@@ -168,10 +175,15 @@ def stage_c1_partial_divergence_overlap() -> None:
     """rank-0 evicts {u1}, rank-1 evicts {u1, u2} → divergence
     (rank-1 evicted an extra u2 that rank-0 still holds)."""
     seq = [
-        _multi([[_unit("u0"), _unit("u1"), _unit("u2")],
-                [_unit("u0"), _unit("u1"), _unit("u2")]]),
-        _multi([[_unit("u0"), _unit("u2")],            # rank-0 lost u1
-                [_unit("u0")]]),                       # rank-1 lost u1 + u2
+        _multi(
+            [
+                [_unit("u0"), _unit("u1"), _unit("u2")],
+                [_unit("u0"), _unit("u1"), _unit("u2")],
+            ]
+        ),
+        _multi(
+            [[_unit("u0"), _unit("u2")], [_unit("u0")]]  # rank-0 lost u1
+        ),  # rank-1 lost u1 + u2
     ]
     reports = detect_divergence(seq)
     if len(reports) != 1:
@@ -186,11 +198,13 @@ def stage_c2_three_ranks_2v1() -> None:
     """3 ranks: rank-0 + rank-1 agree, rank-2 diverges → 1 report."""
     seq = [
         _multi([[_unit("u0"), _unit("u1")]] * 3),
-        _multi([
-            [_unit("u0")],         # rank-0 evicted u1
-            [_unit("u0")],         # rank-1 evicted u1
-            [_unit("u0"), _unit("u1")],  # rank-2 kept u1
-        ]),
+        _multi(
+            [
+                [_unit("u0")],  # rank-0 evicted u1
+                [_unit("u0")],  # rank-1 evicted u1
+                [_unit("u0"), _unit("u1")],  # rank-2 kept u1
+            ]
+        ),
     ]
     reports = detect_divergence(seq)
     if len(reports) != 1:
@@ -214,12 +228,22 @@ def stage_c3_sustained_divergence_4_windows() -> None:
         next_rank_0 = [_unit(f"u{j}") for j in range(10) if j != i * 2]
         next_rank_1 = [_unit(f"u{j}") for j in range(10) if j != i * 2 + 1]
         # Carry the previous "kept" sets forward across windows.
-        snapshots.append(_multi([
-            [u for u in snapshots[-1]["per_rank"][0]["units"]
-             if u["hash"] in {x["hash"] for x in next_rank_0}],
-            [u for u in snapshots[-1]["per_rank"][1]["units"]
-             if u["hash"] in {x["hash"] for x in next_rank_1}],
-        ]))
+        snapshots.append(
+            _multi(
+                [
+                    [
+                        u
+                        for u in snapshots[-1]["per_rank"][0]["units"]
+                        if u["hash"] in {x["hash"] for x in next_rank_0}
+                    ],
+                    [
+                        u
+                        for u in snapshots[-1]["per_rank"][1]["units"]
+                        if u["hash"] in {x["hash"] for x in next_rank_1}
+                    ],
+                ]
+            )
+        )
     reports = detect_divergence(snapshots)
     if len(reports) != 4:
         raise StageFail(
@@ -235,27 +259,26 @@ def stage_d0_rank_set_changes_raises() -> None:
     is a deployment-bug class signal — raise rather than silently
     proceed.  Cross-rank comparison is undefined."""
     seq = [
-        _multi([[_unit("u0")], [_unit("u0")]]),   # 2 ranks
-        _multi([[_unit("u0")]]),                  # 1 rank
+        _multi([[_unit("u0")], [_unit("u0")]]),  # 2 ranks
+        _multi([[_unit("u0")]]),  # 1 rank
     ]
     try:
         detect_divergence(seq)
     except ValueError:
         return
-    raise StageFail(
-        "rank-count change must raise ValueError; got no exception"
-    )
+    raise StageFail("rank-count change must raise ValueError; got no exception")
 
 
 def stage_d1_time_counter_propagated() -> None:
     """Reports carry both endpoints' time_counter for log correlation."""
     seq = [
-        _multi([[_unit("u0"), _unit("u1")],
-                [_unit("u0"), _unit("u1")]],
-               time_counter=100),
-        _multi([[_unit("u0")],                # rank-0 evicted u1
-                [_unit("u1")]],                # rank-1 evicted u0
-               time_counter=200),
+        _multi(
+            [[_unit("u0"), _unit("u1")], [_unit("u0"), _unit("u1")]], time_counter=100
+        ),
+        _multi(
+            [[_unit("u0")], [_unit("u1")]],  # rank-0 evicted u1  # rank-1 evicted u0
+            time_counter=200,
+        ),
     ]
     reports = detect_divergence(seq)
     if len(reports) != 1:
@@ -273,8 +296,7 @@ def stage_d2_summarise_smoke() -> None:
     hashes listed.  Smoke test only — exact format is operator-
     facing, not contract."""
     seq = [
-        _multi([[_unit("u0"), _unit("u1")],
-                [_unit("u0"), _unit("u1")]]),
+        _multi([[_unit("u0"), _unit("u1")], [_unit("u0"), _unit("u1")]]),
         _multi([[_unit("u0")], [_unit("u1")]]),
     ]
     reports = detect_divergence(seq)
@@ -292,17 +314,35 @@ def stage_d2_summarise_smoke() -> None:
 
 
 _STAGES = [
-    ("A0 single-rank, single snapshot → no report",   stage_a0_single_rank_single_snapshot),
-    ("A1 single-rank, multi-snapshot → no report",    stage_a1_single_rank_multi_snapshot),
-    ("B0 multi-rank, no eviction → no report",        stage_b0_multi_rank_no_eviction),
-    ("B1 multi-rank, identical eviction → no report", stage_b1_multi_rank_identical_eviction),
-    ("C0 rank-0 evicts u1, rank-1 evicts u2 → divergence", stage_c0_divergence_distinct_evictions),
-    ("C1 partial divergence (rank-1 evicts extra)",   stage_c1_partial_divergence_overlap),
-    ("C2 3 ranks, 2 agree + 1 diverges",              stage_c2_three_ranks_2v1),
-    ("C3 sustained divergence across 4 windows",      stage_c3_sustained_divergence_4_windows),
-    ("D0 rank-set changes between windows → ValueError", stage_d0_rank_set_changes_raises),
-    ("D1 time_counter propagated to reports",         stage_d1_time_counter_propagated),
-    ("D2 summarise() smoke",                          stage_d2_summarise_smoke),
+    (
+        "A0 single-rank, single snapshot → no report",
+        stage_a0_single_rank_single_snapshot,
+    ),
+    ("A1 single-rank, multi-snapshot → no report", stage_a1_single_rank_multi_snapshot),
+    ("B0 multi-rank, no eviction → no report", stage_b0_multi_rank_no_eviction),
+    (
+        "B1 multi-rank, identical eviction → no report",
+        stage_b1_multi_rank_identical_eviction,
+    ),
+    (
+        "C0 rank-0 evicts u1, rank-1 evicts u2 → divergence",
+        stage_c0_divergence_distinct_evictions,
+    ),
+    (
+        "C1 partial divergence (rank-1 evicts extra)",
+        stage_c1_partial_divergence_overlap,
+    ),
+    ("C2 3 ranks, 2 agree + 1 diverges", stage_c2_three_ranks_2v1),
+    (
+        "C3 sustained divergence across 4 windows",
+        stage_c3_sustained_divergence_4_windows,
+    ),
+    (
+        "D0 rank-set changes between windows → ValueError",
+        stage_d0_rank_set_changes_raises,
+    ),
+    ("D1 time_counter propagated to reports", stage_d1_time_counter_propagated),
+    ("D2 summarise() smoke", stage_d2_summarise_smoke),
 ]
 
 

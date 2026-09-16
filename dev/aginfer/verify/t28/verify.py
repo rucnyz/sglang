@@ -48,13 +48,13 @@ Stages:
        write_backup fires IFF hit_count >= threshold (byte-identical
        to pre-#178 behaviour)
 """
+
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, List, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -64,18 +64,23 @@ _SGLANG_PY = "/scratch/yuzhou/projects/sglang/python"
 if _SGLANG_PY not in sys.path:
     sys.path.insert(0, _SGLANG_PY)
 
-from sglang.srt.mem_cache.unified_radix_cache import (  # noqa: E402
-    _default_eviction_score,
-    _load_eviction_scorer,
-    _default_should_write_through,
-    _load_write_through_policy,
-    UnifiedRadixCache,
-)
 from baselines.sglang_adapter import default_policy_score  # noqa: E402
 
+from sglang.srt.mem_cache.unified_radix_cache import (  # noqa: E402
+    UnifiedRadixCache,
+    _default_eviction_score,
+    _default_should_write_through,
+    _load_eviction_scorer,
+    _load_write_through_policy,
+)
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -88,8 +93,14 @@ class StageFail(AssertionError):
 class _Node:
     """Duck-typed UnifiedTreeNode for the score functions (they read
     only last_access_time + hit_count)."""
-    def __init__(self, last_access_time: int, hit_count: int = 0,
-                 backuped: bool = False, evicted: bool = False):
+
+    def __init__(
+        self,
+        last_access_time: int,
+        hit_count: int = 0,
+        backuped: bool = False,
+        evicted: bool = False,
+    ):
         self.last_access_time = last_access_time
         self.hit_count = hit_count
         self.backuped = backuped
@@ -125,7 +136,7 @@ def stage_a1_distinct_age_unchanged() -> None:
     """No-tie path (ablation): two nodes with DISTINCT last_access_time
     are ordered by age regardless of hit_count — the bonus < 1.0 never
     flips a distinct-age pair, so baseline ordering is unchanged."""
-    older = _Node(last_access_time=1000, hit_count=10**6)   # huge hits
+    older = _Node(last_access_time=1000, hit_count=10**6)  # huge hits
     newer = _Node(last_access_time=1001, hit_count=0)
     s_old = _default_eviction_score(older, _LAYER)
     s_new = _default_eviction_score(newer, _LAYER)
@@ -205,8 +216,13 @@ def stage_a4_plugin_override_resolves() -> None:
 
 
 def stage_b0_default_preserves_threshold() -> None:
-    for hc, thr, expect in [(0, 2, False), (1, 2, False), (2, 2, True),
-                            (5, 2, True), (1, 1, True)]:
+    for hc, thr, expect in [
+        (0, 2, False),
+        (1, 2, False),
+        (2, 2, True),
+        (5, 2, True),
+        (1, 1, True),
+    ]:
         n = _Node(last_access_time=0, hit_count=hc)
         got = _default_should_write_through(n, thr)
         if got is not expect:
@@ -226,8 +242,7 @@ def stage_b1_load_default() -> None:
             os.environ["SGLANG_WRITE_THROUGH_MODULE"] = old
     if fn is not _default_should_write_through:
         raise StageFail(
-            f"no-env _load_write_through_policy should be the default; "
-            f"got {fn!r}"
+            f"no-env _load_write_through_policy should be the default; " f"got {fn!r}"
         )
 
 
@@ -238,6 +253,7 @@ def stage_b2_load_override_and_failure() -> None:
     # fixture used a (node, layer) -> float scorer, which resolves but
     # returns a float that silently mis-decides at the callsite).
     from baselines.sglang_adapter import default_policy_should_write_through
+
     spec = "baselines.sglang_adapter:default_policy_should_write_through"
     old = os.environ.get("SGLANG_WRITE_THROUGH_MODULE")
     os.environ["SGLANG_WRITE_THROUGH_MODULE"] = spec
@@ -246,7 +262,9 @@ def stage_b2_load_override_and_failure() -> None:
         if fn is _default_should_write_through:
             raise StageFail("valid override should NOT fall back to default")
         if fn is not default_policy_should_write_through:
-            raise StageFail(f"override should resolve to the spec'd callable; got {fn!r}")
+            raise StageFail(
+                f"override should resolve to the spec'd callable; got {fn!r}"
+            )
         # it must actually behave as a (node, threshold) -> bool policy
         verdict = fn(_Node(last_access_time=0, hit_count=3), 2)
         if verdict is not True:
@@ -343,12 +361,27 @@ _STAGES: List[Tuple[str, Callable[[], None]]] = [
     ("A1 distinct-age ordering unchanged (ablation)", stage_a1_distinct_age_unchanged),
     ("A2 no hit_count tie-break in eviction default", stage_a2_no_hit_count_tiebreak),
     ("A3 cross-tree drift guard (sglang == adapter)", stage_a3_cross_tree_drift_guard),
-    ("A4 SGLANG_KV_POLICY_MODULE override still resolves", stage_a4_plugin_override_resolves),
-    ("B0 _default_should_write_through == (hit >= threshold)", stage_b0_default_preserves_threshold),
+    (
+        "A4 SGLANG_KV_POLICY_MODULE override still resolves",
+        stage_a4_plugin_override_resolves,
+    ),
+    (
+        "B0 _default_should_write_through == (hit >= threshold)",
+        stage_b0_default_preserves_threshold,
+    ),
     ("B1 _load_write_through_policy no-env → default", stage_b1_load_default),
-    ("B2 override resolves; malformed/failed → default", stage_b2_load_override_and_failure),
-    ("B3 _inc_hit_count consults the write-through policy (#178)", stage_b3_callsite_uses_policy),
-    ("B4 default callsite regression (hit >= threshold)", stage_b4_default_callsite_regression),
+    (
+        "B2 override resolves; malformed/failed → default",
+        stage_b2_load_override_and_failure,
+    ),
+    (
+        "B3 _inc_hit_count consults the write-through policy (#178)",
+        stage_b3_callsite_uses_policy,
+    ),
+    (
+        "B4 default callsite regression (hit >= threshold)",
+        stage_b4_default_callsite_regression,
+    ),
 ]
 
 
@@ -363,8 +396,10 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: "
-                  f"unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: "
+                f"unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\nT28 FAILED ({len(failures)}): {failures}"))
         return 1

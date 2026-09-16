@@ -15,6 +15,7 @@ end of the forced sequence.
 
 Run: python dev/aginfer/verify/forced_tokens/verify.py
 """
+
 import os
 import sys
 
@@ -25,12 +26,20 @@ from sglang.srt.managers.forced_tokens import forced_override_positions
 
 class _SP:
     def __init__(self, forced):
-        self.custom_params = {"forced_output_ids": forced} if forced is not None else None
+        self.custom_params = (
+            {"forced_output_ids": forced} if forced is not None else None
+        )
 
 
 class FakeReq:
-    def __init__(self, forced=None, inflight_middle_chunks=0, finished=False,
-                 retracted=False, dispatched=0):
+    def __init__(
+        self,
+        forced=None,
+        inflight_middle_chunks=0,
+        finished=False,
+        retracted=False,
+        dispatched=0,
+    ):
         self.sampling_params = _SP(forced)
         # Kept only to prove the override no longer consults this lagging counter.
         self.inflight_middle_chunks = inflight_middle_chunks
@@ -69,7 +78,11 @@ def test_mixed_batch_indices():
     c = FakeReq(forced=[300, 301], dispatched=1)
     out = forced_override_positions([a, b, c], b)
     assert out == [(0, 100), (2, 301)], out
-    assert a.forced_dispatched == 1 and b.forced_dispatched == 0 and c.forced_dispatched == 2
+    assert (
+        a.forced_dispatched == 1
+        and b.forced_dispatched == 0
+        and c.forced_dispatched == 2
+    )
     print("  PASS  mixed batch: correct (index, token), only eligible advance")
 
 
@@ -125,7 +138,10 @@ def test_no_custom_params():
             self.inflight_middle_chunks = 0
             self.is_retracted = False
             self.forced_dispatched = 0
-        def finished(self): return False
+
+        def finished(self):
+            return False
+
     assert forced_override_positions([BareReq()]) == []
     print("  PASS  no custom_params is a no-op")
 
@@ -150,6 +166,7 @@ def main():
         except Exception as e:
             print(f"  FAIL  {t.__name__}: {e}")
             import traceback
+
             traceback.print_exc()
     ok = passed == len(tests)
     print(f"\nforced_tokens: {passed}/{len(tests)} {'PASS' if ok else 'FAIL'}")

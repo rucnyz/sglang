@@ -29,6 +29,7 @@ The heap holds opaque payloads; the daemon (kv_scheduler) defines what a payload
 means and how to fire it.  This keeps the timeline a pure ordering primitive with
 no daemon-domain knowledge.
 """
+
 from __future__ import annotations
 
 import heapq
@@ -46,6 +47,7 @@ class _HeapItem:
     ``seq`` is a monotonic insertion counter that breaks ties deterministically
     and keeps the opaque ``payload`` out of the comparison (payloads are not
     required to be orderable)."""
+
     due_time: float
     seq: int
     payload: Any = field(compare=False)
@@ -65,8 +67,8 @@ class ActionTimeline:
         self._seq: int = 0
         # Observability counters (read by main.py / _observability).
         self.scheduled: int = 0
-        self.fired: int = 0          # popped + handed to the fire callback
-        self.dropped: int = 0        # explicitly cancelled before firing
+        self.fired: int = 0  # popped + handed to the fire callback
+        self.dropped: int = 0  # explicitly cancelled before firing
 
     def schedule(self, due_time: float, payload: Any) -> None:
         """Place ``payload`` on the heap to be drained once the event-stream
@@ -113,6 +115,7 @@ class PromoteAction:
     is a hint, not a trusted fact.  ``eta_s`` / ``load_back_s`` / ``scheduled_at``
     are carried for observability and for the §7 ``T_start + ETA − load_back``
     audit trail."""
+
     session: str
     unit_hashes: tuple
     from_tiers: tuple = ()

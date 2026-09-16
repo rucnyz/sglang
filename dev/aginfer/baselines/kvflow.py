@@ -13,11 +13,12 @@ Specialization:
 Reads `state.units[uid].p_hat` as the (precomputed) inverse-steps-to-execution
 score. The workload driver fills this in (steps_until_next_use(unit) -> p_hat).
 """
+
 from __future__ import annotations
+
 from typing import List
 
 from .base import Action, ReuseUnit, SchedulerState, Tier
-
 
 _PROMOTE_ORDER = {Tier.DROP: 0, Tier.DISK: 1, Tier.DRAM: 2, Tier.HBM: 3}
 

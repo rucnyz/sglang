@@ -20,6 +20,7 @@ to compare against until HiCache/Mooncake instrumentation reports.
 Usage:
     python dev/aginfer/verify/t13/verify.py
 """
+
 from __future__ import annotations
 
 import os
@@ -28,7 +29,6 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -41,8 +41,12 @@ from daemon.events import Event, EventKind  # noqa: E402
 from daemon.program_tracker import ProgramTracker  # noqa: E402
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -72,14 +76,20 @@ def _state_json_with_links(
     subpool: str = "kv",
 ) -> Dict[str, Any]:
     """Minimal state JSON exercising only the link_stats branch."""
+
     def _pool() -> Dict[str, Any]:
-        return {"subpools": {
-            subpool: {
-                "used_bytes": 0, "cap_bytes": 10 * 1024**3,
-                "available_bytes": 10 * 1024**3, "evictable_bytes": 0,
-                "page_bytes": 64 * 1024,
+        return {
+            "subpools": {
+                subpool: {
+                    "used_bytes": 0,
+                    "cap_bytes": 10 * 1024**3,
+                    "available_bytes": 10 * 1024**3,
+                    "evictable_bytes": 0,
+                    "page_bytes": 64 * 1024,
+                }
             }
-        }}
+        }
+
     return {
         "time_counter": 0,
         "throughput_ema": {"prefill_bps": 0.0, "decode_per_program": {}},
@@ -88,8 +98,7 @@ def _state_json_with_links(
         "units": [],
         "link_stats": link_stats,
         "tier_holding_cost": {
-            t: {subpool: {"h_max_per_byte_sec": 0.0}}
-            for t in ("HBM", "DRAM", "DISK")
+            t: {subpool: {"h_max_per_byte_sec": 0.0}} for t in ("HBM", "DRAM", "DISK")
         },
     }
 
@@ -119,19 +128,17 @@ def stage_a0_sglang_emits_four_directions() -> None:
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedRadixCache,
     )
+
     # _aginfer_link_stats is a pure dict constructor; class-level call.
     stats = UnifiedRadixCache._aginfer_link_stats(None)  # type: ignore[arg-type]
     missing = set(_REQUIRED_LINKS) - set(stats.keys())
     if missing:
-        raise StageFail(
-            f"sglang link_stats missing directions: {missing}"
-        )
+        raise StageFail(f"sglang link_stats missing directions: {missing}")
     for link in _REQUIRED_LINKS:
         keys = set(stats[link].keys())
         if not _REQUIRED_KEYS_PER_LINK.issubset(keys):
             raise StageFail(
-                f"link {link} missing keys: "
-                f"{_REQUIRED_KEYS_PER_LINK - keys}"
+                f"link {link} missing keys: " f"{_REQUIRED_KEYS_PER_LINK - keys}"
             )
 
 
@@ -143,6 +150,7 @@ def stage_a1_cold_start_recent_throughput_is_zero() -> None:
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedRadixCache,
     )
+
     stats = UnifiedRadixCache._aginfer_link_stats(None)  # type: ignore[arg-type]
     for link, entry in stats.items():
         if entry["recent_throughput_bps"] != 0:
@@ -161,6 +169,7 @@ def stage_a2_cold_start_idle_path_taken() -> None:
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedRadixCache,
     )
+
     stats = UnifiedRadixCache._aginfer_link_stats(None)  # type: ignore[arg-type]
     for link, entry in stats.items():
         t_idle = float(entry["time_since_last_sample_s"])
@@ -181,13 +190,12 @@ def stage_a3_peak_bw_positive() -> None:
     from sglang.srt.mem_cache.unified_radix_cache import (
         UnifiedRadixCache,
     )
+
     stats = UnifiedRadixCache._aginfer_link_stats(None)  # type: ignore[arg-type]
     for link, entry in stats.items():
         peak = entry["peak_bw_bps"]
         if peak <= 0:
-            raise StageFail(
-                f"link {link}: peak_bw_bps must be > 0; got {peak}"
-            )
+            raise StageFail(f"link {link}: peak_bw_bps must be > 0; got {peak}")
 
 
 # ============================================================ B. daemon bw_free
@@ -202,7 +210,8 @@ def stage_b0_idle_link_bw_equals_peak() -> None:
             "peak_bw_bps": 64 * 1024**3,
             "recent_throughput_bps": 10 * 1024**3,  # stale; should ignore
             "time_since_last_sample_s": 5.0,  # idle (> 1.0)
-        } for link in _REQUIRED_LINKS
+        }
+        for link in _REQUIRED_LINKS
     }
     s = _build(_state_json_with_links(link_stats))
     for (src, dst), bw in s.tier_usage.bw_free.items():
@@ -224,7 +233,8 @@ def stage_b1_busy_link_bw_equals_peak_minus_recent() -> None:
             "peak_bw_bps": peak,
             "recent_throughput_bps": recent,
             "time_since_last_sample_s": 0.5,  # busy (< 1.0)
-        } for link in _REQUIRED_LINKS
+        }
+        for link in _REQUIRED_LINKS
     }
     s = _build(_state_json_with_links(link_stats))
     expected = float(peak - recent)
@@ -248,7 +258,8 @@ def stage_b2_saturated_link_bw_clamps_to_zero() -> None:
             "peak_bw_bps": peak,
             "recent_throughput_bps": recent,
             "time_since_last_sample_s": 0.1,  # busy
-        } for link in _REQUIRED_LINKS
+        }
+        for link in _REQUIRED_LINKS
     }
     s = _build(_state_json_with_links(link_stats))
     for (src, dst), bw in s.tier_usage.bw_free.items():
@@ -310,9 +321,14 @@ kvs.build_paper_state(
 """
         result = subprocess.run(
             [sys.executable, "-c", script],
-            env={**os.environ, "PYTHONPATH": str(_AGINFER_ROOT),
-                 "AGINFER_DATA_DIR": td},
-            capture_output=True, text=True, timeout=10,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(_AGINFER_ROOT),
+                "AGINFER_DATA_DIR": td,
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode != 1:
             raise StageFail(
@@ -338,7 +354,8 @@ def stage_b4_idle_threshold_boundary() -> None:
             "peak_bw_bps": peak,
             "recent_throughput_bps": recent,
             "time_since_last_sample_s": 1.0,  # not > 1.0
-        } for link in _REQUIRED_LINKS
+        }
+        for link in _REQUIRED_LINKS
     }
     s = _build(_state_json_with_links(link_stats))
     for (src, dst), bw in s.tier_usage.bw_free.items():
@@ -354,7 +371,8 @@ def stage_b4_idle_threshold_boundary() -> None:
             "peak_bw_bps": peak,
             "recent_throughput_bps": recent,
             "time_since_last_sample_s": 1.0001,  # > 1.0
-        } for link in _REQUIRED_LINKS
+        }
+        for link in _REQUIRED_LINKS
     }
     s2 = _build(_state_json_with_links(link_stats2))
     for (src, dst), bw in s2.tier_usage.bw_free.items():
@@ -369,24 +387,39 @@ def stage_b4_idle_threshold_boundary() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 sglang emits 4 directions + 3 keys each",
-                              stage_a0_sglang_emits_four_directions),
-    ("A1 cold-start recent_throughput_bps == 0 (pre-T26)",
-                              stage_a1_cold_start_recent_throughput_is_zero),
-    ("A2 cold-start time_since > LINK_IDLE_SECONDS (idle path)",
-                              stage_a2_cold_start_idle_path_taken),
-    ("A3 peak_bw_bps > 0 for every direction",
-                              stage_a3_peak_bw_positive),
-    ("B0 idle link → bw_free = peak (ignores stale recent)",
-                              stage_b0_idle_link_bw_equals_peak),
-    ("B1 busy link → bw_free = peak − recent",
-                              stage_b1_busy_link_bw_equals_peak_minus_recent),
-    ("B2 saturated link → bw_free clamps to 0 (no negative)",
-                              stage_b2_saturated_link_bw_clamps_to_zero),
-    ("B3 peak_bw_bps <= 0 → fatal(peak_bw_bps_non_positive)",
-                              stage_b3_peak_zero_fatals),
-    ("B4 idle threshold boundary: t_idle = 1.0 vs 1.0001",
-                              stage_b4_idle_threshold_boundary),
+    (
+        "A0 sglang emits 4 directions + 3 keys each",
+        stage_a0_sglang_emits_four_directions,
+    ),
+    (
+        "A1 cold-start recent_throughput_bps == 0 (pre-T26)",
+        stage_a1_cold_start_recent_throughput_is_zero,
+    ),
+    (
+        "A2 cold-start time_since > LINK_IDLE_SECONDS (idle path)",
+        stage_a2_cold_start_idle_path_taken,
+    ),
+    ("A3 peak_bw_bps > 0 for every direction", stage_a3_peak_bw_positive),
+    (
+        "B0 idle link → bw_free = peak (ignores stale recent)",
+        stage_b0_idle_link_bw_equals_peak,
+    ),
+    (
+        "B1 busy link → bw_free = peak − recent",
+        stage_b1_busy_link_bw_equals_peak_minus_recent,
+    ),
+    (
+        "B2 saturated link → bw_free clamps to 0 (no negative)",
+        stage_b2_saturated_link_bw_clamps_to_zero,
+    ),
+    (
+        "B3 peak_bw_bps <= 0 → fatal(peak_bw_bps_non_positive)",
+        stage_b3_peak_zero_fatals,
+    ),
+    (
+        "B4 idle threshold boundary: t_idle = 1.0 vs 1.0001",
+        stage_b4_idle_threshold_boundary,
+    ),
 ]
 
 

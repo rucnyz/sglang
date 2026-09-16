@@ -29,13 +29,11 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import run_agentreplay_steady_arm as steady  # noqa: E402
-
 
 SCHEMA_VERSION = 1
 
@@ -46,9 +44,7 @@ def playlist_order(
     return sorted(
         programs,
         key=lambda program_id: (
-            float(
-                programs[program_id][0].get("scheduled_session_arrival_s") or 0.0
-            ),
+            float(programs[program_id][0].get("scheduled_session_arrival_s") or 0.0),
             str(programs[program_id][0].get("steady_root_id") or ""),
             program_id,
         ),
@@ -147,11 +143,7 @@ def request_metrics(
 ) -> dict[str, Any]:
     ok = [row for row in rows if row.get("ok")]
     total_output = sum(int(row.get("n_out") or 0) for row in ok)
-    live_revisit = [
-        row
-        for row in ok
-        if row.get("traffic_class") == "live_revisit"
-    ]
+    live_revisit = [row for row in ok if row.get("traffic_class") == "live_revisit"]
     prompt = sum(int(row.get("prompt") or 0) for row in live_revisit)
     cached = sum(int(row.get("cached") or 0) for row in live_revisit)
     return {
@@ -261,9 +253,7 @@ async def execute(
         for program_id in order
     ]
     playlist_sha256 = hashlib.sha256(
-        json.dumps(
-            playlist_descriptor, sort_keys=True, separators=(",", ":")
-        ).encode()
+        json.dumps(playlist_descriptor, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
     request_path = out_dir / "requests.jsonl"
@@ -420,9 +410,7 @@ async def execute(
                     },
                 )
                 if row.get("ok"):
-                    end_acked.add(
-                        driver._runtime_program_id(program_id, args.salt)
-                    )
+                    end_acked.add(driver._runtime_program_id(program_id, args.salt))
 
         def release_waiting_live() -> None:
             for program_id, step_index in list(waiting_live.items()):
@@ -621,9 +609,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.monotonic()
     try:
         steady.flush_cache(base_url, args.flush_timeout_s)
-        summary["initial_state"] = steady.wait_empty(
-            state_url, args.flush_timeout_s
-        )
+        summary["initial_state"] = steady.wait_empty(state_url, args.flush_timeout_s)
         result = asyncio.run(execute(args, records, driver, out_dir))
         summary.update({key: value for key, value in result.items() if key != "issues"})
         summary["configuration"]["playlist_sha256"] = result["playlist_sha256"]

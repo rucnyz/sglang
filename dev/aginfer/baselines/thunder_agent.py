@@ -15,7 +15,9 @@ Decision rule:
     * repeat until HBM occupancy < low_watermark.
     * on every other event, no-op.
 """
+
 from __future__ import annotations
+
 from collections import defaultdict
 from typing import Dict, List
 

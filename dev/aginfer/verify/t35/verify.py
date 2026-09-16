@@ -28,12 +28,12 @@ Stages (8):
   A7 empty residence → ValueError (deployment-bug class — unit shouldn't
      appear in units[] per DESIGN §5)
 """
+
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 from typing import Callable, List, Tuple
-
 
 _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
@@ -43,8 +43,12 @@ if str(_AGINFER_ROOT) not in sys.path:
 from baselines.base import ReuseUnit, Scope, Tier, UnitType  # noqa: E402
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -54,11 +58,16 @@ class StageFail(AssertionError):
 def _u(residence: List[Tier]) -> ReuseUnit:
     """Minimal ReuseUnit with the requested residence."""
     return ReuseUnit(
-        id="u", type=UnitType.SESSION, scope=Scope.SESSION,
+        id="u",
+        type=UnitType.SESSION,
+        scope=Scope.SESSION,
         n_tokens=100,
         n_bytes_by_tier={t: {"kv": 100 * 2048} for t in residence},
         residence=list(residence),
-        age_seconds=1.0, p_hat=0.5, lambda_rate=0.1, holders=["p"],
+        age_seconds=1.0,
+        p_hat=0.5,
+        lambda_rate=0.1,
+        holders=["p"],
     )
 
 
@@ -118,9 +127,16 @@ def stage_a7_empty_raises() -> None:
     # Build directly (bypassing _u so the residence is genuinely
     # empty AND n_bytes_by_tier is empty).
     u = ReuseUnit(
-        id="bad", type=UnitType.SESSION, scope=Scope.SESSION,
-        n_tokens=100, n_bytes_by_tier={}, residence=[],
-        age_seconds=1.0, p_hat=0.5, lambda_rate=0.1, holders=["p"],
+        id="bad",
+        type=UnitType.SESSION,
+        scope=Scope.SESSION,
+        n_tokens=100,
+        n_bytes_by_tier={},
+        residence=[],
+        age_seconds=1.0,
+        p_hat=0.5,
+        lambda_rate=0.1,
+        holders=["p"],
     )
     try:
         _ = u.authoritative_tier
@@ -130,13 +146,13 @@ def stage_a7_empty_raises() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 HBM-only → HBM",              stage_a0_hbm_dominates),
-    ("A1 DRAM-only → DRAM",            stage_a1_dram_only),
-    ("A2 DISK-only → DISK",            stage_a2_disk_only),
-    ("A3 HBM+DRAM → HBM",              stage_a3_hbm_dram),
-    ("A4 HBM+DISK → HBM",              stage_a4_hbm_disk),
-    ("A5 DRAM+DISK → DRAM",            stage_a5_dram_disk),
-    ("A6 HBM+DRAM+DISK → HBM",         stage_a6_all_three),
+    ("A0 HBM-only → HBM", stage_a0_hbm_dominates),
+    ("A1 DRAM-only → DRAM", stage_a1_dram_only),
+    ("A2 DISK-only → DISK", stage_a2_disk_only),
+    ("A3 HBM+DRAM → HBM", stage_a3_hbm_dram),
+    ("A4 HBM+DISK → HBM", stage_a4_hbm_disk),
+    ("A5 DRAM+DISK → DRAM", stage_a5_dram_disk),
+    ("A6 HBM+DRAM+DISK → HBM", stage_a6_all_three),
     ("A7 empty residence → ValueError", stage_a7_empty_raises),
 ]
 

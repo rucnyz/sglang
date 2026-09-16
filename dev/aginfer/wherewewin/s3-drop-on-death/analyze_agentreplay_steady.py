@@ -22,7 +22,6 @@ import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
-
 SCHEMA_VERSION = 1
 RUN_RE = re.compile(r"^(baseline|ours)-r(.+)$")
 
@@ -516,10 +515,7 @@ def pair_runs(
             treatment = number(get_path(ours, "metrics", name))
             delta = (
                 float(treatment) - float(base)
-                if not issues
-                and paired
-                and base is not None
-                and treatment is not None
+                if not issues and paired and base is not None and treatment is not None
                 else None
             )
             delta_percent = (
@@ -630,9 +626,7 @@ def aggregate_pairs(
             mean_delta = mean_or_none(deltas)
             delta_percent = (
                 100 * (ours_mean - baseline_mean) / baseline_mean
-                if paired
-                and baseline_mean not in (None, 0)
-                and ours_mean is not None
+                if paired and baseline_mean not in (None, 0) and ours_mean is not None
                 else None
             )
             improvement = (
@@ -781,9 +775,7 @@ def markdown_report(report: Mapping[str, Any]) -> str:
         for name, label, unit, _higher, paired in METRICS:
             metric = model["metrics"][name]
             ci = (
-                metric["mean_paired_delta_ci95"]
-                if paired
-                else metric["ours_mean_ci95"]
+                metric["mean_paired_delta_ci95"] if paired else metric["ours_mean_ci95"]
             )
             ci_text = format_ci(ci, unit)
             if ci_text != "—" and not paired:

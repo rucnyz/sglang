@@ -16,6 +16,7 @@ Run::
 
 Expected last line: ``=== T7 PASSED ===``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -37,8 +38,9 @@ _HERE = Path(__file__).resolve().parent
 _AGINFER_ROOT = _HERE.parent.parent
 sys.path.insert(0, str(_AGINFER_ROOT))
 
-from daemon.events import Event, EventBus, EventKind  # noqa: E402
+from baselines.base import Tier  # noqa: E402
 from daemon.event_router import EventRouter  # noqa: E402
+from daemon.events import Event, EventBus, EventKind  # noqa: E402
 from daemon.kv_scheduler import (  # noqa: E402
     KvScheduler,
     assignments_to_wire,
@@ -46,8 +48,6 @@ from daemon.kv_scheduler import (  # noqa: E402
     build_paper_state,
 )
 from daemon.program_tracker import ProgramTracker, State  # noqa: E402
-from baselines.base import Tier  # noqa: E402
-
 
 # ---------------------------------------------------------------- helpers
 
@@ -95,8 +95,8 @@ def make_synthetic_state(
 ) -> Dict[str, Any]:
     """Build a /aginfer/state JSON that mirrors the T7 README fixture:
 
-      * 1 shared "platform" prefix held by all N programs;
-      * N per-program "session" tails (varying age).
+    * 1 shared "platform" prefix held by all N programs;
+    * N per-program "session" tails (varying age).
     """
     units: List[Dict[str, Any]] = []
     holders = [f"prog-{i}" for i in range(n_programs)]
@@ -172,9 +172,7 @@ async def boot_router(
 ) -> tuple[EventRouter, KvScheduler]:
     bus = EventBus()
     router = EventRouter(bus=bus, sglang_base_url=sglang_base_url)
-    scheduler = KvScheduler(
-        tracker=tracker, sglang_base_url=sglang_base_url
-    )
+    scheduler = KvScheduler(tracker=tracker, sglang_base_url=sglang_base_url)
     attach_kv_scheduler(router, scheduler)
     await router.start()
     try:
@@ -314,7 +312,7 @@ def step_top_k_bounded() -> None:
                 "n_tokens": 4096,
                 "n_bytes": 4096 * 2048,  # 8 MiB each — biggest in the pool
                 "last_access_time": 10_000 - j,  # young (high age denom)
-                "hit_count": 0,                  # zero p_hat
+                "hit_count": 0,  # zero p_hat
                 "session_ids": [],
             }
         )
@@ -388,9 +386,7 @@ async def step_event_to_migrate_e2e() -> None:
 
     assert scheduler.decisions >= 1, scheduler.decisions
     # The decision_set was just prog-2's tail.
-    assert scheduler.last_decision_set_size == 1, (
-        scheduler.last_decision_set_size
-    )
+    assert scheduler.last_decision_set_size == 1, scheduler.last_decision_set_size
     if not migrate_calls:
         # Action was empty (decide() declined).  That's a legitimate
         # outcome — assert state-derived expectation matches.
@@ -456,9 +452,7 @@ async def step_no_migrate_when_action_empty() -> None:
         f"{scheduler.migrate_calls}"
     )
     assert scheduler.last_action is not None
-    assert not scheduler.last_action.assignments, (
-        scheduler.last_action.assignments
-    )
+    assert not scheduler.last_action.assignments, scheduler.last_action.assignments
 
 
 async def step_state_fetch_failure_recovers() -> None:
@@ -511,9 +505,9 @@ async def step_state_fetch_failure_recovers() -> None:
                 )
             )
             await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
-    assert router.events_handled >= 2, (
-        f"second event was not drained: events_handled={router.events_handled}"
-    )
+    assert (
+        router.events_handled >= 2
+    ), f"second event was not drained: events_handled={router.events_handled}"
 
 
 async def step_decide_latency_at_1k_units() -> dict:
@@ -541,16 +535,18 @@ async def step_decide_latency_at_1k_units() -> dict:
         )
     state_json = {
         "tier_usage": {
-            "HBM": {"used_bytes": sum(u["n_bytes"] for u in units),
-                    "cap_bytes": 256 * 1024 * 1024},
+            "HBM": {
+                "used_bytes": sum(u["n_bytes"] for u in units),
+                "cap_bytes": 256 * 1024 * 1024,
+            },
             "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
             "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
         },
         "units": units,
         "time_counter": 2000,
     }
-    from baselines.ours_greedy import OursGreedyPolicy
     from baselines.costs import default_costs
+    from baselines.ours_greedy import OursGreedyPolicy
 
     policy = OursGreedyPolicy(default_costs())
 
@@ -601,9 +597,9 @@ async def step_decide_latency_at_1k_units() -> dict:
         f"decide() mean+3σ = {decide_env:.2f} ms exceeds 5 ms budget "
         f"(was 50 ms before audit round-1 N5 tightened)"
     )
-    assert build_env < 5.0, (
-        f"build_paper_state mean+3σ = {build_env:.2f} ms exceeds 5 ms budget"
-    )
+    assert (
+        build_env < 5.0
+    ), f"build_paper_state mean+3σ = {build_env:.2f} ms exceeds 5 ms budget"
     return stats
 
 
@@ -625,8 +621,8 @@ async def step_lambda_acting_sweep() -> None:
     tracker.observe_arrival("prog-1")
     tracker.observe_completion("prog-1")  # ACTING
 
-    from baselines.ours_greedy import OursGreedyPolicy
     from baselines.costs import default_costs
+    from baselines.ours_greedy import OursGreedyPolicy
 
     policy = OursGreedyPolicy(default_costs())
     # Audit round-1 N1: previously {1/30, 1/5, 1/1, 2/1} tested only
@@ -859,9 +855,7 @@ async def step_migrate_5xx_does_not_crash() -> None:
         if state_holder["fail_migrate"]:
             from fastapi.responses import JSONResponse
 
-            return JSONResponse(
-                {"error": "simulated 500"}, status_code=500
-            )
+            return JSONResponse({"error": "simulated 500"}, status_code=500)
         return {"applied": 0, "applied_hashes": [], "skipped": []}
 
     stub_port = _free_port()
@@ -920,16 +914,24 @@ def step_env_var_binding() -> None:
         "'topk': k._DEFAULT_MEMORY_PRESSURE_TOPK, "
         "'lam':  k._DEFAULT_LAMBDA_ACTING}))"
     )
-    out = subprocess.check_output(
-        [sys.executable, "-c", probe],
-        env={
-            **{k: v for k, v in __import__("os").environ.items()
-               if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))},
-            "AGINFER_MEMORY_PRESSURE_TOPK": "7",
-            "AGINFER_LAMBDA_ACTING": "0.42",
-        },
-        timeout=15,
-    ).decode().strip().splitlines()[-1]
+    out = (
+        subprocess.check_output(
+            [sys.executable, "-c", probe],
+            env={
+                **{
+                    k: v
+                    for k, v in __import__("os").environ.items()
+                    if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))
+                },
+                "AGINFER_MEMORY_PRESSURE_TOPK": "7",
+                "AGINFER_LAMBDA_ACTING": "0.42",
+            },
+            timeout=15,
+        )
+        .decode()
+        .strip()
+        .splitlines()[-1]
+    )
     parsed = json.loads(out)
     assert parsed["topk"] == 7, (
         f"AGINFER_MEMORY_PRESSURE_TOPK -> _DEFAULT_MEMORY_PRESSURE_TOPK "
@@ -956,9 +958,7 @@ async def step_unknown_event_kind_safe() -> None:
         async with boot_router(stub_url, tracker) as (router, scheduler):
             # LLM_PREFILL produces empty D_t (informational).  Worker
             # must drain it without calling decide().
-            await router.bus.emit(
-                Event(kind=EventKind.LLM_PREFILL, session="prog-0")
-            )
+            await router.bus.emit(Event(kind=EventKind.LLM_PREFILL, session="prog-0"))
             await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
     assert scheduler.decisions == 0, scheduler.decisions
     assert scheduler.migrate_calls == 0, scheduler.migrate_calls
@@ -989,41 +989,57 @@ async def main() -> None:
     print("[4] WORST CASE: nothing worth moving → 0 migrate POSTs ✓")
 
     await step_state_fetch_failure_recovers()
-    print("[5] WORST CASE: /aginfer/state 500 → log + continue; worker "
-          "drains next event ✓")
+    print(
+        "[5] WORST CASE: /aginfer/state 500 → log + continue; worker "
+        "drains next event ✓"
+    )
 
     stats = await step_decide_latency_at_1k_units()
     global _T7_STATS  # noqa: PLW0603
     _T7_STATS = stats
-    print("[6] COST: decide() @ 1k units, build + decide within budget "
-          "(5-run mean ± std) ✓")
+    print(
+        "[6] COST: decide() @ 1k units, build + decide within budget "
+        "(5-run mean ± std) ✓"
+    )
 
     await step_lambda_acting_sweep()
-    print("[7] λ_ACTING sweep {1/30, 1/5, 1/1, 2/1}: clamp saturates; no "
-          "DROP migrations at floor ✓")
+    print(
+        "[7] λ_ACTING sweep {1/30, 1/5, 1/1, 2/1}: clamp saturates; no "
+        "DROP migrations at floor ✓"
+    )
 
     step_assignments_to_wire_contract()
-    print("[8] assignments_to_wire schema matches sglang's "
-          "POST /aginfer/migrate contract ✓")
+    print(
+        "[8] assignments_to_wire schema matches sglang's "
+        "POST /aginfer/migrate contract ✓"
+    )
 
     await step_idempotent_repeat_event()
-    print("[9] same event replayed 3× → identical migrate body "
-          "(paper §9 idempotence) ✓")
+    print(
+        "[9] same event replayed 3× → identical migrate body "
+        "(paper §9 idempotence) ✓"
+    )
 
     await step_unknown_event_kind_safe()
     print("[10] LLM_PREFILL (empty D_t) drains without crashing worker ✓")
 
     await step_all_event_kinds_registered()
-    print("[11] audit M3 fix: all 8 EventKinds routed to kv_scheduler "
-          "(incl. PRESSURE_RESOLVED) + end-to-end fire ✓")
+    print(
+        "[11] audit M3 fix: all 8 EventKinds routed to kv_scheduler "
+        "(incl. PRESSURE_RESOLVED) + end-to-end fire ✓"
+    )
 
     await step_migrate_5xx_does_not_crash()
-    print("[12] audit N2 fix: /aginfer/migrate 500 → log+continue; "
-          "handler_failures stays 0; worker drains next event ✓")
+    print(
+        "[12] audit N2 fix: /aginfer/migrate 500 → log+continue; "
+        "handler_failures stays 0; worker drains next event ✓"
+    )
 
     step_env_var_binding()
-    print("[13] audit N3 fix: AGINFER_* env vars actually bind to "
-          "module-level constants (subprocess probe) ✓")
+    print(
+        "[13] audit N3 fix: AGINFER_* env vars actually bind to "
+        "module-level constants (subprocess probe) ✓"
+    )
 
     if _T7_STATS:
         print()

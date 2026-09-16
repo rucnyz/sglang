@@ -41,22 +41,22 @@ candidate set is bounded by the live unit/program count, so a knapsack
 budget overflow means the generators produced more axes than the DP can
 hold — an algorithm bug, not a workload reality.
 """
+
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List
 
+from . import admission_controller as adm
+from ._fatal import fatal
 from .base import SchedulerState, Tier
+from .events import EventKind
 from .knapsack import (
     KnapsackBudgetExceededError,
     knapsack_max_value_multi,
 )
 from .ours_greedy import migrate_candidates
-
-from . import admission_controller as adm
-from .events import EventKind
-from ._fatal import fatal
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,7 @@ class _ValueItem:
       group  = the per-unit MCKP group (a unit's transitions are mutually
                exclusive alternatives); src = the original candidate, put
                back into the plan when chosen."""
+
     gain: float
     re_use: Dict[str, Dict[str, int]]
     group: Any
@@ -95,8 +96,7 @@ def _page_bytes(state: SchedulerState, tier_label: str, sp: str) -> int:
     ``peak_bw_bps`` / ``h_max`` / ``prefill_bps`` (DESIGN §10)."""
     pb = int(state.tier_usage.page_bytes[_TIER[tier_label]][sp])
     if pb <= 0:
-        fatal("nonpositive_page_bytes", tier=tier_label, subpool=sp,
-              page_bytes=pb)
+        fatal("nonpositive_page_bytes", tier=tier_label, subpool=sp, page_bytes=pb)
     return pb
 
 
@@ -133,8 +133,8 @@ def _budget_and_buckets(state, base_budget, items):
         try:
             bucket[ax] = _page_bytes(state, ax[0], ax[1])
         except KeyError:
-            bucket[ax] = 1   # unconfigured ⇒ 0-room axis; bucket only needs
-                             # to be positive so consumption rounds up > 0.
+            bucket[ax] = 1  # unconfigured ⇒ 0-room axis; bucket only needs
+            # to be positive so consumption rounds up > 0.
     return budget, bucket
 
 
@@ -149,7 +149,7 @@ def _shadow_prices(state, pressured_sps, costs, pi_u) -> Dict[str, float]:
     relief be VALUED against Migrate in the SAME value-knapsack — the term whose
     absence (relief measured in bytes, never converted to time) was half of why
     Pause stayed dormant."""
-    best: Dict[str, Any] = {}   # sp -> (lowest V_u, that unit's bytes in sp)
+    best: Dict[str, Any] = {}  # sp -> (lowest V_u, that unit's bytes in sp)
     for u in state.units.values():
         if Tier.HBM not in u.residence:
             continue
@@ -218,13 +218,14 @@ def joint_decide(
     relief is migrate-only either way."""
     tu = state.tier_usage
     hbm_cap = tu.pool_cap.get(Tier.HBM, {})
-    fc = adm.forecast(state, heartbeat_s)            # {sp: forecast bytes}
+    fc = adm.forecast(state, heartbeat_s)  # {sp: forecast bytes}
     plan: List[Any] = []
 
     # ---- Relief (value-gated, migrate-only, pressured-subpool-targeted):
     #      net-positive migrates that relieve a pegged subpool; may no-op.
-    pressured_sps = {sp for sp, cap in hbm_cap.items()
-                     if fc.get(sp, 0.0) > theta_hi * float(cap)}
+    pressured_sps = {
+        sp for sp, cap in hbm_cap.items() if fc.get(sp, 0.0) > theta_hi * float(cap)
+    }
     if pressured_sps:
         cands = migrate_candidates(state, state.decision_set, costs, pi_u)
         # #223: at TOOL_CALL_END the decision set is the caller's session
@@ -257,18 +258,24 @@ def joint_decide(
         # per-transition id would split them into singletons and let the DP
         # double-count the unit's bytes.
         items = [
-            _ValueItem(gain=-float(c.cost),
-                       re_use=(getattr(c, "acquired", None) or {}),
-                       group=c.group,
-                       src=c)
+            _ValueItem(
+                gain=-float(c.cost),
+                re_use=(getattr(c, "acquired", None) or {}),
+                group=c.group,
+                src=c,
+            )
             for c in cands
             if float(c.cost) < 0.0
             and any(sp in pressured_sps for sp in c.relief.get("HBM", {}))
             # guard the c.id[2] unpack (consistency with scheduler_driver's id guards):
             # a live migrate_candidate's id is always (uid, add, remove); behaviour-identical
             # for valid 3-tuples, and a malformed/None id can never crash this filter.
-            and not (reuse_imminent and isinstance(c.id, tuple) and len(c.id) == 3
-                     and Tier.HBM in c.id[2])
+            and not (
+                reuse_imminent
+                and isinstance(c.id, tuple)
+                and len(c.id) == 3
+                and Tier.HBM in c.id[2]
+            )
         ]
         # Pause lever — now LIVE (#260; was DORMANT).  Value each Pause's HBM
         # relief at the pressured-subpool shadow price (the eviction it averts),
@@ -298,11 +305,15 @@ def joint_decide(
                 hold_frac = 0.0 if pstate == "REASONING" else 1.0
                 relief_value = hold_frac * sum(
                     float(pc.relief.get(sp, 0)) * shadow.get(sp, 0.0)
-                    for sp in pressured_sps)
+                    for sp in pressured_sps
+                )
                 gain = relief_value - float(pc.cost)
                 if gain > 0.0:
-                    items.append(_ValueItem(
-                        gain=gain, re_use={}, group=("pause", pc.pid), src=pc))
+                    items.append(
+                        _ValueItem(
+                            gain=gain, re_use={}, group=("pause", pc.pid), src=pc
+                        )
+                    )
         if items:
             # Only constraint: do not overflow any destination (DRAM|DISK,
             # subpool) cap.  Clamp to >= 0 (an over-subscribed destination
@@ -313,14 +324,18 @@ def joint_decide(
             for tier_label, tier in (("DRAM", Tier.DRAM), ("DISK", Tier.DISK)):
                 used = tu.pool_used.get(tier, {})
                 for sp, cap in tu.pool_cap.get(tier, {}).items():
-                    cap_left[(tier_label, sp)] = max(
-                        0, int(cap) - int(used.get(sp, 0)))
+                    cap_left[(tier_label, sp)] = max(0, int(cap) - int(used.get(sp, 0)))
             cap_left, bucket_size = _budget_and_buckets(state, cap_left, items)
-            ctx = {"event": getattr(event, "kind", event), "phase": "relief",
-                   "forecast": fc, "theta_hi": theta_hi}
+            ctx = {
+                "event": getattr(event, "kind", event),
+                "phase": "relief",
+                "forecast": fc,
+                "theta_hi": theta_hi,
+            }
             try:
                 chosen = knapsack_max_value_multi(
-                    items, cap_left, bucket_size, context=ctx)
+                    items, cap_left, bucket_size, context=ctx
+                )
             except KnapsackBudgetExceededError as exc:
                 fatal("joint_decide_dp_blowup", **exc.context)
                 chosen = []  # unreachable (fatal never returns)
@@ -328,19 +343,26 @@ def joint_decide(
 
     # ---- Resume (value-gated): runs every event; net-positive fits; no-op.
     if admission_enabled and hbm_cap:
-        free_room = {("HBM", sp): max(0.0, theta_lo * float(cap) - fc.get(sp, 0.0))
-                     for sp, cap in hbm_cap.items()}
+        free_room = {
+            ("HBM", sp): max(0.0, theta_lo * float(cap) - fc.get(sp, 0.0))
+            for sp, cap in hbm_cap.items()
+        }
         rcands = adm.resume_candidates(state, heartbeat_s, theta_hi)
         rcands = [replace(c, re_use={"HBM": c.re_use}) for c in rcands]
         if rcands:
             # Cover every HBM subpool a resume re-enters, not just the
             # configured ones (an off-budget subpool = 0 room → rejected).
             free_room, rbucket = _budget_and_buckets(state, free_room, rcands)
-            rctx = {"event": getattr(event, "kind", event), "phase": "resume",
-                    "forecast": fc, "theta_lo": theta_lo}
+            rctx = {
+                "event": getattr(event, "kind", event),
+                "phase": "resume",
+                "forecast": fc,
+                "theta_lo": theta_lo,
+            }
             try:
                 plan += knapsack_max_value_multi(
-                    rcands, free_room, rbucket, context=rctx)
+                    rcands, free_room, rbucket, context=rctx
+                )
             except KnapsackBudgetExceededError as exc:
                 fatal("joint_decide_dp_blowup", **exc.context)
 

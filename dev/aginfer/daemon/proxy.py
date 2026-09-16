@@ -38,6 +38,7 @@ Cost ceiling (per t4/README.md):
   * Streaming throughput: ≥ 95 % of direct
   * Event emission: < 0.1 ms per event (put_nowait on unbounded queue)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -48,7 +49,6 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 import httpx
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-
 
 # Headers we forward upstream verbatim.  Body is forwarded verbatim; the
 # rest of the request headers are mostly hop-by-hop and irrelevant to
@@ -322,15 +322,11 @@ def create_app(
         outbound = getattr(app.state, "outbound", None)
         body: Dict[str, Any] = {"status": "ok"}
         if outbound is not None:
-            body["outbound_consecutive_failures"] = (
-                outbound.consecutive_failures
-            )
+            body["outbound_consecutive_failures"] = outbound.consecutive_failures
             # #166: live peek of the current in-queue head; decays to
             # 0 when sglang heals and the queue drains.  Previous
             # cached-field implementation was sticky.
-            body["outbound_oldest_age_ms"] = (
-                outbound.current_oldest_pending_age_ms()
-            )
+            body["outbound_oldest_age_ms"] = outbound.current_oldest_pending_age_ms()
         return body
 
     @app.post("/v1/chat/completions")
@@ -399,7 +395,8 @@ def create_app(
                         outbound = getattr(app.state, "outbound", None)
                         if outbound is not None:
                             outbound.enqueue_program_paused(
-                                pid=pid, state="ENDED",
+                                pid=pid,
+                                state="ENDED",
                                 pre_pause_state=None,
                             )
                     return Response(status_code=499)
@@ -435,13 +432,9 @@ def create_app(
         # Audit round-1 MINOR: use ``is True`` rather than truthy so a
         # buggy client sending ``"stream": "false"`` doesn't trip into
         # the streaming branch.
-        is_stream = (
-            isinstance(body, dict) and body.get("stream") is True
-        )
+        is_stream = isinstance(body, dict) and body.get("stream") is True
         forwarded_headers = {
-            k: v
-            for k, v in raw.headers.items()
-            if k.lower() in _FORWARD_HEADERS
+            k: v for k, v in raw.headers.items() if k.lower() in _FORWARD_HEADERS
         }
 
         async def _emit_completion() -> None:
@@ -529,9 +522,7 @@ def create_app(
             )
         except Exception as exc:  # noqa: BLE001
             await _emit_completion()
-            logger.warning(
-                "stream connect raised; returning 502", exc_info=True
-            )
+            logger.warning("stream connect raised; returning 502", exc_info=True)
             return JSONResponse(
                 {
                     "error": {
@@ -583,9 +574,7 @@ def create_app(
                     )
 
         # Preserve upstream content-type if present (defaults to SSE).
-        upstream_ct = upstream_resp.headers.get(
-            "content-type", "text/event-stream"
-        )
+        upstream_ct = upstream_resp.headers.get("content-type", "text/event-stream")
         return StreamingResponse(_stream(), media_type=upstream_ct)
 
     return app

@@ -32,6 +32,7 @@ conditions is the whole point of the helper, so a JSON-serialisation
 failure on one context field falls back to ``repr(value)`` for that
 field and keeps dumping the rest.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -44,7 +45,6 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
-
 
 logger = logging.getLogger("aginfer.daemon.fatal")
 
@@ -157,7 +157,9 @@ def fatal(reason: str, **context: Any) -> None:
         logger.critical(
             "fatal(reason=%s): could not create forensic dir %s: %s; "
             "dumping to stderr",
-            reason, forensic_dir, exc,
+            reason,
+            forensic_dir,
+            exc,
         )
         forensic_dir = None
 
@@ -176,7 +178,8 @@ def fatal(reason: str, **context: Any) -> None:
         "reason": reason,
         "timestamp_unix": ts,
         "timestamp_iso": time.strftime(
-            "%Y-%m-%dT%H:%M:%S", time.gmtime(ts),
+            "%Y-%m-%dT%H:%M:%S",
+            time.gmtime(ts),
         ),
         "pid": os.getpid(),
         "traceback": tb_lines,
@@ -195,21 +198,26 @@ def fatal(reason: str, **context: Any) -> None:
         except OSError as exc:  # pragma: no cover - very degraded env
             logger.critical(
                 "fatal(reason=%s): could not write forensic file %s: %s",
-                reason, forensic_path, exc,
+                reason,
+                forensic_path,
+                exc,
             )
             forensic_path = None
 
     if forensic_path is not None:
         logger.critical(
             "FATAL reason=%s forensic_file=%s pid=%d",
-            reason, forensic_path, os.getpid(),
+            reason,
+            forensic_path,
+            os.getpid(),
         )
     else:
         # Degraded path: dump payload directly to stderr so the
         # supervisor at least has the traceback.
         logger.critical(
             "FATAL reason=%s (no forensic file written) payload=%s",
-            reason, json.dumps(payload, default=repr),
+            reason,
+            json.dumps(payload, default=repr),
         )
     # Flush logging handlers + stdio so the supervisor's log scrape
     # captures the CRITICAL line before we kill the process.

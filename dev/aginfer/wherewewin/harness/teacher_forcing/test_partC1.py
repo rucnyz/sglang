@@ -19,6 +19,7 @@ retract/preempt evidence so a no-preemption run is not silently counted as a pas
 Launch with a SMALL pool to guarantee preemption (see run_partC1.sh:
   --max-total-tokens 8192 --max-running-requests 64).
 """
+
 import argparse
 import concurrent.futures as cf
 import json
@@ -26,14 +27,18 @@ import sys
 
 import requests
 
-L = 512                                   # long enough to span the preempt window
-F = list(range(2000, 2000 + L))           # forced sequence (known)
+L = 512  # long enough to span the preempt window
+F = list(range(2000, 2000 + L))  # forced sequence (known)
 TARGET_PREFIX = list(range(1500, 1500 + 64))
-N_FILLERS = 48                            # concurrent long decodes to exhaust pool
+N_FILLERS = 48  # concurrent long decodes to exhaust pool
 
 
 def gen(base, input_ids, max_new, forced=None, prefix_salt=0):
-    ids = [TARGET_PREFIX[0] + prefix_salt] + list(input_ids[1:]) if prefix_salt else list(input_ids)
+    ids = (
+        [TARGET_PREFIX[0] + prefix_salt] + list(input_ids[1:])
+        if prefix_salt
+        else list(input_ids)
+    )
     sp = {"temperature": 0.0, "max_new_tokens": max_new, "ignore_eos": True}
     if forced is not None:
         sp["custom_params"] = {"forced_output_ids": list(forced)}
@@ -41,8 +46,13 @@ def gen(base, input_ids, max_new, forced=None, prefix_salt=0):
     r = requests.post(base.rstrip("/") + "/generate", json=body, timeout=900)
     r.raise_for_status()
     d = r.json()
-    return d["text"], int((d["meta_info"].get("completion_tokens")
-                           or d["meta_info"].get("completion_tokens", 0)) or max_new)
+    return d["text"], int(
+        (
+            d["meta_info"].get("completion_tokens")
+            or d["meta_info"].get("completion_tokens", 0)
+        )
+        or max_new
+    )
 
 
 def main():
@@ -80,9 +90,20 @@ def main():
     print("\n=== Part C1 result ===")
     print(f"  reference n={ref_n}, pressured n={pre_n}, len(F)={L}")
     print(f"  text identical: {pre_txt == ref_txt}")
-    print(f"PART C1: {'PASS — forcing survived preemption byte-identical' if same else 'REVIEW — diverged (check log for retract evidence + multimodal branch)'}")
-    print(json.dumps({"ref_n": ref_n, "pre_n": pre_n, "L": L,
-                      "text_identical": pre_txt == ref_txt, "pass": same}))
+    print(
+        f"PART C1: {'PASS — forcing survived preemption byte-identical' if same else 'REVIEW — diverged (check log for retract evidence + multimodal branch)'}"
+    )
+    print(
+        json.dumps(
+            {
+                "ref_n": ref_n,
+                "pre_n": pre_n,
+                "L": L,
+                "text_identical": pre_txt == ref_txt,
+                "pass": same,
+            }
+        )
+    )
     return 0 if same else 1
 
 

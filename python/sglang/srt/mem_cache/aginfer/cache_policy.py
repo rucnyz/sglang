@@ -5,9 +5,12 @@ LRU-equivalent default scorer (byte-for-byte stock sglang when unset), and
 the birth-seed constants. Extracted from unified_radix_cache.py so the
 upstream cache file carries only a thin re-import hook. Identity of
 `_default_eviction_score` is preserved across the re-import."""
+
 import logging
 
 logger = logging.getLogger("sglang.srt.mem_cache.unified_radix_cache")
+
+import importlib
 
 # --- aginfer: pluggable eviction scorer -------------------------------------
 # When set, replaces the default LRU heap key (= node.last_access_time) used by
@@ -17,7 +20,6 @@ logger = logging.getLogger("sglang.srt.mem_cache.unified_radix_cache")
 # callable signature is (node: UnifiedTreeNode, layer: EvictLayer) -> float.
 # The default fallback below preserves stock sglang LRU behaviour.
 import os
-import importlib
 
 
 # #177 (T38 follow-on, DESIGN §3 "one code path"): the in-process
@@ -86,8 +88,7 @@ def _load_eviction_scorer():
         return fn
     except Exception as e:
         logger.warning(
-            "[aginfer] kv_policy_loaded=default_lru "
-            "(load_failed:%r exception=%s)",
+            "[aginfer] kv_policy_loaded=default_lru " "(load_failed:%r exception=%s)",
             spec,
             e,
         )

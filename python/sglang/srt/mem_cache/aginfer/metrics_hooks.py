@@ -2,10 +2,13 @@
 per-program decode tokens/sec + prefill bytes/sec EMA sampling and the
 runtime-metrics push, as free functions over a Scheduler. Upstream keeps thin
 delegators. No-op (do-no-harm) when the cache is not aginfer-capable."""
+
 from __future__ import annotations
+
 import logging
 import time
 from typing import TYPE_CHECKING, Dict
+
 from sglang.srt.mem_cache.aginfer_metrics import (
     AGINFER_THROUGHPUT_EMA_ALPHA,
     decode_tokens_by_program,
@@ -19,6 +22,7 @@ if TYPE_CHECKING:  # annotation-only (lazy via from __future__ import annotation
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger("sglang.srt.managers.scheduler")
+
 
 def _aginfer_record_throughput(sched, batch: ScheduleBatch) -> None:
     """T26 (#200): update the per-program decode tokens/sec EMA and the
@@ -61,7 +65,10 @@ def _aginfer_record_throughput(sched, batch: ScheduleBatch) -> None:
             sched._aginfer_throughput_warned = True
             logger.warning(
                 "aginfer throughput measurement raised (suppressed; "
-                "metric degrades to no-signal)", exc_info=True)
+                "metric degrades to no-signal)",
+                exc_info=True,
+            )
+
 
 def _aginfer_record_throughput_inner(sched, batch: ScheduleBatch) -> None:
     cache = getattr(sched, "tree_cache", None)
@@ -82,11 +89,11 @@ def _aginfer_record_throughput_inner(sched, batch: ScheduleBatch) -> None:
     if fm == ForwardMode.DECODE:
         if defer_decode:
             return
-        sched._aginfer_update_decode(
-            decode_tokens_by_program(batch.reqs), now)
+        sched._aginfer_update_decode(decode_tokens_by_program(batch.reqs), now)
     elif fm == ForwardMode.EXTEND:
         sched._aginfer_update_prefill(
-            sched._aginfer_extend_token_count(batch), cache, now)
+            sched._aginfer_extend_token_count(batch), cache, now
+        )
     elif fm.is_mixed():
         # MIXED = chunked prefill + running decode in one batch.  Split
         # by identity against batch.decoding_reqs (sglang's own metrics
@@ -96,8 +103,7 @@ def _aginfer_record_throughput_inner(sched, batch: ScheduleBatch) -> None:
         decode_ids = {id(r) for r in (getattr(batch, "decoding_reqs", None) or [])}
         reqs = list(getattr(batch, "reqs", None) or [])
         prefill_reqs = [r for r in reqs if id(r) not in decode_ids]
-        ntok = sum(int(getattr(r, "extend_input_len", 0) or 0)
-                   for r in prefill_reqs)
+        ntok = sum(int(getattr(r, "extend_input_len", 0) or 0) for r in prefill_reqs)
         sched._aginfer_update_prefill(ntok, cache, now)
         # Decode portion is always counted 1/req HERE — even under
         # spec-v2.  The post-forward accept_lens hook only fires for
@@ -107,8 +113,8 @@ def _aginfer_record_throughput_inner(sched, batch: ScheduleBatch) -> None:
         # length for spec-v2 MIXED (rare combo) but is never zero and is
         # never double-counted (the post-forward hook can't reach MIXED).
         decode_reqs = [r for r in reqs if id(r) in decode_ids]
-        sched._aginfer_update_decode(
-            decode_tokens_by_program(decode_reqs), now)
+        sched._aginfer_update_decode(decode_tokens_by_program(decode_reqs), now)
+
 
 def _aginfer_extend_token_count(batch: ScheduleBatch) -> int:
     """Prefill-token count for a pure EXTEND batch.  ``extend_num_tokens``
@@ -128,6 +134,7 @@ def _aginfer_extend_token_count(batch: ScheduleBatch) -> int:
                 ntok = 0
     return ntok
 
+
 def _aginfer_update_prefill(sched, ntok: int, cache, now: float) -> None:
     """Blend ``ntok × bytes_per_token / dt`` into the prefill_bps EMA,
     timed off the previous prefill-bearing forward."""
@@ -142,8 +149,9 @@ def _aginfer_update_prefill(sched, ntok: int, cache, now: float) -> None:
     if bpt <= 0:
         return
     sched._aginfer_prefill_bps_ema = ema_update(
-        sched._aginfer_prefill_bps_ema, (ntok * bpt) / dt,
-        AGINFER_THROUGHPUT_EMA_ALPHA)
+        sched._aginfer_prefill_bps_ema, (ntok * bpt) / dt, AGINFER_THROUGHPUT_EMA_ALPHA
+    )
+
 
 def _aginfer_update_decode(sched, counts: Dict[str, int], now: float) -> None:
     """Blend per-program ``tokens / dt`` into the decode EMA, timed off
@@ -157,8 +165,9 @@ def _aginfer_update_decode(sched, counts: Dict[str, int], now: float) -> None:
         return
     for pid, n in counts.items():
         sched._aginfer_decode_ema[pid] = ema_update(
-            sched._aginfer_decode_ema.get(pid), n / dt,
-            AGINFER_THROUGHPUT_EMA_ALPHA)
+            sched._aginfer_decode_ema.get(pid), n / dt, AGINFER_THROUGHPUT_EMA_ALPHA
+        )
+
 
 def _aginfer_record_spec_throughput(sched, batch: ScheduleBatch, result) -> None:
     """Raise-safe wrapper for the spec-decode post-forward hook (#206):
@@ -171,7 +180,10 @@ def _aginfer_record_spec_throughput(sched, batch: ScheduleBatch, result) -> None
             sched._aginfer_throughput_warned = True
             logger.warning(
                 "aginfer spec-decode measurement raised (suppressed; "
-                "metric degrades to no-signal)", exc_info=True)
+                "metric degrades to no-signal)",
+                exc_info=True,
+            )
+
 
 def _aginfer_record_spec_decode(sched, batch: ScheduleBatch, result) -> None:
     """T26 (#206): record spec-v2 decode throughput from the POST-forward
@@ -193,9 +205,11 @@ def _aginfer_record_spec_decode(sched, batch: ScheduleBatch, result) -> None:
         return
     per_req = [int(n) + 1 for n in ncd]
     counts = decode_tokens_by_program(
-        getattr(batch, "reqs", None) or [], per_req_tokens=per_req)
+        getattr(batch, "reqs", None) or [], per_req_tokens=per_req
+    )
     if counts:
         sched._aginfer_update_decode(counts, time.perf_counter())
+
 
 def _aginfer_push_runtime_metrics(sched) -> None:
     """T26 (#200): assemble the measured decode/prefill EMAs +
@@ -214,7 +228,8 @@ def _aginfer_push_runtime_metrics(sched) -> None:
         rb = getattr(sched, "running_batch", None)
         reqs = list(rb.reqs) if rb is not None else []
         running_pids = {
-            str(r.program_id) for r in reqs
+            str(r.program_id)
+            for r in reqs
             if getattr(r, "program_id", None) is not None
         }
         # Prune decode EMAs for programs that are no longer running so
@@ -222,22 +237,19 @@ def _aginfer_push_runtime_metrics(sched) -> None:
         # ever seen) — the ONLY prune point, so a never-dumped daemon
         # can't make the dict grow unbounded on the hot path.
         sched._aginfer_decode_ema = {
-            p: v for p, v in sched._aginfer_decode_ema.items()
-            if p in running_pids
+            p: v for p, v in sched._aginfer_decode_ema.items() if p in running_pids
         }
-        decode_pp = running_program_view(
-            sched._aginfer_decode_ema, running_pids)
+        decode_pp = running_program_view(sched._aginfer_decode_ema, running_pids)
         bpt = int(cache._aginfer_bytes_per_token())
         subpool = cache._aginfer_subpool_name(BASE_COMPONENT_TYPE)
         inflight = inflight_bytes_by_program(reqs, bpt, subpool)
     except Exception:  # noqa: BLE001 — never break the state dump
         logger.warning(
-            "aginfer runtime-metric push raised; emitting empty",
-            exc_info=True)
+            "aginfer runtime-metric push raised; emitting empty", exc_info=True
+        )
         decode_pp, inflight = {}, {}
     setter(
         decode_per_program=decode_pp,
         prefill_bps=float(sched._aginfer_prefill_bps_ema or 0.0),
         inflight=inflight,
     )
-

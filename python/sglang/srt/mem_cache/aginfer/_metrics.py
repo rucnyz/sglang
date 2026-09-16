@@ -18,6 +18,7 @@ Performance contract:
   scorer) — that runs orders of magnitude more often and would taint
   per-trial timings.
 """
+
 from __future__ import annotations
 
 import logging

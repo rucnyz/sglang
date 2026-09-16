@@ -12,6 +12,7 @@ Run:
     cd /scratch/yuzhou/projects/sglang/dev/aginfer
     python -m baselines.compare
 """
+
 from __future__ import annotations
 
 import copy
@@ -22,8 +23,8 @@ from typing import Dict, List, Tuple
 from .base import (
     Action,
     ReuseUnit,
-    Scope,
     SchedulerState,
+    Scope,
     Tier,
     TierUsage,
     UnitType,
@@ -60,7 +61,7 @@ class WorldConfig:
     dram_cap: int = 1024 * 2**20
     disk_cap: int = 64 * 2**30
     # Unit-size distribution.
-    bytes_per_token: int = 2048   # MLA + sidecar pools roughly 2 KB / token
+    bytes_per_token: int = 2048  # MLA + sidecar pools roughly 2 KB / token
     tokens_min: int = 512
     tokens_max: int = 4096
     # Workload mix -- bias toward llm_prefill (the "hit/miss" trigger) and
@@ -71,7 +72,7 @@ class WorldConfig:
     p_llm_prefill: float = 0.30
     p_tool_call_end: float = 0.10
     # Reward weighting
-    prefill_cost_per_token: float = 5e-5    # ~20K tok/s prefill on V4-Flash
+    prefill_cost_per_token: float = 5e-5  # ~20K tok/s prefill on V4-Flash
 
 
 def _build_units(cfg: WorldConfig, rng: random.Random) -> Dict[str, ReuseUnit]:
@@ -120,7 +121,9 @@ def _build_event_stream(
         if k == "memory_pressure":
             d_set = list(units.keys())
         else:
-            d_set = [uid for uid, u in units.items() if u.holders and u.holders[0] == sess]
+            d_set = [
+                uid for uid, u in units.items() if u.holders and u.holders[0] == sess
+            ]
         events.append((t, k, sess, d_set))
     return events
 
@@ -155,7 +158,9 @@ def _saved_prefill(units, hit_uids, costs, pi_u) -> float:
     r1 = 0.0
     for uid in hit_uids:
         u = units[uid]
-        r1 += reload_cost(u, Tier.DROP, costs, pi_u) - reload_cost(u, u.tier, costs, pi_u)
+        r1 += reload_cost(u, Tier.DROP, costs, pi_u) - reload_cost(
+            u, u.tier, costs, pi_u
+        )
     return r1
 
 
@@ -178,18 +183,18 @@ def _holding_step(units, usage, dt: float, costs) -> float:
 @dataclass
 class PolicyScore:
     name: str
-    r1: float = 0.0   # saved prefill (higher = better)  -- units of seconds
-    r2: float = 0.0   # migration paid (lower = better)  -- units of seconds
-    r3: float = 0.0   # holding paid (lower = better)    -- bytes*sec*coef
+    r1: float = 0.0  # saved prefill (higher = better)  -- units of seconds
+    r2: float = 0.0  # migration paid (lower = better)  -- units of seconds
+    r3: float = 0.0  # holding paid (lower = better)    -- bytes*sec*coef
     n_actions: int = 0
     n_hits: int = 0
     n_misses: int = 0
 
     # Wall-clock-flavored counters used to derive throughput / total runtime.
     # These are accumulated by _simulate_policy and read by main()/sweep_seeds.
-    trace_duration_s: float = 0.0   # last_event.t -- "the workload's own length"
+    trace_duration_s: float = 0.0  # last_event.t -- "the workload's own length"
     total_workload_tokens: int = 0  # all unit n_tokens seen at hit/miss events
-    prefill_paid_s: float = 0.0     # sum over miss units of pi_u * n_tokens
+    prefill_paid_s: float = 0.0  # sum over miss units of pi_u * n_tokens
 
     @property
     def reward(self) -> float:
@@ -244,8 +249,7 @@ def _simulate_policy(
         # session's units: tier HBM/DRAM = hit, DROP = miss.
         if kind in ("llm_prefill", "tool_call_end"):
             hit_uids = [
-                uid for uid in d_set
-                if units[uid].tier in (Tier.HBM, Tier.DRAM)
+                uid for uid in d_set if units[uid].tier in (Tier.HBM, Tier.DRAM)
             ]
             score.n_hits += len(hit_uids)
             score.n_misses += len(d_set) - len(hit_uids)
@@ -260,7 +264,9 @@ def _simulate_policy(
                     score.prefill_paid_s += pi_u * u.n_tokens
                     # Re-prefill brings the unit back to HBM.
                     u.tier = Tier.HBM
-                    usage.used_bytes[Tier.HBM] = usage.used_bytes.get(Tier.HBM, 0) + u.n_bytes
+                    usage.used_bytes[Tier.HBM] = (
+                        usage.used_bytes.get(Tier.HBM, 0) + u.n_bytes
+                    )
 
         action = policy.decide(state)
         score.r2 += _apply_action(units, usage, action, costs)
@@ -295,10 +301,14 @@ def main() -> None:
         OursGreedyPolicy(costs, prefill_cost_per_token=cfg.prefill_cost_per_token),
     ]
 
-    print(f"# Workload: {cfg.n_sessions} sessions × {cfg.units_per_session} units, "
-          f"{cfg.n_events} events, HBM cap {cfg.hbm_cap / 2**30:.1f} GB")
+    print(
+        f"# Workload: {cfg.n_sessions} sessions × {cfg.units_per_session} units, "
+        f"{cfg.n_events} events, HBM cap {cfg.hbm_cap / 2**30:.1f} GB"
+    )
     print(f"# Reward = r1 (saved prefill, +) − r2 (migration, −) − r3 (holding, −)")
-    print(f"# total_runtime_s = trace_duration + prefill_paid_s + r2 (excludes r3 holding)")
+    print(
+        f"# total_runtime_s = trace_duration + prefill_paid_s + r2 (excludes r3 holding)"
+    )
     print()
 
     header = (
@@ -323,11 +333,19 @@ def main() -> None:
     print()
     ours = next(s for s in scores if s.name == "ours_greedy")
     print("# Relative to ours_greedy:")
-    print(f"  {'policy':<14} {'rel_reward':>10} {'rel_runtime':>11} {'rel_throughput':>14}")
+    print(
+        f"  {'policy':<14} {'rel_reward':>10} {'rel_runtime':>11} {'rel_throughput':>14}"
+    )
     for s in scores:
         rel_r = s.reward / ours.reward if ours.reward else 0
-        rel_run = s.total_runtime_s / ours.total_runtime_s if ours.total_runtime_s else 0
-        rel_tp = s.throughput_tok_per_s / ours.throughput_tok_per_s if ours.throughput_tok_per_s else 0
+        rel_run = (
+            s.total_runtime_s / ours.total_runtime_s if ours.total_runtime_s else 0
+        )
+        rel_tp = (
+            s.throughput_tok_per_s / ours.throughput_tok_per_s
+            if ours.throughput_tok_per_s
+            else 0
+        )
         print(f"  {s.name:<14} {rel_r:>10.3f} {rel_run:>11.3f} {rel_tp:>14.3f}")
 
 

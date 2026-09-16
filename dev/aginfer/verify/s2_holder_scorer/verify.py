@@ -21,12 +21,13 @@ n_holders, and that it agrees in DIRECTION with ``_value``.
 Usage:
     PYTHONPATH=dev/aginfer python dev/aginfer/verify/s2_holder_scorer/verify.py
 """
+
 from __future__ import annotations
 
 import sys
 
-from baselines.base import ReuseUnit, Scope, Tier, UnitType
 import baselines.sglang_adapter as A
+from baselines.base import ReuseUnit, Scope, Tier, UnitType
 
 
 class StageFail(Exception):
@@ -36,9 +37,16 @@ class StageFail(Exception):
 def _mk(n_tokens: int, p_hat: float, lam: float, n_holders: int) -> ReuseUnit:
     b = n_tokens * A._BYTES_PER_TOKEN
     u = ReuseUnit(
-        id="x", type=UnitType.SESSION, scope=Scope.SESSION, n_tokens=n_tokens,
-        n_bytes_by_tier={Tier.HBM: {"full": b}}, residence=[Tier.HBM],
-        age_seconds=1.0, p_hat=p_hat, lambda_rate=lam, holders=[],
+        id="x",
+        type=UnitType.SESSION,
+        scope=Scope.SESSION,
+        n_tokens=n_tokens,
+        n_bytes_by_tier={Tier.HBM: {"full": b}},
+        residence=[Tier.HBM],
+        age_seconds=1.0,
+        p_hat=p_hat,
+        lambda_rate=lam,
+        holders=[],
     )
     u.n_holders = n_holders
     return u
@@ -92,9 +100,13 @@ def stage_d_agrees_with_value_direction() -> None:
         pi = A._PI_U
         tier = u.authoritative_tier
         nh = max(1, len(u.holders), int(getattr(u, "n_holders", 0)))
-        sp = nh * u.p_hat * (
-            reload_cost(u, Tier.DROP, A._COSTS, pi)
-            - reload_cost(u, tier, A._COSTS, pi)
+        sp = (
+            nh
+            * u.p_hat
+            * (
+                reload_cost(u, Tier.DROP, A._COSTS, pi)
+                - reload_cost(u, tier, A._COSTS, pi)
+            )
         )
         h = A._COSTS.h_base[tier]
         eff = nh * u.lambda_rate
@@ -102,7 +114,9 @@ def stage_d_agrees_with_value_direction() -> None:
         return float(sp - h * u.n_bytes * ht)
 
     # both formulas: 8 holders strictly above 1 holder
-    live_1, live_8 = A._v_u_from_unit(_mk(24000, 1.0, 1.0, 1)), A._v_u_from_unit(_mk(24000, 1.0, 1.0, 8))
+    live_1, live_8 = A._v_u_from_unit(_mk(24000, 1.0, 1.0, 1)), A._v_u_from_unit(
+        _mk(24000, 1.0, 1.0, 8)
+    )
     val_1, val_8 = value_with_holders(1), value_with_holders(8)
     if not (live_8 > live_1 and val_8 > val_1):
         raise StageFail(

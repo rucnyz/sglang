@@ -18,6 +18,7 @@ Usage:
     AGINFER_VERIFY_BASE=http://127.0.0.1:30001 \\
         python dev/aginfer/verify/t14/verify.py
 """
+
 from __future__ import annotations
 
 import os
@@ -26,10 +27,11 @@ import time
 from pathlib import Path
 from typing import Callable, List, Tuple
 
-
 # Make the sglang package importable from the source tree.
 _HERE = Path(__file__).resolve().parent
-_SGLANG_PY = _HERE.parent.parent.parent.parent / "python"  # dev/aginfer/verify/t14 → repo/python
+_SGLANG_PY = (
+    _HERE.parent.parent.parent.parent / "python"
+)  # dev/aginfer/verify/t14 → repo/python
 if (_SGLANG_PY / "sglang").is_dir() and str(_SGLANG_PY) not in sys.path:
     sys.path.insert(0, str(_SGLANG_PY))
 
@@ -62,9 +64,17 @@ def stage_a0_empty_summary() -> None:
     m = _StateDumpMetrics(capacity=128)
     s = m.summary()
     expected_keys = {
-        "n_samples", "n_recorded_total", "capacity", "window_seconds",
-        "p50_ms", "p95_ms", "p99_ms", "max_ms", "mean_ms",
-        "last_dump_ms", "last_dump_bytes",
+        "n_samples",
+        "n_recorded_total",
+        "capacity",
+        "window_seconds",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "max_ms",
+        "mean_ms",
+        "last_dump_ms",
+        "last_dump_bytes",
     }
     if set(s.keys()) != expected_keys:
         raise StageFail(
@@ -76,8 +86,7 @@ def stage_a0_empty_summary() -> None:
         raise StageFail(f"cold-start n != 0: {s}")
     if s["capacity"] != 128:
         raise StageFail(f"capacity not echoed: {s['capacity']}")
-    for q in ("p50_ms", "p95_ms", "p99_ms", "max_ms", "mean_ms",
-              "last_dump_ms"):
+    for q in ("p50_ms", "p95_ms", "p99_ms", "max_ms", "mean_ms", "last_dump_ms"):
         if s[q] != 0.0:
             raise StageFail(f"cold-start {q} != 0.0: {s[q]}")
     if s["last_dump_bytes"] != -1:
@@ -90,8 +99,18 @@ def stage_a1_record_and_summary() -> None:
     final record."""
     m = _StateDumpMetrics(capacity=128)
     # Latencies in ns, ascending so quantiles are easy.  Use integers.
-    lats = [1_000_000, 2_000_000, 3_000_000, 4_000_000, 5_000_000,
-            6_000_000, 7_000_000, 8_000_000, 9_000_000, 10_000_000]
+    lats = [
+        1_000_000,
+        2_000_000,
+        3_000_000,
+        4_000_000,
+        5_000_000,
+        6_000_000,
+        7_000_000,
+        8_000_000,
+        9_000_000,
+        10_000_000,
+    ]
     for i, ns in enumerate(lats):
         m.record(elapsed_ns=ns, dump_bytes=1024 * (i + 1))
     s = m.summary()
@@ -135,9 +154,7 @@ def stage_a2_ring_buffer_wrap() -> None:
         )
     # Min sample in window = 1488 ms; mean = (1488+1999)/2 = 1743.5 ms.
     if abs(s["mean_ms"] - 1743.5) > 0.5:
-        raise StageFail(
-            f"mean_ms after wrap should be ~1743.5; got {s['mean_ms']}"
-        )
+        raise StageFail(f"mean_ms after wrap should be ~1743.5; got {s['mean_ms']}")
 
 
 def stage_a3_quantile_monotonicity() -> None:
@@ -171,7 +188,7 @@ def stage_a4_dict_path_bytes_sentinel() -> None:
     bytes should still produce coherent latency stats."""
     m = _StateDumpMetrics(capacity=128)
     for _ in range(5):
-        m.record(elapsed_ns=2_000_000, dump_bytes=-1)   # dict path
+        m.record(elapsed_ns=2_000_000, dump_bytes=-1)  # dict path
     for _ in range(5):
         m.record(elapsed_ns=4_000_000, dump_bytes=8192)  # bytes path
     s = m.summary()
@@ -196,8 +213,9 @@ def _maybe_get_base() -> str:
 
 
 def _fetch_state(base: str):
-    import urllib.request
     import json
+    import urllib.request
+
     with urllib.request.urlopen(f"{base}/aginfer/state", timeout=10) as resp:
         return json.loads(resp.read())
 
@@ -218,9 +236,17 @@ def stage_b0_state_carries_metrics_field() -> None:
         )
     m = state["state_dump_metrics"]
     expected = {
-        "n_samples", "n_recorded_total", "capacity", "window_seconds",
-        "p50_ms", "p95_ms", "p99_ms", "max_ms", "mean_ms",
-        "last_dump_ms", "last_dump_bytes",
+        "n_samples",
+        "n_recorded_total",
+        "capacity",
+        "window_seconds",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "max_ms",
+        "mean_ms",
+        "last_dump_ms",
+        "last_dump_bytes",
     }
     if set(m.keys()) != expected:
         raise StageFail(
@@ -302,16 +328,21 @@ def stage_b3_bytes_path_reports_positive_bytes() -> None:
 
 
 _STAGES: List[Tuple[str, Callable[[], None]]] = [
-    ("A0 _StateDumpMetrics empty summary",          stage_a0_empty_summary),
-    ("A1 record + summary",                         stage_a1_record_and_summary),
-    ("A2 ring buffer wraps at capacity",            stage_a2_ring_buffer_wrap),
-    ("A3 quantile monotonicity (p50≤p95≤p99≤max)",  stage_a3_quantile_monotonicity),
+    ("A0 _StateDumpMetrics empty summary", stage_a0_empty_summary),
+    ("A1 record + summary", stage_a1_record_and_summary),
+    ("A2 ring buffer wraps at capacity", stage_a2_ring_buffer_wrap),
+    ("A3 quantile monotonicity (p50≤p95≤p99≤max)", stage_a3_quantile_monotonicity),
     ("A4 dict-path bytes=-1 sentinel + mixed mean", stage_a4_dict_path_bytes_sentinel),
-    ("B0 state carries state_dump_metrics field",   stage_b0_state_carries_metrics_field),
-    ("B1 n_recorded_total grows by exactly 1 per poll",
-                                                    stage_b1_metrics_grow_with_polls),
-    ("B2 live quantile monotonicity",               stage_b2_quantile_monotonicity_live),
-    ("B3 bytes-path last_dump_bytes positive",      stage_b3_bytes_path_reports_positive_bytes),
+    ("B0 state carries state_dump_metrics field", stage_b0_state_carries_metrics_field),
+    (
+        "B1 n_recorded_total grows by exactly 1 per poll",
+        stage_b1_metrics_grow_with_polls,
+    ),
+    ("B2 live quantile monotonicity", stage_b2_quantile_monotonicity_live),
+    (
+        "B3 bytes-path last_dump_bytes positive",
+        stage_b3_bytes_path_reports_positive_bytes,
+    ),
 ]
 
 

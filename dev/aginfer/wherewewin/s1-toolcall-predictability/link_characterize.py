@@ -12,7 +12,13 @@ Links:
   DISK->HBM  (cold load_back from disk)          : file read + H2D
 Each at sizes spanning the realistic KV range; warm + median of N.
 """
-import torch, time, os, tempfile, statistics
+
+import os
+import statistics
+import tempfile
+import time
+
+import torch
 
 KV_PER_TOKEN = 1.17e3  # bytes/token (measured: 4.19MB / 3584 tok)
 SIZES = {  # tokens -> bytes
@@ -37,7 +43,9 @@ def med_ms(fn):
     return statistics.median(ts)
 
 
-print(f"{'size':>6} {'MB':>7} | {'DRAM->HBM(H2D)':>16} {'HBM->DRAM(D2H)':>16} {'DISK->host':>12} {'DISK->HBM':>12}")
+print(
+    f"{'size':>6} {'MB':>7} | {'DRAM->HBM(H2D)':>16} {'HBM->DRAM(D2H)':>16} {'DISK->host':>12} {'DISK->HBM':>12}"
+)
 for name, nbytes in SIZES.items():
     n_el = nbytes // 4
     host = torch.empty(n_el, dtype=torch.float32, pin_memory=True)
@@ -46,29 +54,47 @@ for name, nbytes in SIZES.items():
     h2d = med_ms(lambda: gpu.copy_(host, non_blocking=True))
     d2h = med_ms(lambda: host.copy_(gpu, non_blocking=True))
     # disk
-    with tempfile.NamedTemporaryFile(delete=False, dir="/scratch/yuzhou/tmp_linkchar") as f:
+    with tempfile.NamedTemporaryFile(
+        delete=False, dir="/scratch/yuzhou/tmp_linkchar"
+    ) as f:
         path = f.name
         f.write(host.numpy().tobytes())
-    os.system("sync")  # flush; then drop-cache read not available without root -> approximate warm
+    os.system(
+        "sync"
+    )  # flush; then drop-cache read not available without root -> approximate warm
+
     def disk_read():
         with open(path, "rb", buffering=0) as fh:
             b = fh.read()
         return b
+
     # DISK->host (read into a host buffer)
     def disk_to_host():
         with open(path, "rb", buffering=0) as fh:
             buf = fh.read()
+
     dh = med_ms(disk_to_host)
+
     def disk_to_hbm():
         with open(path, "rb", buffering=0) as fh:
             buf = fh.read()
         t = torch.frombuffer(bytearray(buf), dtype=torch.float32)
         gpu.copy_(t.pin_memory(), non_blocking=True)
+
     dhbm = med_ms(disk_to_hbm)
     os.unlink(path)
     mb = nbytes / 1e6
-    def bw(ms): return mb / (ms / 1000) / 1000  # GB/s
-    print(f"{name:>6} {mb:>7.1f} | {h2d:>7.2f}ms {bw(h2d):>4.0f}GB/s {d2h:>7.2f}ms {bw(d2h):>4.0f}GB/s "
-          f"{dh:>6.1f}ms {dhbm:>6.1f}ms")
-print("\nload_back = the cost S1's predictive promote moves OFF the resume critical path.")
-print("DRAM->HBM cheap => single-resume TTFT win small; DISK->HBM (and aggregate) is where S1 pays.")
+
+    def bw(ms):
+        return mb / (ms / 1000) / 1000  # GB/s
+
+    print(
+        f"{name:>6} {mb:>7.1f} | {h2d:>7.2f}ms {bw(h2d):>4.0f}GB/s {d2h:>7.2f}ms {bw(d2h):>4.0f}GB/s "
+        f"{dh:>6.1f}ms {dhbm:>6.1f}ms"
+    )
+print(
+    "\nload_back = the cost S1's predictive promote moves OFF the resume critical path."
+)
+print(
+    "DRAM->HBM cheap => single-resume TTFT win small; DISK->HBM (and aggregate) is where S1 pays."
+)

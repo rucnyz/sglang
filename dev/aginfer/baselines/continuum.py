@@ -15,7 +15,9 @@ For the simulator we expose:
     * On memory_pressure: demote DRAM-pinning of units whose p_hat < pin_threshold.
     * On session_arrival / llm_prefill: promote DRAM->HBM if p_hat >= pin_threshold.
 """
+
 from __future__ import annotations
+
 from typing import List
 
 from .base import Action, ReuseUnit, SchedulerState, Tier
@@ -46,9 +48,8 @@ class ContinuumPolicy:
                     plan.append((u.id, Tier.DRAM))
 
         elif state.event_kind in ("session_arrival", "llm_prefill", "tool_call_end"):
-            cap_left = (
-                usage.capacity_bytes.get(Tier.HBM, 0)
-                - usage.used_bytes.get(Tier.HBM, 0)
+            cap_left = usage.capacity_bytes.get(Tier.HBM, 0) - usage.used_bytes.get(
+                Tier.HBM, 0
             )
             promote: List[tuple] = []
             for uid in state.decision_set:

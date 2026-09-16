@@ -32,6 +32,7 @@ Stages:
     B1 wall-clock: migrate dispatch latency under the flood is bounded by a
        few apply-times, not N×apply-time (N≥3 trials, report mean).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -46,12 +47,18 @@ if str(_AGINFER_ROOT) not in sys.path:
     sys.path.insert(0, str(_AGINFER_ROOT))
 
 from daemon.outbound import (  # noqa: E402
-    OutboundBatch, OutboundQueue, _partition_and_coalesce,
+    OutboundBatch,
+    OutboundQueue,
+    _partition_and_coalesce,
 )
 
 
-def _green(s: str) -> str: return f"\033[32m{s}\033[0m"
-def _red(s: str) -> str:   return f"\033[31m{s}\033[0m"
+def _green(s: str) -> str:
+    return f"\033[32m{s}\033[0m"
+
+
+def _red(s: str) -> str:
+    return f"\033[31m{s}\033[0m"
 
 
 class StageFail(AssertionError):
@@ -62,22 +69,38 @@ class StageFail(AssertionError):
 
 
 def _hint_batch(ts: float, hints: List[Dict[str, Any]]) -> OutboundBatch:
-    return OutboundBatch(batch_id=f"h{ts}", endpoint="hints",
-                         body={"hints": hints, "batch_id": f"h{ts}"},
-                         enqueue_ts=ts, method="PUT")
+    return OutboundBatch(
+        batch_id=f"h{ts}",
+        endpoint="hints",
+        body={"hints": hints, "batch_id": f"h{ts}"},
+        enqueue_ts=ts,
+        method="PUT",
+    )
 
 
 def _migrate_batch(ts: float, actions: List[Dict[str, Any]]) -> OutboundBatch:
-    return OutboundBatch(batch_id=f"m{ts}", endpoint="migrate",
-                         body={"actions": actions, "batch_id": f"m{ts}"},
-                         enqueue_ts=ts, method="POST")
+    return OutboundBatch(
+        batch_id=f"m{ts}",
+        endpoint="migrate",
+        body={"actions": actions, "batch_id": f"m{ts}"},
+        enqueue_ts=ts,
+        method="POST",
+    )
 
 
 def _paused_batch(ts: float, pid: str, state: str) -> OutboundBatch:
-    return OutboundBatch(batch_id=f"p{ts}", endpoint="program_paused",
-                         body={"pid": pid, "state": state,
-                               "pre_pause_state": None, "batch_id": f"p{ts}"},
-                         enqueue_ts=ts, method="PUT")
+    return OutboundBatch(
+        batch_id=f"p{ts}",
+        endpoint="program_paused",
+        body={
+            "pid": pid,
+            "state": state,
+            "pre_pause_state": None,
+            "batch_id": f"p{ts}",
+        },
+        enqueue_ts=ts,
+        method="PUT",
+    )
 
 
 # ============================================================ A. pure
@@ -86,17 +109,24 @@ def _paused_batch(ts: float, pid: str, state: str) -> OutboundBatch:
 def stage_a0_hints_coalesce_latest_wins() -> None:
     now = 1000.0
     batches = [
-        _hint_batch(now - 0.3, [{"hash": "u1", "p_hat": 0.1, "stamp": 1},
-                                {"hash": "u2", "p_hat": 0.2, "stamp": 1}]),
+        _hint_batch(
+            now - 0.3,
+            [
+                {"hash": "u1", "p_hat": 0.1, "stamp": 1},
+                {"hash": "u2", "p_hat": 0.2, "stamp": 1},
+            ],
+        ),
         _hint_batch(now - 0.2, [{"hash": "u2", "p_hat": 0.9, "stamp": 2}]),
         _hint_batch(now - 0.1, [{"hash": "u3", "p_hat": 0.3, "stamp": 3}]),
     ]
     out, stats = _partition_and_coalesce(
-        batches, now_ts=now, migrate_freshness_ms=30000)
+        batches, now_ts=now, migrate_freshness_ms=30000
+    )
     hint_posts = [b for b in out if b.endpoint == "hints"]
     if len(hint_posts) != 1:
-        raise StageFail(f"A0: 3 hint batches must coalesce to 1 PUT; "
-                        f"got {len(hint_posts)}")
+        raise StageFail(
+            f"A0: 3 hint batches must coalesce to 1 PUT; " f"got {len(hint_posts)}"
+        )
     hints = {h["hash"]: h for h in hint_posts[0].body["hints"]}
     if set(hints) != {"u1", "u2", "u3"}:
         raise StageFail(f"A0: coalesced PUT must carry every hash; got {set(hints)}")
@@ -113,13 +143,21 @@ def stage_a0_hints_coalesce_latest_wins() -> None:
         _hint_batch(now - 0.1, [{"hash": "w", "p_hat": 0.1, "stamp": 2}]),
     ]
     out2, _ = _partition_and_coalesce(inv, now_ts=now, migrate_freshness_ms=30000)
-    hw = {h["hash"]: h for h in
-          next(b for b in out2 if b.endpoint == "hints").body["hints"]}["w"]
+    hw = {
+        h["hash"]: h
+        for h in next(b for b in out2 if b.endpoint == "hints").body["hints"]
+    }["w"]
     if hw["stamp"] != 5:
-        raise StageFail(f"A0: highest stamp (5) must win regardless of enqueue "
-                        f"order; got stamp={hw['stamp']}")
-    print(_green("  [A0] hints coalesce → 1 PUT, all hashes, max-stamp-wins "
-                 "(order-independent) OK"))
+        raise StageFail(
+            f"A0: highest stamp (5) must win regardless of enqueue "
+            f"order; got stamp={hw['stamp']}"
+        )
+    print(
+        _green(
+            "  [A0] hints coalesce → 1 PUT, all hashes, max-stamp-wins "
+            "(order-independent) OK"
+        )
+    )
 
 
 def stage_a1_migrates_coalesce_latest_wins() -> None:
@@ -129,26 +167,57 @@ def stage_a1_migrates_coalesce_latest_wins() -> None:
     The single-flight ceiling remains, but a burst is one round-trip, not N."""
     now = 1000.0
     batches = [
-        _migrate_batch(now - 0.3, [{"hash": "u1", "add_tiers": [],
-                                    "remove_tiers": ["HBM"], "action_id": "a1"}]),
-        _migrate_batch(now - 0.2, [{"hash": "u2", "add_tiers": [],
-                                    "remove_tiers": ["HBM"], "action_id": "a2"}]),
+        _migrate_batch(
+            now - 0.3,
+            [
+                {
+                    "hash": "u1",
+                    "add_tiers": [],
+                    "remove_tiers": ["HBM"],
+                    "action_id": "a1",
+                }
+            ],
+        ),
+        _migrate_batch(
+            now - 0.2,
+            [
+                {
+                    "hash": "u2",
+                    "add_tiers": [],
+                    "remove_tiers": ["HBM"],
+                    "action_id": "a2",
+                }
+            ],
+        ),
         # later decision for u1 SUPERSEDES the earlier one (latest-per-hash):
-        _migrate_batch(now - 0.1, [{"hash": "u1", "add_tiers": ["DRAM"],
-                                    "remove_tiers": [], "action_id": "a3"}]),
+        _migrate_batch(
+            now - 0.1,
+            [
+                {
+                    "hash": "u1",
+                    "add_tiers": ["DRAM"],
+                    "remove_tiers": [],
+                    "action_id": "a3",
+                }
+            ],
+        ),
     ]
     out, stats = _partition_and_coalesce(
-        batches, now_ts=now, migrate_freshness_ms=30000)
+        batches, now_ts=now, migrate_freshness_ms=30000
+    )
     migs = [b for b in out if b.endpoint == "migrate"]
     if len(migs) != 1:
-        raise StageFail(f"A1: a migrate burst must coalesce to 1 POST; "
-                        f"got {len(migs)}")
+        raise StageFail(
+            f"A1: a migrate burst must coalesce to 1 POST; " f"got {len(migs)}"
+        )
     acts = {a["hash"]: a for a in migs[0].body["actions"]}
     if set(acts) != {"u1", "u2"}:
         raise StageFail(f"A1: coalesced POST must carry every unit; got {set(acts)}")
     if acts["u1"]["action_id"] != "a3":
-        raise StageFail(f"A1: latest decision per hash must win — u1 should be "
-                        f"a3, got {acts['u1']['action_id']}")
+        raise StageFail(
+            f"A1: latest decision per hash must win — u1 should be "
+            f"a3, got {acts['u1']['action_id']}"
+        )
     if stats["migrate_in"] != 3 or stats["migrate_out"] != 1:
         raise StageFail(f"A1: stats wrong: {stats}")
     print(_green("  [A1] migrate burst → 1 POST, every unit, latest-per-hash OK"))
@@ -157,41 +226,65 @@ def stage_a1_migrates_coalesce_latest_wins() -> None:
 def stage_a2_migrate_freshness_drop() -> None:
     now = 1000.0
     batches = [
-        _migrate_batch(now - 5.0, [{"hash": "stale", "add_tiers": [],
-                                    "remove_tiers": ["HBM"], "action_id": "s"}]),
-        _migrate_batch(now - 0.1, [{"hash": "fresh", "add_tiers": [],
-                                    "remove_tiers": ["HBM"], "action_id": "f"}]),
+        _migrate_batch(
+            now - 5.0,
+            [
+                {
+                    "hash": "stale",
+                    "add_tiers": [],
+                    "remove_tiers": ["HBM"],
+                    "action_id": "s",
+                }
+            ],
+        ),
+        _migrate_batch(
+            now - 0.1,
+            [
+                {
+                    "hash": "fresh",
+                    "add_tiers": [],
+                    "remove_tiers": ["HBM"],
+                    "action_id": "f",
+                }
+            ],
+        ),
     ]
     # freshness=1000ms: the 5 s-old batch is stale-dropped BEFORE the merge;
     # only the fresh action survives into the single coalesced POST.
-    out, stats = _partition_and_coalesce(
-        batches, now_ts=now, migrate_freshness_ms=1000)
+    out, stats = _partition_and_coalesce(batches, now_ts=now, migrate_freshness_ms=1000)
     migs = [b for b in out if b.endpoint == "migrate"]
     acts = {a["hash"] for b in migs for a in b.body["actions"]}
     if acts != {"fresh"}:
-        raise StageFail(f"A2: stale migrate must be dropped, only fresh kept; "
-                        f"got {acts}")
+        raise StageFail(
+            f"A2: stale migrate must be dropped, only fresh kept; " f"got {acts}"
+        )
     if stats["migrate_dropped_stale"] != 1 or stats["migrate_out"] != 1:
         raise StageFail(f"A2: stats wrong: {stats}")
     # freshness=0 disables the bound → BOTH actions survive (in 1 coalesced POST).
     out0, _ = _partition_and_coalesce(batches, now_ts=now, migrate_freshness_ms=0)
-    acts0 = {a["hash"] for b in out0 if b.endpoint == "migrate"
-             for a in b.body["actions"]}
+    acts0 = {
+        a["hash"] for b in out0 if b.endpoint == "migrate" for a in b.body["actions"]
+    }
     if acts0 != {"stale", "fresh"}:
         raise StageFail(f"A2: freshness=0 must keep both actions; got {acts0}")
-    print(_green("  [A2] #227 freshness: stale action dropped, fresh kept, "
-                 "0=disabled (both actions) OK"))
+    print(
+        _green(
+            "  [A2] #227 freshness: stale action dropped, fresh kept, "
+            "0=disabled (both actions) OK"
+        )
+    )
 
 
 def stage_a3_paused_coalesce_by_pid() -> None:
     now = 1000.0
     batches = [
         _paused_batch(now - 0.3, "p1", "PAUSED"),
-        _paused_batch(now - 0.2, "p1", "REASONING"),   # newer for p1
+        _paused_batch(now - 0.2, "p1", "REASONING"),  # newer for p1
         _paused_batch(now - 0.1, "p2", "ENDED"),
     ]
     out, stats = _partition_and_coalesce(
-        batches, now_ts=now, migrate_freshness_ms=30000)
+        batches, now_ts=now, migrate_freshness_ms=30000
+    )
     paused = [b for b in out if b.endpoint == "program_paused"]
     by_pid = {b.body["pid"]: b.body["state"] for b in paused}
     if by_pid != {"p1": "REASONING", "p2": "ENDED"}:
@@ -205,16 +298,26 @@ def stage_a4_dispatch_order() -> None:
     now = 1000.0
     batches = [
         _hint_batch(now - 0.4, [{"hash": "u1", "p_hat": 0.1, "stamp": 1}]),
-        _migrate_batch(now - 0.3, [{"hash": "u2", "add_tiers": [],
-                                    "remove_tiers": ["HBM"], "action_id": "a"}]),
+        _migrate_batch(
+            now - 0.3,
+            [
+                {
+                    "hash": "u2",
+                    "add_tiers": [],
+                    "remove_tiers": ["HBM"],
+                    "action_id": "a",
+                }
+            ],
+        ),
         _paused_batch(now - 0.2, "p1", "PAUSED"),
     ]
-    out, _ = _partition_and_coalesce(
-        batches, now_ts=now, migrate_freshness_ms=30000)
+    out, _ = _partition_and_coalesce(batches, now_ts=now, migrate_freshness_ms=30000)
     order = [b.endpoint for b in out]
     if order != ["program_paused", "migrate", "hints"]:
-        raise StageFail(f"A4: order must be paused→migrate→hints (time-sensitive "
-                        f"never behind the flood); got {order}")
+        raise StageFail(
+            f"A4: order must be paused→migrate→hints (time-sensitive "
+            f"never behind the flood); got {order}"
+        )
     print(_green("  [A4] dispatch order paused→migrate→hints OK"))
 
 
@@ -224,6 +327,7 @@ def stage_a4_dispatch_order() -> None:
 class _RecordingClient:
     """Records (verb, endpoint, monotonic_ts) per call; simulates the
     single-flight sglang apply with a fixed per-POST sleep."""
+
     def __init__(self, apply_s: float):
         self.apply_s = apply_s
         self.calls: List[Tuple[str, str, float]] = []
@@ -249,23 +353,35 @@ class _RecordingClient:
 class _Resp:
     status_code = 200
     text = ""
-    def json(self): return {}
+
+    def json(self):
+        return {}
 
 
 def stage_b0_migrate_not_behind_hint_flood() -> None:
     """The decisive structural proof: a migrate queued BEHIND 200 hint PUTs
     must dispatch as an O(1) call, not the 201st — and the 200 hints collapse
     to ONE PUT carrying all 200 hashes."""
+
     async def _go():
         client = _RecordingClient(apply_s=0.005)
         ob = OutboundQueue(sglang_base_url="http://x", http_client=client)
         N = 200
         # Enqueue 200 hint PUTs, THEN one migrate (worst case: at the back).
         for i in range(N):
-            ob.enqueue_hints([{"hash": f"u{i}", "p_hat": 0.1,
-                               "lambda": 0.01, "stamp": i}])
-        ob.enqueue_migrate([{"hash": "evict-me", "add_tiers": [],
-                             "remove_tiers": ["HBM"], "action_id": "a0"}])
+            ob.enqueue_hints(
+                [{"hash": f"u{i}", "p_hat": 0.1, "lambda": 0.01, "stamp": i}]
+            )
+        ob.enqueue_migrate(
+            [
+                {
+                    "hash": "evict-me",
+                    "add_tiers": [],
+                    "remove_tiers": ["HBM"],
+                    "action_id": "a0",
+                }
+            ]
+        )
         await ob.start()
         await ob.queue.join()
         await ob.stop()
@@ -282,10 +398,16 @@ def stage_b0_migrate_not_behind_hint_flood() -> None:
     # NOT the 201st — i.e. it did NOT wait behind the flood.
     migrate_idx = calls.index(posts[0])
     if migrate_idx > 1:
-        raise StageFail(f"B0: migrate dispatched as call #{migrate_idx} — it "
-                        f"waited behind the hint flood (should be O(1))")
-    print(_green(f"  [B0] migrate is call #{migrate_idx} (not #{200}); 200 hints "
-                 f"→ 1 PUT — migrate does NOT wait behind the flood OK"))
+        raise StageFail(
+            f"B0: migrate dispatched as call #{migrate_idx} — it "
+            f"waited behind the hint flood (should be O(1))"
+        )
+    print(
+        _green(
+            f"  [B0] migrate is call #{migrate_idx} (not #{200}); 200 hints "
+            f"→ 1 PUT — migrate does NOT wait behind the flood OK"
+        )
+    )
 
 
 def stage_b1_latency_bounded_under_flood() -> None:
@@ -298,11 +420,20 @@ def stage_b1_latency_bounded_under_flood() -> None:
         client = _RecordingClient(apply_s=APPLY)
         ob = OutboundQueue(sglang_base_url="http://x", http_client=client)
         for i in range(N):
-            ob.enqueue_hints([{"hash": f"u{i}", "p_hat": 0.1,
-                               "lambda": 0.01, "stamp": i}])
+            ob.enqueue_hints(
+                [{"hash": f"u{i}", "p_hat": 0.1, "lambda": 0.01, "stamp": i}]
+            )
         t_enq = time.monotonic()
-        ob.enqueue_migrate([{"hash": "evict-me", "add_tiers": [],
-                             "remove_tiers": ["HBM"], "action_id": "a0"}])
+        ob.enqueue_migrate(
+            [
+                {
+                    "hash": "evict-me",
+                    "add_tiers": [],
+                    "remove_tiers": ["HBM"],
+                    "action_id": "a0",
+                }
+            ]
+        )
         await ob.start()
         await ob.queue.join()
         await ob.stop()
@@ -318,9 +449,14 @@ def stage_b1_latency_bounded_under_flood() -> None:
         raise StageFail(
             f"B1: migrate latency {mean*1000:.1f}ms not << serial floor "
             f"{serial_floor*1000:.0f}ms (N×apply) — flood not un-clogged. "
-            f"trials={[f'{x*1000:.1f}ms' for x in lats]}")
-    print(_green(f"  [B1] migrate latency mean={mean*1000:.1f}ms over 3 trials "
-                 f"<< serial-floor {serial_floor*1000:.0f}ms (N={N}×{APPLY*1000:.0f}ms) OK"))
+            f"trials={[f'{x*1000:.1f}ms' for x in lats]}"
+        )
+    print(
+        _green(
+            f"  [B1] migrate latency mean={mean*1000:.1f}ms over 3 trials "
+            f"<< serial-floor {serial_floor*1000:.0f}ms (N={N}×{APPLY*1000:.0f}ms) OK"
+        )
+    )
 
 
 _STAGES = [
@@ -344,6 +480,7 @@ def main() -> int:
             failures.append(name)
         except Exception as e:  # noqa: BLE001
             import traceback
+
             traceback.print_exc()
             print(_red(f"  FAIL {name}: unexpected {e!r}"))
             failures.append(name)

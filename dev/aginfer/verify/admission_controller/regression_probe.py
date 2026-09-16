@@ -9,6 +9,7 @@ Same protocol as verify/t7/regression_probe.py:
 
 Each probe prints ``PASS  <finding>: pre-fix FAIL → post-fix PASS``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -33,8 +34,8 @@ from daemon.admission_controller import (  # noqa: E402
     attach_admission_controller,
     shared_aware_prog_scores,
 )
-from daemon.events import Event, EventBus, EventKind  # noqa: E402
 from daemon.event_router import EventRouter  # noqa: E402
+from daemon.events import Event, EventBus, EventKind  # noqa: E402
 from daemon.kv_scheduler import (  # noqa: E402
     KvScheduler,
     attach_kv_scheduler,
@@ -137,9 +138,12 @@ def probe_b1_holding_tax_restored() -> None:
 
     def _check() -> bool:
         from daemon.kv_scheduler import build_paper_state as _bps
+
         s = _bps(
-            state, event=Event(kind=EventKind.MEMORY_PRESSURE),
-            tracker=ProgramTracker(), unknown_tier_log=set(),
+            state,
+            event=Event(kind=EventKind.MEMORY_PRESSURE),
+            tracker=ProgramTracker(),
+            unknown_tier_log=set(),
         )
         scores = shared_aware_prog_scores(s)
         # FIX: huge cold unit drags prog-B BELOW prog-A.
@@ -150,14 +154,13 @@ def probe_b1_holding_tax_restored() -> None:
     # PRE-FIX simulation: patch _value_at_current_tier to drop the
     # holding tax (the original bug behavior).
     saved = adm_mod._value_at_current_tier
-    from baselines.ours_greedy import reload_cost
     from baselines.costs import default_costs as _default_costs
+    from baselines.ours_greedy import reload_cost
 
     def _bug_value(u, state, costs, pi_u):
         # PRE-FIX bug: only saved_prefill, no holding tax.
         return u.p_hat * (
-            reload_cost(u, Tier.DROP, costs, pi_u)
-            - reload_cost(u, u.tier, costs, pi_u)
+            reload_cost(u, Tier.DROP, costs, pi_u) - reload_cost(u, u.tier, costs, pi_u)
         )
 
     adm_mod._value_at_current_tier = _bug_value
@@ -290,9 +293,7 @@ async def probe_n4_drain_resumes_per_event() -> None:
         router = EventRouter(bus=bus, sglang_base_url=url)
         sched = KvScheduler(tracker=tracker, sglang_base_url=url)
         attach_kv_scheduler(router, sched)
-        admission = AdmissionController(
-            tracker=tracker, theta_hi=0.8, theta_lo=0.5
-        )
+        admission = AdmissionController(tracker=tracker, theta_hi=0.8, theta_lo=0.5)
         attach_admission_controller(router, admission)
         # Pre-pause 5 programs into the FIFO (simulate prior pressure events).
         for i in range(n_programs):
@@ -303,8 +304,10 @@ async def probe_n4_drain_resumes_per_event() -> None:
         async with run_server(stub_app, "127.0.0.1", port):
             # One pressure_resolved event.
             await router.bus.emit(
-                Event(kind=EventKind.PRESSURE_RESOLVED,
-                      payload={"state": "OK", "occ": 0.0})
+                Event(
+                    kind=EventKind.PRESSURE_RESOLVED,
+                    payload={"state": "OK", "occ": 0.0},
+                )
             )
             await asyncio.wait_for(router.bus.queue.join(), timeout=5.0)
             await router.stop()
@@ -316,21 +319,22 @@ async def probe_n4_drain_resumes_per_event() -> None:
         return len(admission._paused_fifo)
 
     still_paused_post = await _run()
-    post_fix_passed = (still_paused_post == 0)
+    post_fix_passed = still_paused_post == 0
 
     # PRE-FIX: monkey-patch _on_resolved to ONLY resume the oldest one.
     saved = AdmissionController._on_resolved
 
     async def _bug_on_resolved(self, event, router_):
         self._paused_fifo = [
-            pid for pid in self._paused_fifo
-            if self.tracker.state(pid) == State.PAUSED
+            pid for pid in self._paused_fifo if self.tracker.state(pid) == State.PAUSED
         ]
         if not self._paused_fifo:
             return
         state_json = await router_.fetch_state()
         sched_state = build_paper_state(
-            state_json, event=event, tracker=self.tracker,
+            state_json,
+            event=event,
+            tracker=self.tracker,
             unknown_tier_log=self._unknown_tier_log,
         )
         occ = self._hbm_occ(sched_state)
@@ -345,7 +349,7 @@ async def probe_n4_drain_resumes_per_event() -> None:
         still_paused_pre = await _run()
     finally:
         AdmissionController._on_resolved = saved
-    pre_fix_passed = (still_paused_pre == 0)
+    pre_fix_passed = still_paused_pre == 0
 
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
@@ -369,7 +373,7 @@ def probe_r2_m1_step1_catches_holding_tax_revert() -> None:
     name = "R2-M1 (verify step [1] catches holding-tax revert, not tautological)"
 
     from baselines.costs import default_costs
-    from baselines.ours_greedy import reload_cost, holding_unit_cost
+    from baselines.ours_greedy import holding_unit_cost, reload_cost
     from daemon.kv_scheduler import build_paper_state as _bps
 
     # The state from `make_pressure_state(n_programs=4)` equivalent:
@@ -459,8 +463,7 @@ def probe_r2_m1_step1_catches_holding_tax_revert() -> None:
 
     def _bug_value(u, state, costs, pi_u):
         return u.p_hat * (
-            reload_cost(u, Tier.DROP, costs, pi_u)
-            - reload_cost(u, u.tier, costs, pi_u)
+            reload_cost(u, Tier.DROP, costs, pi_u) - reload_cost(u, u.tier, costs, pi_u)
         )
 
     adm_mod._value_at_current_tier = _bug_value
@@ -506,9 +509,7 @@ def probe_r2_m2_composite_overwrite_refused() -> None:
         tracker = ProgramTracker()
         sched = KvScheduler(tracker=tracker, sglang_base_url="http://x")
         attach_kv_scheduler(router, sched)
-        admission = AdmissionController(
-            tracker=tracker, theta_hi=0.8, theta_lo=0.6
-        )
+        admission = AdmissionController(tracker=tracker, theta_hi=0.8, theta_lo=0.6)
         attach_admission_controller(router, admission)
 
         async def _new_handler(evt, r):
@@ -528,9 +529,7 @@ def probe_r2_m2_composite_overwrite_refused() -> None:
         tracker = ProgramTracker()
         sched = KvScheduler(tracker=tracker, sglang_base_url="http://x")
         attach_kv_scheduler(router, sched)
-        admission = AdmissionController(
-            tracker=tracker, theta_hi=0.8, theta_lo=0.6
-        )
+        admission = AdmissionController(tracker=tracker, theta_hi=0.8, theta_lo=0.6)
         attach_admission_controller(router, admission)
 
         async def _new_handler(evt, r):

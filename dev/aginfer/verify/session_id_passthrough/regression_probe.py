@@ -13,6 +13,7 @@ Usage:
     AGINFER_VERIFY_MODEL=Qwen/Qwen3-0.6B \
     python dev/aginfer/verify/t3/regression_probe.py
 """
+
 from __future__ import annotations
 
 import os
@@ -54,7 +55,9 @@ def probe_session_forward() -> str:
     except Exception:
         pass  # /flush_cache may not exist on all builds; ignore.
 
-    open_r = requests.post(f"{BASE}/open_session", json={"capacity_of_str_len": 1024}, timeout=30)
+    open_r = requests.post(
+        f"{BASE}/open_session", json={"capacity_of_str_len": 1024}, timeout=30
+    )
     open_r.raise_for_status()
     # /open_session currently returns a bare JSON string ("abc-def-..."),
     # but the response shape is not contractually fixed.  Try the JSON
@@ -129,11 +132,13 @@ def probe_recursion_dos() -> str:
     # via the sglang-native path; building raw JSON bytes also avoids
     # Python's client-side json.dumps recursion limit.
     raw = (
-        b'{"text":"recursion probe via raw POST"' +
-        b',"sampling_params":{"max_new_tokens":4,"temperature":0.0}' +
-        b',"program_id":' +
-        b"[" * depth + b'"deeply-buried"' + b"]" * depth +
-        b"}"
+        b'{"text":"recursion probe via raw POST"'
+        + b',"sampling_params":{"max_new_tokens":4,"temperature":0.0}'
+        + b',"program_id":'
+        + b"[" * depth
+        + b'"deeply-buried"'
+        + b"]" * depth
+        + b"}"
     )
     try:
         r = requests.post(
@@ -229,9 +234,7 @@ def _assignment_present(func, attr_chain: str) -> bool:
     target = attr_chain.strip()
     for node in ast.walk(tree):
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = (
-                node.targets if isinstance(node, ast.Assign) else [node.target]
-            )
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for t in targets:
                 try:
                     if ast.unparse(t).strip() == target:
@@ -287,9 +290,7 @@ def assert_fix_state_restored() -> None:
 
     Session = getattr(_sc_mod, "Session", None)
     assert Session is not None, "Could not import Session class"
-    assert _function_passes_kwarg(
-        Session.create_req, "program_id", "req.program_id"
-    ), (
+    assert _function_passes_kwarg(Session.create_req, "program_id", "req.program_id"), (
         "Session.create_req does NOT pass `program_id=req.program_id` "
         "as a real keyword argument (AST check).  The bisect demo's "
         "revert was forgotten -- restore the line in "
@@ -349,9 +350,7 @@ def assert_fix_state_restored() -> None:
         UnifiedTreeNode,
     )
 
-    assert _assignment_present(
-        UnifiedTreeNode.__init__, "self.session_ids"
-    ), (
+    assert _assignment_present(UnifiedTreeNode.__init__, "self.session_ids"), (
         "UnifiedTreeNode.__init__ does NOT assign `self.session_ids` "
         "(AST check).  Every node would start without the attribute "
         "and the dump path would silently emit empty session_ids.  "
@@ -362,9 +361,7 @@ def assert_fix_state_restored() -> None:
     # (round-6 MINOR 6).  Without this, internal nodes created by
     # radix splits lose all tags carried by the original (longer-
     # prefix) child.
-    assert _assignment_present(
-        UnifiedRadixCache._split_node, "new_node.session_ids"
-    ), (
+    assert _assignment_present(UnifiedRadixCache._split_node, "new_node.session_ids"), (
         "_split_node does NOT assign `new_node.session_ids` "
         "(AST check).  After a radix split, the new internal node "
         "would lose every program tag carried by its child.  Restore "

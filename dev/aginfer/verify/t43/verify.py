@@ -20,6 +20,7 @@ fatal with a recognisable reason.
 Usage:
     python dev/aginfer/verify/t43/verify.py
 """
+
 from __future__ import annotations
 
 import copy
@@ -32,10 +33,9 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-
 _HERE = Path(__file__).resolve().parent
-_AGINFER_ROOT = _HERE.parent.parent          # dev/aginfer
-_SGLANG_ROOT = _AGINFER_ROOT.parent.parent   # repo root
+_AGINFER_ROOT = _HERE.parent.parent  # dev/aginfer
+_SGLANG_ROOT = _AGINFER_ROOT.parent.parent  # repo root
 RESULTS_DIR = _HERE / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -114,24 +114,27 @@ def _assert_forensic_file(
     # Asserting these here means every subsequent stage gets the
     # presence check for free, so an impl regression (e.g. someone
     # drops the pid field) is caught by ANY stage, not just S0.
-    for key in ("reason", "timestamp_unix", "timestamp_iso", "pid",
-                "traceback", "context"):
+    for key in (
+        "reason",
+        "timestamp_unix",
+        "timestamp_iso",
+        "pid",
+        "traceback",
+        "context",
+    ):
         if key not in payload:
-            raise StageFail(
-                f"forensic payload missing {key!r}; keys={list(payload)}"
-            )
+            raise StageFail(f"forensic payload missing {key!r}; keys={list(payload)}")
     if payload["reason"] != reason:
         raise StageFail(
             f"forensic payload reason mismatch: "
             f"want {reason!r}, got {payload['reason']!r}"
         )
     if not isinstance(payload["pid"], int) or payload["pid"] <= 0:
-        raise StageFail(
-            f"forensic payload pid not a positive int: {payload['pid']!r}"
-        )
+        raise StageFail(f"forensic payload pid not a positive int: {payload['pid']!r}")
     iso = payload["timestamp_iso"]
     if not isinstance(iso, str) or not re.match(
-            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", iso):
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", iso
+    ):
         raise StageFail(
             f"timestamp_iso does not look like YYYY-MM-DDTHH:MM:SS: {iso!r}"
         )
@@ -143,9 +146,7 @@ def _assert_forensic_file(
                 )
             got = payload["context"][k]
             if got != want:
-                raise StageFail(
-                    f"context[{k!r}] mismatch: want {want!r}, got {got!r}"
-                )
+                raise StageFail(f"context[{k!r}] mismatch: want {want!r}, got {got!r}")
     return payload
 
 
@@ -166,18 +167,18 @@ def stage_0_helper_contract() -> None:
         )
         if result.returncode != 1:
             raise StageFail(
-                f"expected exit=1; got {result.returncode}; "
-                f"stderr={result.stderr}"
+                f"expected exit=1; got {result.returncode}; " f"stderr={result.stderr}"
             )
         _assert_forensic_file(
-            data_dir, "schema_sanity", result.stderr,
+            data_dir,
+            "schema_sanity",
+            result.stderr,
             expected_context_subset={"foo": 1, "bar": [1, 2, 3]},
         )
         # CRITICAL-level marker (§10: "logs a fatal-level line").
         if "CRITICAL" not in result.stderr and "fatal" not in result.stderr.lower():
             raise StageFail(
-                f"stderr does not look like a fatal-level log line: "
-                f"{result.stderr}"
+                f"stderr does not look like a fatal-level log line: " f"{result.stderr}"
             )
 
 
@@ -198,9 +199,7 @@ def stage_1_traceback_captured() -> None:
         )
         if result.returncode != 1:
             raise StageFail(f"expected exit=1; got {result.returncode}")
-        payload = _assert_forensic_file(
-            data_dir, "tb_check", result.stderr
-        )
+        payload = _assert_forensic_file(data_dir, "tb_check", result.stderr)
         tb = "\n".join(payload["traceback"])
         for needle in ("outer_frame_name", "inner_frame_name"):
             if needle not in tb:
@@ -238,7 +237,9 @@ def stage_2_unserialisable_context_falls_back_to_repr() -> None:
                 f"stderr={result.stderr}"
             )
         payload = _assert_forensic_file(
-            data_dir, "unser_check", result.stderr,
+            data_dir,
+            "unser_check",
+            result.stderr,
             expected_context_subset={"good": "still here"},
         )
         if "socket" not in str(payload["context"]["bad"]):
@@ -265,7 +266,9 @@ def stage_2_unserialisable_context_falls_back_to_repr() -> None:
                 f"stderr={result.stderr}"
             )
         payload = _assert_forensic_file(
-            data_dir, "unser_nested", result.stderr,
+            data_dir,
+            "unser_nested",
+            result.stderr,
         )
         deep_dict = payload["context"]["nested"]["deep"][0]
         if "socket" not in str(deep_dict["bad"]):
@@ -275,8 +278,7 @@ def stage_2_unserialisable_context_falls_back_to_repr() -> None:
             )
         if deep_dict.get("keep") != "me":
             raise StageFail(
-                f"(b) sibling-in-same-dict 'keep' got dropped: "
-                f"{deep_dict!r}"
+                f"(b) sibling-in-same-dict 'keep' got dropped: " f"{deep_dict!r}"
             )
         if payload["context"]["sibling"] != {"plain": 42}:
             raise StageFail(
@@ -294,21 +296,39 @@ def _seed_valid_state() -> Dict[str, Any]:
     drive each fatal path."""
     return {
         "pool_usage": {
-            "HBM":  {"subpools": {"attn": {
-                "used_bytes": 1024, "cap_bytes": 65536,
-                "available_bytes": 64512, "evictable_bytes": 0,
-                "page_bytes": 16,
-            }}},
-            "DRAM": {"subpools": {"attn": {
-                "used_bytes": 0, "cap_bytes": 1048576,
-                "available_bytes": 1048576, "evictable_bytes": 0,
-                "page_bytes": 16,
-            }}},
-            "DISK": {"subpools": {"attn": {
-                "used_bytes": 0, "cap_bytes": 0,
-                "available_bytes": 0, "evictable_bytes": 0,
-                "page_bytes": 16,
-            }}},
+            "HBM": {
+                "subpools": {
+                    "attn": {
+                        "used_bytes": 1024,
+                        "cap_bytes": 65536,
+                        "available_bytes": 64512,
+                        "evictable_bytes": 0,
+                        "page_bytes": 16,
+                    }
+                }
+            },
+            "DRAM": {
+                "subpools": {
+                    "attn": {
+                        "used_bytes": 0,
+                        "cap_bytes": 1048576,
+                        "available_bytes": 1048576,
+                        "evictable_bytes": 0,
+                        "page_bytes": 16,
+                    }
+                }
+            },
+            "DISK": {
+                "subpools": {
+                    "attn": {
+                        "used_bytes": 0,
+                        "cap_bytes": 0,
+                        "available_bytes": 0,
+                        "evictable_bytes": 0,
+                        "page_bytes": 16,
+                    }
+                }
+            },
         },
         "link_stats": {
             "HBM->DRAM": {
@@ -333,7 +353,7 @@ def _seed_valid_state() -> Dict[str, Any]:
             },
         },
         "tier_holding_cost": {
-            "HBM":  {"attn": {"h_max_per_byte_sec": 1.0e-9}},
+            "HBM": {"attn": {"h_max_per_byte_sec": 1.0e-9}},
             "DRAM": {"attn": {"h_max_per_byte_sec": 1.0e-10}},
             "DISK": {"attn": {"h_max_per_byte_sec": 1.0e-11}},
         },
@@ -376,7 +396,10 @@ def _run_build_paper_state(
     env["AGINFER_DATA_DIR"] = str(data_dir)
     return subprocess.run(
         [_PYTHON, "-c", _BUILD_PAPER_STATE_HARNESS, json.dumps(state_json)],
-        env=env, capture_output=True, text=True, timeout=30,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
 
 
@@ -386,8 +409,11 @@ def stage_3_cross_rank_subpool_key_mismatch() -> None:
     rank0 = _seed_valid_state()
     rank1 = copy.deepcopy(rank0)
     rank1["pool_usage"]["HBM"]["subpools"]["moe_expert"] = {
-        "used_bytes": 0, "cap_bytes": 4096,
-        "available_bytes": 4096, "evictable_bytes": 0, "page_bytes": 16,
+        "used_bytes": 0,
+        "cap_bytes": 4096,
+        "available_bytes": 4096,
+        "evictable_bytes": 0,
+        "page_bytes": 16,
     }
     multi_rank = {"per_rank": [rank0, rank1]}
     with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
@@ -395,13 +421,14 @@ def stage_3_cross_rank_subpool_key_mismatch() -> None:
         result = _run_build_paper_state(multi_rank, data_dir=data_dir)
         if result.returncode != 1:
             raise StageFail(
-                f"expected exit=1; got {result.returncode}; "
-                f"stderr={result.stderr}"
+                f"expected exit=1; got {result.returncode}; " f"stderr={result.stderr}"
             )
         if "UNEXPECTED-SUCCESS" in result.stderr:
             raise StageFail("build_paper_state did not raise/fatal")
         _assert_forensic_file(
-            data_dir, "subpool_key_mismatch_across_ranks", result.stderr,
+            data_dir,
+            "subpool_key_mismatch_across_ranks",
+            result.stderr,
         )
 
 
@@ -426,7 +453,9 @@ def stage_4_peak_bw_bps_zero() -> None:
                     f"not raise/fatal"
                 )
             _assert_forensic_file(
-                data_dir, "peak_bw_bps_non_positive", result.stderr,
+                data_dir,
+                "peak_bw_bps_non_positive",
+                result.stderr,
             )
 
 
@@ -439,8 +468,13 @@ def stage_5_missing_required_fields_parametrized() -> None:
     shrinks the required-list to 4 fields) is caught immediately
     instead of slipping through a single-field smoke."""
     required = (
-        "pool_usage", "link_stats", "tier_holding_cost",
-        "throughput_ema", "per_program_usage", "units", "time_counter",
+        "pool_usage",
+        "link_stats",
+        "tier_holding_cost",
+        "throughput_ema",
+        "per_program_usage",
+        "units",
+        "time_counter",
     )
     for field in required:
         state = _seed_valid_state()
@@ -455,11 +489,12 @@ def stage_5_missing_required_fields_parametrized() -> None:
                 )
             if "UNEXPECTED-SUCCESS" in result.stderr:
                 raise StageFail(
-                    f"missing {field!r}: build_paper_state did not "
-                    f"raise/fatal"
+                    f"missing {field!r}: build_paper_state did not " f"raise/fatal"
                 )
             payload = _assert_forensic_file(
-                data_dir, "missing_state_field", result.stderr,
+                data_dir,
+                "missing_state_field",
+                result.stderr,
             )
             if payload["context"].get("missing") != field:
                 raise StageFail(
@@ -476,13 +511,14 @@ def stage_6_per_rank_empty() -> None:
         result = _run_build_paper_state(multi_rank, data_dir=data_dir)
         if result.returncode != 1:
             raise StageFail(
-                f"expected exit=1; got {result.returncode}; "
-                f"stderr={result.stderr}"
+                f"expected exit=1; got {result.returncode}; " f"stderr={result.stderr}"
             )
         if "UNEXPECTED-SUCCESS" in result.stderr:
             raise StageFail("build_paper_state did not raise/fatal")
         _assert_forensic_file(
-            data_dir, "per_rank_empty", result.stderr,
+            data_dir,
+            "per_rank_empty",
+            result.stderr,
         )
 
 
@@ -495,11 +531,12 @@ def stage_7_unsupported_tree_cache() -> None:
         result = _run_build_paper_state(state, data_dir=data_dir)
         if result.returncode != 1:
             raise StageFail(
-                f"expected exit=1; got {result.returncode}; "
-                f"stderr={result.stderr}"
+                f"expected exit=1; got {result.returncode}; " f"stderr={result.stderr}"
             )
         _assert_forensic_file(
-            data_dir, "unsupported_tree_cache", result.stderr,
+            data_dir,
+            "unsupported_tree_cache",
+            result.stderr,
         )
 
 
@@ -533,7 +570,9 @@ def stage_9_h_max_per_byte_sec_non_positive() -> None:
         if "UNEXPECTED-SUCCESS" in result.stderr:
             raise StageFail("build_paper_state did not raise/fatal")
         _assert_forensic_file(
-            data_dir, "holding_cost_non_positive", result.stderr,
+            data_dir,
+            "holding_cost_non_positive",
+            result.stderr,
         )
 
     # (b) negative — always fatal (covers all-other-zero AND seed-positive)
@@ -543,11 +582,11 @@ def stage_9_h_max_per_byte_sec_non_positive() -> None:
         data_dir = Path(td)
         result = _run_build_paper_state(state, data_dir=data_dir)
         if result.returncode != 1:
-            raise StageFail(
-                f"(b) negative: expected exit=1; got {result.returncode}"
-            )
+            raise StageFail(f"(b) negative: expected exit=1; got {result.returncode}")
         _assert_forensic_file(
-            data_dir, "holding_cost_non_positive", result.stderr,
+            data_dir,
+            "holding_cost_non_positive",
+            result.stderr,
         )
 
     # (c) all-zero cold-start — no fatal
@@ -615,21 +654,25 @@ def stage_10_prefill_bps_positivity_conditional() -> None:
                 f"stderr={result.stderr}"
             )
         _assert_forensic_file(
-            data_dir, "prefill_bps_non_positive_with_traffic", result.stderr,
+            data_dir,
+            "prefill_bps_non_positive_with_traffic",
+            result.stderr,
         )
 
     # (c) zero + units: pre-T26 placeholder; NO fatal (relaxed by #161)
     state_c = _seed_valid_state()
     state_c["throughput_ema"]["prefill_bps"] = 0.0
-    state_c["units"] = [{
-        "hash": "node-1",
-        "residence": ["HBM"],
-        "n_tokens": 256,
-        "n_bytes": {"HBM": {"attn": 4096}},
-        "last_access_time": 0,
-        "hit_count": 1,
-        "session_ids": [],
-    }]
+    state_c["units"] = [
+        {
+            "hash": "node-1",
+            "residence": ["HBM"],
+            "n_tokens": 256,
+            "n_bytes": {"HBM": {"attn": 4096}},
+            "last_access_time": 0,
+            "hit_count": 1,
+            "session_ids": [],
+        }
+    ]
     state_c["time_counter"] = 1
     with tempfile.TemporaryDirectory(prefix="aginfer_t43_") as td:
         data_dir = Path(td)
@@ -652,15 +695,17 @@ def stage_11_cross_rank_n_bytes_disagreement() -> None:
     ``n_bytes[HBM][attn] = 4096`` on rank-0 and ``8192`` on rank-1
     and asserts fatal."""
     rank0 = _seed_valid_state()
-    rank0["units"] = [{
-        "hash": "node-replica",
-        "residence": ["HBM"],
-        "n_tokens": 256,
-        "n_bytes": {"HBM": {"attn": 4096}},
-        "last_access_time": 0,
-        "hit_count": 1,
-        "session_ids": [],
-    }]
+    rank0["units"] = [
+        {
+            "hash": "node-replica",
+            "residence": ["HBM"],
+            "n_tokens": 256,
+            "n_bytes": {"HBM": {"attn": 4096}},
+            "last_access_time": 0,
+            "hit_count": 1,
+            "session_ids": [],
+        }
+    ]
     rank0["time_counter"] = 1
     rank1 = copy.deepcopy(rank0)
     rank1["units"][0]["n_bytes"]["HBM"]["attn"] = 8192  # disagrees
@@ -679,7 +724,9 @@ def stage_11_cross_rank_n_bytes_disagreement() -> None:
                 "n_bytes disagreement instead of fataling"
             )
         _assert_forensic_file(
-            data_dir, "n_bytes_disagreement_across_ranks", result.stderr,
+            data_dir,
+            "n_bytes_disagreement_across_ranks",
+            result.stderr,
         )
 
 
@@ -706,16 +753,16 @@ def stage_12_exception_context_traceback() -> None:
         result = _run_subprocess_fatal(body, data_dir=data_dir)
         if result.returncode != 1:
             raise StageFail(
-                f"expected exit=1; got {result.returncode}; "
-                f"stderr={result.stderr}"
+                f"expected exit=1; got {result.returncode}; " f"stderr={result.stderr}"
             )
         payload = _assert_forensic_file(
-            data_dir, "exc_check", result.stderr,
+            data_dir,
+            "exc_check",
+            result.stderr,
             expected_context_subset={"note": "inside-except"},
         )
         tb_joined = "\n".join(payload["traceback"])
-        for needle in ("RuntimeError", "boom-from-test",
-                       "the_raising_frame"):
+        for needle in ("RuntimeError", "boom-from-test", "the_raising_frame"):
             if needle not in tb_joined:
                 raise StageFail(
                     f"traceback missing {needle!r}; trace was:\n{tb_joined}"
@@ -774,11 +821,12 @@ def stage_13_full_context_contract_round_trip() -> None:
         result = _run_subprocess_fatal(body, data_dir=data_dir)
         if result.returncode != 1:
             raise StageFail(
-                f"expected exit=1; got {result.returncode}; "
-                f"stderr={result.stderr}"
+                f"expected exit=1; got {result.returncode}; " f"stderr={result.stderr}"
             )
         payload = _assert_forensic_file(
-            data_dir, "full_ctx_check", result.stderr,
+            data_dir,
+            "full_ctx_check",
+            result.stderr,
         )
         ctx = payload["context"]
         # ---- event: dataclass + Enum coercion ----
@@ -800,9 +848,12 @@ def stage_13_full_context_contract_round_trip() -> None:
         if not isinstance(ctx["candidates"], list) or len(ctx["candidates"]) != 2:
             raise StageFail(f"candidates shape: {ctx['candidates']!r}")
         c0 = ctx["candidates"][0]
-        if (c0.get("hash") != "h1" or c0.get("source_tier") != "HBM"
-                or c0.get("target_tier") != "DRAM"
-                or c0.get("expected_bytes") != 4096):
+        if (
+            c0.get("hash") != "h1"
+            or c0.get("source_tier") != "HBM"
+            or c0.get("target_tier") != "DRAM"
+            or c0.get("expected_bytes") != 4096
+        ):
             raise StageFail(f"candidate[0] round-trip: {c0!r}")
         # ---- dp_inputs: numeric dict ----
         if ctx["dp_inputs"].get("bytes_needed") != {"HBM:attn": 12288}:
@@ -827,39 +878,40 @@ def stage_14_unwritable_data_dir_degraded_path() -> None:
     if not Path("/proc/cmdline").exists():
         # Non-Linux sandbox: skip with a soft pass instead of failing
         # the suite for an env-specific reason.
-        print(f"  (skip) /proc/cmdline unavailable; degraded-path probe needs Linux proc")
+        print(
+            f"  (skip) /proc/cmdline unavailable; degraded-path probe needs Linux proc"
+        )
         return
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_AGINFER_ROOT)
     env["AGINFER_DATA_DIR"] = "/proc/cmdline"
     result = subprocess.run(
-        [_PYTHON, "-c",
-         "from daemon._fatal import fatal\n"
-         "fatal('unwritable_dir_check', note='degraded')\n"],
-        env=env, capture_output=True, text=True, timeout=30,
+        [
+            _PYTHON,
+            "-c",
+            "from daemon._fatal import fatal\n"
+            "fatal('unwritable_dir_check', note='degraded')\n",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if result.returncode != 1:
         raise StageFail(
-            f"expected exit=1; got {result.returncode}; "
-            f"stderr={result.stderr}"
+            f"expected exit=1; got {result.returncode}; " f"stderr={result.stderr}"
         )
     # Must mention the reason in stderr (fallback log line includes it).
     if "unwritable_dir_check" not in result.stderr:
-        raise StageFail(
-            f"stderr missing reason marker; stderr={result.stderr}"
-        )
+        raise StageFail(f"stderr missing reason marker; stderr={result.stderr}")
     # Fallback log line names the payload — must include both the
     # 'no forensic file written' marker AND the supplied note kwarg
     # (proving the payload was actually emitted, not just the
     # reason).
     if "no forensic file written" not in result.stderr:
-        raise StageFail(
-            f"stderr missing degraded marker; stderr={result.stderr}"
-        )
+        raise StageFail(f"stderr missing degraded marker; stderr={result.stderr}")
     if "degraded" not in result.stderr:
-        raise StageFail(
-            f"stderr missing payload-note kwarg; stderr={result.stderr}"
-        )
+        raise StageFail(f"stderr missing payload-note kwarg; stderr={result.stderr}")
 
 
 def stage_15_concurrent_fatals_no_clobber() -> None:
@@ -873,13 +925,14 @@ def stage_15_concurrent_fatals_no_clobber() -> None:
         env["PYTHONPATH"] = str(_AGINFER_ROOT)
         env["AGINFER_DATA_DIR"] = str(data_dir)
         body = (
-            "from daemon._fatal import fatal\n"
-            "fatal('race_test', who='subprocess')\n"
+            "from daemon._fatal import fatal\n" "fatal('race_test', who='subprocess')\n"
         )
         procs = [
             subprocess.Popen(
                 [_PYTHON, "-c", body],
-                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
             )
             for _ in range(2)
@@ -889,13 +942,9 @@ def stage_15_concurrent_fatals_no_clobber() -> None:
                 p.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 p.kill()
-                raise StageFail(
-                    "concurrent fatal subprocess timed out"
-                )
+                raise StageFail("concurrent fatal subprocess timed out")
             if p.returncode != 1:
-                raise StageFail(
-                    f"concurrent fatal exit code: got {p.returncode}"
-                )
+                raise StageFail(f"concurrent fatal exit code: got {p.returncode}")
         files = sorted((data_dir / "forensic").glob("race_test_*.json"))
         if len(files) != 2:
             raise StageFail(
@@ -933,30 +982,46 @@ def stage_8_happy_path_does_not_fatal() -> None:
 
 
 _STAGES = [
-    ("0  fatal helper contract",              stage_0_helper_contract),
-    ("1  traceback captured (no exception)",  stage_1_traceback_captured),
-    ("2  unserialisable context falls back to repr",
-                                              stage_2_unserialisable_context_falls_back_to_repr),
-    ("3  cross-rank subpool key mismatch",    stage_3_cross_rank_subpool_key_mismatch),
-    ("4  peak_bw_bps non-positive (0 and negative)",
-                                              stage_4_peak_bw_bps_zero),
-    ("5  missing required fields (parametrized × 7)",
-                                              stage_5_missing_required_fields_parametrized),
-    ("6  per_rank empty list",                stage_6_per_rank_empty),
-    ("7  unsupported_tree_cache field",       stage_7_unsupported_tree_cache),
-    ("9  h_max_per_byte_sec non-positive (DESIGN §10 positivity)",
-                                              stage_9_h_max_per_byte_sec_non_positive),
-    ("10 prefill_bps positivity (conditional on prefill having run)",
-                                              stage_10_prefill_bps_positivity_conditional),
-    ("11 cross-rank n_bytes disagreement (DESIGN §6 L736)",
-                                              stage_11_cross_rank_n_bytes_disagreement),
-    ("12 exception-context traceback (sys.exc_info path)",
-                                              stage_12_exception_context_traceback),
-    ("13 full context contract round-trip (event/state/candidates/dp_inputs)",
-                                              stage_13_full_context_contract_round_trip),
-    ("14 unwritable data dir degraded path",  stage_14_unwritable_data_dir_degraded_path),
-    ("15 concurrent fatals no clobber",       stage_15_concurrent_fatals_no_clobber),
-    ("8  happy-path sanity (no fatal)",       stage_8_happy_path_does_not_fatal),
+    ("0  fatal helper contract", stage_0_helper_contract),
+    ("1  traceback captured (no exception)", stage_1_traceback_captured),
+    (
+        "2  unserialisable context falls back to repr",
+        stage_2_unserialisable_context_falls_back_to_repr,
+    ),
+    ("3  cross-rank subpool key mismatch", stage_3_cross_rank_subpool_key_mismatch),
+    ("4  peak_bw_bps non-positive (0 and negative)", stage_4_peak_bw_bps_zero),
+    (
+        "5  missing required fields (parametrized × 7)",
+        stage_5_missing_required_fields_parametrized,
+    ),
+    ("6  per_rank empty list", stage_6_per_rank_empty),
+    ("7  unsupported_tree_cache field", stage_7_unsupported_tree_cache),
+    (
+        "9  h_max_per_byte_sec non-positive (DESIGN §10 positivity)",
+        stage_9_h_max_per_byte_sec_non_positive,
+    ),
+    (
+        "10 prefill_bps positivity (conditional on prefill having run)",
+        stage_10_prefill_bps_positivity_conditional,
+    ),
+    (
+        "11 cross-rank n_bytes disagreement (DESIGN §6 L736)",
+        stage_11_cross_rank_n_bytes_disagreement,
+    ),
+    (
+        "12 exception-context traceback (sys.exc_info path)",
+        stage_12_exception_context_traceback,
+    ),
+    (
+        "13 full context contract round-trip (event/state/candidates/dp_inputs)",
+        stage_13_full_context_contract_round_trip,
+    ),
+    (
+        "14 unwritable data dir degraded path",
+        stage_14_unwritable_data_dir_degraded_path,
+    ),
+    ("15 concurrent fatals no clobber", stage_15_concurrent_fatals_no_clobber),
+    ("8  happy-path sanity (no fatal)", stage_8_happy_path_does_not_fatal),
 ]
 
 
@@ -971,7 +1036,9 @@ def main() -> int:
             print(f"  {_red('FAIL')}  Stage {label}: {exc}")
         except Exception as exc:  # noqa: BLE001
             failures.append(label)
-            print(f"  {_red('FAIL')}  Stage {label}: unexpected {type(exc).__name__}: {exc}")
+            print(
+                f"  {_red('FAIL')}  Stage {label}: unexpected {type(exc).__name__}: {exc}"
+            )
     if failures:
         print(_red(f"\nT43 FAILED ({len(failures)} stage(s)): {failures}"))
         return 1

@@ -31,6 +31,7 @@ Run against a live a3 stack (sglang :30000 + daemon :9100):
   python s1_driver.py --programs 8 --turns 4 --prefix-tokens 24000 \
       --output-tokens 1500 --gap-s 6 --tool-eta-s 6 --arm ours
 """
+
 from __future__ import annotations
 
 import argparse
@@ -43,8 +44,9 @@ from typing import Any, Dict, List, Optional
 import requests
 
 
-def post_event(daemon: str, kind: str, session: str,
-               extra: Optional[Dict[str, Any]] = None) -> None:
+def post_event(
+    daemon: str, kind: str, session: str, extra: Optional[Dict[str, Any]] = None
+) -> None:
     body = {"kind": kind, "session": session}
     if extra:
         body.update(extra)
@@ -54,29 +56,42 @@ def post_event(daemon: str, kind: str, session: str,
         print(f"[s1] event {kind} for {session} failed: {e}", file=sys.stderr)
 
 
-def generate(base: str, input_ids: List[int], max_new: int,
-             forced: Optional[List[int]], program_id: str,
-             stream: bool) -> Dict[str, Any]:
+def generate(
+    base: str,
+    input_ids: List[int],
+    max_new: int,
+    forced: Optional[List[int]],
+    program_id: str,
+    stream: bool,
+) -> Dict[str, Any]:
     sp = {"temperature": 0.0, "max_new_tokens": max_new, "ignore_eos": True}
     if forced is not None:
         sp["custom_params"] = {"forced_output_ids": list(forced)}
-    body = {"input_ids": input_ids, "sampling_params": sp,
-            "program_id": program_id, "stream": stream}
+    body = {
+        "input_ids": input_ids,
+        "sampling_params": sp,
+        "program_id": program_id,
+        "stream": stream,
+    }
     if not stream:
         t0 = time.perf_counter()
         r = requests.post(base.rstrip("/") + "/generate", json=body, timeout=900)
         e2e = (time.perf_counter() - t0) * 1000.0
         r.raise_for_status()
         mi = r.json()["meta_info"]
-        return {"ttft_ms": None, "e2e_ms": e2e,
-                "cached": int(mi.get("cached_tokens") or 0),
-                "prompt": int(mi.get("prompt_tokens") or len(input_ids))}
+        return {
+            "ttft_ms": None,
+            "e2e_ms": e2e,
+            "cached": int(mi.get("cached_tokens") or 0),
+            "prompt": int(mi.get("prompt_tokens") or len(input_ids)),
+        }
     # streaming: measure TTFT = time to first token chunk
     t0 = time.perf_counter()
     ttft = None
     cached = prompt = 0
-    with requests.post(base.rstrip("/") + "/generate", json=body, timeout=900,
-                       stream=True) as r:
+    with requests.post(
+        base.rstrip("/") + "/generate", json=body, timeout=900, stream=True
+    ) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line:
@@ -100,7 +115,7 @@ def generate(base: str, input_ids: List[int], max_new: int,
 def run_program(idx: int, args) -> Dict[str, Any]:
     pid = f"s1p{idx}"
     base, daemon = args.base_url, args.daemon_url
-    inject = (args.arm in ("ours", "ta"))           # b = HiCache-only, no gap events
+    inject = args.arm in ("ours", "ta")  # b = HiCache-only, no gap events
     # Stagger program starts so the per-program prefills don't pile into one
     # giant concurrent batch. Staggering bounds the instantaneous prefill width
     # while still building enough working set to pressure a small KV pool.
@@ -113,13 +128,13 @@ def run_program(idx: int, args) -> Dict[str, Any]:
     # even though mid-sequence ids may coincide after the wrap (dedup is
     # prefix-from-root only).
     _VOCAB = 129000
-    salt = (idx * 3001) % _VOCAB          # distinct lead per program
+    salt = (idx * 3001) % _VOCAB  # distinct lead per program
     seq = [(salt + i) % _VOCAB for i in range(args.prefix_tokens)]
     if inject:
         post_event(daemon, "session_arrival", pid)
     resume_rows: List[Dict[str, Any]] = []
     for turn in range(args.turns):
-        _ob = (salt + 64000 + turn * 9000)   # output band, disjoint-ish from prefix
+        _ob = salt + 64000 + turn * 9000  # output band, disjoint-ish from prefix
         out = [(_ob + i) % _VOCAB for i in range(args.output_tokens)]
         if inject:
             post_event(daemon, "llm_prefill", pid)
@@ -135,10 +150,12 @@ def run_program(idx: int, args) -> Dict[str, Any]:
             # SAME `bash` tool; `ls`/`sleep` differ only in the COMMAND argument,
             # so a tool-TYPE estimator can't tell them apart — the daemon's
             # fine-grained (tool, command-token) estimator learns the split online.
-            slow = (turn % 2 == 0)
+            slow = turn % 2 == 0
             tool_name = "bash"
             if slow:
-                command, real_gap = f"sleep {int(max(1, args.gap_s))}", float(args.gap_s)
+                command, real_gap = f"sleep {int(max(1, args.gap_s))}", float(
+                    args.gap_s
+                )
             else:
                 command, real_gap = "ls -la /tmp", max(0.3, args.gap_s * 0.04)
             if inject:
@@ -146,16 +163,23 @@ def run_program(idx: int, args) -> Dict[str, Any]:
                 # will resume) so the daemon's action-timeline promote can warm it
                 # back to HBM during the gap (prefill-only) if it gets evicted.
                 try:
-                    requests.post(f"{daemon}/aginfer/session_prefix",
-                                  json={"program_id": pid, "input_ids": seq},
-                                  timeout=15)
+                    requests.post(
+                        f"{daemon}/aginfer/session_prefix",
+                        json={"program_id": pid, "input_ids": seq},
+                        timeout=15,
+                    )
                 except Exception:
                     pass
-                post_event(daemon, "tool_call_start", pid, {
-                    "tool_name": tool_name,
-                    "tool_args": {"command": command},
-                    "tool_eta_s": real_gap,   # bootstrap until the estimator has obs
-                })
+                post_event(
+                    daemon,
+                    "tool_call_start",
+                    pid,
+                    {
+                        "tool_name": tool_name,
+                        "tool_args": {"command": command},
+                        "tool_eta_s": real_gap,  # bootstrap until the estimator has obs
+                    },
+                )
             time.sleep(real_gap)
             if inject:
                 post_event(daemon, "tool_call_end", pid)
@@ -174,14 +198,20 @@ def main() -> int:
     ap.add_argument("--output-tokens", type=int, default=1500)
     ap.add_argument("--gap-s", type=float, default=6.0)
     ap.add_argument("--tool-eta-s", type=float, default=6.0)
-    ap.add_argument("--stagger-s", type=float, default=1.5,
-                    help="delay between program starts (avoids prefill pile-up)")
+    ap.add_argument(
+        "--stagger-s",
+        type=float,
+        default=1.5,
+        help="delay between program starts (avoids prefill pile-up)",
+    )
     ap.add_argument("--arm", choices=["ours", "b", "ta"], default="ours")
     ap.add_argument("--out", default=None, help="write per-resume rows JSONL")
     a = ap.parse_args()
-    print(f"=== S1 driver arm={a.arm} programs={a.programs} turns={a.turns} "
-          f"prefix={a.prefix_tokens} out={a.output_tokens} gap={a.gap_s}s "
-          f"eta={a.tool_eta_s}s ===")
+    print(
+        f"=== S1 driver arm={a.arm} programs={a.programs} turns={a.turns} "
+        f"prefix={a.prefix_tokens} out={a.output_tokens} gap={a.gap_s}s "
+        f"eta={a.tool_eta_s}s ==="
+    )
     t0 = time.perf_counter()
     results: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=a.programs) as ex:
@@ -205,16 +235,26 @@ def main() -> int:
         p99 = ttfts_s[min(n - 1, int(0.99 * n))]
         print(f"resume TTFT ms: mean={mean:.1f} p50={p50:.1f} p99={p99:.1f}")
     if cached:
-        print(f"resume cached_tokens: mean={sum(cached)/len(cached):.0f} "
-              f"(prefix={a.prefix_tokens})")
+        print(
+            f"resume cached_tokens: mean={sum(cached)/len(cached):.0f} "
+            f"(prefix={a.prefix_tokens})"
+        )
     if a.out:
         with open(a.out, "w") as fh:
             for r in resume:
                 fh.write(json.dumps(r) + "\n")
         print(f"wrote per-resume rows -> {a.out}")
-    print(json.dumps({"arm": a.arm, "programs": a.programs, "resume_n": len(resume),
-                      "ttft_mean": (sum(ttfts)/len(ttfts) if ttfts else None),
-                      "cached_mean": (sum(cached)/len(cached) if cached else None)}))
+    print(
+        json.dumps(
+            {
+                "arm": a.arm,
+                "programs": a.programs,
+                "resume_n": len(resume),
+                "ttft_mean": (sum(ttfts) / len(ttfts) if ttfts else None),
+                "cached_mean": (sum(cached) / len(cached) if cached else None),
+            }
+        )
+    )
     return 0
 
 

@@ -3,6 +3,7 @@
 ``Req.__init__`` carries only a thin ``sanitize_program_id(...)`` call; the
 adversarial-input-hardened coercion (verify/t3) lives here.
 """
+
 from __future__ import annotations
 
 from typing import Any, Optional

@@ -16,6 +16,7 @@ State (radix-tree) identity is checked separately (Part A-state) once the daemon
 Run: sglang must be up with --enable-custom-logit-processor (see run_partA.sh).
   python test_partA.py --base-url http://127.0.0.1:30000 --reps 7 --out-len 256
 """
+
 import argparse
 import json
 import statistics
@@ -46,8 +47,12 @@ def gen(base_url, *, out_len, forced_ids=None):
     # len(forced) tokens by construction; matching the baseline's count isolates
     # the override mechanism as the only difference.
     sp = {"temperature": 0.0, "max_new_tokens": out_len, "ignore_eos": True}
-    body = {"text": PROMPT, "sampling_params": sp, "return_logprob": True,
-            "stream": False}
+    body = {
+        "text": PROMPT,
+        "sampling_params": sp,
+        "return_logprob": True,
+        "stream": False,
+    }
     if forced_ids is not None:
         sp["custom_params"] = {"forced_output_ids": list(forced_ids)}
     t0 = time.perf_counter()
@@ -85,8 +90,11 @@ def main():
     O_star, _, _ = gen(a.base_url, out_len=a.out_len)
     print(f"[partA] O* length = {len(O_star)} tokens", flush=True)
     if len(O_star) < a.out_len // 2:
-        print(f"WARNING: O* shorter than expected ({len(O_star)} < {a.out_len}); "
-              f"model hit EOS — forcing will reproduce only this length", flush=True)
+        print(
+            f"WARNING: O* shorter than expected ({len(O_star)} < {a.out_len}); "
+            f"model hit EOS — forcing will reproduce only this length",
+            flush=True,
+        )
 
     # warmup one of each (compile / cache) then timed reps
     gen(a.base_url, out_len=len(O_star))
@@ -97,34 +105,61 @@ def main():
     for i in range(a.reps):
         ids_b, ttft_b, tot_b = gen(a.base_url, out_len=len(O_star))
         ids_f, ttft_f, tot_f = gen(a.base_url, out_len=len(O_star), forced_ids=O_star)
-        base_tot.append(tot_b); base_ttft.append(ttft_b)
-        force_tot.append(tot_f); force_ttft.append(ttft_f)
+        base_tot.append(tot_b)
+        base_ttft.append(ttft_b)
+        force_tot.append(tot_f)
+        force_ttft.append(ttft_f)
         if ids_b != O_star:
-            print(f"  rep{i}: baseline drifted from O* (nondeterminism?) "
-                  f"first-diff at {next((k for k in range(min(len(ids_b),len(O_star))) if ids_b[k]!=O_star[k]), 'len')}",
-                  flush=True)
+            print(
+                f"  rep{i}: baseline drifted from O* (nondeterminism?) "
+                f"first-diff at {next((k for k in range(min(len(ids_b),len(O_star))) if ids_b[k]!=O_star[k]), 'len')}",
+                flush=True,
+            )
         if ids_f != O_star:
             mismatches += 1
-            k = next((k for k in range(min(len(ids_f), len(O_star))) if ids_f[k] != O_star[k]), None)
+            k = next(
+                (
+                    k
+                    for k in range(min(len(ids_f), len(O_star)))
+                    if ids_f[k] != O_star[k]
+                ),
+                None,
+            )
             print(f"  rep{i}: FORCED output != O*  (first diff idx {k})", flush=True)
         print(f"  rep{i}: base {tot_b:7.1f}ms  forced {tot_f:7.1f}ms", flush=True)
 
-    bt, bs, bn = band(base_tot); ft, fs, fn = band(force_tot)
-    btt = band(base_ttft); ftt = band(force_ttft)
+    bt, bs, bn = band(base_tot)
+    ft, fs, fn = band(force_tot)
+    btt = band(base_ttft)
+    ftt = band(force_ttft)
     print("\n=== Part A result ===")
-    print(f"correctness: forced == O* on {a.reps - mismatches}/{a.reps} reps "
-          f"({'PASS' if mismatches == 0 else 'FAIL'})")
-    print(f"total latency  base {bt:.1f}±{bs:.1f}ms   forced {ft:.1f}±{fs:.1f}ms   "
-          f"Δ {ft-bt:+.1f}ms ({100*(ft-bt)/bt:+.2f}%)")
-    print(f"TTFT           base {btt[0]:.1f}±{btt[1]:.1f}ms forced {ftt[0]:.1f}±{ftt[1]:.1f}ms")
+    print(
+        f"correctness: forced == O* on {a.reps - mismatches}/{a.reps} reps "
+        f"({'PASS' if mismatches == 0 else 'FAIL'})"
+    )
+    print(
+        f"total latency  base {bt:.1f}±{bs:.1f}ms   forced {ft:.1f}±{fs:.1f}ms   "
+        f"Δ {ft-bt:+.1f}ms ({100*(ft-bt)/bt:+.2f}%)"
+    )
+    print(
+        f"TTFT           base {btt[0]:.1f}±{btt[1]:.1f}ms forced {ftt[0]:.1f}±{ftt[1]:.1f}ms"
+    )
     # verdict: forced within base's noise band (2σ) on total latency
     overlap = abs(ft - bt) <= 2 * max(bs, fs, 1e-9)
     print(f"timing no-op (|Δ| ≤ 2σ): {'PASS' if overlap else 'REVIEW'}")
-    print(json.dumps({"o_star_len": len(O_star), "reps": a.reps,
-                      "force_correct": mismatches == 0,
-                      "base_total_ms": [bt, bs], "forced_total_ms": [ft, fs],
-                      "delta_pct": 100*(ft-bt)/bt if bt else None,
-                      "timing_overlap_2sigma": overlap}))
+    print(
+        json.dumps(
+            {
+                "o_star_len": len(O_star),
+                "reps": a.reps,
+                "force_correct": mismatches == 0,
+                "base_total_ms": [bt, bs],
+                "forced_total_ms": [ft, fs],
+                "delta_pct": 100 * (ft - bt) / bt if bt else None,
+                "timing_overlap_2sigma": overlap,
+            }
+        )
+    )
     return 0 if mismatches == 0 else 1
 
 

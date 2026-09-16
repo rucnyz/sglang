@@ -17,6 +17,7 @@ This file is the per-task-RESULTS-doc artifact for the audit round
 
 Expected: each probe prints ``PASS  <finding>: pre-fix FAIL → post-fix PASS``.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -41,16 +42,15 @@ sys.path.insert(0, str(_AGINFER_ROOT))
 # Force a clean import of kv_scheduler so monkey-patches can be
 # applied / reverted cleanly.
 import daemon.kv_scheduler as kvs_mod  # noqa: E402
-from daemon.events import Event, EventBus, EventKind  # noqa: E402
+from baselines.base import Tier  # noqa: E402
 from daemon.event_router import EventRouter  # noqa: E402
+from daemon.events import Event, EventBus, EventKind  # noqa: E402
 from daemon.kv_scheduler import (  # noqa: E402
     KvScheduler,
     attach_kv_scheduler,
     build_paper_state,
 )
 from daemon.program_tracker import ProgramTracker, State  # noqa: E402
-from baselines.base import Tier  # noqa: E402
-
 
 # ---------------------------------------------------------------- helpers
 
@@ -217,8 +217,8 @@ def probe_b1_unknown_tier_unsafe_default() -> None:
     # truly orthogonal test we'd need to surgically patch
     # build_paper_state's loop — too invasive.  Mark as covered.
     pre2 = post2  # Acknowledge: sub-probe coverage is via composition
-                  # with the B1 primary probe rather than a clean
-                  # orthogonal regression.  See docstring.
+    # with the B1 primary probe rather than a clean
+    # orthogonal regression.  See docstring.
     print(
         f"NOTE  {name2}: composed with B1 primary; orthogonal pin via "
         f"_tier_from_string is sufficient since skip-None branch is "
@@ -239,7 +239,10 @@ def probe_b2_per_rank_aggregation() -> None:
         "per_rank": [
             {
                 "tier_usage": {
-                    "HBM": {"used_bytes": 4 * 1024 * 1024, "cap_bytes": 8 * 1024 * 1024},
+                    "HBM": {
+                        "used_bytes": 4 * 1024 * 1024,
+                        "cap_bytes": 8 * 1024 * 1024,
+                    },
                     "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
                     "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
                 },
@@ -258,7 +261,10 @@ def probe_b2_per_rank_aggregation() -> None:
             },
             {
                 "tier_usage": {
-                    "HBM": {"used_bytes": 4 * 1024 * 1024, "cap_bytes": 8 * 1024 * 1024},
+                    "HBM": {
+                        "used_bytes": 4 * 1024 * 1024,
+                        "cap_bytes": 8 * 1024 * 1024,
+                    },
                     "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
                     "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
                 },
@@ -419,7 +425,11 @@ def probe_m2_target_tier_not_drop() -> None:
         async def _migrate(raw: Request) -> Any:
             body = await raw.json()
             captured.append(body)
-            return {"applied": len(body.get("actions", [])), "applied_hashes": [], "skipped": []}
+            return {
+                "applied": len(body.get("actions", [])),
+                "applied_hashes": [],
+                "skipped": [],
+            }
 
         port = _free_port()
         url = f"http://127.0.0.1:{port}"
@@ -513,7 +523,10 @@ def _make_simple_state() -> Dict[str, Any]:
     ]
     return {
         "tier_usage": {
-            "HBM": {"used_bytes": sum(u["n_bytes"] for u in units), "cap_bytes": 8 * 1024 * 1024},
+            "HBM": {
+                "used_bytes": sum(u["n_bytes"] for u in units),
+                "cap_bytes": 8 * 1024 * 1024,
+            },
             "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
             "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
         },
@@ -601,6 +614,7 @@ def probe_n2_migrate_5xx_no_raise() -> None:
         async def _m(raw: Request) -> Any:
             await raw.body()
             from fastapi.responses import JSONResponse
+
             return JSONResponse({"error": "boom"}, status_code=500)
 
         port = _free_port()
@@ -627,18 +641,17 @@ def probe_n2_migrate_5xx_no_raise() -> None:
         return router.handler_failures, router.events_handled
 
     failures, handled = asyncio.run(_run())
-    post_fix_passed = (failures == 0 and handled == 1)
+    post_fix_passed = failures == 0 and handled == 1
 
     # PRE-FIX: monkey-patch _dispatch_migrate to raise on 5xx.
     saved = KvScheduler._dispatch_migrate
 
     async def _bug_dispatch(self, assignments):  # noqa: ANN001
         from daemon.kv_scheduler import assignments_to_wire as _atw
+
         body = {"actions": _atw(assignments)}
         client = await self.ensure_client()
-        r = await client.post(
-            f"{self.sglang_base_url}/aginfer/migrate", json=body
-        )
+        r = await client.post(f"{self.sglang_base_url}/aginfer/migrate", json=body)
         r.raise_for_status()  # BUG: previously logged + continued.
         self.migrate_calls += 1
 
@@ -647,7 +660,7 @@ def probe_n2_migrate_5xx_no_raise() -> None:
         b_failures, b_handled = asyncio.run(_run())
     finally:
         KvScheduler._dispatch_migrate = saved
-    pre_fix_passed = (b_failures == 0 and b_handled == 1)
+    pre_fix_passed = b_failures == 0 and b_handled == 1
 
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
@@ -677,7 +690,8 @@ def probe_n3_env_var_binding() -> None:
     (default).  Test would catch this.
     """
     name = "N3 (AGINFER_* env -> module constant, real bisect)"
-    import tempfile, shutil
+    import shutil
+    import tempfile
 
     src_root = _AGINFER_ROOT
     real_src = (src_root / "daemon" / "kv_scheduler.py").read_text()
@@ -696,7 +710,8 @@ def probe_n3_env_var_binding() -> None:
             shutil.copytree(src_root / "daemon", Path(shadow) / "daemon")
             # Also copy baselines (kv_scheduler imports from it).
             shutil.copytree(
-                src_root / "baselines", Path(shadow) / "baselines",
+                src_root / "baselines",
+                Path(shadow) / "baselines",
                 ignore=shutil.ignore_patterns("__pycache__"),
             )
             # Overwrite the shadow kv_scheduler with the custom source.
@@ -707,20 +722,30 @@ def probe_n3_env_var_binding() -> None:
                 "print(k._DEFAULT_MEMORY_PRESSURE_TOPK)"
             )
             env = {
-                **{k: v for k, v in os.environ.items()
-                   if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))},
+                **{
+                    k: v
+                    for k, v in os.environ.items()
+                    if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))
+                },
                 **env_extra,
             }
-            out = subprocess.check_output(
-                [sys.executable, "-c", probe_src], env=env, timeout=20,
-            ).decode().strip().splitlines()[-1]
+            out = (
+                subprocess.check_output(
+                    [sys.executable, "-c", probe_src],
+                    env=env,
+                    timeout=20,
+                )
+                .decode()
+                .strip()
+                .splitlines()[-1]
+            )
             return int(out)
         finally:
             shutil.rmtree(shadow, ignore_errors=True)
 
     # POST-FIX: stock source.
     post_observed = _probe_with_source(real_src, {"AGINFER_MEMORY_PRESSURE_TOPK": "7"})
-    post_fix_passed = (post_observed == 7)
+    post_fix_passed = post_observed == 7
 
     # PRE-FIX: source with the env var renamed.  Setting the OLD env
     # var should NOT bind; constant should be 256 (default).
@@ -731,7 +756,7 @@ def probe_n3_env_var_binding() -> None:
     pre_observed = _probe_with_source(
         renamed_src, {"AGINFER_MEMORY_PRESSURE_TOPK": "7"}
     )
-    pre_fix_passed = (pre_observed == 7)
+    pre_fix_passed = pre_observed == 7
 
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
@@ -788,8 +813,10 @@ def probe_n4_idempotence_forced() -> None:
             )
         state = {
             "tier_usage": {
-                "HBM": {"used_bytes": sum(u["n_bytes"] for u in units),
-                         "cap_bytes": 32 * 1024 * 1024},
+                "HBM": {
+                    "used_bytes": sum(u["n_bytes"] for u in units),
+                    "cap_bytes": 32 * 1024 * 1024,
+                },
                 "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
                 "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
             },
@@ -817,9 +844,11 @@ def probe_n4_idempotence_forced() -> None:
         router = EventRouter(bus=bus, sglang_base_url=url)
         sched = KvScheduler(tracker=tracker, sglang_base_url=url)
         if force_empty:
+
             class _EmptyPolicy:
                 def decide(self, state):
                     return Action(assignments=[])
+
             sched.policy = _EmptyPolicy()
         attach_kv_scheduler(router, sched)
         await router.start()
@@ -839,8 +868,8 @@ def probe_n4_idempotence_forced() -> None:
     post_n_calls = asyncio.run(_run(force_empty=False))
     pre_n_calls = asyncio.run(_run(force_empty=True))
     # New assertion: len == 3.  POST passes (>= 3 migrates), PRE fails (0).
-    post_fix_passed = (post_n_calls == 3)
-    pre_fix_passed = (pre_n_calls == 3)
+    post_fix_passed = post_n_calls == 3
+    pre_fix_passed = pre_n_calls == 3
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
 
@@ -878,7 +907,10 @@ async def probe_r2_b1_multi_rank_hash_round_trip() -> None:
         "per_rank": [
             {
                 "tier_usage": {
-                    "HBM": {"used_bytes": 8 * 1024 * 1024, "cap_bytes": 16 * 1024 * 1024},
+                    "HBM": {
+                        "used_bytes": 8 * 1024 * 1024,
+                        "cap_bytes": 16 * 1024 * 1024,
+                    },
                     "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
                     "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
                 },
@@ -897,7 +929,10 @@ async def probe_r2_b1_multi_rank_hash_round_trip() -> None:
             },
             {
                 "tier_usage": {
-                    "HBM": {"used_bytes": 8 * 1024 * 1024, "cap_bytes": 16 * 1024 * 1024},
+                    "HBM": {
+                        "used_bytes": 8 * 1024 * 1024,
+                        "cap_bytes": 16 * 1024 * 1024,
+                    },
                     "DRAM": {"used_bytes": 0, "cap_bytes": 1 << 30},
                     "DISK": {"used_bytes": 0, "cap_bytes": 1 << 40},
                 },
@@ -943,7 +978,8 @@ async def probe_r2_b1_multi_rank_hash_round_trip() -> None:
                 "applied_hashes": applied,
                 "skipped": [
                     {"hash": h, "reason": "race:not_in_tree"}
-                    for h in dispatched if h not in sglang_tree_hashes
+                    for h in dispatched
+                    if h not in sglang_tree_hashes
                 ],
             }
 
@@ -1005,7 +1041,9 @@ async def probe_r2_b1_multi_rank_hash_round_trip() -> None:
                 agg_units.append(u2)
             agg_time = max(agg_time, int(rank.get("time_counter", 0) or 0))
         return {
-            "tier_usage": agg_tu, "units": agg_units, "time_counter": agg_time,
+            "tier_usage": agg_tu,
+            "units": agg_units,
+            "time_counter": agg_time,
         }
 
     kvs_mod._flatten_per_rank = _bug_flatten
@@ -1163,9 +1201,7 @@ def probe_r2_n1_units_for_session_set_semantics() -> None:
     def _bug_units_for_session(units, session):
         if session is None:
             return []
-        return [
-            uid for uid, u in units.items() if u.holders == [session]
-        ]
+        return [uid for uid, u in units.items() if u.holders == [session]]
 
     kvs_mod._units_for_session = _bug_units_for_session
     try:
@@ -1212,21 +1248,30 @@ def probe_r3_vacuous2_malformed_env_var() -> None:
 
     def _probe() -> str:
         env = {
-            **{k: v for k, v in os.environ.items()
-               if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))},
+            **{
+                k: v
+                for k, v in os.environ.items()
+                if k.startswith(("PATH", "PYTHON", "LD_", "CONDA"))
+            },
             "AGINFER_LAMBDA_ACTING": "not_a_float",
         }
-        out = subprocess.check_output(
-            [sys.executable, "-c", probe_src], env=env, timeout=15,
-        ).decode().strip().splitlines()[-1]
+        out = (
+            subprocess.check_output(
+                [sys.executable, "-c", probe_src],
+                env=env,
+                timeout=15,
+            )
+            .decode()
+            .strip()
+            .splitlines()[-1]
+        )
         return out
 
     out = _probe()
     # FIX accepts EITHER (a) IMPORT_OK (safe fallback) OR (b)
     # IMPORT_FAIL with a clear "AGINFER_LAMBDA_ACTING" mention.
-    post_fix_passed = (
-        out == "IMPORT_OK"
-        or (out.startswith("IMPORT_FAIL") and "AGINFER_LAMBDA_ACTING" in out)
+    post_fix_passed = out == "IMPORT_OK" or (
+        out.startswith("IMPORT_FAIL") and "AGINFER_LAMBDA_ACTING" in out
     )
 
     # PRE-FIX (current behavior pre-this-fix): bare float() crashes
@@ -1385,6 +1430,7 @@ async def probe_r3_depth3_malformed_state_smoke() -> None:
         # attach_kv_scheduler captures is the bug version.
         saved = KvScheduler.handle
         if strip_handle_guard:
+
             async def _bug_handle(self, event, r):
                 state_json = await r.fetch_state()
                 sched_state = kvs_mod.build_paper_state(
@@ -1402,6 +1448,7 @@ async def probe_r3_depth3_malformed_state_smoke() -> None:
                 self.last_action = action
                 if action.assignments:
                     await self._dispatch_migrate(action.assignments)
+
             KvScheduler.handle = _bug_handle  # type: ignore[assignment]
 
         port = _free_port()
@@ -1444,8 +1491,8 @@ async def probe_r3_depth3_malformed_state_smoke() -> None:
     # PRE-FIX (no try/except in handle): event_worker catches the
     # malformed-state exception → handler_failures bumps to 1.
     # POST-FIX: handle()'s try/except catches → handler_failures 0.
-    post_fix_passed = (failures_post == 0 and handled_post == 2)
-    pre_fix_passed = (failures_pre == 0 and handled_pre == 2)
+    post_fix_passed = failures_post == 0 and handled_post == 2
+    pre_fix_passed = failures_pre == 0 and handled_pre == 2
     _bisect_outcome(name, pre_fix_passed, post_fix_passed)
 
 
@@ -1469,6 +1516,7 @@ async def probe_r3_depth4_null_fetch_state() -> None:
     @stub_app.get("/aginfer/state")
     async def _s() -> Any:
         from fastapi.responses import JSONResponse
+
         return JSONResponse(content=state_holder["state"])
 
     @stub_app.post("/aginfer/migrate")
@@ -1587,7 +1635,7 @@ async def probe_r3_depth4_null_fetch_state() -> None:
             pre_failures = router.handler_failures
             await router.stop()
             await sched.aclose()
-        pre_fix_passed = (pre_failures == 0)
+        pre_fix_passed = pre_failures == 0
     finally:
         KvScheduler.handle = saved_handle
 
@@ -1622,7 +1670,7 @@ def probe_r5_per_rank_tier_disagree_prefers_colder() -> None:
                 "units": [
                     {
                         "hash": "u-mid-migration",
-                        "tier": "HBM",            # rank-0 still sees HBM
+                        "tier": "HBM",  # rank-0 still sees HBM
                         "n_tokens": 1024,
                         "n_bytes": 1 << 20,
                         "last_access_time": 0,
@@ -1641,7 +1689,7 @@ def probe_r5_per_rank_tier_disagree_prefers_colder() -> None:
                 "units": [
                     {
                         "hash": "u-mid-migration",
-                        "tier": "DRAM",           # rank-1 already demoted
+                        "tier": "DRAM",  # rank-1 already demoted
                         "n_tokens": 1024,
                         "n_bytes": 1 << 20,
                         "last_access_time": 0,
@@ -1662,6 +1710,7 @@ def probe_r5_per_rank_tier_disagree_prefers_colder() -> None:
             unknown_tier_log=set(),
         )
         from baselines.base import Tier
+
         return s.units["u-mid-migration"].tier == Tier.DRAM
 
     post_fix_passed = _check()
@@ -1727,8 +1776,8 @@ def probe_r5_unsupported_tree_cache_log() -> None:
     PRE-FIX: nothing logged.
     """
     name = "R5-MAJOR (unsupported_tree_cache marker is logged once)"
-    import logging
     import io
+    import logging
 
     state_with_marker = {
         "unsupported_tree_cache": "MysteryTreeCache",
@@ -1754,10 +1803,16 @@ def probe_r5_unsupported_tree_cache_log() -> None:
         # NOT emit any warning (pre-fix behavior).
         saved = kvs_mod.build_paper_state
         if monkey_patch_strip_logger:
+
             def _bug_build(state_json_in, **kw):
                 # Pre-fix: ignore the marker entirely.
-                sj = {k: v for k, v in state_json_in.items() if k != "unsupported_tree_cache"}
+                sj = {
+                    k: v
+                    for k, v in state_json_in.items()
+                    if k != "unsupported_tree_cache"
+                }
                 return saved(sj, **kw)
+
             kvs_mod.build_paper_state = _bug_build
         try:
             kvs_mod.build_paper_state(
@@ -1842,10 +1897,7 @@ def probe_r35_tier_field_missing() -> None:
 
     def _bug_build(state_json_in, **kw):
         sj = dict(state_json_in)
-        sj["units"] = [
-            {**u, "tier": u.get("tier", "HBM")}
-            for u in sj.get("units", [])
-        ]
+        sj["units"] = [{**u, "tier": u.get("tier", "HBM")} for u in sj.get("units", [])]
         return saved(sj, **kw)
 
     kvs_mod.build_paper_state = _bug_build
@@ -1956,8 +2008,10 @@ async def probe_r3_depth5_no_caching_contract() -> None:
         if force_cache:
             # PRE-FIX: pin fetch_state to ALWAYS return the first state.
             first_state = state_holder["state"]
+
             async def _bug_fetch():
                 return first_state
+
             router.fetch_state = _bug_fetch  # type: ignore[assignment]
 
         await router.start()
@@ -2101,12 +2155,8 @@ def probe_r2_n2_unknown_tier_log_scope() -> None:
     name = "R2-N2 (unknown-tier log is instance-scoped, not module)"
 
     def _check() -> bool:
-        s1 = KvScheduler(
-            tracker=ProgramTracker(), sglang_base_url="http://x"
-        )
-        s2 = KvScheduler(
-            tracker=ProgramTracker(), sglang_base_url="http://x"
-        )
+        s1 = KvScheduler(tracker=ProgramTracker(), sglang_base_url="http://x")
+        s2 = KvScheduler(tracker=ProgramTracker(), sglang_base_url="http://x")
         state_with_unknown = {
             "tier_usage": {
                 "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
@@ -2141,8 +2191,7 @@ def probe_r2_n2_unknown_tier_log_scope() -> None:
             unknown_tier_log=s2._unknown_tier_log,
         )
         return (
-            "ZSTD_TEST" in s1._unknown_tier_log
-            and "ZSTD_TEST" in s2._unknown_tier_log
+            "ZSTD_TEST" in s1._unknown_tier_log and "ZSTD_TEST" in s2._unknown_tier_log
         )
 
     post_fix_passed = _check()
@@ -2156,7 +2205,11 @@ def probe_r2_n2_unknown_tier_log_scope() -> None:
     saved = kvs_mod.build_paper_state
 
     def _bug_build(
-        state_json, *, event, tracker, lambda_acting=0.2,
+        state_json,
+        *,
+        event,
+        tracker,
+        lambda_acting=0.2,
         unknown_tier_log=None,
     ):
         # Force the module-global behavior: ignore the per-instance
@@ -2175,15 +2228,13 @@ def probe_r2_n2_unknown_tier_log_scope() -> None:
         # signature.  Because build_paper_state is the module-level
         # function we bind it back here for the in-process call.
         import importlib
+
         # Re-import the probe's reference too:
         import daemon.kv_scheduler  # noqa: F401
+
         # Simulate: only ONE instance's set ever sees the label.
-        s1 = KvScheduler(
-            tracker=ProgramTracker(), sglang_base_url="http://x"
-        )
-        s2 = KvScheduler(
-            tracker=ProgramTracker(), sglang_base_url="http://x"
-        )
+        s1 = KvScheduler(tracker=ProgramTracker(), sglang_base_url="http://x")
+        s2 = KvScheduler(tracker=ProgramTracker(), sglang_base_url="http://x")
         state_with_unknown = {
             "tier_usage": {
                 "HBM": {"used_bytes": 0, "cap_bytes": 1 << 30},
@@ -2218,8 +2269,7 @@ def probe_r2_n2_unknown_tier_log_scope() -> None:
         # Under the bug, both call paths share `shared_global`; the
         # per-instance sets stay empty.
         pre_fix_passed = (
-            "ZSTD_TEST" in s1._unknown_tier_log
-            and "ZSTD_TEST" in s2._unknown_tier_log
+            "ZSTD_TEST" in s1._unknown_tier_log and "ZSTD_TEST" in s2._unknown_tier_log
         )
     finally:
         kvs_mod.build_paper_state = saved
